@@ -40,7 +40,6 @@ public:
         Interval Align(size_t alignment) const {
             const auto align_down = [alignment](AddressType addr) {
                 if constexpr (std::is_pointer_v<AddressType>) {
-                    using Pointee = std::remove_pointer_t<AddressType>;
                     const auto raw = reinterpret_cast<uintptr_t>(addr);
                     return reinterpret_cast<AddressType>(raw - (raw % alignment));
                 } else {
@@ -49,7 +48,6 @@ public:
             };
             const auto align_up = [alignment](AddressType addr) {
                 if constexpr (std::is_pointer_v<AddressType>) {
-                    using Pointee = std::remove_pointer_t<AddressType>;
                     const auto raw = reinterpret_cast<uintptr_t>(addr);
                     const auto rem = raw % alignment;
                     const auto adjusted = rem == 0 ? raw : raw + (alignment - rem);
