@@ -45,6 +45,7 @@ using VideoCore::Surface::PixelFormatFromRenderTargetFormat;
 constexpr size_t NUM_STAGES = Tegra::Engines::Maxwell3D::Regs::MaxShaderStage;
 constexpr size_t MAX_IMAGE_ELEMENTS = 16384;
 
+namespace GraphicsPipelineLocal {
 constexpr u64 FNV1A_OFFSET = 0xcbf29ce484222325ULL;
 constexpr u64 FNV1A_PRIME = 0x100000001b3ULL;
 
@@ -99,6 +100,7 @@ BindlessCacheEntry& AcquireBindlessEntry(BindlessCache& cache, size_t& round_rob
     slot.valid = false;
     return slot;
 }
+} // namespace GraphicsPipelineLocal
 
 DescriptorLayoutBuilder MakeBuilder(const Device& device, std::span<const Shader::Info> infos) {
     DescriptorLayoutBuilder builder{device};
@@ -376,7 +378,7 @@ void GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     // per draw; small_vector lets the span size match the actual write count.
     thread_local boost::container::small_vector<VideoCommon::ImageViewInOut, 64> views;
     thread_local boost::container::small_vector<VideoCommon::SamplerId, 64> samplers;
-    thread_local BindlessCache bindless_cache;
+    thread_local GraphicsPipelineLocal::BindlessCache bindless_cache;
     thread_local size_t bindless_cache_rr{0};
     thread_local std::vector<u8> bindless_scratch;
     views.clear();
@@ -451,8 +453,9 @@ void GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 bindless_scratch.resize(byte_size);
                 gpu_memory->ReadBlockUnsafe(cbuf_addr, bindless_scratch.data(),
                                             byte_size);
-                BindlessCacheEntry& entry = AcquireBindlessEntry(
-                    bindless_cache, bindless_cache_rr, cbuf_addr, desc.count);
+                GraphicsPipelineLocal::BindlessCacheEntry& entry =
+                    GraphicsPipelineLocal::AcquireBindlessEntry(bindless_cache, bindless_cache_rr,
+                                                                cbuf_addr, desc.count);
                 const bool hit = entry.valid &&
                                  entry.last_bytes.size() == byte_size &&
                                  std::memcmp(entry.last_bytes.data(),
@@ -653,7 +656,8 @@ void GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             return;
         }
         const vk::Device& dev{device.GetLogical()};
-        const u64 data_hash = HashDescriptorBlock(descriptor_data, upload_entries);
+        const u64 data_hash =
+            GraphicsPipelineLocal::HashDescriptorBlock(descriptor_data, upload_entries);
         auto& semaphore = scheduler.GetMasterSemaphore();
         // Strict per-CB cache: DescriptorAllocator tracks lifetime via
         // Commit() but not BindDescriptorSets(), so reusing a cached handle

@@ -28,6 +28,7 @@ using Shader::Backend::SPIRV::RESCALING_LAYOUT_WORDS_OFFSET;
 using Tegra::Texture::TexturePair;
 
 namespace {
+namespace ComputePipelineLocal {
 struct BindlessCacheEntry {
     GPUVAddr key_addr{0};
     u32 key_count{0};
@@ -79,6 +80,7 @@ BindlessCacheEntry& AcquireBindlessEntry(BindlessCache& cache, size_t& round_rob
     slot.valid = false;
     return slot;
 }
+} // namespace ComputePipelineLocal
 } // namespace
 
 ComputePipeline::ComputePipeline(const Device& device_, vk::PipelineCache& pipeline_cache_,
@@ -192,7 +194,7 @@ void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     thread_local boost::container::small_vector<VideoCommon::SamplerId, 64> samplers;
     views.clear();
     samplers.clear();
-    thread_local BindlessCache bindless_cache;
+    thread_local ComputePipelineLocal::BindlessCache bindless_cache;
     thread_local size_t bindless_cache_rr{0};
     thread_local std::vector<u8> bindless_scratch;
 
@@ -241,8 +243,9 @@ void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             const size_t byte_size = static_cast<size_t>(desc.count) << desc.size_shift;
             bindless_scratch.resize(byte_size);
             gpu_memory.ReadBlockUnsafe(cbuf_addr, bindless_scratch.data(), byte_size);
-            BindlessCacheEntry& entry = AcquireBindlessEntry(
-                bindless_cache, bindless_cache_rr, cbuf_addr, desc.count);
+            ComputePipelineLocal::BindlessCacheEntry& entry =
+                ComputePipelineLocal::AcquireBindlessEntry(bindless_cache, bindless_cache_rr,
+                                                           cbuf_addr, desc.count);
             const bool hit = entry.valid &&
                              entry.last_bytes.size() == byte_size &&
                              std::memcmp(entry.last_bytes.data(),
@@ -340,7 +343,8 @@ void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                                  rescaling_data.data());
         }
         const vk::Device& dev{device.GetLogical()};
-        const u64 data_hash = HashDescriptorBlock(descriptor_data, upload_entries);
+        const u64 data_hash =
+            ComputePipelineLocal::HashDescriptorBlock(descriptor_data, upload_entries);
         auto& semaphore = scheduler.GetMasterSemaphore();
         // Strict per-CB cache - see GraphicsPipeline::ConfigureDraw.
         const u64 current_tick = semaphore.CurrentTick();
