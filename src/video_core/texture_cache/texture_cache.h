@@ -440,6 +440,16 @@ void TextureCache<P>::FillComputeImageViews(std::span<ImageViewInOut> views) {
 }
 
 template <class P>
+u64 TextureCache<P>::GraphicsImageTableGeneration() const noexcept {
+    return channel_state->graphics_image_table.Generation();
+}
+
+template <class P>
+u64 TextureCache<P>::ComputeImageTableGeneration() const noexcept {
+    return channel_state->compute_image_table.Generation();
+}
+
+template <class P>
 void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views) {
     if (!Settings::values.barrier_feedback_loops.GetValue()) {
         return;
@@ -718,7 +728,13 @@ void TextureCache<P>::FillImageViews(DescriptorTable<TICEntry>& table,
             has_blacklisted = false;
         }
         for (ImageViewInOut& view : views) {
-            view.id = VisitImageView(table, cached_image_view_ids, view.index);
+            if (view.id_cached) {
+                if (view.id != NULL_IMAGE_VIEW_ID) {
+                    PrepareImageView(view.id, false, false);
+                }
+            } else {
+                view.id = VisitImageView(table, cached_image_view_ids, view.index);
+            }
             if constexpr (has_blacklists) {
                 if (view.blacklist && view.id != NULL_IMAGE_VIEW_ID) {
                     const ImageViewBase& image_view{slot_image_views[view.id]};
