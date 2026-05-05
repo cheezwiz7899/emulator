@@ -205,7 +205,11 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
     });
 }
 
-RasterizerVulkan::~RasterizerVulkan() {
+void RasterizerVulkan::Shutdown() {
+    // Use exchange to guarantee idempotence — called from ~RasterizerVulkan and GPU::Impl::~Impl.
+    if (is_shutting_down.exchange(true, std::memory_order::acq_rel)) {
+        return;
+    }
     // 1. Tell the GPU to finish current work
     scheduler.Finish();
 
@@ -213,6 +217,10 @@ RasterizerVulkan::~RasterizerVulkan() {
     // This ensures VkBuffer/VkImage handles are gone before the memory they sit on is freed
     buffer_cache_runtime.Finish();
     texture_cache_runtime.Finish();
+}
+
+RasterizerVulkan::~RasterizerVulkan() {
+    Shutdown();
 
     // 3. Clear the Staging Pool slabs
     staging_pool.TriggerCacheRelease(MemoryUsage::Upload);
@@ -234,10 +242,13 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     query_cache.NotifySegment(true);
 
     GraphicsPipeline* const pipeline{pipeline_cache.CurrentGraphicsPipeline()};
-    if (!pipeline) {
+    if (!pipeline || is_shutting_down.load(std::memory_order::relaxed)) {
         return;
     }
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    if (is_shutting_down.load(std::memory_order::relaxed)) {
+        return;
+    }
     // update engine as channel may be different.
     pipeline->SetEngine(maxwell3d, gpu_memory);
     pipeline->Configure(is_indexed);
@@ -513,10 +524,13 @@ void RasterizerVulkan::DispatchCompute() {
     gpu_memory->FlushCaching();
 
     ComputePipeline* const pipeline{pipeline_cache.CurrentComputePipeline()};
-    if (!pipeline) {
+    if (!pipeline || is_shutting_down.load(std::memory_order::relaxed)) {
         return;
     }
-    std::scoped_lock lock{texture_cache.mutex, buffer_cache.mutex};
+    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    if (is_shutting_down.load(std::memory_order::relaxed)) {
+        return;
+    }
     pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache, texture_cache);
 
     const auto& qmd{kepler_compute->launch_description};
@@ -849,7 +863,7 @@ u64 RasterizerVulkan::GetStagingMemoryUsage() const {
 }
 
 void RasterizerVulkan::TriggerMemoryGC() {
-    std::scoped_lock lock{texture_cache.mutex, buffer_cache.mutex};
+    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
     texture_cache.TriggerGarbageCollection();
     buffer_cache.TriggerGarbageCollection();
 }
@@ -879,13 +893,10 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
     }
     gpu_memory->WriteBlockUnsafe(address, memory.data(), copy_size);
     {
-        std::unique_lock<std::recursive_mutex> lock{buffer_cache.mutex};
+        std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
         if (!buffer_cache.InlineMemory(*cpu_addr, copy_size, memory)) {
             buffer_cache.WriteMemory(*cpu_addr, copy_size);
         }
-    }
-    {
-        std::scoped_lock lock_texture{texture_cache.mutex};
         texture_cache.WriteMemory(*cpu_addr, copy_size);
     }
     pipeline_cache.InvalidateRegion(*cpu_addr, copy_size);

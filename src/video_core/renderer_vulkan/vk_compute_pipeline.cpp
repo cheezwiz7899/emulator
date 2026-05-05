@@ -347,10 +347,12 @@ void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                          views_it);
 
     if (!is_built.load(std::memory_order::relaxed)) {
-        // Wait for the pipeline to be built
+        // Wait for the pipeline to be built, or bail out if shutdown was requested.
         scheduler.Record([this](vk::CommandBuffer) {
             std::unique_lock lock{build_mutex};
-            build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
+            build_condvar.wait(lock, [this] {
+                return is_built.load(std::memory_order::relaxed) || is_being_shutdown;
+            });
         });
     }
     const auto* const descriptor_data{guest_descriptor_queue.UpdateData()};

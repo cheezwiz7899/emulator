@@ -82,6 +82,8 @@ public:
                               StateTracker& state_tracker_, Scheduler& scheduler_);
     ~RasterizerVulkan() override;
 
+    void Shutdown() override;
+
     void Draw(bool is_indexed, u32 instance_count) override;
     void DrawIndirect() override;
     void DrawTexture() override;
@@ -223,6 +225,7 @@ private:
     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
 
     u32 draw_counter = 0;
+    std::atomic<bool> is_shutting_down{false};
 };
 
 } // namespace Vulkan

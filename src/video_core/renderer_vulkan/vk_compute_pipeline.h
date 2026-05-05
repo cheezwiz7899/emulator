@@ -46,6 +46,11 @@ public:
     void Configure(Tegra::Engines::KeplerCompute& kepler_compute, Tegra::MemoryManager& gpu_memory,
                    Scheduler& scheduler, BufferCache& buffer_cache, TextureCache& texture_cache);
 
+    void Shutdown() {
+        std::scoped_lock lock{build_mutex};
+        build_condvar.notify_all();
+    }
+
 private:
     const Device& device;
     vk::PipelineCache& pipeline_cache;

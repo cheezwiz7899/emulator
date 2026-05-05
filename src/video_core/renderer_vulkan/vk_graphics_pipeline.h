@@ -103,6 +103,11 @@ public:
         return is_built.load(std::memory_order::relaxed);
     }
 
+    void Shutdown() {
+        std::scoped_lock lock{build_mutex};
+        build_condvar.notify_all();
+    }
+
     template <typename Spec>
     static auto MakeConfigureSpecFunc() {
         return [](GraphicsPipeline* pl, bool is_indexed) { pl->ConfigureImpl<Spec>(is_indexed); };
@@ -176,6 +181,7 @@ private:
     std::atomic_bool is_built{false};
     bool uses_push_descriptor{false};
     bool split_descriptor_sets{false};
+    bool is_being_shutdown{false};
 };
 
 } // namespace Vulkan
