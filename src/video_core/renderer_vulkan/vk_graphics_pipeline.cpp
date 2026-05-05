@@ -43,7 +43,7 @@ using VideoCore::Surface::PixelFormatFromDepthFormat;
 using VideoCore::Surface::PixelFormatFromRenderTargetFormat;
 
 constexpr size_t NUM_STAGES = Tegra::Engines::Maxwell3D::Regs::MaxShaderStage;
-constexpr size_t MAX_IMAGE_ELEMENTS = 1024;
+constexpr size_t MAX_IMAGE_ELEMENTS = 16384;
 
 constexpr u64 FNV1A_OFFSET = 0xcbf29ce484222325ULL;
 constexpr u64 FNV1A_PRIME = 0x100000001b3ULL;
@@ -1094,6 +1094,9 @@ void GraphicsPipeline::Validate() {
         num_images += Shader::NumDescriptors(info.image_buffer_descriptors);
         num_images += Shader::NumDescriptors(info.texture_descriptors);
         num_images += Shader::NumDescriptors(info.image_descriptors);
+    }
+    if (num_images > MAX_IMAGE_ELEMENTS) {
+        LOG_CRITICAL(Render_Vulkan, "Too many image elements: {} (max: {})", num_images, MAX_IMAGE_ELEMENTS);
     }
     ASSERT(num_images <= MAX_IMAGE_ELEMENTS);
 }

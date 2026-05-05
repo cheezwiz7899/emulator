@@ -54,13 +54,7 @@ void UpdateDescriptorQueue::Acquire() {
 
 void UpdateDescriptorQueue::EnsureCapacity(size_t required_entries) {
     if (std::distance(payload_start, payload_cursor) + required_entries >= FRAME_PAYLOAD_SIZE) {
-        const size_t already_pushed = GetUploadSize();
         HandleOverflow();
-        if (already_pushed > 0) {
-            std::memcpy(payload_start, upload_start, already_pushed * sizeof(DescriptorUpdateEntry));
-            payload_cursor = payload_start + already_pushed;
-            upload_start = payload_start;
-        }
     }
 }
 
