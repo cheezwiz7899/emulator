@@ -235,25 +235,30 @@ void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     }
     for (const auto& desc : info.texture_descriptors) {
         if (desc.count > 1 && !desc.has_secondary) {
+            const bool cbuf_valid = desc.cbuf_index < cbufs.size();
             const GPUVAddr cbuf_addr =
-                cbufs[desc.cbuf_index].Address() + desc.cbuf_offset;
+                cbuf_valid ? (cbufs[desc.cbuf_index].Address() + desc.cbuf_offset) : 0;
             const u64 image_table_generation = texture_cache.ComputeImageTableGeneration();
+            const size_t byte_size = static_cast<size_t>(desc.count) << desc.size_shift;
 
-            // Fast path: if we have a valid cache entry whose generation matches,
-            // the TIC table hasn't been invalidated. Skip ReadBlockUnsafe + memcmp.
-            if (auto* fast = FindBindlessEntry(bindless_cache, cbuf_addr,
-                                               desc.count, image_table_generation);
-                fast != nullptr) {
-                for (const auto& v : fast->cached_views) {
-                    views.push_back(v);
+            // Nitro fast path: gate the cache hit on buffer modification tracking
+            // so that cbuf writes without TIC generation bumps are always caught.
+            if (cbuf_valid &&
+                !buffer_cache.IsRegionCpuModified(cbuf_addr, byte_size) &&
+                !buffer_cache.IsRegionGpuModified(cbuf_addr, byte_size)) {
+                if (auto* fast = FindBindlessEntry(bindless_cache, cbuf_addr,
+                                                   desc.count, image_table_generation);
+                    fast != nullptr) {
+                    for (const auto& v : fast->cached_views) {
+                        views.push_back(v);
+                    }
+                    for (const auto& s : fast->cached_samplers) {
+                        samplers.push_back(s);
+                    }
+                    continue;
                 }
-                for (const auto& s : fast->cached_samplers) {
-                    samplers.push_back(s);
-                }
-                continue;
             }
 
-            const size_t byte_size = static_cast<size_t>(desc.count) << desc.size_shift;
             bindless_scratch.resize(byte_size);
             gpu_memory.ReadBlockUnsafe(cbuf_addr, bindless_scratch.data(), byte_size);
             BindlessCacheEntry& entry = AcquireBindlessEntry(

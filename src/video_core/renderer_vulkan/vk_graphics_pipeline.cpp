@@ -442,27 +442,36 @@ void GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
         for (const auto& desc : info.texture_descriptors) {
             if (desc.count > 1 && !desc.has_secondary) {
+                const bool cbuf_valid = desc.cbuf_index < cbufs.size();
                 const GPUVAddr cbuf_addr =
-                    cbufs[desc.cbuf_index].address + desc.cbuf_offset;
+                    cbuf_valid ? (cbufs[desc.cbuf_index].address + desc.cbuf_offset) : 0;
                 const u64 image_table_generation =
                     texture_cache.GraphicsImageTableGeneration();
-
-                // Fast path: if we have a valid cache entry whose generation
-                // matches, the TIC table hasn't been invalidated since the last
-                // check. Skip the ReadBlockUnsafe + memcmp entirely.
-                if (auto* fast = FindBindlessEntry(bindless_cache, cbuf_addr,
-                                                    desc.count,
-                                                    image_table_generation);
-                    fast != nullptr) {
-                    views.insert(views.end(), fast->cached_views.begin(),
-                                 fast->cached_views.end());
-                    samplers.insert(samplers.end(), fast->cached_samplers.begin(),
-                                    fast->cached_samplers.end());
-                    continue;
-                }
-
                 const size_t byte_size =
                     static_cast<size_t>(desc.count) << desc.size_shift;
+
+                // Nitro fast path: if the buffer cache reports no CPU or GPU writes
+                // to this cbuf region since the last check, and the TIC generation
+                // still matches, the handles cannot have changed.
+                // This is strictly safer than the generation-only check: games that
+                // stream new texture handles (e.g. grass in Tomodachi Life) write
+                // to the cbuf without bumping TIC generation, so the modification
+                // tracker catches them even when the generation check would not.
+                if (cbuf_valid &&
+                    !buffer_cache.IsRegionCpuModified(cbuf_addr, byte_size) &&
+                    !buffer_cache.IsRegionGpuModified(cbuf_addr, byte_size)) {
+                    if (auto* fast = FindBindlessEntry(bindless_cache, cbuf_addr,
+                                                       desc.count,
+                                                       image_table_generation);
+                        fast != nullptr) {
+                        views.insert(views.end(), fast->cached_views.begin(),
+                                     fast->cached_views.end());
+                        samplers.insert(samplers.end(), fast->cached_samplers.begin(),
+                                        fast->cached_samplers.end());
+                        continue;
+                    }
+                }
+
                 bindless_scratch.resize(byte_size);
                 gpu_memory->ReadBlockUnsafe(cbuf_addr, bindless_scratch.data(),
                                             byte_size);
