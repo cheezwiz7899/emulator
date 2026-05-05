@@ -124,7 +124,7 @@ public:
 protected:
 
     static constexpr size_t FRAMES_IN_FLIGHT = 12;
-    static constexpr size_t FRAME_PAYLOAD_SIZE = 0x200000;
+    static constexpr size_t FRAME_PAYLOAD_SIZE = 0x40000;
     static constexpr size_t PAYLOAD_SIZE = FRAME_PAYLOAD_SIZE * FRAMES_IN_FLIGHT;
 
     void EnsureCapacity(size_t required_entries);

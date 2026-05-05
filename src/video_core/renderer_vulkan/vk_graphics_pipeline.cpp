@@ -43,7 +43,7 @@ using VideoCore::Surface::PixelFormatFromDepthFormat;
 using VideoCore::Surface::PixelFormatFromRenderTargetFormat;
 
 constexpr size_t NUM_STAGES = Tegra::Engines::Maxwell3D::Regs::MaxShaderStage;
-constexpr size_t MAX_IMAGE_ELEMENTS = 16384;
+constexpr size_t MAX_IMAGE_ELEMENTS = 1024;
 
 constexpr u64 FNV1A_OFFSET = 0xcbf29ce484222325ULL;
 constexpr u64 FNV1A_PRIME = 0x100000001b3ULL;
@@ -410,6 +410,9 @@ void GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 const size_t byte_size =
                     static_cast<size_t>(desc.count) << desc.size_shift;
 
+                if (cbuf_valid && buffer_cache.IsRegionGpuModified(cbuf_addr, byte_size)) {
+                    buffer_cache.DownloadMemory(cbuf_addr, byte_size);
+                }
 
                 bindless_scratch.resize(byte_size);
                 gpu_memory->ReadBlockUnsafe(cbuf_addr, bindless_scratch.data(),

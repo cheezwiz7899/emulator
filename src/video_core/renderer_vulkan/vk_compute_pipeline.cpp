@@ -205,6 +205,9 @@ void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             const u64 image_table_generation = texture_cache.ComputeImageTableGeneration();
             const size_t byte_size = static_cast<size_t>(desc.count) << desc.size_shift;
 
+            if (cbuf_valid && buffer_cache.IsRegionGpuModified(cbuf_addr, byte_size)) {
+                buffer_cache.DownloadMemory(cbuf_addr, byte_size);
+            }
 
             bindless_scratch.resize(byte_size);
             gpu_memory.ReadBlockUnsafe(cbuf_addr, bindless_scratch.data(), byte_size);
