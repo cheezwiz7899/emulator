@@ -64,46 +64,6 @@ inline u64 HashDescriptorBlock(const DescriptorUpdateEntry* data, size_t entry_c
     return h;
 }
 
-// Stale SamplerIds are possible if the sampler pool is rebuilt with a different
-// sampler at the same handle while the cbuf bytes don't change. Add a pool
-// sequence-number check here if that ever surfaces as a visible bug.
-struct BindlessCacheEntry {
-    GPUVAddr key_addr{0};
-    u32 key_count{0};
-    u64 key_image_table_generation{};
-    bool valid{false};
-    boost::container::small_vector<u8, 256> last_bytes;
-    boost::container::small_vector<VideoCommon::ImageViewInOut, 16> cached_views;
-    boost::container::small_vector<VideoCommon::SamplerId, 16> cached_samplers;
-};
-constexpr size_t BINDLESS_CACHE_SIZE = 64;
-using BindlessCache = std::array<BindlessCacheEntry, BINDLESS_CACHE_SIZE>;
-
-BindlessCacheEntry* FindBindlessEntry(BindlessCache& cache, GPUVAddr addr, u32 count,
-                                      u64 image_table_generation) {
-    for (auto& entry : cache) {
-        if (entry.valid && entry.key_addr == addr && entry.key_count == count &&
-            entry.key_image_table_generation == image_table_generation) {
-            return &entry;
-        }
-    }
-    return nullptr;
-}
-
-BindlessCacheEntry& AcquireBindlessEntry(BindlessCache& cache, size_t& round_robin,
-                                         GPUVAddr addr, u32 count,
-                                         u64 image_table_generation) {
-    if (auto* found = FindBindlessEntry(cache, addr, count, image_table_generation)) {
-        return *found;
-    }
-    auto& slot = cache[round_robin];
-    round_robin = (round_robin + 1) % BINDLESS_CACHE_SIZE;
-    slot.key_addr = addr;
-    slot.key_count = count;
-    slot.key_image_table_generation = image_table_generation;
-    slot.valid = false;
-    return slot;
-}
 
 DescriptorLayoutBuilder MakeBuilder(const Device& device, std::span<const Shader::Info> infos) {
     DescriptorLayoutBuilder builder{device};
@@ -450,27 +410,6 @@ void GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 const size_t byte_size =
                     static_cast<size_t>(desc.count) << desc.size_shift;
 
-                // Nitro fast path: if the buffer cache reports no CPU or GPU writes
-                // to this cbuf region since the last check, and the TIC generation
-                // still matches, the handles cannot have changed.
-                // This is strictly safer than the generation-only check: games that
-                // stream new texture handles (e.g. grass in Tomodachi Life) write
-                // to the cbuf without bumping TIC generation, so the modification
-                // tracker catches them even when the generation check would not.
-                if (cbuf_valid &&
-                    !buffer_cache.IsRegionCpuModified(cbuf_addr, byte_size) &&
-                    !buffer_cache.IsRegionGpuModified(cbuf_addr, byte_size)) {
-                    if (auto* fast = FindBindlessEntry(bindless_cache, cbuf_addr,
-                                                       desc.count,
-                                                       image_table_generation);
-                        fast != nullptr) {
-                        views.insert(views.end(), fast->cached_views.begin(),
-                                     fast->cached_views.end());
-                        samplers.insert(samplers.end(), fast->cached_samplers.begin(),
-                                        fast->cached_samplers.end());
-                        continue;
-                    }
-                }
 
                 bindless_scratch.resize(byte_size);
                 gpu_memory->ReadBlockUnsafe(cbuf_addr, bindless_scratch.data(),

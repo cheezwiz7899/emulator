@@ -57,6 +57,13 @@ enum class RelaxedOptions : u32 {
 };
 DECLARE_ENUM_FLAG_OPERATORS(RelaxedOptions)
 
+struct ImageViewInOut {
+    u32 index{};
+    bool blacklist{};
+    ImageViewId id{};
+    bool id_cached{};
+};
+
 struct Offset2D {
     constexpr auto operator<=>(const Offset2D&) const noexcept = default;
 

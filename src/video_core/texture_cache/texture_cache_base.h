@@ -50,12 +50,7 @@ using Tegra::Texture::TSCEntry;
 using VideoCore::Surface::PixelFormat;
 using namespace Common::Literals;
 
-struct ImageViewInOut {
-    u32 index{};
-    bool blacklist{};
-    ImageViewId id{};
-    bool id_cached{};
-};
+
 
 struct AsyncDecodeContext {
     ImageId image_id;
