@@ -727,11 +727,39 @@ void TextureCache<P>::FillImageViews(DescriptorTable<TICEntry>& table,
         if constexpr (has_blacklists) {
             has_blacklisted = false;
         }
+
+        // Batch-prepare unique images from id_cached views FIRST so that
+        // has_deleted_images is set before we process VisitImageView below.
+        // PrepareImage may delete images (e.g. under VRAM pressure), which
+        // would leave stale id_cached view.ids pointing at freed slots.
+        // If deletion occurs, clear id_cached so those views re-resolve.
+        {
+            boost::container::small_vector<ImageId, 64> cached_ids;
+            for (const ImageViewInOut& view : views) {
+                if (view.id_cached && view.id != NULL_IMAGE_VIEW_ID) {
+                    const ImageViewBase& iv = slot_image_views[view.id];
+                    if (!iv.IsBuffer()) {
+                        cached_ids.push_back(iv.image_id);
+                    }
+                }
+            }
+            std::sort(cached_ids.begin(), cached_ids.end());
+            cached_ids.erase(std::unique(cached_ids.begin(), cached_ids.end()),
+                             cached_ids.end());
+            for (const ImageId id : cached_ids) {
+                PrepareImage(id, false, false);
+            }
+        }
+        // If PrepareImage triggered image deletion, stale id_cached view.ids
+        // may now be invalid. Force re-resolution via VisitImageView.
+        if (has_deleted_images) {
+            for (ImageViewInOut& view : views) {
+                view.id_cached = false;
+            }
+        }
+
         for (ImageViewInOut& view : views) {
-            if (view.id_cached) {
-                // Already resolved and prepared during cache population.
-                // Batch-prepare unique images below instead of per-entry PrepareImageView.
-            } else {
+            if (!view.id_cached) {
                 view.id = VisitImageView(table, cached_image_view_ids, view.index);
             }
             if constexpr (has_blacklists) {
@@ -744,27 +772,6 @@ void TextureCache<P>::FillImageViews(DescriptorTable<TICEntry>& table,
             }
         }
     } while (has_deleted_images || (has_blacklists && has_blacklisted));
-
-    // Batch-prepare unique images from id_cached views.  The cache-miss path
-    // already called VisitImageView (which does PrepareImageView) for each
-    // entry; here we only need to touch/refresh each *unique* underlying
-    // image once, rather than 1024 individual PrepareImageView calls.
-    boost::container::small_vector<ImageId, 64> cached_image_ids;
-    for (const ImageViewInOut& view : views) {
-        if (view.id_cached && view.id != NULL_IMAGE_VIEW_ID) {
-            const ImageViewBase& iv = slot_image_views[view.id];
-            if (!iv.IsBuffer()) {
-                cached_image_ids.push_back(iv.image_id);
-            }
-        }
-    }
-    std::sort(cached_image_ids.begin(), cached_image_ids.end());
-    cached_image_ids.erase(
-        std::unique(cached_image_ids.begin(), cached_image_ids.end()),
-        cached_image_ids.end());
-    for (const ImageId id : cached_image_ids) {
-        PrepareImage(id, false, false);
-    }
 }
 
 template <class P>
