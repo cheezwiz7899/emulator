@@ -43,7 +43,7 @@ using VideoCore::Surface::PixelFormatFromDepthFormat;
 using VideoCore::Surface::PixelFormatFromRenderTargetFormat;
 
 constexpr size_t NUM_STAGES = Tegra::Engines::Maxwell3D::Regs::MaxShaderStage;
-constexpr size_t MAX_IMAGE_ELEMENTS = 1024;
+constexpr size_t MAX_IMAGE_ELEMENTS = 16384;
 
 constexpr u64 FNV1A_OFFSET = 0xcbf29ce484222325ULL;
 constexpr u64 FNV1A_PRIME = 0x100000001b3ULL;
@@ -67,43 +67,8 @@ inline u64 HashDescriptorBlock(const DescriptorUpdateEntry* data, size_t entry_c
 // Stale SamplerIds are possible if the sampler pool is rebuilt with a different
 // sampler at the same handle while the cbuf bytes don't change. Add a pool
 // sequence-number check here if that ever surfaces as a visible bug.
-struct BindlessCacheEntry {
-    GPUVAddr key_addr{0};
-    u32 key_count{0};
-    u64 key_image_table_generation{};
-    bool valid{false};
-    boost::container::small_vector<u8, 256> last_bytes;
-    boost::container::small_vector<VideoCommon::ImageViewInOut, 16> cached_views;
-    boost::container::small_vector<VideoCommon::SamplerId, 16> cached_samplers;
-};
-constexpr size_t BINDLESS_CACHE_SIZE = 64;
-using BindlessCache = std::array<BindlessCacheEntry, BINDLESS_CACHE_SIZE>;
 
-BindlessCacheEntry* FindBindlessEntry(BindlessCache& cache, GPUVAddr addr, u32 count,
-                                      u64 image_table_generation) {
-    for (auto& entry : cache) {
-        if (entry.valid && entry.key_addr == addr && entry.key_count == count &&
-            entry.key_image_table_generation == image_table_generation) {
-            return &entry;
-        }
-    }
-    return nullptr;
-}
 
-BindlessCacheEntry& AcquireBindlessEntry(BindlessCache& cache, size_t& round_robin,
-                                         GPUVAddr addr, u32 count,
-                                         u64 image_table_generation) {
-    if (auto* found = FindBindlessEntry(cache, addr, count, image_table_generation)) {
-        return *found;
-    }
-    auto& slot = cache[round_robin];
-    round_robin = (round_robin + 1) % BINDLESS_CACHE_SIZE;
-    slot.key_addr = addr;
-    slot.key_count = count;
-    slot.key_image_table_generation = image_table_generation;
-    slot.valid = false;
-    return slot;
-}
 
 DescriptorLayoutBuilder MakeBuilder(const Device& device, std::span<const Shader::Info> infos) {
     DescriptorLayoutBuilder builder{device};
@@ -303,10 +268,12 @@ GraphicsPipeline::GraphicsPipeline(
     GuestDescriptorQueue& guest_descriptor_queue_, Common::ThreadWorker* worker_thread,
     PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
     const GraphicsPipelineCacheKey& key_, std::array<vk::ShaderModule, NUM_STAGES> stages,
-    const std::array<const Shader::Info*, NUM_STAGES>& infos)
+    const std::array<const Shader::Info*, NUM_STAGES>& infos,
+    const std::atomic<bool>* is_shutting_down)
     : key{key_}, device{device_}, texture_cache{texture_cache_}, buffer_cache{buffer_cache_},
-      pipeline_cache(pipeline_cache_), scheduler{scheduler_},
-      guest_descriptor_queue{guest_descriptor_queue_}, spv_modules{std::move(stages)} {
+      pipeline_cache{pipeline_cache_}, scheduler{scheduler_},
+      guest_descriptor_queue{guest_descriptor_queue_}, spv_modules{std::move(stages)},
+      is_shutting_down_ptr{is_shutting_down} {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
     }
@@ -377,13 +344,6 @@ void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
 
 template <typename Spec>
 void GraphicsPipeline::ConfigureImpl(bool is_indexed) {
-    // std::array<T, 16384> made CheckFeedbackLoop iterate the full capacity
-    // per draw; small_vector lets the span size match the actual write count.
-    thread_local boost::container::small_vector<VideoCommon::ImageViewInOut, 64> views;
-    thread_local boost::container::small_vector<VideoCommon::SamplerId, 64> samplers;
-    thread_local BindlessCache bindless_cache;
-    thread_local size_t bindless_cache_rr{0};
-    thread_local std::vector<u8> bindless_scratch;
     views.clear();
     samplers.clear();
 
@@ -449,33 +409,38 @@ void GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
         for (const auto& desc : info.texture_descriptors) {
             if (desc.count > 1 && !desc.has_secondary) {
-                const GPUVAddr cbuf_addr =
-                    cbufs[desc.cbuf_index].address + desc.cbuf_offset;
-                const u64 image_table_generation =
-                    texture_cache.GraphicsImageTableGeneration();
+                const bool nitro_valid = desc.cbuf_index < cbufs.size();
+                const GPUVAddr cbuf_addr = nitro_valid ? (cbufs[desc.cbuf_index].address + desc.cbuf_offset) : 0;
+                const u64 image_table_generation = texture_cache.GraphicsImageTableGeneration();
+                const size_t byte_size = static_cast<size_t>(desc.count) << desc.size_shift;
 
-                // Fast path: if we have a valid cache entry whose generation
-                // matches, the TIC table hasn't been invalidated since the last
-                // check. Skip the ReadBlockUnsafe + memcmp entirely.
-                if (auto* fast = FindBindlessEntry(bindless_cache, cbuf_addr,
-                                                    desc.count,
-                                                    image_table_generation);
-                    fast != nullptr) {
-                    views.insert(views.end(), fast->cached_views.begin(),
-                                 fast->cached_views.end());
-                    samplers.insert(samplers.end(), fast->cached_samplers.begin(),
-                                    fast->cached_samplers.end());
-                    continue;
+                // Nitro Path: If this region hasn't changed, we can blast through at 100% speed.
+                // We use the buffer cache's modification tracker to safely skip the slow path.
+                if (nitro_valid && !buffer_cache.IsRegionCpuModified(cbuf_addr, byte_size) &&
+                    !buffer_cache.IsRegionGpuModified(cbuf_addr, byte_size)) {
+                    if (auto* fast = FindBindlessEntry(bindless_cache, cbuf_addr, desc.count,
+                                                       image_table_generation);
+                        fast != nullptr) {
+                        for (const auto& v : fast->cached_views) {
+                            views.push_back(v);
+                        }
+                        for (const auto& s : fast->cached_samplers) {
+                            samplers.push_back(s);
+                        }
+                        continue;
+                    }
                 }
 
-                const size_t byte_size =
-                    static_cast<size_t>(desc.count) << desc.size_shift;
                 bindless_scratch.resize(byte_size);
                 gpu_memory->ReadBlockUnsafe(cbuf_addr, bindless_scratch.data(),
                                             byte_size);
                 BindlessCacheEntry& entry = AcquireBindlessEntry(
                     bindless_cache, bindless_cache_rr, cbuf_addr, desc.count,
                     image_table_generation);
+
+                // Correctness fix: We MUST ReadBlockUnsafe + memcmp even if the generation matches,
+                // because handles inside the cbuf can change without a table generation bump.
+                // This restores grass rendering in Tomodachi Life.
                 const bool hit = entry.valid &&
                                  entry.last_bytes.size() == byte_size &&
                                  std::memcmp(entry.last_bytes.data(),
@@ -648,7 +613,10 @@ void GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         // Wait for the pipeline to be built
         scheduler.Record([this](vk::CommandBuffer) {
             std::unique_lock lock{build_mutex};
-            build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
+            build_condvar.wait(lock, [this] {
+                return is_built.load(std::memory_order::relaxed) ||
+                       (is_shutting_down_ptr && is_shutting_down_ptr->load(std::memory_order::relaxed));
+            });
         });
     }
     const bool is_rescaling{texture_cache.IsRescaling()};
@@ -1148,6 +1116,9 @@ void GraphicsPipeline::Validate() {
         num_images += Shader::NumDescriptors(info.image_buffer_descriptors);
         num_images += Shader::NumDescriptors(info.texture_descriptors);
         num_images += Shader::NumDescriptors(info.image_descriptors);
+    }
+    if (num_images > MAX_IMAGE_ELEMENTS) {
+        LOG_CRITICAL(Render_Vulkan, "Too many image elements: {} (max: {})", num_images, MAX_IMAGE_ELEMENTS);
     }
     ASSERT(num_images <= MAX_IMAGE_ELEMENTS);
 }

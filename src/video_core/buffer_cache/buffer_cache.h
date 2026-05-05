@@ -75,6 +75,11 @@ template <class P>
 BufferCache<P>::~BufferCache() = default;
 
 template <class P>
+void BufferCache<P>::Shutdown() {
+    runtime.Finish();
+}
+
+template <class P>
 void BufferCache<P>::RunGarbageCollector() {
     const bool aggressive_gc = total_used_memory >= critical_memory;
     const u64 ticks_to_destroy = aggressive_gc ? 60 : 120;

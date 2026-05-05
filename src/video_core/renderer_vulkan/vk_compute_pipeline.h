@@ -11,6 +11,7 @@
 #include "common/common_types.h"
 #include "common/thread_worker.h"
 #include "shader_recompiler/shader_info.h"
+#include "video_core/renderer_vulkan/vk_bindless_cache.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
@@ -35,7 +36,8 @@ public:
                              Common::ThreadWorker* thread_worker,
                              PipelineStatistics* pipeline_statistics,
                              VideoCore::ShaderNotify* shader_notify, const Shader::Info& info,
-                             vk::ShaderModule spv_module);
+                             vk::ShaderModule spv_module,
+                             const std::atomic<bool>* is_shutting_down);
 
     ComputePipeline& operator=(ComputePipeline&&) noexcept = delete;
     ComputePipeline(ComputePipeline&&) noexcept = delete;
@@ -45,6 +47,11 @@ public:
 
     void Configure(Tegra::Engines::KeplerCompute& kepler_compute, Tegra::MemoryManager& gpu_memory,
                    Scheduler& scheduler, BufferCache& buffer_cache, TextureCache& texture_cache);
+
+    void Shutdown() {
+        std::scoped_lock lock{build_mutex};
+        build_condvar.notify_all();
+    }
 
 private:
     const Device& device;
@@ -73,15 +80,23 @@ private:
         u64 cb_tick{0};
         VkDescriptorSet set{VK_NULL_HANDLE};
     };
-    static constexpr size_t DESC_SET_CACHE_SIZE = 16;
+    static constexpr size_t DESC_SET_CACHE_SIZE = 512;
     std::array<CachedDescSet, DESC_SET_CACHE_SIZE> descriptor_set_cache{};
     size_t descriptor_set_cache_rr{0};
 
+    const std::atomic<bool>* is_shutting_down_ptr;
     std::condition_variable build_condvar;
     std::mutex build_mutex;
     std::atomic_bool is_built{false};
     bool uses_push_descriptor{false};
     bool split_descriptor_sets{false};
+
+    BindlessCache bindless_cache{};
+    size_t bindless_cache_rr{0};
+    std::vector<u8> bindless_scratch;
+
+    boost::container::small_vector<VideoCommon::ImageViewInOut, 64> views;
+    boost::container::small_vector<VideoCommon::SamplerId, 64> samplers;
 };
 
 } // namespace Vulkan

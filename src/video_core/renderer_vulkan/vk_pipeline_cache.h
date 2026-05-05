@@ -102,7 +102,8 @@ public:
                            Scheduler& scheduler, DescriptorPool& descriptor_pool,
                            GuestDescriptorQueue& guest_descriptor_queue,
                            RenderPassCache& render_pass_cache, BufferCache& buffer_cache,
-                           TextureCache& texture_cache, VideoCore::ShaderNotify& shader_notify_);
+                           TextureCache& texture_cache, VideoCore::ShaderNotify& shader_notify_,
+                           const std::atomic<bool>* is_shutting_down_);
     ~PipelineCache();
 
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
@@ -111,6 +112,8 @@ public:
 
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback);
+
+    void Shutdown();
 
 private:
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath();
@@ -156,6 +159,7 @@ public:
     BufferCache& buffer_cache;
     TextureCache& texture_cache;
     VideoCore::ShaderNotify& shader_notify;
+    const std::atomic<bool>* is_shutting_down_ptr;
     bool use_asynchronous_shaders{};
     bool use_vulkan_pipeline_cache{};
 
@@ -173,6 +177,7 @@ public:
 
     ShaderPools main_pools;
 
+    mutable std::mutex cache_mutex;
     Shader::Profile profile;
     Shader::HostTranslateInfo host_info;
 
