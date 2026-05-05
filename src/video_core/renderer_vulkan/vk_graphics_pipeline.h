@@ -172,7 +172,7 @@ private:
         u64 cb_tick{0};
         VkDescriptorSet set{VK_NULL_HANDLE};
     };
-    static constexpr size_t DESC_SET_CACHE_SIZE = 16;
+    static constexpr size_t DESC_SET_CACHE_SIZE = 512;
     std::array<CachedDescSet, DESC_SET_CACHE_SIZE> descriptor_set_cache{};
     size_t descriptor_set_cache_rr{0};
 
@@ -182,6 +182,14 @@ private:
     bool uses_push_descriptor{false};
     bool split_descriptor_sets{false};
     bool is_being_shutdown{false};
+
+    // Per-instance bindless descriptor cache (previously thread_local, which caused
+    // cross-pipeline cache interference when multiple pipelines ran on the same thread).
+    BindlessCache bindless_cache{};
+    size_t bindless_cache_rr{0};
+    std::vector<u8> bindless_scratch;
+    boost::container::small_vector<VideoCommon::ImageViewInOut, 64> views;
+    boost::container::small_vector<VideoCommon::SamplerId, 64> samplers;
 };
 
 } // namespace Vulkan

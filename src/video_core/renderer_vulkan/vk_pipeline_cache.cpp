@@ -471,6 +471,7 @@ void PipelineCache::EvictOldPipelines() {
     size_t evicted_graphics = 0;
     size_t evicted_compute = 0;
 
+    std::scoped_lock lock{cache_mutex};
     for (auto it = graphics_cache.begin(); it != graphics_cache.end();) {
         const GraphicsPipeline* pipeline = it->second.get();
         if (pipeline && pipeline != current_pipeline) {
@@ -509,6 +510,16 @@ void PipelineCache::EvictOldPipelines() {
     }
 }
 
+void PipelineCache::Shutdown() {
+    std::scoped_lock lock{cache_mutex};
+    for (auto& [key, pipeline] : graphics_cache) {
+        if (pipeline) pipeline->Shutdown();
+    }
+    for (auto& [key, pipeline] : compute_cache) {
+        if (pipeline) pipeline->Shutdown();
+    }
+}
+
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     if (!RefreshStages(graphics_key.unique_hashes)) {
         current_pipeline = nullptr;
@@ -543,17 +554,24 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
         .shared_memory_size = qmd.shared_alloc,
         .workgroup_size{qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z},
     };
-    const auto [pair, is_new]{compute_cache.try_emplace(key)};
-    auto& pipeline{pair->second};
-    if (!is_new && pipeline) {
+    {
+        std::scoped_lock lock{cache_mutex};
+        const auto [pair, is_new]{compute_cache.try_emplace(key)};
+        auto& pipeline{pair->second};
+        if (!is_new && pipeline) {
+            compute_pipeline_last_use[pipeline.get()] = scheduler.CurrentTick();
+            return pipeline.get();
+        }
+    }
+    auto pipeline_ptr = CreateComputePipeline(key, shader);
+    if (pipeline_ptr) {
+        std::scoped_lock lock{cache_mutex};
+        auto& pipeline{compute_cache[key]};
+        pipeline = std::move(pipeline_ptr);
         compute_pipeline_last_use[pipeline.get()] = scheduler.CurrentTick();
         return pipeline.get();
     }
-    pipeline = CreateComputePipeline(key, shader);
-    if (pipeline) {
-        compute_pipeline_last_use[pipeline.get()] = scheduler.CurrentTick();
-    }
-    return pipeline.get();
+    return nullptr;
 }
 
 void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
@@ -595,10 +613,13 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         workers.QueueWork([this, key, env_ = std::move(env), &state, &callback]() mutable {
             ShaderPools pools;
             auto pipeline{CreateComputePipeline(pools, key, env_, state.statistics.get(), false)};
-            std::scoped_lock lock{state.mutex};
-            if (pipeline) {
-                compute_cache.emplace(key, std::move(pipeline));
+            {
+                std::scoped_lock lock{cache_mutex};
+                if (pipeline) {
+                    compute_cache.emplace(key, std::move(pipeline));
+                }
             }
+            std::scoped_lock state_lock{state.mutex};
             ++state.built;
             if (state.has_loaded) {
                 callback(VideoCore::LoadCallbackStage::Build, state.built, state.total);
@@ -633,11 +654,13 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             }
             auto pipeline{CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs),
                                                  state.statistics.get(), false)};
-
-            std::scoped_lock lock{state.mutex};
-            if (pipeline) {
-                graphics_cache.emplace(key, std::move(pipeline));
+            {
+                std::scoped_lock lock{cache_mutex};
+                if (pipeline) {
+                    graphics_cache.emplace(key, std::move(pipeline));
+                }
             }
+            std::scoped_lock state_lock{state.mutex};
             ++state.built;
             if (state.has_loaded) {
                 callback(VideoCore::LoadCallbackStage::Build, state.built, state.total);
@@ -653,7 +676,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
 
     // Pre-reserve space in caches to reduce rehashing during async builds
     {
-        std::scoped_lock lock{state.mutex};
+        std::scoped_lock lock{cache_mutex};
         if (state.total_compute > 0) {
             compute_cache.reserve(state.total_compute);
         }
@@ -679,6 +702,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
 }
 
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
+    std::scoped_lock lock{cache_mutex};
     const auto [pair, is_new]{graphics_cache.try_emplace(graphics_key)};
     auto& pipeline{pair->second};
     if (is_new) {

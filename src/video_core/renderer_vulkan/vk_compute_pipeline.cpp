@@ -191,15 +191,9 @@ void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
 
     texture_cache.SynchronizeComputeDescriptors();
 
-    // See vk_graphics_pipeline.cpp: small_vector keeps the span sized to the
-    // actual write count.
-    thread_local boost::container::small_vector<VideoCommon::ImageViewInOut, 64> views;
-    thread_local boost::container::small_vector<VideoCommon::SamplerId, 64> samplers;
+    // Views/samplers/bindless cache are per-instance members (not thread_local).
     views.clear();
     samplers.clear();
-    thread_local BindlessCache bindless_cache;
-    thread_local size_t bindless_cache_rr{0};
-    thread_local std::vector<u8> bindless_scratch;
 
     const auto& qmd{kepler_compute.launch_description};
     const auto& cbufs{qmd.const_buffer_config};

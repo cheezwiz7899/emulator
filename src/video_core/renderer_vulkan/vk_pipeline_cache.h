@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -112,6 +113,8 @@ public:
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback);
 
+    void Shutdown();
+
 private:
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath();
 
@@ -173,6 +176,7 @@ public:
 
     ShaderPools main_pools;
 
+    mutable std::mutex cache_mutex;
     Shader::Profile profile;
     Shader::HostTranslateInfo host_info;
 
