@@ -32,6 +32,25 @@ struct DescriptorUpdateEntry {
     };
 };
 
+constexpr u64 FNV1A_OFFSET = 0xcbf29ce484222325ULL;
+constexpr u64 FNV1A_PRIME = 0x100000001b3ULL;
+
+inline u64 HashDescriptorBlock(const DescriptorUpdateEntry* data, size_t entry_count) noexcept {
+    static_assert(sizeof(DescriptorUpdateEntry) % sizeof(u64) == 0,
+                  "DescriptorUpdateEntry must be 8-byte aligned");
+    if (entry_count == 0 || data == nullptr) {
+        return FNV1A_OFFSET;
+    }
+    const size_t word_count = entry_count * (sizeof(DescriptorUpdateEntry) / sizeof(u64));
+    const u64* words = reinterpret_cast<const u64*>(data);
+    u64 h = FNV1A_OFFSET;
+    for (size_t i = 0; i < word_count; ++i) {
+        h ^= words[i];
+        h *= FNV1A_PRIME;
+    }
+    return h;
+}
+
 class UpdateDescriptorQueue {
 public:
     explicit UpdateDescriptorQueue(const Device& device_, Scheduler& scheduler_);
@@ -124,7 +143,7 @@ public:
 protected:
 
     static constexpr size_t FRAMES_IN_FLIGHT = 12;
-    static constexpr size_t FRAME_PAYLOAD_SIZE = 0x40000;
+    static constexpr size_t FRAME_PAYLOAD_SIZE = 0x200000;
     static constexpr size_t PAYLOAD_SIZE = FRAME_PAYLOAD_SIZE * FRAMES_IN_FLIGHT;
 
     void EnsureCapacity(size_t required_entries);

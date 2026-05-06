@@ -199,8 +199,6 @@ public:
 
     ~BufferCache();
 
-    void Shutdown();
-
     void TickFrame();
 
     void WriteMemory(DAddr device_addr, u64 size);

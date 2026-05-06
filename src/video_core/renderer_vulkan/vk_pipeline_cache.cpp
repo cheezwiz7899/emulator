@@ -320,17 +320,15 @@ bool GraphicsPipelineCacheKey::operator==(const GraphicsPipelineCacheKey& rhs) c
 }
 
 PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
-                           const Device& device_, Scheduler& scheduler_,
-                           DescriptorPool& descriptor_pool_,
-                           GuestDescriptorQueue& guest_descriptor_queue_,
-                           Vulkan::RenderPassCache& render_pass_cache_, Vulkan::BufferCache& buffer_cache_,
-                           Vulkan::TextureCache& texture_cache_, VideoCore::ShaderNotify& shader_notify_,
-                           const std::atomic<bool>* is_shutting_down_)
+                             const Device& device_, Scheduler& scheduler_,
+                             DescriptorPool& descriptor_pool_,
+                             GuestDescriptorQueue& guest_descriptor_queue_,
+                             RenderPassCache& render_pass_cache_, BufferCache& buffer_cache_,
+                             TextureCache& texture_cache_, VideoCore::ShaderNotify& shader_notify_)
     : VideoCommon::ShaderCache{device_memory_}, device{device_}, scheduler{scheduler_},
       descriptor_pool{descriptor_pool_}, guest_descriptor_queue{guest_descriptor_queue_},
       render_pass_cache{render_pass_cache_}, buffer_cache{buffer_cache_},
       texture_cache{texture_cache_}, shader_notify{shader_notify_},
-      is_shutting_down_ptr{is_shutting_down_},
       use_asynchronous_shaders{Settings::values.use_asynchronous_shaders.GetValue()},
       use_vulkan_pipeline_cache{Settings::values.use_vulkan_driver_pipeline_cache.GetValue()},
       workers(device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers(),
@@ -450,16 +448,6 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     };
 }
 
-void PipelineCache::Shutdown() {
-    std::scoped_lock lock{cache_mutex};
-    for (auto& [key, pipeline] : graphics_cache) {
-        pipeline->Shutdown();
-    }
-    for (auto& [key, pipeline] : compute_cache) {
-        pipeline->Shutdown();
-    }
-}
-
 PipelineCache::~PipelineCache() {
     if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
@@ -522,6 +510,16 @@ void PipelineCache::EvictOldPipelines() {
     }
 }
 
+void PipelineCache::Shutdown() {
+    std::scoped_lock lock{cache_mutex};
+    for (auto& [key, pipeline] : graphics_cache) {
+        if (pipeline) pipeline->Shutdown();
+    }
+    for (auto& [key, pipeline] : compute_cache) {
+        if (pipeline) pipeline->Shutdown();
+    }
+}
+
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     if (!RefreshStages(graphics_key.unique_hashes)) {
         current_pipeline = nullptr;
@@ -534,16 +532,12 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
         if (next) {
             current_pipeline = next;
             // Update last use frame
-            {
-                std::scoped_lock lock{cache_mutex};
-                graphics_pipeline_last_use[current_pipeline] = scheduler.CurrentTick();
-            }
+            graphics_pipeline_last_use[current_pipeline] = scheduler.CurrentTick();
             return BuiltPipeline(current_pipeline);
         }
     }
     GraphicsPipeline* result = CurrentGraphicsPipelineSlowPath();
     if (result) {
-        std::scoped_lock lock{cache_mutex};
         graphics_pipeline_last_use[result] = scheduler.CurrentTick();
     }
     return result;
@@ -619,9 +613,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         workers.QueueWork([this, key, env_ = std::move(env), &state, &callback]() mutable {
             ShaderPools pools;
             auto pipeline{CreateComputePipeline(pools, key, env_, state.statistics.get(), false)};
-            std::scoped_lock lock{cache_mutex};
-            if (pipeline) {
-                compute_cache.emplace(key, std::move(pipeline));
+            {
+                std::scoped_lock lock{cache_mutex};
+                if (pipeline) {
+                    compute_cache.emplace(key, std::move(pipeline));
+                }
             }
             std::scoped_lock state_lock{state.mutex};
             ++state.built;
@@ -658,10 +654,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             }
             auto pipeline{CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs),
                                                  state.statistics.get(), false)};
-
-            std::scoped_lock lock{cache_mutex};
-            if (pipeline) {
-                graphics_cache.emplace(key, std::move(pipeline));
+            {
+                std::scoped_lock lock{cache_mutex};
+                if (pipeline) {
+                    graphics_cache.emplace(key, std::move(pipeline));
+                }
             }
             std::scoped_lock state_lock{state.mutex};
             ++state.built;
@@ -819,7 +816,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     return std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, &shader_notify, device,
         descriptor_pool, guest_descriptor_queue, thread_worker, statistics, render_pass_cache, key,
-        std::move(modules), infos, is_shutting_down_ptr);
+        std::move(modules), infos);
 
 } catch (const vk::Exception& exception) {
     if (exception.GetResult() == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
@@ -920,8 +917,7 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
     return std::make_unique<ComputePipeline>(device, vulkan_pipeline_cache, descriptor_pool,
                                              guest_descriptor_queue, thread_worker, statistics,
-                                             &shader_notify, program.info, std::move(spv_module),
-                                             is_shutting_down_ptr);
+                                             &shader_notify, program.info, std::move(spv_module));
 
 } catch (const vk::Exception& exception) {
     if (exception.GetResult() == VK_ERROR_OUT_OF_DEVICE_MEMORY) {

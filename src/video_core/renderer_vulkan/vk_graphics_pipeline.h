@@ -9,14 +9,13 @@
 #include <condition_variable>
 #include <mutex>
 #include <type_traits>
-#include <vector>
 
 #include "common/thread_worker.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
-#include "video_core/renderer_vulkan/vk_bindless_cache.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
+#include "video_core/renderer_vulkan/vk_bindless_cache.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -78,8 +77,7 @@ public:
         GuestDescriptorQueue& guest_descriptor_queue, Common::ThreadWorker* worker_thread,
         PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
         const GraphicsPipelineCacheKey& key, std::array<vk::ShaderModule, NUM_STAGES> stages,
-        const std::array<const Shader::Info*, NUM_STAGES>& infos,
-        const std::atomic<bool>* is_shutting_down);
+        const std::array<const Shader::Info*, NUM_STAGES>& infos);
 
     GraphicsPipeline& operator=(GraphicsPipeline&&) noexcept = delete;
     GraphicsPipeline(GraphicsPipeline&&) noexcept = delete;
@@ -179,17 +177,18 @@ private:
     std::array<CachedDescSet, DESC_SET_CACHE_SIZE> descriptor_set_cache{};
     size_t descriptor_set_cache_rr{0};
 
-    const std::atomic<bool>* is_shutting_down_ptr;
     std::condition_variable build_condvar;
     std::mutex build_mutex;
     std::atomic_bool is_built{false};
     bool uses_push_descriptor{false};
     bool split_descriptor_sets{false};
+    bool is_being_shutdown{false};
 
+    // Per-instance bindless descriptor cache (previously thread_local, which caused
+    // cross-pipeline cache interference when multiple pipelines ran on the same thread).
     BindlessCache bindless_cache{};
     size_t bindless_cache_rr{0};
     std::vector<u8> bindless_scratch;
-
     boost::container::small_vector<VideoCommon::ImageViewInOut, 64> views;
     boost::container::small_vector<VideoCommon::SamplerId, 64> samplers;
 };

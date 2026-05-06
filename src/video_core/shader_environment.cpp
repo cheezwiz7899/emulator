@@ -376,7 +376,13 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
     // causing a spurious 0 that would inflate descriptor array sizes via the fallback.
     const auto& stage_cbufs{maxwell3d->state.shader_stages[stage_index].const_buffers};
     for (u32 i = 0; i < static_cast<u32>(stage_cbufs.size()); ++i) {
-        if (stage_cbufs[i].enabled) {
+        // Only store non-zero sizes. On Linux (NVIDIA proprietary), the driver may
+        // populate cbuf size lazily, leaving size=0 even when enabled=true at
+        // GraphicsEnvironment construction time. A stored 0 would be returned by
+        // ReadCbufSize() as a valid hit, bypassing BINDLESS_FALLBACK_LENGTH.
+        // A map miss returns 0 too, but texture_pass.cpp handles that via the
+        // fallback path which uses BINDLESS_ARRAY_LENGTH (1024).
+        if (stage_cbufs[i].enabled && stage_cbufs[i].size > 0) {
             cbuf_sizes.emplace(i, static_cast<u32>(stage_cbufs[i].size));
         }
     }
@@ -470,7 +476,11 @@ ComputeEnvironment::ComputeEnvironment(Tegra::Engines::KeplerCompute& kepler_com
     workgroup_size = {qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z};
     // Pre-capture cbuf sizes on the main thread while launch_description is live.
     for (u32 i = 0; i < static_cast<u32>(qmd.const_buffer_config.size()); ++i) {
-        if ((qmd.const_buffer_enable_mask.Value() >> i) & 1) {
+        // Same guard as GraphicsEnvironment: skip zero-size entries so that
+        // ReadCbufSize() falls through to the BINDLESS_ARRAY_LENGTH fallback
+        // rather than returning a stored 0 on Linux drivers.
+        if (((qmd.const_buffer_enable_mask.Value() >> i) & 1) &&
+            qmd.const_buffer_config[i].size > 0) {
             cbuf_sizes.emplace(i, static_cast<u32>(qmd.const_buffer_config[i].size));
         }
     }

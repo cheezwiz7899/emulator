@@ -50,12 +50,7 @@ using Tegra::Texture::TSCEntry;
 using VideoCore::Surface::PixelFormat;
 using namespace Common::Literals;
 
-struct ImageViewInOut {
-    u32 index{};
-    bool blacklist{};
-    ImageViewId id{};
-    bool id_cached{};
-};
+
 
 struct AsyncDecodeContext {
     ImageId image_id;
@@ -140,8 +135,6 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
 
 public:
     explicit TextureCache(Runtime&, Tegra::MaxwellDeviceMemoryManager&);
-
-    ~TextureCache();
 
     /// Notify the cache that a new frame has been queued
     void TickFrame();
@@ -308,7 +301,6 @@ private:
     void RunGarbageCollector();
 
 public:
-    void Shutdown();
     /// Public interface to trigger garbage collection
     void TriggerGarbageCollection() {
         RunGarbageCollector();

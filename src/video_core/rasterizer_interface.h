@@ -37,9 +37,6 @@ using DiskResourceLoadCallback = std::function<void(LoadCallbackStage, std::size
 class RasterizerInterface {
 public:
     virtual ~RasterizerInterface() = default;
-    
-    /// Prepare the rasterizer for shutdown
-    virtual void Shutdown() {}
 
     /// Dispatches a draw invocation
     virtual void Draw(bool is_indexed, u32 instance_count) = 0;

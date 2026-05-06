@@ -27,26 +27,6 @@ using Shader::ImageBufferDescriptor;
 using Shader::Backend::SPIRV::RESCALING_LAYOUT_WORDS_OFFSET;
 using Tegra::Texture::TexturePair;
 
-namespace {
-constexpr u64 FNV1A_OFFSET = 0xcbf29ce484222325ULL;
-constexpr u64 FNV1A_PRIME = 0x100000001b3ULL;
-
-inline u64 HashDescriptorBlock(const DescriptorUpdateEntry* data, size_t entry_count) noexcept {
-    static_assert(sizeof(DescriptorUpdateEntry) % sizeof(u64) == 0,
-                  "DescriptorUpdateEntry must be 8-byte aligned");
-    if (entry_count == 0 || data == nullptr) {
-        return FNV1A_OFFSET;
-    }
-    const size_t word_count = entry_count * (sizeof(DescriptorUpdateEntry) / sizeof(u64));
-    const u64* words = reinterpret_cast<const u64*>(data);
-    u64 h = FNV1A_OFFSET;
-    for (size_t i = 0; i < word_count; ++i) {
-        h ^= words[i];
-        h *= FNV1A_PRIME;
-    }
-    return h;
-}
-} // namespace
 
 ComputePipeline::ComputePipeline(const Device& device_, vk::PipelineCache& pipeline_cache_,
                                  DescriptorPool& descriptor_pool,
@@ -54,11 +34,10 @@ ComputePipeline::ComputePipeline(const Device& device_, vk::PipelineCache& pipel
                                  Common::ThreadWorker* thread_worker,
                                  PipelineStatistics* pipeline_statistics,
                                  VideoCore::ShaderNotify* shader_notify, const Shader::Info& info_,
-                                 vk::ShaderModule spv_module_,
-                                 const std::atomic<bool>* is_shutting_down)
-    : device{device_}, pipeline_cache(pipeline_cache_),
-      guest_descriptor_queue{guest_descriptor_queue_}, info{info_},
-      spv_module(std::move(spv_module_)), is_shutting_down_ptr{is_shutting_down} {
+                                 vk::ShaderModule spv_module_)
+    : device{device_},
+      pipeline_cache(pipeline_cache_), guest_descriptor_queue{guest_descriptor_queue_}, info{info_},
+      spv_module(std::move(spv_module_)) {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
     }
@@ -154,8 +133,7 @@ void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
 
     texture_cache.SynchronizeComputeDescriptors();
 
-    // See vk_graphics_pipeline.cpp: small_vector keeps the span sized to the
-    // actual write count.
+    // Views/samplers/bindless cache are per-instance members (not thread_local).
     views.clear();
     samplers.clear();
 
@@ -199,26 +177,14 @@ void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     }
     for (const auto& desc : info.texture_descriptors) {
         if (desc.count > 1 && !desc.has_secondary) {
-            const bool nitro_valid = desc.cbuf_index < cbufs.size();
-            const GPUVAddr cbuf_addr = nitro_valid ? (cbufs[desc.cbuf_index].Address() + desc.cbuf_offset) : 0;
+            const bool cbuf_valid = desc.cbuf_index < cbufs.size();
+            const GPUVAddr cbuf_addr =
+                cbuf_valid ? (cbufs[desc.cbuf_index].Address() + desc.cbuf_offset) : 0;
             const u64 image_table_generation = texture_cache.ComputeImageTableGeneration();
             const size_t byte_size = static_cast<size_t>(desc.count) << desc.size_shift;
 
-            // Nitro Path: If this region hasn't changed, we can blast through at 100% speed.
-            // We use the buffer cache's modification tracker to safely skip the slow path.
-            if (nitro_valid && !buffer_cache.IsRegionCpuModified(cbuf_addr, byte_size) &&
-                !buffer_cache.IsRegionGpuModified(cbuf_addr, byte_size)) {
-                if (auto* fast = FindBindlessEntry(bindless_cache, cbuf_addr,
-                                                   desc.count, image_table_generation);
-                    fast != nullptr) {
-                    for (const auto& v : fast->cached_views) {
-                        views.push_back(v);
-                    }
-                    for (const auto& s : fast->cached_samplers) {
-                        samplers.push_back(s);
-                    }
-                    continue;
-                }
+            if (cbuf_valid && buffer_cache.IsRegionGpuModified(cbuf_addr, byte_size)) {
+                buffer_cache.DownloadMemory(cbuf_addr, byte_size);
             }
 
             bindless_scratch.resize(byte_size);
@@ -226,10 +192,6 @@ void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             BindlessCacheEntry& entry = AcquireBindlessEntry(
                 bindless_cache, bindless_cache_rr, cbuf_addr, desc.count,
                 image_table_generation);
-
-            // Correctness fix: We MUST ReadBlockUnsafe + memcmp even if the generation matches,
-            // because handles inside the cbuf can change without a table generation bump.
-            // This restores grass rendering in Tomodachi Life.
             const bool hit = entry.valid &&
                              entry.last_bytes.size() == byte_size &&
                              std::memcmp(entry.last_bytes.data(),
@@ -312,12 +274,11 @@ void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                          views_it);
 
     if (!is_built.load(std::memory_order::relaxed)) {
-        // Wait for the pipeline to be built
+        // Wait for the pipeline to be built, or bail out if shutdown was requested.
         scheduler.Record([this](vk::CommandBuffer) {
             std::unique_lock lock{build_mutex};
             build_condvar.wait(lock, [this] {
-                return is_built.load(std::memory_order::relaxed) ||
-                       (is_shutting_down_ptr && is_shutting_down_ptr->load(std::memory_order::relaxed));
+                return is_built.load(std::memory_order::relaxed) || is_being_shutdown;
             });
         });
     }

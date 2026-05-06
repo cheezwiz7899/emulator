@@ -190,8 +190,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
                           staging_pool, compute_pass_descriptor_queue, descriptor_pool),
       query_cache(gpu, *this, device_memory, query_cache_runtime),
       pipeline_cache(device_memory, device, scheduler, descriptor_pool, guest_descriptor_queue,
-                     render_pass_cache, buffer_cache, texture_cache, gpu.ShaderNotify(),
-                     &is_shutting_down),
+                     render_pass_cache, buffer_cache, texture_cache, gpu.ShaderNotify()),
       accelerate_dma(buffer_cache, texture_cache, scheduler),
       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
       wfi_event(device.GetLogical().CreateEvent()) {
@@ -207,16 +206,17 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
 }
 
 void RasterizerVulkan::Shutdown() {
-    if (is_shutting_down.exchange(true)) {
+    // Use exchange to guarantee idempotence — called from ~RasterizerVulkan and GPU::Impl::~Impl.
+    if (is_shutting_down.exchange(true, std::memory_order::acq_rel)) {
         return;
     }
-    pipeline_cache.Shutdown();
     // 1. Tell the GPU to finish current work
     scheduler.Finish();
 
     // 2. Force runtimes to release internal references/handles FIRST
-    texture_cache.Shutdown();
-    buffer_cache.Shutdown();
+    // This ensures VkBuffer/VkImage handles are gone before the memory they sit on is freed
+    buffer_cache_runtime.Finish();
+    texture_cache_runtime.Finish();
 }
 
 RasterizerVulkan::~RasterizerVulkan() {
@@ -242,11 +242,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     query_cache.NotifySegment(true);
 
     GraphicsPipeline* const pipeline{pipeline_cache.CurrentGraphicsPipeline()};
-    if (!pipeline || is_shutting_down) {
+    if (!pipeline || is_shutting_down.load(std::memory_order::relaxed)) {
         return;
     }
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
-    if (is_shutting_down) {
+    if (is_shutting_down.load(std::memory_order::relaxed)) {
         return;
     }
     // update engine as channel may be different.
@@ -524,7 +524,7 @@ void RasterizerVulkan::DispatchCompute() {
     gpu_memory->FlushCaching();
 
     ComputePipeline* const pipeline{pipeline_cache.CurrentComputePipeline()};
-    if (!pipeline || is_shutting_down) {
+    if (!pipeline || is_shutting_down.load(std::memory_order::relaxed)) {
         return;
     }
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};

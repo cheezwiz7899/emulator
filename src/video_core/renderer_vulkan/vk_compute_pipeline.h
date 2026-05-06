@@ -11,8 +11,8 @@
 #include "common/common_types.h"
 #include "common/thread_worker.h"
 #include "shader_recompiler/shader_info.h"
-#include "video_core/renderer_vulkan/vk_bindless_cache.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
+#include "video_core/renderer_vulkan/vk_bindless_cache.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
@@ -36,8 +36,7 @@ public:
                              Common::ThreadWorker* thread_worker,
                              PipelineStatistics* pipeline_statistics,
                              VideoCore::ShaderNotify* shader_notify, const Shader::Info& info,
-                             vk::ShaderModule spv_module,
-                             const std::atomic<bool>* is_shutting_down);
+                             vk::ShaderModule spv_module);
 
     ComputePipeline& operator=(ComputePipeline&&) noexcept = delete;
     ComputePipeline(ComputePipeline&&) noexcept = delete;
@@ -84,17 +83,17 @@ private:
     std::array<CachedDescSet, DESC_SET_CACHE_SIZE> descriptor_set_cache{};
     size_t descriptor_set_cache_rr{0};
 
-    const std::atomic<bool>* is_shutting_down_ptr;
     std::condition_variable build_condvar;
     std::mutex build_mutex;
     std::atomic_bool is_built{false};
     bool uses_push_descriptor{false};
     bool split_descriptor_sets{false};
+    bool is_being_shutdown{false};
 
+    // Per-instance bindless descriptor cache.
     BindlessCache bindless_cache{};
     size_t bindless_cache_rr{0};
     std::vector<u8> bindless_scratch;
-
     boost::container::small_vector<VideoCommon::ImageViewInOut, 64> views;
     boost::container::small_vector<VideoCommon::SamplerId, 64> samplers;
 };

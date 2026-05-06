@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -102,8 +103,7 @@ public:
                            Scheduler& scheduler, DescriptorPool& descriptor_pool,
                            GuestDescriptorQueue& guest_descriptor_queue,
                            RenderPassCache& render_pass_cache, BufferCache& buffer_cache,
-                           TextureCache& texture_cache, VideoCore::ShaderNotify& shader_notify_,
-                           const std::atomic<bool>* is_shutting_down_);
+                           TextureCache& texture_cache, VideoCore::ShaderNotify& shader_notify_);
     ~PipelineCache();
 
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
@@ -159,7 +159,6 @@ public:
     BufferCache& buffer_cache;
     TextureCache& texture_cache;
     VideoCore::ShaderNotify& shader_notify;
-    const std::atomic<bool>* is_shutting_down_ptr;
     bool use_asynchronous_shaders{};
     bool use_vulkan_pipeline_cache{};
 

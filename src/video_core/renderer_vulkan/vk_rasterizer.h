@@ -82,7 +82,7 @@ public:
                               StateTracker& state_tracker_, Scheduler& scheduler_);
     ~RasterizerVulkan() override;
 
-    void Shutdown() override;
+    void Shutdown();
 
     void Draw(bool is_indexed, u32 instance_count) override;
     void DrawIndirect() override;
