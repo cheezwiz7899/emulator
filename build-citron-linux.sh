@@ -663,7 +663,9 @@ common_cmake_args() {
         "-DUSE_SYSTEM_QT=OFF" \
         "-DENABLE_QT6=ON" \
         "-DCITRON_USE_BUNDLED_FFMPEG=ON" \
+        "-DBUILD_TESTING=OFF" \
         "-DCITRON_TESTS=OFF" \
+        "-DCITRON_DOWNLOAD_TIME_ZONE_DATA=ON" \
         "-DCITRON_CHECK_SUBMODULES=OFF" \
         "-DCITRON_USE_LLVM_DEMANGLE=OFF" \
         "-DCITRON_USE_QT_MULTIMEDIA=ON" \
@@ -679,6 +681,7 @@ common_cmake_args() {
         "-DCITRON_USE_AUTO_UPDATER=ON" \
         "-DCITRON_BUILD_TYPE=Release" \
         "-DCMAKE_POLICY_VERSION_MINIMUM=3.5" \
+        "-DCMAKE_BUILD_RPATH=\$ORIGIN" \
         "-Wno-dev"
 
     [[ "${UNITY_BUILD}" == "ON" ]] && echo "-DENABLE_UNITY_BUILD=ON"
@@ -822,6 +825,7 @@ stage_generate() {
         "-DCMAKE_EXE_LINKER_FLAGS_${bt_upper}=${linker_flags}"
 
     write_gen_sentinel
+    mkdir -p "${BUILD_GENERATE}/bin/user"
     success "Instrumented build: ${BUILD_GENERATE}/bin/citron"
     print_profiling_instructions "${BUILD_GENERATE}/bin/citron"
 }
@@ -894,6 +898,7 @@ stage_csgenerate() {
         "-DCMAKE_CXX_FLAGS_${bt_upper}=${compile_flags}" \
         "-DCMAKE_EXE_LINKER_FLAGS_${bt_upper}=${linker_flags}"
 
+    mkdir -p "${BUILD_CSGENERATE}/bin/user"
     success "CS-IRPGO instrumented build: ${BUILD_CSGENERATE}/bin/citron"
     echo ""
     echo -e "${YELLOW}════════════════════════════════════════════════════════════════${RESET}"
@@ -963,6 +968,7 @@ stage_use() {
         header "Build: Baseline Release (no PGO, LTO=${LTO_MODE})"
         apply_source_patches
         _build_with_flags "${BUILD_ROOT}/use-nopgo" nopgo
+        mkdir -p "${BUILD_ROOT}/use-nopgo/bin/user"
         success "Baseline build: ${BUILD_ROOT}/use-nopgo/bin/citron"
         return 0
     fi
@@ -1004,6 +1010,7 @@ stage_use() {
     echo ""
     success "════════════════════════════════════════════════════════════════"
     success "  Stage use complete"
+    mkdir -p "${BUILD_USE}/bin/user"
     success "  Binary:  ${BUILD_USE}/bin/citron"
     success "  PGO:     ${pgo_label}"
     success "  LTO:     ${LTO_MODE}${LTO_MODE:+ ($(lto_clang_flag))}"
@@ -1123,8 +1130,8 @@ stage_bolt() {
     fi
 
     local elf_binary="${relocs_dir}/bin/citron"
-    mkdir -p "${BOLT_PROFILE_DIR}" "${BUILD_BOLT}"
-    local instrumented="${BUILD_BOLT}/citron-bolt-instrumented"
+    mkdir -p "${BOLT_PROFILE_DIR}" "${BUILD_BOLT}/bin"
+    local instrumented="${BUILD_BOLT}/bin/citron-bolt-instrumented"
     local fdata_pattern="${BOLT_PROFILE_DIR}/citron-%p.fdata"
     local merged_fdata="${BOLT_PROFILE_DIR}/citron-merged.fdata"
 
@@ -1167,15 +1174,17 @@ stage_bolt() {
         --split-all-cold \
         --split-eh \
         --dyno-stats \
-        -o "${BUILD_BOLT}/citron" \
+        -o "${BUILD_BOLT}/bin/citron" \
         || error "BOLT optimization failed."
 
     echo ""
     success "════════════════════════════════════════════════════════════════"
     success "  Stage bolt complete"
-    success "  Binary: ${BUILD_BOLT}/citron"
+    mkdir -p "${BUILD_BOLT}/user"
+    success "  Binary: ${BUILD_BOLT}/bin/citron"
     success "  Optimizations: PGO + LTO + BOLT basic-block reordering"
     success "════════════════════════════════════════════════════════════════"
+    echo ""
 }
 
 # =============================================================================
@@ -1341,9 +1350,11 @@ stage_propeller() {
     echo ""
     success "════════════════════════════════════════════════════════════════"
     success "  Stage propeller complete"
+    mkdir -p "${BUILD_PROPELLER}/bin/user"
     success "  Binary: ${BUILD_PROPELLER}/bin/citron"
     success "  Optimizations: PGO + LTO + Propeller BB+function layout"
     success "════════════════════════════════════════════════════════════════"
+    echo ""
 }
 
 # =============================================================================
