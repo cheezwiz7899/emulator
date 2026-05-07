@@ -303,6 +303,16 @@ endif()
 # Output binaries to bin/
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/bin)
 
+if (CITRON_USE_CPM AND CITRON_USE_BUNDLED_QT AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # Build-tree binaries are the portable deliverable for local Linux CPM builds.
+    # Keep their loader search path relative to bin/ instead of embedding Qt or
+    # dependency cache directories from the build host.
+    set(CMAKE_BUILD_RPATH "$ORIGIN/lib")
+    set(CMAKE_INSTALL_RPATH "$ORIGIN/lib")
+    set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
+    add_link_options("-Wl,--disable-new-dtags")
+endif()
+
 # System imported libraries
 # =======================================================================
 

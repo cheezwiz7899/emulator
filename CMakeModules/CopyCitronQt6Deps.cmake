@@ -114,8 +114,12 @@ function(copy_citron_Qt6_deps target_dir)
                 endif()
             endforeach()
 
-            # Find patchelf to fix RPATHs of bundled libraries
             find_program(PATCHELF_EXE patchelf)
+            if (NOT PATCHELF_EXE)
+                message(FATAL_ERROR
+                    "patchelf is required for portable Linux CPM bundles. "
+                    "Run ./build-citron-linux.sh setup or install patchelf with your package manager.")
+            endif()
 
             # Bundle ICU libraries (required by QtCore)
             if (DEFINED ICU_BINARY_DIR)
@@ -144,12 +148,13 @@ function(copy_citron_Qt6_deps target_dir)
             # Bundle additional XCB support libraries
             set(_xcb_deps 
                 xcb.so.1 Xau.so.6 xcb-xkb.so.1
-                xcb-cursor.so.0 xcb-icccm.so.4 xcb-image.so.0 xcb-keysyms.so.1 
+                xcb-cursor.so.0 xcb-icccm.so.4 xcb-image.so.0 xcb-keysyms.so.1
+                xcb-util.so.1
                 xcb-render-util.so.0 xcb-xinerama.so.0 xcb-xinput.so.0
                 xcb-shm.so.0 xcb-render.so.0 xcb-randr.so.0 xcb-shape.so.0
                 xcb-xfixes.so.0 xcb-sync.so.1 xcb-dri3.so.0
                 # Additional system libs needed by Qt XCB plugin
-                xkbcommon.so.0 xkbcommon-x11.so.0 X11-xcb.so.1
+                xkbcommon.so.0 xkbcommon-x11.so.0 X11-xcb.so.1 Xdmcp.so.6
             )
             
             if (DEFINED XCB_BINARY_DIR)
@@ -177,19 +182,6 @@ function(copy_citron_Qt6_deps target_dir)
                 )
             endforeach()
 
-            # Fix RPATHs of all bundled libraries so they find each other
-            if (PATCHELF_EXE)
-                add_custom_command(TARGET ${target_dir} POST_BUILD
-                    COMMAND find "${LIB_DEST}" -maxdepth 1 -name "*.so*" -exec "${PATCHELF_EXE}" --set-rpath "$ORIGIN" {} \\\;
-                    COMMENT "Fixing RPATHs of bundled libraries"
-                )
-                # Also fix the platform plugins
-                add_custom_command(TARGET ${target_dir} POST_BUILD
-                    COMMAND find "${PLUGINS_DEST}" -name "*.so" -exec "${PATCHELF_EXE}" --set-rpath "$ORIGIN/../../lib" {} \\\;
-                    COMMENT "Fixing RPATHs of Qt plugins"
-                )
-            endif()
-
             # Bundle libstdc++ and libgcc_s
             execute_process(COMMAND ${CMAKE_C_COMPILER} -print-file-name=libstdc++.so.6 OUTPUT_VARIABLE _STDCXX_PATH OUTPUT_STRIP_TRAILING_WHITESPACE)
             execute_process(COMMAND ${CMAKE_C_COMPILER} -print-file-name=libgcc_s.so.1 OUTPUT_VARIABLE _GCC_S_PATH OUTPUT_STRIP_TRAILING_WHITESPACE)
@@ -208,6 +200,25 @@ function(copy_citron_Qt6_deps target_dir)
                     COMMENT "Bundling libgcc_s.so.1"
                 )
             endif()
+
+            set(_runtime_dependency_dirs "${LIB_DEST}" "${Qt6_DLL_DIR}")
+            if (DEFINED ICU_BINARY_DIR)
+                list(APPEND _runtime_dependency_dirs "${ICU_BINARY_DIR}")
+            endif()
+            if (DEFINED XCB_BINARY_DIR)
+                list(APPEND _runtime_dependency_dirs "${XCB_BINARY_DIR}")
+            endif()
+            list(REMOVE_DUPLICATES _runtime_dependency_dirs)
+            string(REPLACE ";" "|" _runtime_dependency_dirs_arg "${_runtime_dependency_dirs}")
+
+            add_custom_command(TARGET ${target_dir} POST_BUILD
+                COMMAND ${CMAKE_COMMAND}
+                    -DBUNDLE_BIN_DIR="${DLL_DEST}"
+                    -DPATCHELF_EXE="${PATCHELF_EXE}"
+                    -DRUNTIME_DEPENDENCY_DIRS="${_runtime_dependency_dirs_arg}"
+                    -P "${CMAKE_SOURCE_DIR}/CMakeModules/FixLinuxBundleRpaths.cmake"
+                COMMENT "Copying Linux runtime dependencies and normalizing RPATHs"
+            )
         endif()
     endif()
 

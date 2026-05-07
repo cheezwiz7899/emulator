@@ -129,6 +129,7 @@
 #   python3 + aqtinstall                    Qt binary download (invoked by cmake)
 #   autoconf + automake + make              FFmpeg autotools build
 #   glslang (glslc)                         Vulkan shader compilation
+#   patchelf                                bundle RPATH normalization
 #   perf                                    propeller stage only
 # =============================================================================
 
@@ -350,7 +351,7 @@ stage_setup() {
         *)
             warn "Unrecognised package manager. Install manually:"
             warn "  clang (${CLANG_VERSION}+), lld, llvm-profdata, cmake, ninja, git,"
-            warn "  nasm, perl, python3, python3-pip, autoconf, automake, make, glslang-tools"
+            warn "  nasm, perl, python3, python3-pip, autoconf, automake, make, glslang-tools, patchelf"
             ;;
     esac
 
@@ -370,6 +371,7 @@ _setup_apt() {
         nasm yasm perl \
         autoconf automake make \
         glslang-tools \
+        patchelf \
         lsb-release software-properties-common gnupg \
         libelf-dev libssl-dev libzstd-dev \
         linux-tools-common linux-tools-generic 2>/dev/null || true
@@ -384,7 +386,7 @@ _setup_pacman() {
         nasm yasm perl \
         autoconf automake make \
         glslang clang lld llvm \
-        perf 2>/dev/null || true
+        patchelf perf 2>/dev/null || true
     # Arch ships unversioned tools — symlink to versioned names
     for tool in clang clang++ lld llvm-profdata llvm-bolt merge-fdata; do
         local versioned="/usr/local/bin/${tool}-${CLANG_VERSION}"
@@ -402,7 +404,7 @@ _setup_dnf() {
         python3 python3-pip curl wget xz \
         nasm yasm perl \
         autoconf automake make \
-        glslang clang lld \
+        glslang clang lld patchelf \
         elfutils-libelf-devel openssl-devel \
         perf 2>/dev/null || true
     sudo dnf install -y "clang${CLANG_VERSION}" "llvm${CLANG_VERSION}" 2>/dev/null \
@@ -417,7 +419,7 @@ _setup_yum() {
         python3 python3-pip curl wget xz \
         nasm yasm perl \
         autoconf automake make \
-        clang lld \
+        clang lld patchelf \
         elfutils-libelf-devel openssl-devel \
         perf 2>/dev/null || true
     warn "yum/CentOS: LLVM ${CLANG_VERSION} may not be in repos. Check SCL or llvm.org."
@@ -430,7 +432,7 @@ _setup_zypper() {
         python3 python3-pip curl wget xz \
         nasm yasm perl \
         autoconf automake make \
-        glslang clang lld llvm \
+        glslang clang lld llvm patchelf \
         libelf-devel libopenssl-devel \
         perf 2>/dev/null || true
 }
@@ -444,6 +446,7 @@ _setup_emerge() {
         sys-devel/clang sys-devel/lld \
         dev-build/autoconf dev-build/automake \
         media-libs/glslang \
+        dev-util/patchelf \
         dev-libs/elfutils dev-libs/openssl 2>/dev/null || true
 }
 
@@ -503,7 +506,7 @@ _verify_tools() {
     info "Verifying installation..."
     local ok=1
     for tool in "${CLANG}" "${CLANGPP}" "${LLD}" "${LLVM_PROFDATA}" \
-                cmake ninja git nasm perl python3; do
+                cmake ninja git nasm perl python3 patchelf; do
         if command -v "${tool}" &>/dev/null; then
             success "  ${tool} -> $(command -v "${tool}")"
         else
@@ -681,7 +684,6 @@ common_cmake_args() {
         "-DCITRON_USE_AUTO_UPDATER=ON" \
         "-DCITRON_BUILD_TYPE=Release" \
         "-DCMAKE_POLICY_VERSION_MINIMUM=3.5" \
-        "-DCMAKE_BUILD_RPATH=\$ORIGIN" \
         "-Wno-dev"
 
     [[ "${UNITY_BUILD}" == "ON" ]] && echo "-DENABLE_UNITY_BUILD=ON"
