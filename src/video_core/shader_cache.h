@@ -6,13 +6,13 @@
 #include <array>
 #include <memory>
 #include <mutex>
+#include <ranges>
 #include <span>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "common/common_types.h"
-#include <ranges>
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/rasterizer_interface.h"
@@ -144,6 +144,11 @@ private:
     Entry* NewEntry(VAddr addr, VAddr addr_end, ShaderInfo* data);
 
     /// @brief Create a new shader entry and register it
+    /// GPL hook — called once per unique new shader after registration.
+    /// Override in PipelineCache to speculatively pre-translate to SPIR-V.
+    virtual void OnNewShaderSeen([[maybe_unused]] GenericEnvironment& env,
+                                 [[maybe_unused]] u64 unique_hash) {}
+
     const ShaderInfo* MakeShaderInfo(GenericEnvironment& env, VAddr cpu_addr);
 
     Tegra::MaxwellDeviceMemoryManager& device_memory;

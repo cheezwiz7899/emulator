@@ -62,6 +62,22 @@ public:
 
     void Serialize(std::ofstream& file) const;
 
+    /// GPL: copy the cached Maxwell code words into @p out.
+    void CopyCode(std::vector<u64>& out) const { out = code; }
+
+    /// GPL: read-only view of cbuf values captured during translation.
+    const std::unordered_map<u64, u32>& CapturedCbufValues() const noexcept {
+        return cbuf_values;
+    }
+
+    /// No-RTTI downcast: GenericEnvironment is always a GenericEnvironment.
+    VideoCommon::GenericEnvironment* AsGenericEnvironment() noexcept override {
+        return this;
+    }
+    const VideoCommon::GenericEnvironment* AsGenericEnvironment() const noexcept override {
+        return this;
+    }
+
     bool HasHLEMacroState() const override {
         return has_hle_engine_state;
     }

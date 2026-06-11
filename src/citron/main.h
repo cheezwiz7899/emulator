@@ -346,6 +346,7 @@ private slots:
     void OnGameListAddDirectory();
     void OnGameListShowList(bool show);
     void OnGameListOpenPerGameProperties(const std::string& file, u64 program_id = 0);
+    void OnGameListPreCacheShaders(u64 program_id, const std::string& game_path);
     void OnMenuLoadFile();
     void OnMenuLoadFolder();
     void OnMenuInstallToNAND();

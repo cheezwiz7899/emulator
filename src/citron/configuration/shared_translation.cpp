@@ -255,6 +255,9 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QWidget* parent) {
               "accuracy.\nExtreme should only be used for debugging.\nThis option can "
               "be changed while playing.\nSome games may require booting on high to render "
               "properly."));
+    INSERT(Settings, use_gpl_speculative_shaders,
+           tr("Speculatively pre-translate shaders (GPL)"),
+           tr("Translates Maxwell shaders to SPIR-V in the background as soon as they arrive in VRAM.\nReduces first-play shader stutter. Disable if the background thread causes frame pacing issues."));
     INSERT(Settings, use_asynchronous_shaders, tr("Use asynchronous shader building (Hack)"),
            tr("Enables asynchronous shader compilation, which may reduce shader stutter.\nThis "
               "feature "

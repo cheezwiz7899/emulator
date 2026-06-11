@@ -115,6 +115,11 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer) {
         };
         cmdbuf.BeginRenderPass(renderpass_bi, VK_SUBPASS_CONTENTS_INLINE);
     });
+    // Conditional rendering can span render passes. If it was active before the pass
+    // transition, restart it now that the new render pass has begun.
+    if (query_cache && Settings::IsGPULevelNormal()) {
+        query_cache->NotifySegment(true);
+    }
     num_renderpass_images = framebuffer->NumImages();
     renderpass_images = framebuffer->Images();
     renderpass_image_ranges = framebuffer->ImageRanges();
@@ -293,6 +298,13 @@ void Scheduler::EndPendingOperations() {
 void Scheduler::EndRenderPass() {
     if (!state.renderpass) {
         return;
+    }
+    // The Vulkan spec forbids vkCmdEndRenderPass while conditional rendering is active.
+    // Pause any running conditional rendering block before ending the render pass so the
+    // command buffer is always in a valid state.  The pause is a no-op when conditional
+    // rendering is disabled or not currently running.
+    if (query_cache && Settings::IsGPULevelNormal()) {
+        query_cache->NotifySegment(false);
     }
     Record([num_images = num_renderpass_images, images = renderpass_images,
             ranges = renderpass_image_ranges](vk::CommandBuffer cmdbuf) {
