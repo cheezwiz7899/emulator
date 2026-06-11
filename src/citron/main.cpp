@@ -7592,10 +7592,10 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
     progress.setAutoClose(false);
     progress.setAutoReset(false);
 
-    auto vfs = std::make_shared<FileSys::RealVfsFilesystem>();
-    const auto game_file = vfs->OpenFile(game_path, FileSys::OpenMode::Read);
+    auto local_vfs = std::make_shared<FileSys::RealVfsFilesystem>();
+    const auto game_file = local_vfs->OpenFile(game_path, FileSys::OpenMode::Read);
 
-    auto worker = [state, game_path, spirv_path, game_file, vfs, this]() {
+    auto worker = [state, game_path, spirv_path, game_file]() {
         // Speculative-translation environment with conservative defaults:
         // all textures as Color2D, cbuf size 64K, no shared memory.
         // This allows SPIR-V translation without live GPU state.
