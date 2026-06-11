@@ -7,6 +7,7 @@
 #include <fstream>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <unordered_set>
 #include <utility>
 
@@ -17,8 +18,8 @@
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
-#include <ranges>
 #include "shader_recompiler/environment.h"
+#include "shader_recompiler/program_header.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/memory_manager.h"
 #include "video_core/shader_environment.h"

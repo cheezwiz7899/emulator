@@ -5,7 +5,11 @@
 
 #include <cinttypes>
 #include <clocale>
+#include <cstring>
+#include <functional>
+#include <mutex>
 #include <random>
+#include <unordered_set>
 #include "citron/theme.h"
 #include <cmath>
 #include <cstdlib>
@@ -47,6 +51,7 @@
 #include "citron/custom_metadata.h"
 #include "citron/multiplayer/state.h"
 #include "citron/util/controller_navigation.h"
+#include "common/cityhash.h"
 #include "common/hex_util.h"
 #include "common/nvidia_flags.h"
 #include "common/settings_enums.h"
@@ -118,6 +123,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include <fmt/ranges.h>
 #include "common/detached_tasks.h"
 #include "common/fs/fs.h"
+#include "common/thread_worker.h"
 #include "common/fs/path_util.h"
 #include "common/literals.h"
 #include "common/logging.h"
@@ -186,6 +192,15 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "ui_main.h"
 #include "util/overlay_dialog.h"
 #include "video_core/gpu.h"
+#include "shader_recompiler/program_header.h"
+#include "shader_recompiler/runtime_info.h"
+#include "shader_recompiler/profile.h"
+#include "shader_recompiler/object_pool.h"
+#include "shader_recompiler/frontend/maxwell/translate_program.h"
+#include "shader_recompiler/frontend/maxwell/control_flow.h"
+#include "shader_recompiler/backend/bindings.h"
+#include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "video_core/spirv_cache.h"
 #include "video_core/renderer_base.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -1728,6 +1743,8 @@ void GMainWindow::ConnectWidgetEvents() {
     connect(game_list, &GameList::GameChosen, this, &GMainWindow::OnGameListLoadFile);
     connect(game_list, &GameList::OpenDirectory, this, &GMainWindow::OnGameListOpenDirectory);
     connect(game_list, &GameList::OpenFolderRequested, this, &GMainWindow::OnGameListOpenFolder);
+    connect(game_list, &GameList::PreCacheShadersRequested, this,
+            &GMainWindow::OnGameListPreCacheShaders);
     connect(game_list, &GameList::OpenTransferableShaderCacheRequested, this,
             &GMainWindow::OnTransferableShaderCacheOpenFile);
     connect(game_list, &GameList::RemoveInstalledEntryRequested, this,
@@ -6854,4 +6871,305 @@ int main(int argc, char* argv[]) {
 
 void GMainWindow::OnToggleGridView() {
     game_list->ToggleViewMode();
+}
+
+
+// ── GPL: Pre-cache Shaders handler ────────────────────────────────────────
+void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
+                                             const std::string& game_path) {
+    if (program_id == 0 || game_path.empty()) return;
+
+    const auto shader_dir = Common::FS::GetCitronPath(Common::FS::CitronPath::ShaderDir);
+    const auto cache_dir  = shader_dir / fmt::format("{:016x}", program_id);
+    if (!Common::FS::CreateDirs(cache_dir)) return;
+    const auto spirv_path = cache_dir / "spirv_cache.bin";
+
+    struct ScanState {
+        std::atomic<int>  files_total{0};
+        std::atomic<int>  files_processed{0};
+        std::atomic<int>  shaders_found{0};
+        std::atomic<int>  shaders_translated{0};
+        std::atomic<int>  shaders_failed{0};
+        std::atomic<bool> cancelled{false};
+        std::string       error_message;
+    };
+    auto state = std::make_shared<ScanState>();
+
+    struct FinalResult { int translated, failed; std::string error; bool cancelled; };
+    FinalResult final_result{};
+
+    QProgressDialog progress(tr("Opening game file..."),
+                             tr("Cancel"), 0, 0, this);
+    progress.setWindowTitle(tr("Pre-cache Shaders"));
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(0);
+    progress.setAutoClose(false);
+    progress.setAutoReset(false);
+
+    auto vfs = std::make_shared<FileSys::RealVfsFilesystem>();
+    const auto game_file = vfs->OpenFile(game_path, FileSys::OpenMode::Read);
+
+    auto worker = [state, game_path, spirv_path, game_file, vfs, this]() {
+        // Speculative-translation environment with conservative defaults:
+        // all textures as Color2D, cbuf size 64K, no shared memory.
+        // This allows SPIR-V translation without live GPU state.
+        struct SpecEnv final : public Shader::Environment {
+            explicit SpecEnv(std::vector<u64> c, Shader::Stage s, u32 lm,
+                             Shader::ProgramHeader h)
+                : code{std::move(c)}, lmem{lm} {
+                start_address = 0; stage = s; sph = h;
+                is_proprietary_driver = false;
+            }
+            u64 ReadInstruction(u32 a) override {
+                const u32 i = (a - sizeof(Shader::ProgramHeader)) / 8;
+                return i < code.size() ? code[i] : 0;
+            }
+            u32  ReadCbufValue(u32,u32) override              { return 0; }
+            u32  ReadCbufSize(u32 i) override                 { return i<18?65536u:0u; }
+            Shader::TextureType ReadTextureType(u32) override { return Shader::TextureType::Color2D; }
+            Shader::TexturePixelFormat ReadTexturePixelFormat(u32) override {
+                return Shader::TexturePixelFormat::A8B8G8R8_UNORM; }
+            bool IsTexturePixelFormatInteger(u32) override    { return false; }
+            u32  ReadViewportTransformState() override        { return 1u; }
+            u32  TextureBoundBuffer() const override          { return 1u; }
+            u32  LocalMemorySize() const override             { return lmem; }
+            u32  SharedMemorySize() const override            { return 0u; }
+            std::array<u32,3> WorkgroupSize() const override  { return {1u,1u,1u}; }
+            bool HasHLEMacroState() const override            { return false; }
+            std::optional<Shader::ReplaceConstant>
+                GetReplaceConstBuffer(u32,u32) override       { return std::nullopt; }
+            void Dump(u64,u64) override {}
+        private:
+            std::vector<u64> code; u32 lmem;
+        };
+
+        // Mount RomFS
+        FileSys::VirtualFile romfs_raw;
+        const auto try_nca = [&]() {
+            FileSys::NCA nca{game_file};
+            if (nca.GetStatus() != Loader::ResultStatus::Success) return;
+            if (nca.GetType()   != FileSys::NCAContentType::Program) return;
+            romfs_raw = nca.GetRomFS();
+        };
+        const auto try_nsp = [&]() {
+            FileSys::NSP nsp{game_file};
+            if (nsp.GetStatus() != Loader::ResultStatus::Success) return;
+            for (const auto& nca : nsp.GetNCAsCollapsed()) {
+                if (!nca || nca->GetStatus() != Loader::ResultStatus::Success) continue;
+                if (nca->GetType() != FileSys::NCAContentType::Program) continue;
+                romfs_raw = nca->GetRomFS();
+                if (romfs_raw) return;
+            }
+        };
+        const auto try_xci = [&]() {
+            FileSys::XCI xci{game_file};
+            if (xci.GetStatus() != Loader::ResultStatus::Success) return;
+            const auto nca = xci.GetNCAByType(FileSys::NCAContentType::Program);
+            if (!nca || nca->GetStatus() != Loader::ResultStatus::Success) return;
+            romfs_raw = nca->GetRomFS();
+        };
+
+        const std::string ext = [&]{
+            const auto dot = game_path.rfind('.');
+            if (dot == std::string::npos) return std::string{};
+            auto e = game_path.substr(dot+1);
+            for (auto& ch : e) ch = static_cast<char>(std::tolower(ch));
+            return e;
+        }();
+        if      (ext=="nca")               try_nca();
+        else if (ext=="nsp"||ext=="nsz")   try_nsp();
+        else if (ext=="xci"||ext=="xcz")   try_xci();
+        else { try_nca(); if (!romfs_raw) try_nsp(); if (!romfs_raw) try_xci(); }
+
+        if (!romfs_raw) {
+            state->error_message =
+                "Could not mount RomFS. Ensure prod.keys is installed.";
+            return;
+        }
+        const auto romfs = FileSys::ExtractRomFS(romfs_raw);
+        if (!romfs) { state->error_message = "Failed to extract RomFS."; return; }
+
+        std::vector<FileSys::VirtualFile> files;
+        std::function<void(const FileSys::VirtualDir&)> walk =
+            [&](const FileSys::VirtualDir& dir) {
+                if (!dir) return;
+                for (const auto& f : dir->GetFiles())         files.push_back(f);
+                for (const auto& sub : dir->GetSubdirectories()) walk(sub);
+            };
+        walk(romfs);
+        state->files_total.store(static_cast<int>(files.size()));
+
+        VideoCommon::SpirvCache cache;
+        cache.Load(spirv_path);
+
+        Shader::Profile profile{};
+        profile.supported_spirv=0x00010300; profile.unified_descriptor_binding=true;
+        profile.support_descriptor_aliasing=true;
+        profile.support_int8=profile.support_int16=profile.support_int64=true;
+        profile.support_float_controls=true; profile.support_vote=true;
+        profile.support_typeless_image_loads=true;
+        profile.support_demote_to_helper_invocation=true;
+        profile.min_ssbo_alignment=16; profile.max_user_clip_distances=8;
+        Shader::HostTranslateInfo host_info{};
+        host_info.support_float64=host_info.support_float16=host_info.support_int64=true;
+        host_info.support_snorm_render_buffer=true;
+        host_info.support_viewport_index_layer=true;
+        host_info.min_ssbo_alignment=16;
+        // Always disable conditional barrier support: shaders cached here may be loaded
+        // on Intel Windows drivers where barriers inside conditional control flow are
+        // illegal.  Stripping barriers from conditional CF is always spec-correct, so
+        // this is safe on all drivers and avoids generating SPIR-V that would be
+        // rejected or miscompiled on the target hardware.
+        host_info.support_conditional_barrier=false;
+
+        std::mutex seen_mutex;
+        std::unordered_set<u64> seen_hashes;
+
+        const size_t nthreads = std::max(1u, std::thread::hardware_concurrency()-1u);
+        Common::ThreadWorker workers{nthreads, "PreCacheShader"};
+
+        for (const auto& file : files) {
+            if (state->cancelled) break;
+            workers.QueueWork([&, file]() {
+                if (state->cancelled) return;
+                ++state->files_processed;
+                const auto raw = file->ReadAllBytes();
+                if (raw.size() < 4) return;
+
+                const u8* data = raw.data();
+                const size_t sz = raw.size();
+
+                const auto process_blob = [&](const std::vector<u8>& blob) {
+                    if (blob.size() < sizeof(Shader::ProgramHeader)) return;
+                    Shader::ProgramHeader bsph{};
+                    std::memcpy(&bsph, blob.data(), sizeof(bsph));
+                    const u32 t = bsph.common0.shader_type.Value();
+                    if (t < 1 || t > 5) return;
+
+                    const u64 hash = Common::CityHash64(
+                        reinterpret_cast<const char*>(blob.data()), blob.size());
+                    { std::lock_guard g{seen_mutex};
+                      if (!seen_hashes.insert(hash).second) return; }
+                    if (cache.Contains(VideoCommon::SpirvKey{hash, 0u})) return;
+                    ++state->shaders_found;
+
+                    const Shader::Stage stage = [t]()->Shader::Stage {
+                        switch(t){case 1:return Shader::Stage::VertexB;
+                                  case 2:return Shader::Stage::TessellationControl;
+                                  case 3:return Shader::Stage::TessellationEval;
+                                  case 4:return Shader::Stage::Geometry;
+                                  default:return Shader::Stage::Fragment;}
+                    }();
+                    const size_t cb = blob.size()-sizeof(Shader::ProgramHeader);
+                    if (!cb || cb%8) return;
+                    std::vector<u64> code(cb/8);
+                    std::memcpy(code.data(), blob.data()+sizeof(Shader::ProgramHeader), cb);
+                    const u32 lm = static_cast<u32>(bsph.LocalMemorySize()) +
+                                   static_cast<u32>(bsph.common3.shader_local_memory_crs_size);
+                    try {
+                        SpecEnv env{std::move(code), stage, lm, bsph};
+                        Shader::ObjectPool<Shader::Maxwell::Flow::Block> fp(16);
+                        Shader::ObjectPool<Shader::IR::Inst> ip(8192);
+                        Shader::ObjectPool<Shader::IR::Block> bp(32);
+                        Shader::Maxwell::Flow::CFG cfg(env, fp,
+                            static_cast<u32>(sizeof(Shader::ProgramHeader)), false);
+                        auto prog = Shader::Maxwell::TranslateProgram(ip,bp,env,cfg,host_info);
+                        Shader::Backend::Bindings binding{};
+                        Shader::RuntimeInfo rt{};
+                        if (stage==Shader::Stage::Fragment) {
+                            rt.previous_stage_stores.mask.set();
+                            rt.input_topology = Shader::InputTopology::Triangles;
+                        }
+                        Shader::Maxwell::ConvertLegacyToGeneric(prog, rt);
+                        auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile,rt,prog,binding);
+                        cache.InsertSpeculative(hash, std::move(spirv));
+                        ++state->shaders_translated;
+                    } catch(...) { ++state->shaders_failed; }
+                };
+
+                constexpr u32 BNSH_MAGIC = 0x68534E42u;
+                u32 magic4{}; std::memcpy(&magic4, data, 4);
+                if (magic4 == BNSH_MAGIC && sz >= 0x14) {
+                    u32 nv{}; std::memcpy(&nv, data+0x0C, 4);
+                    if (nv>0&&nv<=512) for (u32 v=0;v<nv;++v) {
+                        size_t va=0x10+v*4; if(va+4>sz) break;
+                        u32 voff{}; std::memcpy(&voff,data+va,4);
+                        if((size_t)voff+8>sz) continue;
+                        u32 ns{}; std::memcpy(&ns,data+voff+4,4);
+                        if(!ns||ns>64) continue;
+                        for(u32 s=0;s<ns;++s) {
+                            size_t sa=voff+8+s*4; if(sa+4>sz) break;
+                            u32 sr{}; std::memcpy(&sr,data+sa,4);
+                            size_t sabs=(size_t)voff+sr; if(sabs+0x10>sz) continue;
+                            u32 ds{},st{}; std::memcpy(&ds,data+sabs+4,4); std::memcpy(&st,data+sabs+8,4);
+                            if(st>5||sabs+0x10+ds>sz) continue;
+                            Shader::ProgramHeader syn{}; if(st<=4) syn.common0.shader_type.Assign(st+1);
+                            std::vector<u8> blob(sizeof(syn)+ds);
+                            std::memcpy(blob.data(),&syn,sizeof(syn));
+                            std::memcpy(blob.data()+sizeof(syn),data+sabs+0x10,ds);
+                            process_blob(blob);
+                        }
+                    }
+                } else if (sz>=sizeof(Shader::ProgramHeader)) {
+                    Shader::ProgramHeader sph{}; std::memcpy(&sph,data,sizeof(sph));
+                    if (sph.common0.shader_type.Value()>=1 && sph.common0.shader_type.Value()<=5)
+                        process_blob(raw);
+                }
+            });
+        }
+        workers.WaitForRequests();
+        cache.Save(spirv_path);
+    };
+
+    auto future = QtConcurrent::run(std::move(worker));
+
+    QTimer poll;
+    connect(&poll, &QTimer::timeout, [&]() {
+        if (progress.wasCanceled()) state->cancelled = true;
+        const int total     = state->files_total.load();
+        const int processed = state->files_processed.load();
+        const int found     = state->shaders_found.load();
+        const int translated= state->shaders_translated.load();
+        if (total==0) {
+            progress.setMaximum(0);
+            progress.setLabelText(tr("Mounting RomFS..."));
+        } else if (processed<total) {
+            progress.setMaximum(total); progress.setValue(processed);
+            progress.setLabelText(tr("Scanning files... %1 / %2  (%3 shaders found)")
+                .arg(processed).arg(total).arg(found));
+        } else {
+            progress.setMaximum(found>0?found:1); progress.setValue(translated);
+            progress.setLabelText(tr("Translating shaders... %1 / %2")
+                .arg(translated).arg(found));
+        }
+        if (future.isFinished()) {
+            poll.stop();
+            final_result = {state->shaders_translated.load(),
+                            state->shaders_failed.load(),
+                            state->error_message,
+                            state->cancelled.load()};
+            progress.accept();
+        }
+    });
+    poll.start(100);
+    progress.exec();
+    future.waitForFinished();
+
+    if (!final_result.error.empty()) {
+        QMessageBox::critical(this, tr("Pre-cache Shaders"),
+            tr("Shader scan failed:\n%1").arg(QString::fromStdString(final_result.error)));
+    } else if (final_result.cancelled) {
+        QMessageBox::information(this, tr("Pre-cache Shaders"),
+            tr("Pre-cache cancelled. %1 shaders translated so far have been saved.")
+                .arg(final_result.translated));
+    } else {
+        QMessageBox::information(this, tr("Pre-cache Shaders"),
+            tr("Pre-cache complete!\n\n"
+               "New shaders translated:    %1\n"
+               "Failed (runtime fallback): %2\n\n"
+               "Shaders already in cache are skipped automatically.\n"
+               "SPIR-V cache saved — stutter will be reduced on first play.")
+                .arg(final_result.translated)
+                .arg(final_result.failed));
+    }
 }

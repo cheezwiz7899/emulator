@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
+// SPDX-FileCopyrightText: Copyright 2026 citron Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -243,8 +244,12 @@ const ShaderInfo* ShaderCache::MakeShaderInfo(GenericEnvironment& env, VAddr cpu
         info->size_bytes = env.ReadSizeBytes();
     }
     const size_t size_bytes{info->size_bytes};
+    const u64 unique_hash{info->unique_hash};
     const ShaderInfo* const result{info.get()};
     Register(std::move(info), cpu_addr, size_bytes);
+    // Notify the pipeline cache that a new shader has been registered so it can
+    // submit it for speculative SPIR-V translation in the background.
+    OnNewShaderSeen(env, unique_hash);
     return result;
 }
 
