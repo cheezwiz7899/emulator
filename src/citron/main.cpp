@@ -3043,6 +3043,7 @@ void GMainWindow::RemoveSpirvCache(u64 program_id) {
 }
 
 void GMainWindow::RemoveVulkanDriverPipelineCache(u64 program_id) {
+    static constexpr std::string_view target_file_name = "vulkan_pipelines.bin";
 
     const auto shader_cache_dir = Common::FS::GetCitronPath(Common::FS::CitronPath::ShaderDir);
     const auto shader_cache_folder_path = shader_cache_dir / fmt::format("{:016x}", program_id);
