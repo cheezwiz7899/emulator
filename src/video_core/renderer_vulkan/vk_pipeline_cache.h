@@ -170,6 +170,14 @@ public:
     std::filesystem::path spirv_cache_filename;
     Common::ThreadWorker speculative_worker;
     Common::ThreadWorker serialization_thread;
+
+    // Shader recompiler pools reused across speculative translations on the
+    // speculative_worker thread.  Reusing rather than reallocating per shader
+    // eliminates repeated large VirtualAlloc/VirtualFree calls that fragment the
+    // address space and push Dynarmic JIT allocations outside the ±2 GB range
+    // required for 32-bit RIP-relative addressing.
+    // IMPORTANT: must only ever be accessed from speculative_worker's thread.
+    ShaderPools spec_pools;
     bool use_asynchronous_shaders{};
     bool use_vulkan_pipeline_cache{};
 

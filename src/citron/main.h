@@ -427,6 +427,7 @@ private:
     void RemoveUpdateContent(u64 program_id, InstalledEntryType type);
     void RemoveAddOnContent(u64 program_id, InstalledEntryType type);
     void RemoveTransferableShaderCache(u64 program_id);
+    void RemoveSpirvCache(u64 program_id);
     void RemoveVulkanDriverPipelineCache(u64 program_id);
     void RemoveAllTransferableShaderCaches(u64 program_id);
     void RemoveCustomConfiguration(u64 program_id, const std::string& game_path);
