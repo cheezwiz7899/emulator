@@ -1190,17 +1190,16 @@ void PipelineCache::SubmitSpeculativeShader(
                                        workgroup_size, texture_bound, sph,
                                        /*code_offset_in_program=*/0u};
 
-            Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_pool(16);
-            Shader::ObjectPool<Shader::IR::Inst>             inst_pool(8192);
-            Shader::ObjectPool<Shader::IR::Block>            block_pool(32);
+            // Reuse persistent pools to avoid per-translation VirtualAlloc churn.
+            spec_pools.ReleaseContents();
 
             const u32 cfg_start = start_address +
                 ((stage == Shader::Stage::Compute)
                      ? 0u : static_cast<u32>(sizeof(Shader::ProgramHeader)));
 
-            Shader::Maxwell::Flow::CFG cfg(env, flow_pool, cfg_start, false);
+            Shader::Maxwell::Flow::CFG cfg(env, spec_pools.flow_block, cfg_start, false);
             auto program = Shader::Maxwell::TranslateProgram(
-                inst_pool, block_pool, env, cfg, host_info);
+                spec_pools.inst, spec_pools.block, env, cfg, host_info);
 
             Shader::Backend::Bindings binding{};
             Shader::RuntimeInfo rt{};

@@ -2951,6 +2951,8 @@ void GMainWindow::OnGameListRemoveFile(u64 program_id, GameListRemoveTarget targ
         switch (target) {
         case GameListRemoveTarget::VkShaderCache:
             return tr("Delete Vulkan Transferable Shader Cache?");
+        case GameListRemoveTarget::SpirvCache:
+            return tr("Delete SPIR-V Shader Cache?");
         case GameListRemoveTarget::AllShaderCache:
             return tr("Delete All Transferable Shader Caches?");
         case GameListRemoveTarget::CustomConfiguration:
@@ -2971,6 +2973,10 @@ void GMainWindow::OnGameListRemoveFile(u64 program_id, GameListRemoveTarget targ
     case GameListRemoveTarget::VkShaderCache:
         RemoveVulkanDriverPipelineCache(program_id);
         RemoveTransferableShaderCache(program_id);
+        RemoveSpirvCache(program_id);
+        break;
+    case GameListRemoveTarget::SpirvCache:
+        RemoveSpirvCache(program_id);
         break;
     case GameListRemoveTarget::AllShaderCache:
         RemoveAllTransferableShaderCaches(program_id);
@@ -3015,8 +3021,28 @@ void GMainWindow::RemoveTransferableShaderCache(u64 program_id) {
     }
 }
 
+void GMainWindow::RemoveSpirvCache(u64 program_id) {
+    static constexpr std::string_view target_file_name = "spirv_cache.bin";
+
+    const auto shader_cache_dir = Common::FS::GetCitronPath(Common::FS::CitronPath::ShaderDir);
+    const auto shader_cache_folder_path = shader_cache_dir / fmt::format("{:016x}", program_id);
+    const auto target_file = shader_cache_folder_path / target_file_name;
+
+    if (!Common::FS::Exists(target_file)) {
+        QMessageBox::warning(this, tr("Error Removing SPIR-V Shader Cache"),
+                             tr("A SPIR-V shader cache for this title does not exist."));
+        return;
+    }
+    if (Common::FS::RemoveFile(target_file)) {
+        QMessageBox::information(this, tr("Successfully Removed"),
+                                 tr("Successfully removed the SPIR-V shader cache."));
+    } else {
+        QMessageBox::warning(this, tr("Error Removing SPIR-V Shader Cache"),
+                             tr("Failed to remove the SPIR-V shader cache."));
+    }
+}
+
 void GMainWindow::RemoveVulkanDriverPipelineCache(u64 program_id) {
-    static constexpr std::string_view target_file_name = "vulkan_pipelines.bin";
 
     const auto shader_cache_dir = Common::FS::GetCitronPath(Common::FS::CitronPath::ShaderDir);
     const auto shader_cache_folder_path = shader_cache_dir / fmt::format("{:016x}", program_id);
