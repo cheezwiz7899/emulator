@@ -1142,9 +1142,14 @@ public:
     }
 
     u64 ReadInstruction(u32 address) override {
-        if (address < code_lowest) return 0;
+        if (address < code_lowest) {
+            throw Shader::Exception("SpeculativeEnvironment: ReadInstruction below code start");
+        }
         const u32 idx = (address - code_lowest) / 8;
-        return idx < code.size() ? code[idx] : 0;
+        if (idx >= code.size()) {
+            throw Shader::Exception("SpeculativeEnvironment: ReadInstruction out of bounds");
+        }
+        return code[idx];
     }
     u32  ReadCbufValue(u32, u32) override              { return 0; }
     u32  ReadCbufSize(u32 i) override                  { return i < 18 ? 65536u : 0u; }

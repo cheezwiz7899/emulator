@@ -196,6 +196,8 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "shader_recompiler/runtime_info.h"
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/object_pool.h"
+#include "shader_recompiler/exception.h"
+#include "shader_recompiler/frontend/maxwell/decode.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/backend/bindings.h"
@@ -6949,7 +6951,10 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
             }
             u64 ReadInstruction(u32 a) override {
                 const u32 i = (a - sizeof(Shader::ProgramHeader)) / 8;
-                return i < code.size() ? code[i] : 0;
+                if (i >= code.size()) {
+                    throw Shader::Exception("Pre-cache: ReadInstruction out of bounds");
+                }
+                return code[i];
             }
             u32  ReadCbufValue(u32,u32) override              { return 0; }
             u32  ReadCbufSize(u32 i) override                 { return i<18?65536u:0u; }
@@ -7070,8 +7075,48 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                     if (blob.size() < sizeof(Shader::ProgramHeader)) return;
                     Shader::ProgramHeader bsph{};
                     std::memcpy(&bsph, blob.data(), sizeof(bsph));
-                    const u32 t = bsph.common0.shader_type.Value();
-                    if (t < 1 || t > 5) return;
+
+                    // Validate SPH header fields before attempting to decode.
+                    // Real NVIDIA shader program headers have:
+                    //   sph_type     (bits  0-4)  == 1
+                    //   version      (bits  5-9)  != 0  (typically 0x02)
+                    //   shader_type  (bits 10-13) in [1,5]
+                    //   sass_version (bits 17-20) != 0
+                    // Files whose bytes happen to pass only the shader_type check
+                    // (asset data, textures, etc.) are rejected here to avoid
+                    // flooding the Maxwell decoder with garbage and spamming
+                    // "Invalid insn" assertions.
+                    u32 common0_raw{};
+                    std::memcpy(&common0_raw, blob.data(), sizeof(common0_raw));
+                    const u32 sph_type    = (common0_raw >>  0) & 0x1Fu;
+                    const u32 version     = (common0_raw >>  5) & 0x1Fu;
+                    const u32 shader_type = (common0_raw >> 10) & 0x0Fu;
+                    const u32 sass_ver    = (common0_raw >> 17) & 0x0Fu;
+                    if (sph_type != 1u)             return;
+                    if (version == 0u)              return;
+                    if (shader_type < 1u || shader_type > 5u) return;
+                    if (sass_ver == 0u)             return;
+
+                    // Require at least one instruction beyond the header,
+                    // aligned to 8 bytes (Maxwell instruction size).
+                    const size_t payload = blob.size() - sizeof(Shader::ProgramHeader);
+                    if (payload < 8 || payload % 8 != 0) return;
+
+                    // Quick decode check: the first instruction must be recognisable.
+                    // This rejects blobs that have a plausible-looking header but
+                    // non-Maxwell instruction bytes immediately after it.
+                    {
+                        u64 first_insn{};
+                        std::memcpy(&first_insn,
+                                    blob.data() + sizeof(Shader::ProgramHeader), 8);
+                        try {
+                            (void)Shader::Maxwell::Decode(first_insn);
+                        } catch (...) {
+                            return; // Not a valid Maxwell instruction stream
+                        }
+                    }
+
+                    const u32 t = shader_type;
 
                     const u64 hash = Common::CityHash64(
                         reinterpret_cast<const char*>(blob.data()), blob.size());
@@ -7087,10 +7132,8 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                                   case 4:return Shader::Stage::Geometry;
                                   default:return Shader::Stage::Fragment;}
                     }();
-                    const size_t cb = blob.size()-sizeof(Shader::ProgramHeader);
-                    if (!cb || cb%8) return;
-                    std::vector<u64> code(cb/8);
-                    std::memcpy(code.data(), blob.data()+sizeof(Shader::ProgramHeader), cb);
+                    std::vector<u64> code(payload / 8);
+                    std::memcpy(code.data(), blob.data() + sizeof(Shader::ProgramHeader), payload);
                     const u32 lm = static_cast<u32>(bsph.LocalMemorySize()) +
                                    static_cast<u32>(bsph.common3.shader_local_memory_crs_size);
                     try {
