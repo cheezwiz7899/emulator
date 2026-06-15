@@ -202,6 +202,8 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "video_core/shader_cache.h"
+#include "video_core/speculative_shader_environment.h"
 #include "video_core/spirv_cache.h"
 #include "video_core/renderer_base.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
@@ -6939,42 +6941,6 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
     const auto game_file = local_vfs->OpenFile(game_path, FileSys::OpenMode::Read);
 
     auto worker = [state, game_path, spirv_path, game_file]() {
-        // Speculative-translation environment with conservative defaults:
-        // all textures as Color2D, cbuf size 64K, no shared memory.
-        // This allows SPIR-V translation without live GPU state.
-        struct SpecEnv final : public Shader::Environment {
-            explicit SpecEnv(std::vector<u64> c, Shader::Stage s, u32 lm,
-                             Shader::ProgramHeader h)
-                : code{std::move(c)}, lmem{lm} {
-                start_address = 0; stage = s; sph = h;
-                is_proprietary_driver = false;
-            }
-            u64 ReadInstruction(u32 a) override {
-                const u32 i = (a - sizeof(Shader::ProgramHeader)) / 8;
-                if (i >= code.size()) {
-                    throw Shader::Exception("Pre-cache: ReadInstruction out of bounds");
-                }
-                return code[i];
-            }
-            u32  ReadCbufValue(u32,u32) override              { return 0; }
-            u32  ReadCbufSize(u32 i) override                 { return i<18?65536u:0u; }
-            Shader::TextureType ReadTextureType(u32) override { return Shader::TextureType::Color2D; }
-            Shader::TexturePixelFormat ReadTexturePixelFormat(u32) override {
-                return Shader::TexturePixelFormat::A8B8G8R8_UNORM; }
-            bool IsTexturePixelFormatInteger(u32) override    { return false; }
-            u32  ReadViewportTransformState() override        { return 1u; }
-            u32  TextureBoundBuffer() const override          { return 1u; }
-            u32  LocalMemorySize() const override             { return lmem; }
-            u32  SharedMemorySize() const override            { return 0u; }
-            std::array<u32,3> WorkgroupSize() const override  { return {1u,1u,1u}; }
-            bool HasHLEMacroState() const override            { return false; }
-            std::optional<Shader::ReplaceConstant>
-                GetReplaceConstBuffer(u32,u32) override       { return std::nullopt; }
-            void Dump(u64,u64) override {}
-        private:
-            std::vector<u64> code; u32 lmem;
-        };
-
         // Mount RomFS
         FileSys::VirtualFile romfs_raw;
         const auto try_nca = [&]() {
@@ -7118,12 +7084,14 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
 
                     const u32 t = shader_type;
 
-                    const u64 hash = Common::CityHash64(
+                    // Quick same-session dedup using a blob fingerprint.
+                    // This prevents re-translating identical blobs found in multiple
+                    // RomFS files within a single scan. It is NOT the authoritative
+                    // shader hash — that comes from env.CalculateHash() below.
+                    const u64 blob_fingerprint = Common::CityHash64(
                         reinterpret_cast<const char*>(blob.data()), blob.size());
                     { std::lock_guard g{seen_mutex};
-                      if (!seen_hashes.insert(hash).second) return; }
-                    if (cache.Contains(VideoCommon::SpirvKey{hash, 0u})) return;
-                    ++state->shaders_found;
+                      if (!seen_hashes.insert(blob_fingerprint).second) return; }
 
                     const Shader::Stage stage = [t]()->Shader::Stage {
                         switch(t){case 1:return Shader::Stage::VertexB;
@@ -7137,22 +7105,37 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                     const u32 lm = static_cast<u32>(bsph.LocalMemorySize()) +
                                    static_cast<u32>(bsph.common3.shader_local_memory_crs_size);
                     try {
-                        SpecEnv env{std::move(code), stage, lm, bsph};
+                        VideoCommon::SpeculativeShaderEnvironment env{std::move(code), stage, lm, bsph};
                         Shader::ObjectPool<Shader::Maxwell::Flow::Block> fp(16);
                         Shader::ObjectPool<Shader::IR::Inst> ip(8192);
                         Shader::ObjectPool<Shader::IR::Block> bp(32);
                         Shader::Maxwell::Flow::CFG cfg(env, fp,
                             static_cast<u32>(sizeof(Shader::ProgramHeader)), false);
+
+                        // Compute the authoritative hash AFTER CFG determines shader bounds.
+                        // This must match GenericEnvironment::CalculateHash() used by the live path.
+                        const u64 unique_hash = env.CalculateHash();
+                        if (cache.ContainsByUniqueHash(unique_hash)) return;
+                        ++state->shaders_found;
+
                         auto prog = Shader::Maxwell::TranslateProgram(ip,bp,env,cfg,host_info);
                         Shader::Backend::Bindings binding{};
                         Shader::RuntimeInfo rt{};
-                        if (stage==Shader::Stage::Fragment) {
-                            rt.previous_stage_stores.mask.set();
-                            rt.input_topology = Shader::InputTopology::Triangles;
+                        // Without a live pipeline key we have no previous-stage stores
+                        // information, so conservatively set all bits — the same thing
+                        // MakeRuntimeInfo does when there is no previous program.
+                        rt.previous_stage_stores.mask.set();
+                        // Triangles are the overwhelmingly common input topology.
+                        // Geometry and tessellation shaders that need a different
+                        // topology will be recompiled correctly during live play.
+                        rt.input_topology = Shader::InputTopology::Triangles;
+                        if (stage == Shader::Stage::Fragment) {
+                            // Accept all frag color output types conservatively.
+                            rt.frag_color_types.fill(Shader::FragmentOutputType::Float);
                         }
                         Shader::Maxwell::ConvertLegacyToGeneric(prog, rt);
                         auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile,rt,prog,binding);
-                        cache.InsertSpeculative(hash, std::move(spirv));
+                        cache.InsertSpeculative(unique_hash, rt.Hash(), std::move(spirv));
                         ++state->shaders_translated;
                     } catch(...) { ++state->shaders_failed; }
                 };
@@ -7173,7 +7156,16 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                             size_t sabs=(size_t)voff+sr; if(sabs+0x10>sz) continue;
                             u32 ds{},st{}; std::memcpy(&ds,data+sabs+4,4); std::memcpy(&st,data+sabs+8,4);
                             if(st>5||sabs+0x10+ds>sz) continue;
-                            Shader::ProgramHeader syn{}; if(st<=4) syn.common0.shader_type.Assign(st+1);
+                            Shader::ProgramHeader syn{};
+                            // Set all SPH fields validated by process_blob.
+                            // sph_type=1  : rendering shader (not compute)
+                            // version=2   : Maxwell SPH format version
+                            // shader_type : from BNSH stage index
+                            // sass_version=5 : Maxwell2/GM20B (Switch GPU, SM52/53)
+                            syn.common0.sph_type.Assign(1u);
+                            syn.common0.version.Assign(2u);
+                            syn.common0.shader_type.Assign(st < 5u ? st + 1u : 1u);
+                            syn.common0.sass_version.Assign(5u);
                             std::vector<u8> blob(sizeof(syn)+ds);
                             std::memcpy(blob.data(),&syn,sizeof(syn));
                             std::memcpy(blob.data()+sizeof(syn),data+sabs+0x10,ds);
