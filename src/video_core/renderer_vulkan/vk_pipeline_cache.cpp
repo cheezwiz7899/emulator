@@ -60,6 +60,7 @@ using VideoCommon::GenericEnvironment;
 using VideoCommon::GraphicsEnvironment;
 using VideoCommon::SpirvKey;
 using VideoCommon::ComputeCbufKey;
+using VideoCommon::ComputeTextureKey;
 
 // PIPELINE_CACHE_VERSION is defined as inline constexpr in vk_pipeline_cache.h.
 // Use it here directly — single source of truth for the version number.
@@ -855,8 +856,11 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         const u64 cbuf_key = gen_env_stage
             ? ComputeCbufKey(gen_env_stage->CapturedCbufValues())
             : 0;
+        const u64 texture_key = gen_env_stage
+            ? ComputeTextureKey(gen_env_stage->CapturedTextureTypes(), gen_env_stage->CapturedTexturePixelFormats())
+            : 0;
         const u64 runtime_key = runtime_info.Hash();
-        const SpirvKey spirv_key{key.unique_hashes[index], cbuf_key, runtime_key};
+        const SpirvKey spirv_key{key.unique_hashes[index], cbuf_key, runtime_key, texture_key};
         std::vector<u32> code;
         const bool is_merged_vertex = uses_vertex_a && uses_vertex_b && index == 1;
         // Since SpirvKey now includes the runtime_key, we can safely serve cached SPIR-V
@@ -981,10 +985,11 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
     // AsGenericEnvironment() returns nullptr for FileEnvironment (disk-load path).
     auto* gen_env = env.AsGenericEnvironment();
     const u64 cbuf_key_c = gen_env ? ComputeCbufKey(gen_env->CapturedCbufValues()) : 0;
+    const u64 texture_key_c = gen_env ? ComputeTextureKey(gen_env->CapturedTextureTypes(), gen_env->CapturedTexturePixelFormats()) : 0;
     // Use gen_env->CalculateHash() — CalculateHash() is defined on GenericEnvironment,
     // not on the base Shader::Environment. Fall back to key.unique_hash if not available.
     const u64 compute_unique_hash = gen_env ? gen_env->CalculateHash() : key.unique_hash;
-    const SpirvKey spirv_key_c{compute_unique_hash, cbuf_key_c, 0};
+    const SpirvKey spirv_key_c{compute_unique_hash, cbuf_key_c, 0, texture_key_c};
     std::vector<u32> code;
     if (auto cached = spirv_cache.Lookup(spirv_key_c)) {
         code = std::move(*cached);
@@ -1167,7 +1172,8 @@ void PipelineCache::SubmitSpeculativeShader(
                 Shader::Maxwell::ConvertLegacyToGeneric(program, rt);
             }
             auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, rt, program, binding);
-            spirv_cache.InsertSpeculative(unique_hash, rt.Hash(), std::move(spirv));
+            const u64 texture_key = ComputeTextureKey(env.CapturedTextureTypes(), env.CapturedTexturePixelFormats());
+            spirv_cache.InsertSpeculative(unique_hash, rt.Hash(), texture_key, std::move(spirv));
             if (!spirv_cache_filename.empty()) {
                 serialization_thread.QueueWork([this] {
                     spirv_cache.SaveThrottled(spirv_cache_filename);

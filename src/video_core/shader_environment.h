@@ -70,6 +70,16 @@ public:
         return cbuf_values;
     }
 
+    /// GPL: read-only view of texture types captured during translation.
+    const std::unordered_map<u32, Shader::TextureType>& CapturedTextureTypes() const noexcept {
+        return texture_types;
+    }
+
+    /// GPL: read-only view of texture pixel formats captured during translation.
+    const std::unordered_map<u32, Shader::TexturePixelFormat>& CapturedTexturePixelFormats() const noexcept {
+        return texture_pixel_formats;
+    }
+
     /// No-RTTI downcast: GenericEnvironment is always a GenericEnvironment.
     VideoCommon::GenericEnvironment* AsGenericEnvironment() noexcept override {
         return this;

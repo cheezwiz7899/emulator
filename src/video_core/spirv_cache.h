@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "shader_recompiler/shader_info.h"
 
 namespace VideoCommon {
 
@@ -25,27 +26,32 @@ struct SpirvKey {
     u64 unique_hash;
     u64 cbuf_key; // 0 = speculative/AOT (no cbuf specialisation)
     u64 runtime_key; // Hash of RuntimeInfo fields
-
+    u64 texture_key; // Hash of Texture types and formats
     bool operator==(const SpirvKey& o) const noexcept {
-        return unique_hash == o.unique_hash && cbuf_key == o.cbuf_key && runtime_key == o.runtime_key;
+        return unique_hash == o.unique_hash && cbuf_key == o.cbuf_key && runtime_key == o.runtime_key && texture_key == o.texture_key;
     }
 };
-
 struct SpirvKeyHash {
     size_t operator()(const SpirvKey& k) const noexcept {
-        // Boost hash_combine-style mix of the three 64-bit fields.
+        // Boost hash_combine-style mix of the four 64-bit fields.
         size_t h = k.unique_hash;
         h ^= k.cbuf_key + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
         h ^= k.runtime_key + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h ^= k.texture_key + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
         return h;
     }
 };
-
 // ---------------------------------------------------------------------------
 // ComputeCbufKey — hash of cbuf specialisation values used during translation.
 // Zero means the shader was translated without cbuf folding (conservative).
 // ---------------------------------------------------------------------------
 u64 ComputeCbufKey(const std::unordered_map<u64, u32>& cbuf_values);
+
+// ---------------------------------------------------------------------------
+// ComputeTextureKey — hash of texture types and formats used during translation.
+// ---------------------------------------------------------------------------
+u64 ComputeTextureKey(const std::unordered_map<u32, Shader::TextureType>& texture_types,
+                      const std::unordered_map<u32, Shader::TexturePixelFormat>& texture_pixel_formats);
 
 // ---------------------------------------------------------------------------
 // SpirvCache — thread-safe store of pre-translated SPIR-V programs.
@@ -102,10 +108,10 @@ public:
     // Insert a real runtime-compiled entry (keyed with actual cbuf values and runtime info).
     void Insert(const SpirvKey& key, std::vector<u32> spirv);
     void Insert(u64 unique_hash, const std::unordered_map<u64, u32>& cbuf_values,
-                u64 runtime_key, std::vector<u32> spirv);
+                u64 runtime_key, u64 texture_key, std::vector<u32> spirv);
 
     // Insert a speculative/AOT entry (cbuf_key = 0).
-    void InsertSpeculative(u64 unique_hash, u64 runtime_key, std::vector<u32> spirv);
+    void InsertSpeculative(u64 unique_hash, u64 runtime_key, u64 texture_key, std::vector<u32> spirv);
 
 private:
     mutable std::shared_mutex mutex_;

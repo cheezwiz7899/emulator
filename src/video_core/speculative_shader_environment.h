@@ -49,10 +49,16 @@ public:
         return code[i];
     }
 
-    u32 ReadCbufValue(u32, u32) override { return 0; }
+    u32 ReadCbufValue(u32, u32) override {
+        throw Shader::Exception("SpeculativeShaderEnvironment: ReadCbufValue not supported");
+    }
     u32 ReadCbufSize(u32 i) override { return i < 18 ? 65536u : 0u; }
-    Shader::TextureType ReadTextureType(u32) override { return Shader::TextureType::Color2D; }
-    Shader::TexturePixelFormat ReadTexturePixelFormat(u32) override {
+    Shader::TextureType ReadTextureType(u32 handle) override {
+        texture_types.emplace(handle, Shader::TextureType::Color2D);
+        return Shader::TextureType::Color2D;
+    }
+    Shader::TexturePixelFormat ReadTexturePixelFormat(u32 handle) override {
+        texture_pixel_formats.emplace(handle, Shader::TexturePixelFormat::A8B8G8R8_UNORM);
         return Shader::TexturePixelFormat::A8B8G8R8_UNORM;
     }
     bool IsTexturePixelFormatInteger(u32) override { return false; }
@@ -64,6 +70,14 @@ public:
     bool HasHLEMacroState() const override { return false; }
     std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32, u32) override { return std::nullopt; }
     void Dump(u64, u64) override {}
+
+    const std::unordered_map<u32, Shader::TextureType>& CapturedTextureTypes() const noexcept {
+        return texture_types;
+    }
+
+    const std::unordered_map<u32, Shader::TexturePixelFormat>& CapturedTexturePixelFormats() const noexcept {
+        return texture_pixel_formats;
+    }
 
     u64 CalculateHash() const {
         static constexpr u64 SELF_BRANCH_A = 0xE2400FFFFF87000FULL;
@@ -89,6 +103,8 @@ public:
 
 private:
     std::vector<u64> code;
+    std::unordered_map<u32, Shader::TextureType> texture_types;
+    std::unordered_map<u32, Shader::TexturePixelFormat> texture_pixel_formats;
     u32 local_memory_size;
     u32 shared_memory_size;
     u32 texture_bound;
