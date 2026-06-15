@@ -24,17 +24,19 @@ namespace VideoCommon {
 struct SpirvKey {
     u64 unique_hash;
     u64 cbuf_key; // 0 = speculative/AOT (no cbuf specialisation)
+    u64 runtime_key; // Hash of RuntimeInfo fields
 
     bool operator==(const SpirvKey& o) const noexcept {
-        return unique_hash == o.unique_hash && cbuf_key == o.cbuf_key;
+        return unique_hash == o.unique_hash && cbuf_key == o.cbuf_key && runtime_key == o.runtime_key;
     }
 };
 
 struct SpirvKeyHash {
     size_t operator()(const SpirvKey& k) const noexcept {
-        // Boost hash_combine-style mix of the two 64-bit fields.
+        // Boost hash_combine-style mix of the three 64-bit fields.
         size_t h = k.unique_hash;
         h ^= k.cbuf_key + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h ^= k.runtime_key + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
         return h;
     }
 };
@@ -85,6 +87,11 @@ public:
     // Faster than Lookup() when the SPIR-V itself is not needed — avoids the vector copy.
     [[nodiscard]] bool Contains(const SpirvKey& key) const noexcept;
 
+    // Returns true if the cache contains ANY entry whose unique_hash matches.
+    // Use this for "have we already seen this shader?" guards where cbuf_key and
+    // runtime_key are not yet known.
+    [[nodiscard]] bool ContainsByUniqueHash(u64 unique_hash) const noexcept;
+
     /// Number of successful Lookup() calls since construction.
     [[nodiscard]] size_t HitCount() const noexcept { return hit_count_.load(); }
     /// Total number of Lookup() calls (hit or miss) since construction.
@@ -92,13 +99,13 @@ public:
 
     [[nodiscard]] size_t Size() const;
 
-    // Insert a real runtime-compiled entry (keyed with actual cbuf values).
+    // Insert a real runtime-compiled entry (keyed with actual cbuf values and runtime info).
     void Insert(const SpirvKey& key, std::vector<u32> spirv);
     void Insert(u64 unique_hash, const std::unordered_map<u64, u32>& cbuf_values,
-                std::vector<u32> spirv);
+                u64 runtime_key, std::vector<u32> spirv);
 
     // Insert a speculative/AOT entry (cbuf_key = 0).
-    void InsertSpeculative(u64 unique_hash, std::vector<u32> spirv);
+    void InsertSpeculative(u64 unique_hash, u64 runtime_key, std::vector<u32> spirv);
 
 private:
     mutable std::shared_mutex mutex_;

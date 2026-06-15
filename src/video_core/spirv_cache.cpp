@@ -11,7 +11,7 @@
 
 namespace {
 constexpr std::array<char, 8> SPIRV_CACHE_MAGIC{'c', 'i', 't', 'r', 's', 'p', 'v', '\0'};
-constexpr u32 SPIRV_CACHE_VERSION = 1;
+constexpr u32 SPIRV_CACHE_VERSION = 2;
 } // anonymous namespace
 
 namespace VideoCommon {
@@ -49,6 +49,7 @@ void SpirvCache::Load(const std::filesystem::path& path) {
             u32 word_count{};
             file.read(reinterpret_cast<char*>(&key.unique_hash), sizeof(key.unique_hash));
             file.read(reinterpret_cast<char*>(&key.cbuf_key),    sizeof(key.cbuf_key));
+            file.read(reinterpret_cast<char*>(&key.runtime_key), sizeof(key.runtime_key));
             file.read(reinterpret_cast<char*>(&word_count),       sizeof(word_count));
 
             if (word_count == 0 || word_count > 4 * 1024 * 1024) {
@@ -102,6 +103,7 @@ void SpirvCache::Save(const std::filesystem::path& path) const {
             const u32 word_count = static_cast<u32>(spirv.size());
             file.write(reinterpret_cast<const char*>(&key.unique_hash), sizeof(key.unique_hash));
             file.write(reinterpret_cast<const char*>(&key.cbuf_key),    sizeof(key.cbuf_key));
+            file.write(reinterpret_cast<const char*>(&key.runtime_key), sizeof(key.runtime_key));
             file.write(reinterpret_cast<const char*>(&word_count),      sizeof(word_count));
             file.write(reinterpret_cast<const char*>(spirv.data()),     word_count * sizeof(u32));
         }
@@ -151,6 +153,16 @@ bool SpirvCache::Contains(const SpirvKey& key) const noexcept {
     return entries_.count(key) != 0;
 }
 
+bool SpirvCache::ContainsByUniqueHash(u64 unique_hash) const noexcept {
+    std::shared_lock lock{mutex_};
+    for (const auto& [key, _] : entries_) {
+        if (key.unique_hash == unique_hash) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::optional<std::vector<u32>> SpirvCache::Lookup(const SpirvKey& key) const {
     std::shared_lock lock{mutex_};
     ++lookup_count_;
@@ -172,13 +184,13 @@ size_t SpirvCache::Size() const {
 }
 
 void SpirvCache::Insert(u64 unique_hash, const std::unordered_map<u64, u32>& cbuf_values,
-                        std::vector<u32> spirv) {
-    Insert(SpirvKey{unique_hash, ComputeCbufKey(cbuf_values)}, std::move(spirv));
+                        u64 runtime_key, std::vector<u32> spirv) {
+    Insert(SpirvKey{unique_hash, ComputeCbufKey(cbuf_values), runtime_key}, std::move(spirv));
 }
 
-void SpirvCache::InsertSpeculative(u64 unique_hash, std::vector<u32> spirv) {
+void SpirvCache::InsertSpeculative(u64 unique_hash, u64 runtime_key, std::vector<u32> spirv) {
     if (unique_hash == 0 || spirv.empty()) [[unlikely]] return;
-    Insert(SpirvKey{unique_hash, 0}, std::move(spirv));
+    Insert(SpirvKey{unique_hash, 0, runtime_key}, std::move(spirv));
 }
 
 } // namespace VideoCommon

@@ -40,6 +40,7 @@
 #include "video_core/shader_cache.h"
 #include "video_core/spirv_cache.h"
 #include "video_core/shader_environment.h"
+#include "video_core/speculative_shader_environment.h"
 #include "video_core/shader_notify.h"
 #include "video_core/surface.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -854,22 +855,25 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         const u64 cbuf_key = gen_env_stage
             ? ComputeCbufKey(gen_env_stage->CapturedCbufValues())
             : 0;
-        const SpirvKey spirv_key{key.unique_hashes[index], cbuf_key};
+        const u64 runtime_key = runtime_info.Hash();
+        const SpirvKey spirv_key{key.unique_hashes[index], cbuf_key, runtime_key};
         std::vector<u32> code;
         const bool is_merged_vertex = uses_vertex_a && uses_vertex_b && index == 1;
+        // Since SpirvKey now includes the runtime_key, we can safely serve cached SPIR-V
+        // to both the live path and the disk-load path.
         if (!is_merged_vertex) {
             if (auto cached = spirv_cache.Lookup(spirv_key)) { code = std::move(*cached); }
         }
         if (code.empty()) {
             code = EmitSPIRV(profile, runtime_info, program, binding);
-            spirv_cache.Insert(spirv_key, code);
-            // Reserve extra capacity on the local upload copy only — the stored
-            // cache entry was inserted before the reserve so it stays compact.
-            code.reserve(std::max<size_t>(code.size(), 16 * 1024 / sizeof(u32)));
-            if (!spirv_cache_filename.empty()) {
-                serialization_thread.QueueWork([this] {
-                    spirv_cache.SaveThrottled(spirv_cache_filename); });
+            // Insert into the cache if this was generated live
+            if (!is_merged_vertex && gen_env_stage != nullptr) {
+                spirv_cache.Insert(spirv_key, code);
+                if (!spirv_cache_filename.empty()) {
+                    serialization_thread.QueueWork([this] { spirv_cache.SaveThrottled(spirv_cache_filename); });
+                }
             }
+            code.reserve(std::max<size_t>(code.size(), 16 * 1024 / sizeof(u32)));
         }
         device.SaveShader(code);
         modules[stage_index] = BuildShader(device, code);
@@ -980,7 +984,7 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
     // Use gen_env->CalculateHash() — CalculateHash() is defined on GenericEnvironment,
     // not on the base Shader::Environment. Fall back to key.unique_hash if not available.
     const u64 compute_unique_hash = gen_env ? gen_env->CalculateHash() : key.unique_hash;
-    const SpirvKey spirv_key_c{compute_unique_hash, cbuf_key_c};
+    const SpirvKey spirv_key_c{compute_unique_hash, cbuf_key_c, 0};
     std::vector<u32> code;
     if (auto cached = spirv_cache.Lookup(spirv_key_c)) {
         code = std::move(*cached);
@@ -1122,60 +1126,7 @@ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::
 // GPL: speculative Maxwell->SPIR-V translation
 // ---------------------------------------------------------------------------
 
-namespace {
 
-class SpeculativeEnvironment final : public Shader::Environment {
-public:
-    explicit SpeculativeEnvironment(std::vector<u64> code_, u32 start_address_,
-                                    Shader::Stage stage_, u32 local_memory_,
-                                    u32 shared_memory_, std::array<u32, 3> workgroup_,
-                                    u32 texture_bound_, Shader::ProgramHeader sph_,
-                                    u32 code_offset_in_program)
-        : code{std::move(code_)}, local_mem{local_memory_},
-          shared_mem{shared_memory_}, tex_bound{texture_bound_},
-          workgroup{workgroup_},
-          code_lowest{start_address_ + code_offset_in_program} {
-        start_address = start_address_;
-        stage = stage_;
-        sph = sph_;
-        is_proprietary_driver = false;
-    }
-
-    u64 ReadInstruction(u32 address) override {
-        if (address < code_lowest) {
-            throw Shader::Exception("SpeculativeEnvironment: ReadInstruction below code start");
-        }
-        const u32 idx = (address - code_lowest) / 8;
-        if (idx >= code.size()) {
-            throw Shader::Exception("SpeculativeEnvironment: ReadInstruction out of bounds");
-        }
-        return code[idx];
-    }
-    u32  ReadCbufValue(u32, u32) override              { return 0; }
-    u32  ReadCbufSize(u32 i) override                  { return i < 18 ? 65536u : 0u; }
-    Shader::TextureType ReadTextureType(u32) override  { return Shader::TextureType::Color2D; }
-    Shader::TexturePixelFormat ReadTexturePixelFormat(u32) override {
-        return Shader::TexturePixelFormat::A8B8G8R8_UNORM;
-    }
-    bool IsTexturePixelFormatInteger(u32) override    { return false; }
-    u32  ReadViewportTransformState() override         { return 1u; }
-    u32  TextureBoundBuffer() const override           { return tex_bound; }
-    u32  LocalMemorySize() const override              { return local_mem; }
-    u32  SharedMemorySize() const override             { return shared_mem; }
-    std::array<u32, 3> WorkgroupSize() const override  { return workgroup; }
-    bool HasHLEMacroState() const override             { return false; }
-    std::optional<Shader::ReplaceConstant>
-        GetReplaceConstBuffer(u32, u32) override       { return std::nullopt; }
-    void Dump(u64, u64) override {}
-
-private:
-    std::vector<u64> code;
-    u32 local_mem, shared_mem, tex_bound;
-    std::array<u32, 3> workgroup;
-    u32 code_lowest;
-};
-
-} // anonymous namespace (speculative env)
 
 void PipelineCache::SubmitSpeculativeShader(
         u64 unique_hash, std::vector<u64> maxwell_code,
@@ -1183,14 +1134,14 @@ void PipelineCache::SubmitSpeculativeShader(
         u32 shared_memory_size, std::array<u32, 3> workgroup_size,
         u32 start_address, u32 texture_bound,
         Shader::ProgramHeader sph) {
-    if (spirv_cache.Contains(SpirvKey{unique_hash, 0})) return;
+    if (spirv_cache.ContainsByUniqueHash(unique_hash)) return;
 
     speculative_worker.QueueWork(
         [this, unique_hash, code = std::move(maxwell_code),
          stage, local_memory_size, shared_memory_size,
          workgroup_size, start_address, texture_bound, sph]() mutable {
         try {
-            SpeculativeEnvironment env{std::move(code), start_address, stage,
+            VideoCommon::SpeculativeShaderEnvironment env{std::move(code), start_address, stage,
                                        local_memory_size, shared_memory_size,
                                        workgroup_size, texture_bound, sph,
                                        /*code_offset_in_program=*/0u};
@@ -1216,7 +1167,7 @@ void PipelineCache::SubmitSpeculativeShader(
                 Shader::Maxwell::ConvertLegacyToGeneric(program, rt);
             }
             auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, rt, program, binding);
-            spirv_cache.InsertSpeculative(unique_hash, std::move(spirv));
+            spirv_cache.InsertSpeculative(unique_hash, rt.Hash(), std::move(spirv));
             if (!spirv_cache_filename.empty()) {
                 serialization_thread.QueueWork([this] {
                     spirv_cache.SaveThrottled(spirv_cache_filename);
@@ -1230,7 +1181,7 @@ void PipelineCache::OnNewShaderSeen(VideoCommon::GenericEnvironment& env,
                                     u64 unique_hash) {
     if (!Settings::values.use_gpl_speculative_shaders.GetValue()) return;
     if (env.ShaderStage() == Shader::Stage::VertexA) return;
-    if (spirv_cache.Contains(SpirvKey{unique_hash, 0})) return;
+    if (spirv_cache.ContainsByUniqueHash(unique_hash)) return;
 
     // Use CopyCode() rather than CachedSizeBytes() to obtain the shader binary.
     // When GenericEnvironment::Analyze() fails (TryFindSize returns nullopt), the

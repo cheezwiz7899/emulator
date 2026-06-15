@@ -13,6 +13,7 @@
 #include <fmt/format.h>
 #include "common/assert.h"
 #include "common/common_types.h"
+#include "common/logging.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/maxwell/decode.h"
 #include "shader_recompiler/frontend/maxwell/opcodes.h"
