@@ -7821,7 +7821,8 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                         }
                         Shader::Maxwell::ConvertLegacyToGeneric(prog, rt);
                         auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile,rt,prog,binding);
-                        cache.InsertSpeculative(unique_hash, rt.Hash(), std::move(spirv));
+                        const u64 texture_key = VideoCommon::ComputeTextureKey(env.CapturedTextureTypes(), env.CapturedTexturePixelFormats());
+                        cache.InsertSpeculative(unique_hash, rt.Hash(), texture_key, std::move(spirv));
                         ++state->shaders_translated;
                     } catch(...) { ++state->shaders_failed; }
                 };

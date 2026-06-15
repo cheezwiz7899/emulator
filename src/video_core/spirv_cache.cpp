@@ -11,7 +11,7 @@
 
 namespace {
 constexpr std::array<char, 8> SPIRV_CACHE_MAGIC{'c', 'i', 't', 'r', 's', 'p', 'v', '\0'};
-constexpr u32 SPIRV_CACHE_VERSION = 2;
+constexpr u32 SPIRV_CACHE_VERSION = 1;
 } // anonymous namespace
 
 namespace VideoCommon {
@@ -22,6 +22,26 @@ u64 ComputeCbufKey(const std::unordered_map<u64, u32>& cbuf_values) {
     std::sort(sorted.begin(), sorted.end());
     return Common::CityHash64(reinterpret_cast<const char*>(sorted.data()),
                               sorted.size() * sizeof(sorted[0]));
+}
+
+u64 ComputeTextureKey(const std::unordered_map<u32, Shader::TextureType>& texture_types,
+                      const std::unordered_map<u32, Shader::TexturePixelFormat>& texture_pixel_formats) {
+    if (texture_types.empty() && texture_pixel_formats.empty()) return 0;
+    std::vector<std::pair<u32, Shader::TextureType>> sorted_types(texture_types.begin(), texture_types.end());
+    std::sort(sorted_types.begin(), sorted_types.end());
+    std::vector<std::pair<u32, Shader::TexturePixelFormat>> sorted_formats(texture_pixel_formats.begin(), texture_pixel_formats.end());
+    std::sort(sorted_formats.begin(), sorted_formats.end());
+    u64 hash = 0;
+    if (!sorted_types.empty()) {
+        hash ^= Common::CityHash64(reinterpret_cast<const char*>(sorted_types.data()),
+                                   sorted_types.size() * sizeof(sorted_types[0]));
+    }
+    if (!sorted_formats.empty()) {
+        u64 format_hash = Common::CityHash64(reinterpret_cast<const char*>(sorted_formats.data()),
+                                             sorted_formats.size() * sizeof(sorted_formats[0]));
+        hash ^= format_hash + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
+    }
+    return hash;
 }
 
 void SpirvCache::Load(const std::filesystem::path& path) {
@@ -50,6 +70,7 @@ void SpirvCache::Load(const std::filesystem::path& path) {
             file.read(reinterpret_cast<char*>(&key.unique_hash), sizeof(key.unique_hash));
             file.read(reinterpret_cast<char*>(&key.cbuf_key),    sizeof(key.cbuf_key));
             file.read(reinterpret_cast<char*>(&key.runtime_key), sizeof(key.runtime_key));
+            file.read(reinterpret_cast<char*>(&key.texture_key), sizeof(key.texture_key));
             file.read(reinterpret_cast<char*>(&word_count),       sizeof(word_count));
 
             if (word_count == 0 || word_count > 4 * 1024 * 1024) {
@@ -104,6 +125,7 @@ void SpirvCache::Save(const std::filesystem::path& path) const {
             file.write(reinterpret_cast<const char*>(&key.unique_hash), sizeof(key.unique_hash));
             file.write(reinterpret_cast<const char*>(&key.cbuf_key),    sizeof(key.cbuf_key));
             file.write(reinterpret_cast<const char*>(&key.runtime_key), sizeof(key.runtime_key));
+            file.write(reinterpret_cast<const char*>(&key.texture_key), sizeof(key.texture_key));
             file.write(reinterpret_cast<const char*>(&word_count),      sizeof(word_count));
             file.write(reinterpret_cast<const char*>(spirv.data()),     word_count * sizeof(u32));
         }
@@ -184,13 +206,13 @@ size_t SpirvCache::Size() const {
 }
 
 void SpirvCache::Insert(u64 unique_hash, const std::unordered_map<u64, u32>& cbuf_values,
-                        u64 runtime_key, std::vector<u32> spirv) {
-    Insert(SpirvKey{unique_hash, ComputeCbufKey(cbuf_values), runtime_key}, std::move(spirv));
+                        u64 runtime_key, u64 texture_key, std::vector<u32> spirv) {
+    Insert(SpirvKey{unique_hash, ComputeCbufKey(cbuf_values), runtime_key, texture_key}, std::move(spirv));
 }
 
-void SpirvCache::InsertSpeculative(u64 unique_hash, u64 runtime_key, std::vector<u32> spirv) {
+void SpirvCache::InsertSpeculative(u64 unique_hash, u64 runtime_key, u64 texture_key, std::vector<u32> spirv) {
     if (unique_hash == 0 || spirv.empty()) [[unlikely]] return;
-    Insert(SpirvKey{unique_hash, 0, runtime_key}, std::move(spirv));
+    Insert(SpirvKey{unique_hash, 0, runtime_key, texture_key}, std::move(spirv));
 }
 
 } // namespace VideoCommon
