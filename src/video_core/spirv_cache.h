@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/shader_info.h"
 
 namespace VideoCommon {
@@ -85,9 +86,21 @@ public:
                        size_t min_new_entries = 64,
                        std::chrono::seconds min_interval = std::chrono::seconds{30}) const;
 
+    // The result of a cache hit: the SPIR-V words and the Bindings state that EmitSPIRV
+    // left behind after consuming that stage's descriptor slots.  The caller must apply
+    // end_binding to the running Bindings accumulator so subsequent stages start at the
+    // correct slot — exactly as if EmitSPIRV had been called live.
+    //
+    // spirv is shared (not copied) so that Lookup() and Save()'s internal snapshot can
+    // both reference the same underlying buffer without a deep copy on every access.
+    struct LookupResult {
+        std::shared_ptr<const std::vector<u32>> spirv;
+        Shader::Backend::Bindings end_binding;
+    };
+
     // Look up a pre-translated SPIR-V program.
-    // Returns nullopt on miss. The returned vector is a copy of the stored SPIR-V words.
-    [[nodiscard]] std::optional<std::vector<u32>> Lookup(const SpirvKey& key) const;
+    // Returns nullopt on miss.
+    [[nodiscard]] std::optional<LookupResult> Lookup(const SpirvKey& key) const;
 
     // Returns true if the cache already contains an entry for @p key.
     // Faster than Lookup() when the SPIR-V itself is not needed — avoids the vector copy.
@@ -106,16 +119,32 @@ public:
     [[nodiscard]] size_t Size() const;
 
     // Insert a real runtime-compiled entry (keyed with actual cbuf values and runtime info).
-    void Insert(const SpirvKey& key, std::vector<u32> spirv);
+    // end_binding is the Bindings state immediately after EmitSPIRV returned for this stage.
+    void Insert(const SpirvKey& key, std::vector<u32> spirv,
+                const Shader::Backend::Bindings& end_binding);
     void Insert(u64 unique_hash, const std::unordered_map<u64, u32>& cbuf_values,
-                u64 runtime_key, u64 texture_key, std::vector<u32> spirv);
+                u64 runtime_key, u64 texture_key, std::vector<u32> spirv,
+                const Shader::Backend::Bindings& end_binding);
 
     // Insert a speculative/AOT entry (cbuf_key = 0).
+    // Speculative entries store a zero end_binding — they are only valid for the prewarmer
+    // path which accumulates bindings correctly across all stages itself.
     void InsertSpeculative(u64 unique_hash, u64 runtime_key, u64 texture_key, std::vector<u32> spirv);
 
 private:
     mutable std::shared_mutex mutex_;
-    std::unordered_map<SpirvKey, std::vector<u32>, SpirvKeyHash> entries_;
+    struct Entry {
+        // shared_ptr so Save()'s snapshot phase (which copies every Entry while
+        // holding the lock) is O(entry count) — an atomic refcount bump per
+        // entry — rather than O(total SPIR-V bytes in the cache). Without this,
+        // the snapshot copy's lock-hold duration grows with cache size and
+        // blocks the synchronous, frame-blocking CreateGraphicsPipeline() path
+        // (which calls Lookup()/Insert() on every pipeline compile) for
+        // increasingly long stretches as the cache fills up over a session.
+        std::shared_ptr<const std::vector<u32>> spirv;
+        Shader::Backend::Bindings end_binding; // binding state after EmitSPIRV for this stage
+    };
+    std::unordered_map<SpirvKey, Entry, SpirvKeyHash> entries_;
     mutable bool dirty_{false};
     mutable std::atomic<size_t> hit_count_{0};
     mutable std::atomic<size_t> lookup_count_{0};

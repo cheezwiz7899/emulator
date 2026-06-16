@@ -50,7 +50,26 @@ public:
     }
 
     u32 ReadCbufValue(u32, u32) override {
-        throw Shader::Exception("SpeculativeShaderEnvironment: ReadCbufValue not supported");
+        // Speculative translation has no real constant buffer data, so this can
+        // only ever return a guess.  Returning a sentinel (rather than throwing)
+        // is intentional and safe:
+        //
+        // The overwhelmingly common caller is GetTextureHandle() in
+        // texture_pass.cpp, invoked for every texture sample instruction to
+        // resolve a handle before calling ReadTextureType()/ReadTexturePixelFormat()
+        // below — which themselves ignore the handle's value entirely and always
+        // return the same guessed type.  Throwing here previously aborted
+        // translation for ~100% of real shaders (anything that samples a texture).
+        //
+        // The rarer caller is the BRX indirect-branch-table walk in
+        // control_flow.cpp, which reads `num_entries` fake jump targets from
+        // here.  That loop is already bounded by an immediate baked into the
+        // bytecode (an IMNMX instruction operand), not by anything read here, so
+        // a sentinel value cannot cause an unbounded walk.  Any bogus branch
+        // target it produces from this fake data is still caught downstream by
+        // ReadInstruction()'s out-of-bounds throw or Decode()'s
+        // unrecognised-instruction throw.
+        return 0u;
     }
     u32 ReadCbufSize(u32 i) override { return i < 18 ? 65536u : 0u; }
     Shader::TextureType ReadTextureType(u32 handle) override {

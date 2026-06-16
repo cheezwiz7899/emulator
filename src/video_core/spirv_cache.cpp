@@ -11,7 +11,7 @@
 
 namespace {
 constexpr std::array<char, 8> SPIRV_CACHE_MAGIC{'c', 'i', 't', 'r', 's', 'p', 'v', '\0'};
-constexpr u32 SPIRV_CACHE_VERSION = 1;
+constexpr u32 SPIRV_CACHE_VERSION = 2; // v2: adds Bindings end_binding per entry
 } // anonymous namespace
 
 namespace VideoCommon {
@@ -83,7 +83,10 @@ void SpirvCache::Load(const std::filesystem::path& path) {
             }
             std::vector<u32> spirv(word_count);
             file.read(reinterpret_cast<char*>(spirv.data()), word_count * sizeof(u32));
-            entries_.emplace(key, std::move(spirv));
+            Shader::Backend::Bindings end_binding{};
+            file.read(reinterpret_cast<char*>(&end_binding), sizeof(end_binding));
+            entries_.emplace(key, Entry{std::make_shared<const std::vector<u32>>(std::move(spirv)),
+                                        end_binding});
         }
         LOG_INFO(Render_Vulkan, "Loaded {} SPIR-V cache entries", entries_.size());
         saved_entry_count_ = entries_.size();
@@ -95,7 +98,7 @@ void SpirvCache::Load(const std::filesystem::path& path) {
 
 void SpirvCache::Save(const std::filesystem::path& path) const {
     // Phase 1: snapshot under exclusive lock.
-    std::vector<std::pair<SpirvKey, std::vector<u32>>> snapshot;
+    std::vector<std::pair<SpirvKey, Entry>> snapshot;
     {
         std::unique_lock lock{mutex_};
         if (!dirty_) return;
@@ -120,14 +123,15 @@ void SpirvCache::Save(const std::filesystem::path& path) const {
         file.write(reinterpret_cast<const char*>(&SPIRV_CACHE_VERSION), sizeof(SPIRV_CACHE_VERSION));
         file.write(reinterpret_cast<const char*>(&num_entries), sizeof(num_entries));
 
-        for (const auto& [key, spirv] : snapshot) {
-            const u32 word_count = static_cast<u32>(spirv.size());
+        for (const auto& [key, entry] : snapshot) {
+            const u32 word_count = static_cast<u32>(entry.spirv->size());
             file.write(reinterpret_cast<const char*>(&key.unique_hash), sizeof(key.unique_hash));
             file.write(reinterpret_cast<const char*>(&key.cbuf_key),    sizeof(key.cbuf_key));
             file.write(reinterpret_cast<const char*>(&key.runtime_key), sizeof(key.runtime_key));
             file.write(reinterpret_cast<const char*>(&key.texture_key), sizeof(key.texture_key));
             file.write(reinterpret_cast<const char*>(&word_count),      sizeof(word_count));
-            file.write(reinterpret_cast<const char*>(spirv.data()),     word_count * sizeof(u32));
+            file.write(reinterpret_cast<const char*>(entry.spirv->data()), word_count * sizeof(u32));
+            file.write(reinterpret_cast<const char*>(&entry.end_binding), sizeof(entry.end_binding));
         }
     } catch (const std::exception& e) {
         LOG_ERROR(Render_Vulkan, "Failed to write SPIR-V cache: {}", e.what());
@@ -185,18 +189,20 @@ bool SpirvCache::ContainsByUniqueHash(u64 unique_hash) const noexcept {
     return false;
 }
 
-std::optional<std::vector<u32>> SpirvCache::Lookup(const SpirvKey& key) const {
+std::optional<SpirvCache::LookupResult> SpirvCache::Lookup(const SpirvKey& key) const {
     std::shared_lock lock{mutex_};
     ++lookup_count_;
     const auto it = entries_.find(key);
     if (it == entries_.end()) return std::nullopt;
     ++hit_count_;
-    return it->second;
+    return LookupResult{it->second.spirv, it->second.end_binding};
 }
 
-void SpirvCache::Insert(const SpirvKey& key, std::vector<u32> spirv) {
+void SpirvCache::Insert(const SpirvKey& key, std::vector<u32> spirv,
+                        const Shader::Backend::Bindings& end_binding) {
     std::unique_lock lock{mutex_};
-    entries_.insert_or_assign(key, std::move(spirv));
+    entries_.insert_or_assign(key, Entry{std::make_shared<const std::vector<u32>>(std::move(spirv)),
+                                         end_binding});
     dirty_ = true;
 }
 
@@ -206,13 +212,17 @@ size_t SpirvCache::Size() const {
 }
 
 void SpirvCache::Insert(u64 unique_hash, const std::unordered_map<u64, u32>& cbuf_values,
-                        u64 runtime_key, u64 texture_key, std::vector<u32> spirv) {
-    Insert(SpirvKey{unique_hash, ComputeCbufKey(cbuf_values), runtime_key, texture_key}, std::move(spirv));
+                        u64 runtime_key, u64 texture_key, std::vector<u32> spirv,
+                        const Shader::Backend::Bindings& end_binding) {
+    Insert(SpirvKey{unique_hash, ComputeCbufKey(cbuf_values), runtime_key, texture_key},
+           std::move(spirv), end_binding);
 }
 
 void SpirvCache::InsertSpeculative(u64 unique_hash, u64 runtime_key, u64 texture_key, std::vector<u32> spirv) {
     if (unique_hash == 0 || spirv.empty()) [[unlikely]] return;
-    Insert(SpirvKey{unique_hash, 0, runtime_key, texture_key}, std::move(spirv));
+    // Speculative entries have no valid end_binding (they are consumed by the prewarmer,
+    // not by the per-stage pipeline loop).  Store a zero binding delta.
+    Insert(SpirvKey{unique_hash, 0, runtime_key, texture_key}, std::move(spirv), {});
 }
 
 } // namespace VideoCommon

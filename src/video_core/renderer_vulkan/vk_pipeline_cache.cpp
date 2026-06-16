@@ -866,13 +866,20 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         // Since SpirvKey now includes the runtime_key, we can safely serve cached SPIR-V
         // to both the live path and the disk-load path.
         if (!is_merged_vertex) {
-            if (auto cached = spirv_cache.Lookup(spirv_key)) { code = std::move(*cached); }
+            if (auto cached = spirv_cache.Lookup(spirv_key)) {
+                code = *cached->spirv;
+                // Restore the binding counter to where EmitSPIRV left it when this
+                // SPIR-V was first compiled.  Without this, the next stage's
+                // EmitSPIRV (or cache miss) would start at the wrong descriptor
+                // slot, producing binding collisions and graphical corruption.
+                binding = cached->end_binding;
+            }
         }
         if (code.empty()) {
             code = EmitSPIRV(profile, runtime_info, program, binding);
-            // Insert into the cache if this was generated live
+            // binding has now been advanced past this stage's slots.
             if (!is_merged_vertex && gen_env_stage != nullptr) {
-                spirv_cache.Insert(spirv_key, code);
+                spirv_cache.Insert(spirv_key, code, binding);
                 if (!spirv_cache_filename.empty()) {
                     serialization_thread.QueueWork([this] { spirv_cache.SaveThrottled(spirv_cache_filename); });
                 }
@@ -992,10 +999,14 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
     const SpirvKey spirv_key_c{compute_unique_hash, cbuf_key_c, 0, texture_key_c};
     std::vector<u32> code;
     if (auto cached = spirv_cache.Lookup(spirv_key_c)) {
-        code = std::move(*cached);
+        code = *cached->spirv;
+        // Compute pipelines are self-contained (no preceding stage to misalign),
+        // so the stored end_binding is irrelevant here and intentionally ignored.
     } else {
         code = EmitSPIRV(profile, program);
-        spirv_cache.Insert(spirv_key_c, code);
+        // Compute's EmitSPIRV overload takes no Bindings parameter (it always
+        // starts descriptor allocation at zero), so store a default end_binding.
+        spirv_cache.Insert(spirv_key_c, code, {});
         // Reserve extra capacity on the local upload copy only — the stored
         // cache entry was inserted before the reserve so it stays compact.
         code.reserve(std::max<size_t>(code.size(), 16 * 1024 / sizeof(u32)));
