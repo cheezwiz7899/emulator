@@ -203,6 +203,10 @@ public:
         has_started = false;
     }
 
+    bool IsActive() const override {
+        return has_started;
+    }
+
     bool HasPendingSync() const override {
         return !pending_sync.empty();
     }

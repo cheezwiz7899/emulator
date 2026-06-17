@@ -37,6 +37,16 @@ public:
         /* Do Nothing */
     }
 
+    // Whether this streamer currently has an underlying query/counter actually running
+    // (i.e. StartCounter() was called more recently than PauseCounter()/CloseCounter()).
+    // Used by NotifySegment to decide whether a render-pass-boundary close needs to be
+    // paired with a restart once the new render pass begins, so a citron-internal
+    // render-pass split doesn't silently and permanently end a counter the game itself
+    // never asked to stop.
+    virtual bool IsActive() const {
+        return false;
+    }
+
     virtual bool HasPendingSync() const {
         return false;
     }
