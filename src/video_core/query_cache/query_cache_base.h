@@ -168,6 +168,16 @@ protected:
     std::unordered_map<u64, std::unordered_map<u32, QueryLocation>> cached_queries;
     std::mutex cache_mutex;
 
+    // Tracks whether the Z-pass occlusion counter (ZPassPixelCount64) was actually
+    // running at the moment NotifySegment(false) closed it for a render-pass boundary.
+    // NotifySegment(true) uses this to decide whether to restart it, so that a citron-
+    // internal render-pass split (invisible to the game) doesn't silently terminate an
+    // occlusion query the game itself never asked to stop. OR-accumulated rather than
+    // overwritten, since NotifySegment(false) can fire more than once back-to-back
+    // (e.g. EndPendingOperations() calling it directly and then again via its own
+    // nested EndRenderPass() call) without an intervening resume.
+    bool zpass_active_before_segment_pause{};
+
     struct QueryCacheBaseImpl;
     friend struct QueryCacheBaseImpl;
     friend RuntimeType;
