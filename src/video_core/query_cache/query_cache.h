@@ -368,32 +368,16 @@ template <typename Traits>
 void QueryCacheBase<Traits>::NotifySegment(bool resume) {
     if (resume) {
         impl->runtime.ResumeHostConditionalRendering();
-        // If the Z-pass occlusion counter (e.g. an Ultrahand-style object-visibility
-        // test) was actually running when a prior NotifySegment(false) closed it for a
-        // render-pass boundary, restart it now. From the game's perspective it never
-        // stopped — it has no idea citron split its command stream into multiple
-        // render passes underneath it, and never issues a matching re-enable. Without
-        // this, any samples that would have accumulated after the split are lost,
-        // which can make the accumulated query result read back as "not visible
-        // enough" even though the object plainly is.
-        if (zpass_active_before_segment_pause) {
-            CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, true);
-            zpass_active_before_segment_pause = false;
-        }
     } else {
-        StreamerInterface* zpass_streamer =
-            impl->streamers[static_cast<size_t>(VideoCommon::QueryType::ZPassPixelCount64)];
-        // OR-accumulate rather than overwrite: NotifySegment(false) can fire more than
-        // once back-to-back without an intervening resume (EndPendingOperations calls
-        // it directly, then again via its own nested EndRenderPass call). The second
-        // call would otherwise observe the counter already closed by the first and
-        // incorrectly clear a true reading the first call correctly captured.
-        zpass_active_before_segment_pause =
-            zpass_active_before_segment_pause || (zpass_streamer && zpass_streamer->IsActive());
         CounterClose(VideoCommon::QueryType::ZPassPixelCount64);
         CounterClose(VideoCommon::QueryType::StreamingByteCount);
         impl->runtime.PauseHostConditionalRendering();
     }
+}
+
+template <typename Traits>
+void QueryCacheBase<Traits>::PauseConditionalRenderingOnly() {
+    impl->runtime.PauseHostConditionalRendering();
 }
 
 template <typename Traits>
