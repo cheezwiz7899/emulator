@@ -421,7 +421,7 @@ if ((ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64) AND NOT (MSVC AND ARCHITECTURE_a
         CPMAddPackage(
             NAME dynarmic
             GITHUB_REPOSITORY xinitrcn1/dynarmic
-            GIT_TAG b484973aad3e5bc56a8d1eacb17c4428517c2f3c
+            GIT_TAG bee46cba43ce7e7e32701d356ddf1f05e4754842
             OPTIONS
                 "DYNARMIC_USE_PRECOMPILED_HEADERS ${CITRON_USE_PRECOMPILED_HEADERS}"
                 "DYNARMIC_IGNORE_ASSERTS ON"
