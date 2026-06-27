@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <cstdlib>
+#include <cstring>
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -18,6 +21,34 @@
 
 namespace Tegra {
 using Tegra::Memory::GuestMemoryFlags;
+
+namespace {
+bool UltrahandTraceEnabled() {
+    static const bool enabled = std::getenv("CITRON_ULTRAHAND_TRACE") != nullptr;
+    return enabled;
+}
+
+void TraceConditionRangeWrite(GPUVAddr gpu_addr, const void* src_buffer, std::size_t size,
+                              bool safe_write) {
+    if (!UltrahandTraceEnabled()) {
+        return;
+    }
+    static constexpr GPUVAddr ConditionRangeBegin = 0x00000005032B0000ULL;
+    static constexpr GPUVAddr ConditionRangeEnd = 0x00000005032D0000ULL;
+    const GPUVAddr gpu_end = gpu_addr + size;
+    if (gpu_addr >= ConditionRangeEnd || gpu_end <= ConditionRangeBegin) {
+        return;
+    }
+    std::array<u32, 6> words{};
+    const std::size_t copy_size = std::min<std::size_t>(size, sizeof(words));
+    std::memcpy(words.data(), src_buffer, copy_size);
+    LOG_WARNING(HW_GPU,
+                "UHTRACE gpu_write_condition_range gpu=0x{:016X} size={} safe={} "
+                "w=0x{:08X}/0x{:08X}/0x{:08X}/0x{:08X}/0x{:08X}/0x{:08X}",
+                gpu_addr, size, safe_write, words[0], words[1], words[2], words[3], words[4],
+                words[5]);
+}
+} // namespace
 
 std::atomic<size_t> MemoryManager::unique_identifier_generator{};
 
@@ -421,6 +452,7 @@ void MemoryManager::ReadBlockUnsafe(GPUVAddr gpu_src_addr, void* dest_buffer,
 template <bool is_safe>
 void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size,
                                    [[maybe_unused]] VideoCommon::CacheType which) {
+    TraceConditionRangeWrite(gpu_dest_addr, src_buffer, size, is_safe);
     auto just_advance = [&]([[maybe_unused]] std::size_t page_index,
                             [[maybe_unused]] std::size_t offset, std::size_t copy_amount) {
         src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;

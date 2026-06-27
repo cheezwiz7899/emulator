@@ -9,6 +9,7 @@
 #include <span>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "common/assert.h"
 #include "common/bit_field.h"
@@ -61,10 +62,13 @@ public:
 
     void FlushRegion(VAddr addr, std::size_t size) {
         bool result = false;
-        IterateCache<false>(addr, size, [this, &result](QueryLocation location) {
-            result |= SemiFlushQueryDirty(location);
-            return result;
+        std::vector<QueryLocation> locations;
+        IterateCache<false>(addr, size, [&locations](QueryLocation location) {
+            locations.push_back(location);
         });
+        for (const QueryLocation location : locations) {
+            result |= SemiFlushQueryDirty(location);
+        }
         if (result) {
             RequestGuestHostSync();
         }
@@ -77,6 +81,8 @@ public:
         }
         return mask;
     }
+
+    static constexpr u64 QUERY_REPORT_SIZE = 16;
 
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size) {
@@ -128,7 +134,7 @@ protected:
             const u64 page_start = page << Core::DEVICE_PAGEBITS;
             const auto in_range = [page_start, addr_begin, addr_end](const u32 query_location) {
                 const u64 cache_begin = page_start + query_location;
-                const u64 cache_end = cache_begin + sizeof(u32);
+                const u64 cache_end = cache_begin + QUERY_REPORT_SIZE;
                 return cache_begin < addr_end && addr_begin < cache_end;
             };
             const auto& it = cached_queries.find(page);
@@ -163,6 +169,7 @@ protected:
     bool IsQueryDirty(QueryLocation location);
     bool SemiFlushQueryDirty(QueryLocation location);
     void RequestGuestHostSync();
+    void Unregister(QueryLocation location);
     void UnregisterPending();
 
     std::unordered_map<u64, std::unordered_map<u32, QueryLocation>> cached_queries;

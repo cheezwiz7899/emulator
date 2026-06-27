@@ -10,6 +10,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <unordered_set>
 
 #include "common/common_types.h"
 #include "common/range_mutex.h"
@@ -116,6 +117,8 @@ public:
 
     void UpdatePagesCachedCount(DAddr addr, size_t size, s32 delta);
 
+    void PinPagesCached(DAddr addr, size_t size);
+
     static constexpr size_t AS_BITS = Traits::device_virtual_bits;
 
 private:
@@ -215,6 +218,7 @@ private:
         (1ULL << (device_virtual_bits - page_bits)) / subentries;
     using CachedPages = Common::VirtualBuffer<CounterEntry>;
     CachedPages cached_pages;
+    std::unordered_set<size_t> pinned_cached_pages;
     Common::RangeMutex counter_guard;
     std::mutex mapping_guard;
 };

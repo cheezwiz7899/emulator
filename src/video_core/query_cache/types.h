@@ -11,6 +11,7 @@ namespace VideoCommon {
 enum class QueryPropertiesFlags : u32 {
     HasTimeout = 1 << 0,
     IsAFence = 1 << 1,
+    IsRenderEnableReport = 1 << 2,
 };
 DECLARE_ENUM_FLAG_OPERATORS(QueryPropertiesFlags)
 

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <type_traits>
@@ -11,6 +12,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/div_ceil.h"
+#include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/device_memory.h"
@@ -20,6 +22,20 @@
 namespace Core {
 
 namespace {
+
+bool IsDeviceConditionRange(DAddr addr, size_t size) {
+    if (size == 0) {
+        return false;
+    }
+    static constexpr DAddr ConditionRangeBegin = 0x000000001B200000ULL;
+    static constexpr DAddr ConditionRangeEnd = 0x000000001B220000ULL;
+    return addr < ConditionRangeEnd && addr + size > ConditionRangeBegin;
+}
+
+bool TraceDeviceConditionRange(DAddr addr, size_t size) {
+    static const bool enabled = std::getenv("CITRON_ULTRAHAND_TRACE") != nullptr;
+    return enabled && IsDeviceConditionRange(addr, size);
+}
 
 class MultiAddressContainer {
 public:
@@ -519,13 +535,59 @@ void DeviceMemoryManager<Traits>::UnregisterProcess(Asid asid) {
 }
 
 template <typename Traits>
-void DeviceMemoryManager<Traits>::UpdatePagesCachedCount(DAddr addr, size_t size, int delta) {
+void DeviceMemoryManager<Traits>::PinPagesCached(DAddr addr, size_t size) {
+    const bool trace_condition = TraceDeviceConditionRange(addr, size);
     if (addr < Memory::CITRON_PAGESIZE || size == 0) {
+        return;
+    }
+    Common::ScopedRangeLock lk(counter_guard, addr, size);
+    const auto MarkRegionCaching = &DeviceMemoryManager<Traits>::DeviceMethods::MarkRegionCaching;
+    const size_t page_end = Common::DivCeil(addr + size, Memory::CITRON_PAGESIZE);
+    for (size_t page = addr >> Memory::CITRON_PAGEBITS; page != page_end; ++page) {
+        pinned_cached_pages.insert(page);
+        CounterAtomicType& count = cached_pages[page >> subentries_shift].Count(page);
+        const CounterType old_count = count.load(std::memory_order_relaxed);
+        if (old_count == 0) {
+            count.store(1, std::memory_order_release);
+        }
+
+        auto [asid, vaddr] = ExtractCPUBacking(page);
+        if (asid.id >= registered_processes.size()) {
+            continue;
+        }
+        auto* memory_device_inter = registered_processes[asid.id];
+        if (memory_device_inter == nullptr || vaddr == 0) {
+            continue;
+        }
+        if (trace_condition) {
+            LOG_WARNING(HW_GPU,
+                        "UHTRACE dmm_cached_count pin page=0x{:X} vaddr=0x{:016X} "
+                        "asid={} old={}",
+                        page, vaddr, asid.id, static_cast<u32>(old_count));
+        }
+        MarkRegionCaching(memory_device_inter, vaddr, Memory::CITRON_PAGESIZE, true,
+                          page << Memory::CITRON_PAGEBITS);
+    }
+}
+
+template <typename Traits>
+void DeviceMemoryManager<Traits>::UpdatePagesCachedCount(DAddr addr, size_t size, int delta) {
+    const bool condition_range = IsDeviceConditionRange(addr, size);
+    const bool trace_condition = TraceDeviceConditionRange(addr, size);
+    if (addr < Memory::CITRON_PAGESIZE || size == 0) {
+        if (trace_condition) {
+            LOG_WARNING(HW_GPU,
+                        "UHTRACE dmm_cached_count skip=bad_range addr=0x{:016X} size={} "
+                        "delta={}",
+                        addr, size, delta);
+        }
         return;
     }
     Common::ScopedRangeLock lk(counter_guard, addr, size);
     u64 uncache_begin = 0;
     u64 cache_begin = 0;
+    u64 uncache_device_begin = 0;
+    u64 cache_device_begin = 0;
     u64 uncache_bytes = 0;
     u64 cache_bytes = 0;
     const auto MarkRegionCaching = &DeviceMemoryManager<Traits>::DeviceMethods::MarkRegionCaching;
@@ -534,8 +596,28 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCount(DAddr addr, size_t size
     const size_t page_end = Common::DivCeil(addr + size, Memory::CITRON_PAGESIZE);
     size_t page = addr >> Memory::CITRON_PAGEBITS;
     auto [asid, base_vaddress] = ExtractCPUBacking(page);
+    if (trace_condition) {
+        LOG_WARNING(HW_GPU,
+                    "UHTRACE dmm_cached_count begin addr=0x{:016X} size={} delta={} "
+                    "page=0x{:X} page_end=0x{:X} asid={} base_vaddr=0x{:016X}",
+                    addr, size, delta, page, page_end, asid.id, base_vaddress);
+    }
+    if (asid.id >= registered_processes.size()) {
+        if (trace_condition) {
+            LOG_WARNING(HW_GPU,
+                        "UHTRACE dmm_cached_count skip=bad_asid addr=0x{:016X} asid={} "
+                        "registered={}",
+                        addr, asid.id, registered_processes.size());
+        }
+        return;
+    }
     auto* memory_device_inter = registered_processes[asid.id];
     if (memory_device_inter == nullptr) {
+        if (trace_condition) {
+            LOG_WARNING(HW_GPU,
+                        "UHTRACE dmm_cached_count skip=null_process addr=0x{:016X} asid={}",
+                        addr, asid.id);
+        }
         return;
     }
 
@@ -543,14 +625,16 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCount(DAddr addr, size_t size
         if (uncache_bytes > 0) {
             if (memory_device_inter != nullptr) {
                 MarkRegionCaching(memory_device_inter, uncache_begin << Memory::CITRON_PAGEBITS,
-                                  uncache_bytes, false);
+                                  uncache_bytes, false,
+                                  uncache_device_begin << Memory::CITRON_PAGEBITS);
             }
             uncache_bytes = 0;
         }
         if (cache_bytes > 0) {
             if (memory_device_inter != nullptr) {
                 MarkRegionCaching(memory_device_inter, cache_begin << Memory::CITRON_PAGEBITS,
-                                  cache_bytes, true);
+                                  cache_bytes, true,
+                                  cache_device_begin << Memory::CITRON_PAGEBITS);
             }
             cache_bytes = 0;
         }
@@ -562,12 +646,27 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCount(DAddr addr, size_t size
         vpage >>= Memory::CITRON_PAGEBITS;
 
         if (vpage == 0) [[unlikely]] {
+            if (trace_condition) {
+                LOG_WARNING(HW_GPU,
+                            "UHTRACE dmm_cached_count skip=no_cpu_backing page=0x{:X} "
+                            "asid={}",
+                            page, asid_2.id);
+            }
             release_pending();
             continue;
         }
 
         if (asid.id != asid_2.id) [[unlikely]] {
             release_pending();
+            if (asid_2.id >= registered_processes.size()) {
+                if (trace_condition) {
+                    LOG_WARNING(HW_GPU,
+                                "UHTRACE dmm_cached_count skip=bad_asid_mid page=0x{:X} "
+                                "asid={} registered={}",
+                                page, asid_2.id, registered_processes.size());
+                }
+                continue;
+            }
             memory_device_inter = registered_processes[asid_2.id];
         }
 
@@ -577,28 +676,72 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCount(DAddr addr, size_t size
 
         old_vpage = vpage;
 
+        bool pinned = pinned_cached_pages.contains(page);
+        if (condition_range && delta > 0 && !pinned) {
+            pinned_cached_pages.insert(page);
+            pinned = true;
+            if (trace_condition) {
+                LOG_WARNING(HW_GPU,
+                            "UHTRACE dmm_cached_count auto_pin page=0x{:X} vpage=0x{:X} "
+                            "asid={}",
+                            page, vpage, asid_2.id);
+            }
+        }
+
         // Adds or subtracts 1, as count is a unsigned 8-bit value
-        count.fetch_add(static_cast<CounterType>(delta), std::memory_order_release);
+        const CounterType old_count = count.fetch_add(static_cast<CounterType>(delta),
+                                                      std::memory_order_release);
+        CounterType new_count = count.load(std::memory_order::relaxed);
+        if (pinned && new_count == 0) {
+            count.store(1, std::memory_order_release);
+            new_count = 1;
+            if (trace_condition) {
+                LOG_WARNING(HW_GPU,
+                            "UHTRACE dmm_cached_count keep_pinned page=0x{:X} vpage=0x{:X} "
+                            "asid={} delta={} old={}",
+                            page, vpage, asid_2.id, delta, static_cast<u32>(old_count));
+            }
+        }
+        if (trace_condition) {
+            LOG_WARNING(HW_GPU,
+                        "UHTRACE dmm_cached_count page page=0x{:X} vpage=0x{:X} asid={} "
+                        "delta={} old={} new={} memory_null={} pinned={}",
+                        page, vpage, asid_2.id, delta, static_cast<u32>(old_count),
+                        static_cast<u32>(new_count), memory_device_inter == nullptr, pinned);
+        }
+        if (condition_range && delta > 0 && old_count > 0 && memory_device_inter != nullptr) {
+            if (trace_condition) {
+                LOG_WARNING(HW_GPU,
+                            "UHTRACE dmm_cached_count refresh_cached vpage=0x{:X} "
+                            "old={} new={}",
+                            vpage, static_cast<u32>(old_count), static_cast<u32>(new_count));
+            }
+            MarkRegionCaching(memory_device_inter, vpage << Memory::CITRON_PAGEBITS,
+                              Memory::CITRON_PAGESIZE, true, page << Memory::CITRON_PAGEBITS);
+        }
 
         // Assume delta is either -1 or 1
-        if (count.load(std::memory_order::relaxed) == 0) {
+        if (new_count == 0) {
             if (uncache_bytes == 0) {
                 uncache_begin = vpage;
+                uncache_device_begin = page;
             }
             uncache_bytes += Memory::CITRON_PAGESIZE;
         } else if (uncache_bytes > 0) {
             MarkRegionCaching(memory_device_inter, uncache_begin << Memory::CITRON_PAGEBITS,
-                              uncache_bytes, false);
+                              uncache_bytes, false,
+                              uncache_device_begin << Memory::CITRON_PAGEBITS);
             uncache_bytes = 0;
         }
-        if (count.load(std::memory_order::relaxed) == 1 && delta > 0) {
+        if (new_count == 1 && delta > 0) {
             if (cache_bytes == 0) {
                 cache_begin = vpage;
+                cache_device_begin = page;
             }
             cache_bytes += Memory::CITRON_PAGESIZE;
         } else if (cache_bytes > 0) {
             MarkRegionCaching(memory_device_inter, cache_begin << Memory::CITRON_PAGEBITS,
-                              cache_bytes, true);
+                              cache_bytes, true, cache_device_begin << Memory::CITRON_PAGEBITS);
             cache_bytes = 0;
         }
     }

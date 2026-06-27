@@ -7,7 +7,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <bit>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <span>
@@ -42,6 +44,12 @@ static inline bool AddressSpaceContains(const Common::PageTable& table, const Co
     return addr + size >= addr && addr + size <= max_addr;
 }
 
+static bool IsUltrahandConditionDeviceRange(DAddr addr, u64 size) {
+    static constexpr DAddr ConditionRangeBegin = 0x000000001B200000ULL;
+    static constexpr DAddr ConditionRangeEnd = 0x000000001B220000ULL;
+    return size != 0 && addr < ConditionRangeEnd && addr + size > ConditionRangeBegin;
+}
+
 // Implementation class used to keep the specifics of the memory subsystem hidden
 // from outside classes. This also allows modification to the internals of the memory
 // subsystem without needing to rebuild all files that make use of the memory interface.
@@ -57,6 +65,7 @@ struct Memory::Impl {
 
         if (process.IsApplication() && Settings::IsFastmemEnabled()) {
             current_page_table->fastmem_arena = system.DeviceMemory().buffer.VirtualBasePointer();
+            rasterizer_page_table = current_page_table;
         } else {
             current_page_table->fastmem_arena = nullptr;
         }
@@ -122,14 +131,107 @@ struct Memory::Impl {
         }
     }
 
-    [[nodiscard]] inline u8* GetPointerFromRasterizerCachedMemory(u64 vaddr) const {
-        auto const paddr = current_page_table->entries[vaddr >> CITRON_PAGEBITS].backing_addr;
+    [[nodiscard]] inline u8* GetPointerFromRasterizerCachedMemory(
+        const Common::PageTable& page_table, u64 vaddr) const {
+        auto const paddr = page_table.entries[vaddr >> CITRON_PAGEBITS].backing_addr;
         return paddr ? system.DeviceMemory().GetPointer<u8>(paddr + vaddr) : nullptr;
+    }
+
+    [[nodiscard]] inline u8* GetPointerFromRasterizerCachedMemory(u64 vaddr) const {
+        return GetPointerFromRasterizerCachedMemory(*current_page_table, vaddr);
     }
 
     [[nodiscard]] inline u8* GetPointerFromDebugMemory(u64 vaddr) const {
         auto const paddr = current_page_table->entries[vaddr >> CITRON_PAGEBITS].backing_addr;
         return paddr ? system.DeviceMemory().GetPointer<u8>(paddr + vaddr) : nullptr;
+    }
+
+    void TraceConditionRangeWrite(Common::ProcessAddress vaddr, const void* src_buffer,
+                                  std::size_t size, bool unsafe, const char* source) const {
+        static const bool enabled = std::getenv("CITRON_ULTRAHAND_TRACE") != nullptr;
+        if (!enabled || !current_page_table || size == 0) {
+            return;
+        }
+        const u64 raw_vaddr = GetInteger(vaddr);
+        const auto& entry = current_page_table->entries[raw_vaddr >> CITRON_PAGEBITS];
+        const auto backing = entry.backing_addr;
+        if (backing == 0) {
+            return;
+        }
+        const DAddr device_addr = backing + raw_vaddr;
+        if (!IsUltrahandConditionDeviceRange(device_addr, size)) {
+            return;
+        }
+        std::array<u32, 6> words{};
+        const std::size_t copy_size = std::min<std::size_t>(size, sizeof(words));
+        std::memcpy(words.data(), src_buffer, copy_size);
+        LOG_WARNING(HW_GPU,
+                    "UHTRACE app_write_condition_range vaddr=0x{:016X} device=0x{:016X} "
+                    "size={} unsafe={} source={} w=0x{:08X}/0x{:08X}/0x{:08X}/0x{:08X}/"
+                    "0x{:08X}/0x{:08X}",
+                    raw_vaddr, device_addr, size, unsafe, source, words[0], words[1], words[2],
+                    words[3], words[4], words[5]);
+    }
+
+    bool IsMappedConditionRange(VAddr vaddr, u64 size, DAddr* device_addr = nullptr) const {
+        if (!current_page_table || size == 0) {
+            return false;
+        }
+        const auto& entry = current_page_table->entries[vaddr >> CITRON_PAGEBITS];
+        if (entry.backing_addr == 0) {
+            return false;
+        }
+        const DAddr mapped_device_addr = entry.backing_addr + vaddr;
+        if (device_addr != nullptr) {
+            *device_addr = mapped_device_addr;
+        }
+        return IsUltrahandConditionDeviceRange(mapped_device_addr, size);
+    }
+
+    bool PageTableHasBacking(const Common::PageTable& page_table, VAddr vaddr, u64 size) const {
+        if (!AddressSpaceContains(page_table, vaddr, size)) {
+            return false;
+        }
+        const VAddr end = Common::AlignUp(vaddr + size, CITRON_PAGESIZE);
+        for (VAddr page = Common::AlignDown(vaddr, CITRON_PAGESIZE); page < end;
+             page += CITRON_PAGESIZE) {
+            if (page_table.entries[page >> CITRON_PAGEBITS].backing_addr != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    Common::PageTable* GetRasterizerPageTable(VAddr vaddr, u64 size) const {
+        if (rasterizer_page_table && PageTableHasBacking(*rasterizer_page_table, vaddr, size)) {
+            return rasterizer_page_table;
+        }
+        if (current_page_table && PageTableHasBacking(*current_page_table, vaddr, size)) {
+            return current_page_table;
+        }
+        if (rasterizer_page_table && AddressSpaceContains(*rasterizer_page_table, vaddr, size)) {
+            return rasterizer_page_table;
+        }
+        if (current_page_table && AddressSpaceContains(*current_page_table, vaddr, size)) {
+            return current_page_table;
+        }
+        return current_page_table;
+    }
+
+    bool IsMappedConditionRange(const Common::PageTable& page_table, VAddr vaddr, u64 size,
+                                DAddr* device_addr = nullptr) const {
+        if (size == 0) {
+            return false;
+        }
+        const auto& entry = page_table.entries[vaddr >> CITRON_PAGEBITS];
+        if (entry.backing_addr == 0) {
+            return false;
+        }
+        const DAddr mapped_device_addr = entry.backing_addr + vaddr;
+        if (device_addr != nullptr) {
+            *device_addr = mapped_device_addr;
+        }
+        return IsUltrahandConditionDeviceRange(mapped_device_addr, size);
     }
 
     bool WriteExclusive8(const Common::ProcessAddress addr, const u8 data, const u8 expected) {
@@ -285,6 +387,8 @@ struct Memory::Impl {
                           GetInteger(current_vaddr), GetInteger(dest_addr), size);
             },
             [&](const std::size_t copy_amount, u8* const dest_ptr) {
+                TraceConditionRangeWrite(dest_addr, src_buffer, copy_amount, UNSAFE,
+                                         "WriteBlock");
                 std::memcpy(dest_ptr, src_buffer, copy_amount);
             },
             [&](const Common::ProcessAddress current_vaddr, const std::size_t copy_amount,
@@ -292,6 +396,8 @@ struct Memory::Impl {
                 if constexpr (!UNSAFE) {
                     HandleRasterizerWrite(GetInteger(current_vaddr), copy_amount);
                 }
+                TraceConditionRangeWrite(current_vaddr, src_buffer, copy_amount, UNSAFE,
+                                         "WriteBlockRasterizer");
                 std::memcpy(host_ptr, src_buffer, copy_amount);
             },
             [&](const std::size_t copy_amount) {
@@ -465,7 +571,21 @@ struct Memory::Impl {
         }
     }
 
-    void RasterizerMarkRegionCached(VAddr vaddr, u64 size, bool cached) {
+    void RasterizerMarkRegionCached(VAddr vaddr, u64 size, bool cached,
+                                    DAddr known_device_addr = 0) {
+        static const bool ultrahand_trace_enabled =
+            std::getenv("CITRON_ULTRAHAND_TRACE") != nullptr;
+        const VAddr original_vaddr = vaddr;
+        auto* page_table = GetRasterizerPageTable(vaddr, size);
+        DAddr original_device_addr = 0;
+        bool condition_range = false;
+        if (known_device_addr != 0) {
+            original_device_addr = known_device_addr;
+            condition_range = IsUltrahandConditionDeviceRange(known_device_addr, size);
+        } else if (page_table != nullptr) {
+            condition_range =
+                IsMappedConditionRange(*page_table, original_vaddr, size, &original_device_addr);
+        }
         if (vaddr < 0x1000) {
             return;
         }
@@ -474,14 +594,20 @@ struct Memory::Impl {
         }
         // Guard against null or stale page table pointer (can happen during
         // GPU garbage collection when no process page table is active).
-        if (!current_page_table || system.IsShuttingDown()) {
+        if (!page_table || system.IsShuttingDown()) {
             return;
         }
-        if (!AddressSpaceContains(*current_page_table, vaddr, size)) {
+        if (!AddressSpaceContains(*page_table, vaddr, size)) {
+            if (ultrahand_trace_enabled && condition_range) {
+                LOG_WARNING(HW_GPU,
+                            "UHTRACE raster_mark_condition skip=outside_as vaddr=0x{:016X} "
+                            "device=0x{:016X} size={} cached={}",
+                            original_vaddr, original_device_addr, size, cached);
+            }
             return;
         }
 
-        if (current_page_table->fastmem_arena) {
+        if (page_table->fastmem_arena) {
             Common::MemoryPermission perm{};
             if (!Settings::values.use_reactive_flushing.GetValue() || !cached) {
                 perm |= Common::MemoryPermission::Read;
@@ -489,7 +615,19 @@ struct Memory::Impl {
             if (!cached) {
                 perm |= Common::MemoryPermission::Write;
             }
+            if (ultrahand_trace_enabled && condition_range) {
+                LOG_WARNING(HW_GPU,
+                            "UHTRACE raster_mark_condition protect vaddr=0x{:016X} "
+                            "device=0x{:016X} size={} cached={} perm=0x{:X}",
+                            original_vaddr, original_device_addr, size, cached,
+                            static_cast<u32>(perm));
+            }
             buffer->Protect(vaddr, size, perm);
+        } else if (ultrahand_trace_enabled && condition_range) {
+            LOG_WARNING(HW_GPU,
+                        "UHTRACE raster_mark_condition no_fastmem_arena vaddr=0x{:016X} "
+                        "device=0x{:016X} size={} cached={}",
+                        original_vaddr, original_device_addr, size, cached);
         }
 
         // Iterate over a contiguous CPU address space, which corresponds to the specified GPU
@@ -499,7 +637,23 @@ struct Memory::Impl {
 
         const u64 num_pages = ((vaddr + size - 1) >> CITRON_PAGEBITS) - (vaddr >> CITRON_PAGEBITS) + 1;
         for (u64 i = 0; i < num_pages; ++i, vaddr += CITRON_PAGESIZE) {
-            const Common::PageType page_type= current_page_table->entries[vaddr >> CITRON_PAGEBITS].pointer.Type();
+            const Common::PageType page_type= page_table->entries[vaddr >> CITRON_PAGEBITS].pointer.Type();
+            DAddr page_device_addr = 0;
+            bool page_condition_range = false;
+            if (known_device_addr != 0) {
+                page_device_addr = known_device_addr + (vaddr - original_vaddr);
+                page_condition_range =
+                    IsUltrahandConditionDeviceRange(page_device_addr, CITRON_PAGESIZE);
+            } else {
+                page_condition_range =
+                    IsMappedConditionRange(*page_table, vaddr, CITRON_PAGESIZE, &page_device_addr);
+            }
+            if (ultrahand_trace_enabled && page_condition_range) {
+                LOG_WARNING(HW_GPU,
+                            "UHTRACE raster_mark_condition page vaddr=0x{:016X} cached={} "
+                            "device=0x{:016X} old_type={}",
+                            vaddr, cached, page_device_addr, static_cast<u32>(page_type));
+            }
             if (cached) {
                 // Switch page type to cached if now cached
                 switch (page_type) {
@@ -509,7 +663,7 @@ struct Memory::Impl {
                     break;
                 case Common::PageType::DebugMemory:
                 case Common::PageType::Memory:
-                    current_page_table->entries[vaddr >> CITRON_PAGEBITS].pointer.Store(0, Common::PageType::RasterizerCachedMemory);
+                    page_table->entries[vaddr >> CITRON_PAGEBITS].pointer.Store(0, Common::PageType::RasterizerCachedMemory);
                     break;
                 case Common::PageType::RasterizerCachedMemory:
                     // There can be more than one GPU region mapped per CPU region, so it's common
@@ -531,13 +685,13 @@ struct Memory::Impl {
                     // that this area is already unmarked as cached.
                     break;
                 case Common::PageType::RasterizerCachedMemory: {
-                    if (u8* const pointer = GetPointerFromRasterizerCachedMemory(vaddr & ~CITRON_PAGEMASK); pointer == nullptr) {
+                    if (u8* const pointer = GetPointerFromRasterizerCachedMemory(*page_table, vaddr & ~CITRON_PAGEMASK); pointer == nullptr) {
                         // It's possible that this function has been called while updating the
                         // pagetable after unmapping a VMA. In that case the underlying VMA will no
                         // longer exist, and we should just leave the pagetable entry blank.
-                        current_page_table->entries[vaddr >> CITRON_PAGEBITS].pointer.Store(0, Common::PageType::Unmapped);
+                        page_table->entries[vaddr >> CITRON_PAGEBITS].pointer.Store(0, Common::PageType::Unmapped);
                     } else {
-                        current_page_table->entries[vaddr >> CITRON_PAGEBITS].pointer.Store(uintptr_t(pointer) - (vaddr & ~CITRON_PAGEMASK), Common::PageType::Memory);
+                        page_table->entries[vaddr >> CITRON_PAGEBITS].pointer.Store(uintptr_t(pointer) - (vaddr & ~CITRON_PAGEMASK), Common::PageType::Memory);
                     }
                     break;
                 }
@@ -713,6 +867,7 @@ struct Memory::Impl {
             }, [&] {
                 HandleRasterizerWrite(addr_c1, sizeof(T));
             }); ptr_c1) {
+                TraceConditionRangeWrite(vaddr, &data, sizeof(T), false, "Write");
                 std::memcpy(ptr_c1, &data, sizeof(T));
             }
         } else {
@@ -723,6 +878,7 @@ struct Memory::Impl {
                 }, [&] {
                     HandleRasterizerWrite(addr_c1, sizeof(T));
                 }); ptr_c1) {
+                    TraceConditionRangeWrite(vaddr, &data, sizeof(T), false, "Write");
                     std::memcpy(ptr_c1, &data, sizeof(T));
                 }
             } else {
@@ -742,7 +898,12 @@ struct Memory::Impl {
                         HandleRasterizerWrite(addr_c2, count_c2);
                     }); ptr_c2) {
                         std::array<char, sizeof(T)> tmp = std::bit_cast<std::array<char, sizeof(T)>>(data);
+                        TraceConditionRangeWrite(vaddr, tmp.data(), count_c1, false,
+                                                 "WriteSplitA");
                         std::memcpy(ptr_c1, tmp.data() + 0, count_c1);
+                        TraceConditionRangeWrite(Common::ProcessAddress(addr_c2),
+                                                 tmp.data() + count_c1, count_c2, false,
+                                                 "WriteSplitB");
                         std::memcpy(ptr_c2, tmp.data() + count_c1, count_c2);
                     }
                 }
@@ -760,6 +921,7 @@ struct Memory::Impl {
             },
             [&]() { HandleRasterizerWrite(GetInteger(vaddr), sizeof(T)); });
         if (ptr) {
+            TraceConditionRangeWrite(vaddr, &data, sizeof(T), false, "WriteExclusive");
             return Common::AtomicCompareAndSwap(reinterpret_cast<T*>(ptr), data, expected);
         }
         return true;
@@ -774,6 +936,7 @@ struct Memory::Impl {
             },
             [&]() { HandleRasterizerWrite(GetInteger(vaddr), sizeof(u128)); });
         if (ptr) {
+            TraceConditionRangeWrite(vaddr, data.data(), sizeof(u128), false, "WriteExclusive128");
             return Common::AtomicCompareAndSwap(reinterpret_cast<u64*>(ptr), data, expected);
         }
         return true;
@@ -864,6 +1027,7 @@ struct Memory::Impl {
     Core::System& system;
     Tegra::MaxwellDeviceMemoryManager* gpu_device_memory{};
     Common::PageTable* current_page_table = nullptr;
+    Common::PageTable* rasterizer_page_table = nullptr;
 
     // Number of threads to use for parallel memory operations
     unsigned int thread_count = 2;
@@ -1054,6 +1218,11 @@ void Memory::RasterizerMarkRegionCached(Common::ProcessAddress vaddr, u64 size, 
     impl->RasterizerMarkRegionCached(GetInteger(vaddr), size, cached);
 }
 
+void Memory::RasterizerMarkRegionCached(Common::ProcessAddress vaddr, u64 size, bool cached,
+                                        DAddr device_addr) {
+    impl->RasterizerMarkRegionCached(GetInteger(vaddr), size, cached, device_addr);
+}
+
 void Memory::MarkRegionDebug(Common::ProcessAddress vaddr, u64 size, bool debug) {
     impl->MarkRegionDebug(GetInteger(vaddr), size, debug);
 }
@@ -1077,7 +1246,13 @@ bool Memory::InvalidateNCE(Common::ProcessAddress vaddr, size_t size) {
 }
 
 bool Memory::InvalidateSeparateHeap(void* fault_address) {
-    return false;
+    if (!impl->current_page_table || !impl->buffer || !impl->buffer->IsInVirtualRange(fault_address)) {
+        return false;
+    }
+    const auto fault = reinterpret_cast<uintptr_t>(fault_address);
+    const auto base = reinterpret_cast<uintptr_t>(impl->buffer->VirtualBasePointer());
+    const VAddr vaddr = Common::AlignDown(fault - base, CITRON_PAGESIZE);
+    return InvalidateNCE(Common::ProcessAddress{vaddr}, CITRON_PAGESIZE);
 }
 
 } // namespace Core::Memory

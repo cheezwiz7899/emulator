@@ -47,6 +47,16 @@ using VideoCommon::ImageViewId;
 using VideoCommon::ImageViewType;
 
 namespace {
+
+bool IsUltrahandConditionCpuRange(DAddr addr, u64 size) {
+    if (size == 0) {
+        return false;
+    }
+    constexpr DAddr condition_begin = 0x000000001B200000ULL;
+    constexpr DAddr condition_end = 0x000000001B220000ULL;
+    return addr < condition_end && addr + size > condition_begin;
+}
+
 struct DrawParams {
     u32 base_instance;
     u32 num_instances;
@@ -638,6 +648,7 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
             return *area;
         }
     }
+
     VideoCore::RasterizerDownloadArea new_area{
         .start_address = Common::AlignDown(addr, Core::DEVICE_PAGESIZE),
         .end_address = Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE),
@@ -693,6 +704,10 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
 bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
     if (addr == 0 || size == 0) {
         return false;
+    }
+
+    if (IsUltrahandConditionCpuRange(addr, size)) {
+        query_cache.InvalidateRegion(addr, size);
     }
 
     {
@@ -772,7 +787,7 @@ void RasterizerVulkan::ReleaseFences(bool force) {
 
 void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
                                                 VideoCommon::CacheType which) {
-    if (Settings::IsGPULevelExtreme()) {
+    if (Settings::IsGPULevelNormal()) {
         FlushRegion(addr, size, which);
     }
     InvalidateRegion(addr, size, which);

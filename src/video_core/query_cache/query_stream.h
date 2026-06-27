@@ -75,7 +75,7 @@ public:
     }
 
     u64 GetDependentMask() const {
-        return dependence_mask;
+        return dependent_mask;
     }
 
     u64 GetAmendValue() const {

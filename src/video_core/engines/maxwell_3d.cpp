@@ -1,10 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <optional>
 #include "common/assert.h"
 #include "common/bit_util.h"
+#include "common/common_funcs.h"
+#include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
@@ -17,10 +22,69 @@
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/texture.h"
 
+extern "C" {
+volatile unsigned long long citron_uh_watch_gpu_addr = 0;
+volatile unsigned long long citron_uh_watch_cpu_addr = 0;
+volatile unsigned long long citron_uh_watch_host_addr = 0;
+}
+
 namespace Tegra::Engines {
 
 /// First register id that is actually a Macro call.
 constexpr u32 MacroRegistersStart = 0xE00;
+
+namespace {
+bool UltrahandTraceEnabled() {
+    static const bool enabled = std::getenv("CITRON_ULTRAHAND_TRACE") != nullptr;
+    return enabled;
+}
+
+bool UltrahandPassTraceEnabled() {
+    static const bool enabled = std::getenv("CITRON_UH_PASS_TRACE") != nullptr;
+    return enabled;
+}
+
+bool IsUltrahandConditionCpuRange(VAddr addr, u64 size) {
+    constexpr VAddr condition_begin = 0x1B200000;
+    constexpr VAddr condition_end = 0x1B220000;
+    return addr < condition_end && addr + size > condition_begin;
+}
+
+bool UltrahandBreakProbeEnabled(GPUVAddr address) {
+    static const bool enabled = std::getenv("CITRON_UH_BREAK_ON_COND_DIFF") != nullptr;
+    if (!enabled) {
+        return false;
+    }
+    const char* const arm_file = std::getenv("CITRON_UH_BREAK_ARM_FILE");
+    if (arm_file != nullptr && arm_file[0] != '\0' && !std::filesystem::exists(arm_file)) {
+        return false;
+    }
+    static bool already_broke = false;
+    if (already_broke) {
+        return false;
+    }
+    const char* const target = std::getenv("CITRON_UH_BREAK_GPU_ADDR");
+    if (target != nullptr && target[0] != '\0') {
+        const u64 target_addr = std::strtoull(target, nullptr, 0);
+        if (target_addr != address) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool UltrahandBreakOnCondDiff(GPUVAddr address) {
+    if (!UltrahandBreakProbeEnabled(address)) {
+        return false;
+    }
+    static bool already_broke = false;
+    if (already_broke) {
+        return false;
+    }
+    already_broke = true;
+    return true;
+}
+} // namespace
 
 Maxwell3D::Maxwell3D(Core::System& system_, MemoryManager& memory_manager_)
     : draw_manager{std::make_unique<DrawManager>(this)}
@@ -492,6 +556,77 @@ void Maxwell3D::ProcessQueryGet() {
         static_cast<VideoCommon::QueryType>(regs.report_semaphore.query.report.Value());
     const u32 payload = regs.report_semaphore.payload;
     const u32 subreport = regs.report_semaphore.query.sub_report;
+    const bool render_enable_report =
+        regs.render_enable_override == Regs::RenderEnable::Override::UseRenderEnable &&
+        sequence_address == regs.render_enable.Address() &&
+        (regs.render_enable.mode == Regs::RenderEnable::Mode::IfEqual ||
+         regs.render_enable.mode == Regs::RenderEnable::Mode::IfNotEqual) &&
+        query_type == VideoCommon::QueryType::Payload;
+    if (render_enable_report) {
+        flags |= VideoCommon::QueryPropertiesFlags::IsRenderEnableReport;
+    }
+    if (UltrahandTraceEnabled()) {
+        LOG_WARNING(HW_GPU,
+                 "UHTRACE query addr=0x{:016X} type={} op={} raw=0x{:08X} "
+                 "dword={} flags=0x{:X} short={} "
+                 "execute={} render_report={} render_addr=0x{:016X} render_mode={} render_override={} "
+                 "payload=0x{:08X} subreport={}",
+                 sequence_address, static_cast<u32>(query_type),
+                 static_cast<u32>(regs.report_semaphore.query.operation.Value()),
+                 regs.report_semaphore.query.raw, regs.report_semaphore.query.dword_number.Value(),
+                 static_cast<u32>(flags), regs.report_semaphore.query.short_query != 0,
+                 execute_on, render_enable_report, regs.render_enable.Address(),
+                 static_cast<u32>(regs.render_enable.mode),
+                 static_cast<u32>(regs.render_enable_override), payload, subreport);
+    }
+    const auto sequence_cpu_addr = memory_manager.GpuToCpuAddress(sequence_address);
+    const auto render_cpu_addr = memory_manager.GpuToCpuAddress(regs.render_enable.Address());
+    const bool pass_query =
+        sequence_cpu_addr &&
+        IsUltrahandConditionCpuRange(*sequence_cpu_addr,
+                                     regs.report_semaphore.query.short_query != 0 ? sizeof(u32)
+                                                                                  : sizeof(u64));
+    const bool pass_render =
+        render_cpu_addr && IsUltrahandConditionCpuRange(*render_cpu_addr,
+                                                        sizeof(Regs::ReportSemaphore::Compare));
+    if (UltrahandPassTraceEnabled() && (pass_query || pass_render)) {
+        const auto& draw_state = draw_manager->GetDrawState();
+        const auto& rt0 = regs.rt[0];
+        const auto& rt1 = regs.rt[1];
+        const auto& zeta = regs.zeta;
+        const auto shader_offset = [this](Regs::ShaderType type) {
+            const auto index = static_cast<std::size_t>(type);
+            return regs.IsShaderConfigEnabled(index) ? regs.pipelines[index].offset : 0U;
+        };
+        const u32 draw_count =
+            draw_state.draw_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count;
+        LOG_WARNING(HW_GPU,
+                    "UHTRACE pass_query gpu=0x{:016X} cpu=0x{:016X} type={} op={} "
+                    "flags=0x{:X} short={} execute={} render_report={} "
+                    "render_gpu=0x{:016X} render_cpu=0x{:016X} render_mode={} "
+                    "render_override={} payload=0x{:08X} subreport={} "
+                    "ctx topology={} indexed={} count={} inst={} zpass={} "
+                    "rt0=0x{:016X}/{}x{}/fmt{} rt1=0x{:016X}/{}x{}/fmt{} "
+                    "zeta=0x{:016X}/fmt{} clip={}x{} mrt=0x{:08X} "
+                    "sh_vb=0x{:08X} sh_fs=0x{:08X} sh_gs=0x{:08X}",
+                    sequence_address, static_cast<u64>(sequence_cpu_addr.value_or(0)),
+                    static_cast<u32>(query_type),
+                    static_cast<u32>(regs.report_semaphore.query.operation.Value()),
+                    static_cast<u32>(flags), regs.report_semaphore.query.short_query != 0,
+                    execute_on, render_enable_report, regs.render_enable.Address(),
+                    static_cast<u64>(render_cpu_addr.value_or(0)),
+                    static_cast<u32>(regs.render_enable.mode),
+                    static_cast<u32>(regs.render_enable_override), payload, subreport,
+                    static_cast<u32>(draw_state.topology), draw_state.draw_indexed, draw_count,
+                    draw_state.instance_count, regs.zpass_pixel_count_enable != 0, rt0.Address(),
+                    rt0.width, rt0.height, static_cast<u32>(rt0.format), rt1.Address(),
+                    rt1.width, rt1.height, static_cast<u32>(rt1.format), zeta.Address(),
+                    static_cast<u32>(zeta.format), static_cast<u32>(regs.surface_clip.width),
+                    static_cast<u32>(regs.surface_clip.height), regs.color_target_mrt_enable,
+                    shader_offset(Regs::ShaderType::VertexB),
+                    shader_offset(Regs::ShaderType::Pixel),
+                    shader_offset(Regs::ShaderType::Geometry));
+    }
     switch (regs.report_semaphore.query.operation) {
     case Regs::ReportSemaphore::Operation::Release:
         if (regs.report_semaphore.query.short_query != 0) {
@@ -517,46 +652,223 @@ void Maxwell3D::ProcessQueryGet() {
 }
 
 void Maxwell3D::ProcessQueryCondition() {
-    if (rasterizer->AccelerateConditionalRendering()) {
+    const GPUVAddr condition_address{regs.render_enable.Address()};
+    const bool trace = UltrahandTraceEnabled();
+    const bool break_probe = UltrahandBreakProbeEnabled(condition_address);
+    const bool pass_trace = UltrahandPassTraceEnabled();
+    const auto condition_cpu_addr = memory_manager.GpuToCpuAddress(condition_address);
+    const bool pass_condition =
+        condition_cpu_addr &&
+        IsUltrahandConditionCpuRange(*condition_cpu_addr,
+                                     sizeof(Regs::ReportSemaphore::Compare));
+    const bool accelerated = rasterizer->AccelerateConditionalRendering();
+    const auto read_compare = [&](const char* mode_name) {
+        Regs::ReportSemaphore::Compare before{};
+        Regs::ReportSemaphore::Compare cmp{};
+        Regs::ReportSemaphore::Compare after{};
+        const auto cpu_addr = memory_manager.GpuToCpuAddress(condition_address);
+        if (trace || break_probe) {
+            memory_manager.ReadBlockUnsafe(condition_address, &before, sizeof(before));
+        }
+        memory_manager.ReadBlock(condition_address, &cmp, sizeof(cmp));
+        if (trace || break_probe) {
+            memory_manager.ReadBlockUnsafe(condition_address, &after, sizeof(after));
+            if (std::memcmp(&before, &cmp, sizeof(cmp)) != 0 ||
+                std::memcmp(&cmp, &after, sizeof(cmp)) != 0) {
+                const auto& draw_state = draw_manager->GetDrawState();
+                const auto& rt0 = regs.rt[0];
+                const auto& rt1 = regs.rt[1];
+                const auto& zeta = regs.zeta;
+                const auto shader_offset = [this](Regs::ShaderType type) {
+                    const auto index = static_cast<std::size_t>(type);
+                    return regs.IsShaderConfigEnabled(index) ? regs.pipelines[index].offset : 0U;
+                };
+                const u32 draw_count =
+                    draw_state.draw_indexed ? draw_state.index_buffer.count
+                                            : draw_state.vertex_buffer.count;
+                const auto* const host_ptr = memory_manager.GetPointer(condition_address);
+                const u64 host_addr =
+                    static_cast<u64>(reinterpret_cast<std::uintptr_t>(host_ptr));
+                if (trace) {
+                    LOG_WARNING(HW_GPU,
+                                "UHTRACE cond_read_diff mode={} addr=0x{:016X} "
+                                "before=0x{:08X}/0x{:08X},0x{:08X}/0x{:08X} "
+                                "safe=0x{:08X}/0x{:08X},0x{:08X}/0x{:08X} "
+                                "after=0x{:08X}/0x{:08X},0x{:08X}/0x{:08X} "
+                                "ctx topology={} indexed={} count={} inst={} zpass={} "
+                                "rt0=0x{:016X}/{}x{}/fmt{} rt1=0x{:016X}/{}x{}/fmt{} "
+                                "zeta=0x{:016X}/fmt{} clip={}x{} mrt=0x{:08X} "
+                                "sh_vb=0x{:08X} sh_fs=0x{:08X} sh_gs=0x{:08X} "
+                                "cpu=0x{:016X} host=0x{:016X}",
+                                mode_name, condition_address, before.initial_sequence,
+                                before.initial_mode, before.current_sequence, before.current_mode,
+                                cmp.initial_sequence, cmp.initial_mode, cmp.current_sequence,
+                                cmp.current_mode, after.initial_sequence, after.initial_mode,
+                                after.current_sequence, after.current_mode,
+                                static_cast<u32>(draw_state.topology), draw_state.draw_indexed,
+                                draw_count, draw_state.instance_count,
+                                regs.zpass_pixel_count_enable != 0, rt0.Address(), rt0.width,
+                                rt0.height, static_cast<u32>(rt0.format), rt1.Address(), rt1.width,
+                                rt1.height, static_cast<u32>(rt1.format), zeta.Address(),
+                                static_cast<u32>(zeta.format),
+                                static_cast<u32>(regs.surface_clip.width),
+                                static_cast<u32>(regs.surface_clip.height),
+                                regs.color_target_mrt_enable,
+                                shader_offset(Regs::ShaderType::VertexB),
+                                shader_offset(Regs::ShaderType::Pixel),
+                                shader_offset(Regs::ShaderType::Geometry),
+                                static_cast<u64>(cpu_addr.value_or(0)), host_addr);
+                }
+                if (UltrahandBreakOnCondDiff(condition_address)) {
+                    citron_uh_watch_gpu_addr = condition_address;
+                    citron_uh_watch_cpu_addr = static_cast<u64>(cpu_addr.value_or(0));
+                    citron_uh_watch_host_addr = host_addr;
+                    LOG_WARNING(HW_GPU,
+                                "UHTRACE cond_debug_break addr=0x{:016X} cpu=0x{:016X} "
+                                "host=0x{:016X}",
+                                condition_address, static_cast<u64>(cpu_addr.value_or(0)),
+                                host_addr);
+                    Crash();
+                }
+            }
+        }
+        return cmp;
+    };
+    const auto log_pass_condition = [&](const char* mode_name,
+                                        const Regs::ReportSemaphore::Compare* cmp, bool execute,
+                                        bool hcr_accelerated) {
+        if (!pass_trace || !pass_condition) {
+            return;
+        }
+        const auto& draw_state = draw_manager->GetDrawState();
+        const auto& rt0 = regs.rt[0];
+        const auto& rt1 = regs.rt[1];
+        const auto& zeta = regs.zeta;
+        const auto shader_offset = [this](Regs::ShaderType type) {
+            const auto index = static_cast<std::size_t>(type);
+            return regs.IsShaderConfigEnabled(index) ? regs.pipelines[index].offset : 0U;
+        };
+        const u32 draw_count =
+            draw_state.draw_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count;
+        const Regs::ReportSemaphore::Compare empty{};
+        const auto& values = cmp != nullptr ? *cmp : empty;
+        LOG_WARNING(HW_GPU,
+                    "UHTRACE pass_cond mode={} addr=0x{:016X} cpu=0x{:016X} "
+                    "accelerated={} execute={} has_cmp={} "
+                    "init=0x{:08X}/0x{:08X} cur=0x{:08X}/0x{:08X} "
+                    "ctx topology={} indexed={} count={} inst={} zpass={} "
+                    "rt0=0x{:016X}/{}x{}/fmt{} rt1=0x{:016X}/{}x{}/fmt{} "
+                    "zeta=0x{:016X}/fmt{} clip={}x{} mrt=0x{:08X} "
+                    "sh_vb=0x{:08X} sh_fs=0x{:08X} sh_gs=0x{:08X}",
+                    mode_name, condition_address,
+                    static_cast<u64>(condition_cpu_addr.value_or(0)), hcr_accelerated, execute,
+                    cmp != nullptr, values.initial_sequence, values.initial_mode,
+                    values.current_sequence, values.current_mode,
+                    static_cast<u32>(draw_state.topology), draw_state.draw_indexed, draw_count,
+                    draw_state.instance_count, regs.zpass_pixel_count_enable != 0, rt0.Address(),
+                    rt0.width, rt0.height, static_cast<u32>(rt0.format), rt1.Address(),
+                    rt1.width, rt1.height, static_cast<u32>(rt1.format), zeta.Address(),
+                    static_cast<u32>(zeta.format), static_cast<u32>(regs.surface_clip.width),
+                    static_cast<u32>(regs.surface_clip.height), regs.color_target_mrt_enable,
+                    shader_offset(Regs::ShaderType::VertexB),
+                    shader_offset(Regs::ShaderType::Pixel),
+                    shader_offset(Regs::ShaderType::Geometry));
+    };
+    if (accelerated) {
         execute_on = true;
+        log_pass_condition("accelerated", nullptr, execute_on, true);
+        if (trace) {
+            LOG_WARNING(HW_GPU,
+                 "UHTRACE cond accelerated=1 addr=0x{:016X} override={} mode={} execute=1",
+                     condition_address, static_cast<u32>(regs.render_enable_override),
+                     static_cast<u32>(regs.render_enable.mode));
+        }
         return;
     }
-    const GPUVAddr condition_address{regs.render_enable.Address()};
     switch (regs.render_enable_override) {
     case Regs::RenderEnable::Override::AlwaysRender:
         execute_on = true;
+        log_pass_condition("always", nullptr, execute_on, false);
+        if (trace) {
+            LOG_WARNING(HW_GPU,
+                 "UHTRACE cond override addr=0x{:016X} override={} mode={} execute=1",
+                     condition_address, static_cast<u32>(regs.render_enable_override),
+                     static_cast<u32>(regs.render_enable.mode));
+        }
         break;
     case Regs::RenderEnable::Override::NeverRender:
         execute_on = false;
+        log_pass_condition("never", nullptr, execute_on, false);
+        if (trace) {
+            LOG_WARNING(HW_GPU,
+                 "UHTRACE cond override addr=0x{:016X} override={} mode={} execute=0",
+                     condition_address, static_cast<u32>(regs.render_enable_override),
+                     static_cast<u32>(regs.render_enable.mode));
+        }
         break;
     case Regs::RenderEnable::Override::UseRenderEnable: {
         switch (regs.render_enable.mode) {
         case Regs::RenderEnable::Mode::True: {
             execute_on = true;
+            log_pass_condition("true", nullptr, execute_on, false);
+            if (trace) {
+                LOG_WARNING(HW_GPU,
+                 "UHTRACE cond mode_true addr=0x{:016X} override={} mode={} execute=1",
+                         condition_address, static_cast<u32>(regs.render_enable_override),
+                         static_cast<u32>(regs.render_enable.mode));
+            }
             break;
         }
         case Regs::RenderEnable::Mode::False: {
             execute_on = false;
+            log_pass_condition("false", nullptr, execute_on, false);
+            if (trace) {
+                LOG_WARNING(HW_GPU,
+                 "UHTRACE cond mode_false addr=0x{:016X} override={} mode={} execute=0",
+                         condition_address, static_cast<u32>(regs.render_enable_override),
+                         static_cast<u32>(regs.render_enable.mode));
+            }
             break;
         }
         case Regs::RenderEnable::Mode::Conditional: {
-            Regs::ReportSemaphore::Compare cmp;
-            memory_manager.ReadBlock(condition_address, &cmp, sizeof(cmp));
+            Regs::ReportSemaphore::Compare cmp = read_compare("conditional");
             execute_on = cmp.initial_sequence != 0U && cmp.initial_mode != 0U;
+            log_pass_condition("conditional", &cmp, execute_on, false);
+            if (trace) {
+                LOG_WARNING(HW_GPU,
+                 "UHTRACE cond conditional addr=0x{:016X} init=0x{:08X}/0x{:08X} "
+                         "cur=0x{:08X}/0x{:08X} execute={}",
+                         condition_address, cmp.initial_sequence, cmp.initial_mode,
+                         cmp.current_sequence, cmp.current_mode, execute_on);
+            }
             break;
         }
         case Regs::RenderEnable::Mode::IfEqual: {
-            Regs::ReportSemaphore::Compare cmp;
-            memory_manager.ReadBlock(condition_address, &cmp, sizeof(cmp));
+            Regs::ReportSemaphore::Compare cmp = read_compare("equal");
             execute_on = cmp.initial_sequence == cmp.current_sequence &&
                          cmp.initial_mode == cmp.current_mode;
+            log_pass_condition("equal", &cmp, execute_on, false);
+            if (trace) {
+                LOG_WARNING(HW_GPU,
+                 "UHTRACE cond equal addr=0x{:016X} init=0x{:08X}/0x{:08X} "
+                         "cur=0x{:08X}/0x{:08X} execute={}",
+                         condition_address, cmp.initial_sequence, cmp.initial_mode,
+                         cmp.current_sequence, cmp.current_mode, execute_on);
+            }
             break;
         }
         case Regs::RenderEnable::Mode::IfNotEqual: {
-            Regs::ReportSemaphore::Compare cmp;
-            memory_manager.ReadBlock(condition_address, &cmp, sizeof(cmp));
+            Regs::ReportSemaphore::Compare cmp = read_compare("not_equal");
             execute_on = cmp.initial_sequence != cmp.current_sequence ||
                          cmp.initial_mode != cmp.current_mode;
+            log_pass_condition("not_equal", &cmp, execute_on, false);
+            if (trace) {
+                LOG_WARNING(HW_GPU,
+                 "UHTRACE cond notequal addr=0x{:016X} init=0x{:08X}/0x{:08X} "
+                         "cur=0x{:08X}/0x{:08X} execute={}",
+                         condition_address, cmp.initial_sequence, cmp.initial_mode,
+                         cmp.current_sequence, cmp.current_mode, execute_on);
+            }
             break;
         }
         default: {

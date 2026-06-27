@@ -4,10 +4,13 @@
 #pragma once
 
 #include <array>
+#include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include "common/assert.h"
@@ -26,6 +29,45 @@
 #include "video_core/query_cache/types.h"
 
 namespace VideoCommon {
+
+inline bool UltrahandTraceEnabled() {
+    static const bool enabled = std::getenv("CITRON_ULTRAHAND_TRACE") != nullptr;
+    return enabled;
+}
+
+inline bool UltrahandPassTraceEnabled() {
+    static const bool enabled = std::getenv("CITRON_UH_PASS_TRACE") != nullptr;
+    return enabled;
+}
+
+inline bool IsUltrahandConditionCpuRange(VAddr addr, u64 size) {
+    constexpr VAddr condition_begin = 0x1B200000;
+    constexpr VAddr condition_end = 0x1B220000;
+    return addr < condition_end && addr + size > condition_begin;
+}
+
+inline bool IsStaleGuestQueryWrite(const QueryBase& query, const void* pointer, size_t size,
+                                   u64* current_value = nullptr) {
+    if (pointer == nullptr || True(query.flags & QueryFlagBits::IsHostManaged)) {
+        return false;
+    }
+    u64 current{};
+    std::memcpy(&current, pointer, size);
+    if (current_value != nullptr) {
+        *current_value = current;
+    }
+    const u64 mask = size >= sizeof(u64) ? ~0ULL : ((1ULL << (size * 8)) - 1ULL);
+    if ((current & mask) != (query.guest_snapshot & mask)) {
+        return true;
+    }
+    return false;
+}
+
+inline bool IsUnsafeRenderEnableGuestWrite([[maybe_unused]] const QueryBase& query,
+                                           [[maybe_unused]] u64 write_value,
+                                           [[maybe_unused]] u64 current_value) {
+    return false;
+}
 
 struct SyncValuesStruct {
     VAddr address;
@@ -155,6 +197,19 @@ struct QueryCacheBase<Traits>::QueryCacheBaseImpl {
         return streamer->GetQuery(location.query_id.Value());
     }
 
+    void TrackConditionPage(DAddr address) {
+        if (!IsUltrahandConditionCpuRange(address, QueryCacheBase<Traits>::QUERY_REPORT_SIZE)) {
+            return;
+        }
+        const DAddr page = address & ~static_cast<DAddr>(Core::DEVICE_PAGEMASK);
+        if (tracked_condition_pages.insert(page).second) {
+            device_memory.PinPagesCached(page, Core::DEVICE_PAGESIZE);
+            if (UltrahandTraceEnabled()) {
+                LOG_WARNING(HW_GPU, "UHTRACE qc_track_page cpu=0x{:016X}", page);
+            }
+        }
+    }
+
     QueryCacheBase<Traits>* owner;
     VideoCore::RasterizerInterface& rasterizer;
     Tegra::MaxwellDeviceMemoryManager& device_memory;
@@ -165,6 +220,8 @@ struct QueryCacheBase<Traits>::QueryCacheBaseImpl {
     std::mutex flush_guard;
     std::deque<u64> flushes_pending;
     std::vector<QueryCacheBase<Traits>::QueryLocation> pending_unregister;
+    std::unordered_set<GPUVAddr> render_enable_compare_addresses;
+    std::unordered_set<DAddr> tracked_condition_pages;
 };
 
 template <typename Traits>
@@ -228,6 +285,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                                            QueryPropertiesFlags flags, u32 payload, u32 subreport) {
     const bool has_timestamp = True(flags & QueryPropertiesFlags::HasTimeout);
     const bool is_fence = True(flags & QueryPropertiesFlags::IsAFence);
+    const GPUVAddr original_addr = addr;
     size_t streamer_id = static_cast<size_t>(counter_type);
     auto* streamer = impl->streamers[streamer_id];
     if (streamer == nullptr) [[unlikely]] {
@@ -241,8 +299,20 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         return;
     }
     DAddr cpu_addr = *cpu_addr_opt;
+    impl->TrackConditionPage(cpu_addr);
     const size_t new_query_id = streamer->WriteCounter(cpu_addr, has_timestamp, payload, subreport);
     auto* query = streamer->GetQuery(new_query_id);
+    if (True(flags & QueryPropertiesFlags::IsRenderEnableReport)) {
+        query->flags |= QueryFlagBits::IsRenderEnableReport;
+    }
+    if (UltrahandTraceEnabled()) {
+        LOG_WARNING(HW_GPU,
+                 "UHTRACE qc_report gpu=0x{:016X} report_gpu=0x{:016X} cpu=0x{:016X} "
+                 "type={} streamer={} id={} "
+                 "fence={} timestamp={} payload=0x{:08X} subreport={}",
+                 original_addr, addr, cpu_addr, static_cast<u32>(counter_type), streamer_id,
+                 new_query_id, is_fence, has_timestamp, payload, subreport);
+    }
     if (is_fence) {
         query->flags |= QueryFlagBits::IsFence;
     }
@@ -255,10 +325,30 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     };
     u8* pointer = impl->device_memory.template GetPointer<u8>(cpu_addr);
     u8* pointer_timestamp = impl->device_memory.template GetPointer<u8>(cpu_addr + 8);
+    const size_t snapshot_size = has_timestamp ? sizeof(query->value) : sizeof(payload);
+    if (pointer) {
+        std::memcpy(&query->guest_snapshot, pointer, snapshot_size);
+    }
+    if (UltrahandPassTraceEnabled() && IsUltrahandConditionCpuRange(cpu_addr, snapshot_size)) {
+        LOG_WARNING(HW_GPU,
+                    "UHTRACE pass_report gpu=0x{:016X} cpu=0x{:016X} type={} streamer={} "
+                    "id={} flags=0x{:X} fence={} timestamp={} payload=0x{:08X} "
+                    "subreport={} snapshot=0x{:016X} value=0x{:016X}",
+                    original_addr, cpu_addr, static_cast<u32>(counter_type), streamer_id,
+                    new_query_id, static_cast<u32>(query->flags), is_fence, has_timestamp, payload,
+                    subreport, query->guest_snapshot, query->value);
+    }
     bool is_synced = !Settings::IsGPULevelNormal() && is_fence;
     std::function<void()> operation([this, is_synced, streamer, query_base = query, query_location,
                                      pointer, pointer_timestamp] {
-        if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
+        if (True(query_base->flags & QueryFlagBits::IsGuestSynced)) {
+            if (!is_synced) [[likely]] {
+                impl->pending_unregister.push_back(query_location);
+            }
+            return;
+        }
+        if (True(query_base->flags & QueryFlagBits::IsInvalidated) ||
+            True(query_base->flags & QueryFlagBits::IsRewritten)) {
             if (!is_synced) [[likely]] {
                 impl->pending_unregister.push_back(query_location);
             }
@@ -272,12 +362,79 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         streamer->SetAccumulationValue(query_base->value);
         if (True(query_base->flags & QueryFlagBits::HasTimestamp)) {
             u64 timestamp = impl->gpu.GetTicks();
+            u64 current{};
+            if (IsStaleGuestQueryWrite(*query_base, pointer, sizeof(query_base->value),
+                                       &current)) {
+                if ((UltrahandTraceEnabled() || UltrahandPassTraceEnabled()) &&
+                    IsUltrahandConditionCpuRange(query_base->guest_address,
+                                                 sizeof(query_base->value))) {
+                    LOG_WARNING(HW_GPU,
+                                "UHTRACE qc_deferred_guest_skip_stale cpu=0x{:016X} size=8 "
+                                "flags=0x{:X} value=0x{:016X} snapshot=0x{:016X} "
+                                "current=0x{:016X}",
+                                query_base->guest_address, static_cast<u32>(query_base->flags),
+                                query_base->value, query_base->guest_snapshot, current);
+                }
+                query_base->flags |= QueryFlagBits::IsGuestSynced | QueryFlagBits::IsInvalidated;
+                if (!is_synced) [[likely]] {
+                    impl->pending_unregister.push_back(query_location);
+                }
+                return;
+            }
+            if (IsUnsafeRenderEnableGuestWrite(*query_base, query_base->value, current)) {
+                if (UltrahandTraceEnabled()) {
+                    LOG_WARNING(HW_GPU,
+                                "UHTRACE qc_deferred_guest_skip_render_enable cpu=0x{:016X} "
+                                "size=8 flags=0x{:X} value=0x{:016X} snapshot=0x{:016X} "
+                                "current=0x{:016X}",
+                                query_base->guest_address, static_cast<u32>(query_base->flags),
+                                query_base->value, query_base->guest_snapshot, current);
+                }
+                query_base->flags |= QueryFlagBits::IsGuestSynced | QueryFlagBits::IsInvalidated;
+                if (!is_synced) [[likely]] {
+                    impl->pending_unregister.push_back(query_location);
+                }
+                return;
+            }
+            if ((UltrahandTraceEnabled() || UltrahandPassTraceEnabled()) &&
+                IsUltrahandConditionCpuRange(query_base->guest_address, sizeof(query_base->value))) {
+                LOG_WARNING(HW_GPU,
+                            "UHTRACE qc_deferred_guest_write cpu=0x{:016X} size=8 "
+                            "flags=0x{:X} value=0x{:016X} timestamp=1",
+                            query_base->guest_address, static_cast<u32>(query_base->flags),
+                            query_base->value);
+            }
             if (pointer_timestamp) std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
             if (pointer) std::memcpy(pointer, &query_base->value, sizeof(query_base->value));
         } else {
             u32 value = static_cast<u32>(query_base->value);
+            u64 current{};
+            if (IsStaleGuestQueryWrite(*query_base, pointer, sizeof(value), &current)) {
+                if ((UltrahandTraceEnabled() || UltrahandPassTraceEnabled()) &&
+                    IsUltrahandConditionCpuRange(query_base->guest_address, sizeof(value))) {
+                    LOG_WARNING(HW_GPU,
+                                "UHTRACE qc_deferred_guest_skip_stale cpu=0x{:016X} size=4 "
+                                "flags=0x{:X} value=0x{:08X} snapshot=0x{:016X} "
+                                "current=0x{:016X}",
+                                query_base->guest_address, static_cast<u32>(query_base->flags),
+                                value, query_base->guest_snapshot, current);
+                }
+                query_base->flags |= QueryFlagBits::IsGuestSynced | QueryFlagBits::IsInvalidated;
+                if (!is_synced) [[likely]] {
+                    impl->pending_unregister.push_back(query_location);
+                }
+                return;
+            }
+            if ((UltrahandTraceEnabled() || UltrahandPassTraceEnabled()) &&
+                IsUltrahandConditionCpuRange(query_base->guest_address, sizeof(value))) {
+                LOG_WARNING(HW_GPU,
+                            "UHTRACE qc_deferred_guest_write cpu=0x{:016X} size=4 "
+                            "flags=0x{:X} value=0x{:08X} timestamp=0",
+                            query_base->guest_address, static_cast<u32>(query_base->flags), value);
+            }
             if (pointer) std::memcpy(pointer, &value, sizeof(value));
         }
+        query_base->flags |= QueryFlagBits::IsGuestSynced;
         if (!is_synced) [[likely]] {
             impl->pending_unregister.push_back(query_location);
         }
@@ -334,6 +491,9 @@ void QueryCacheBase<Traits>::UnregisterPending() {
             continue;
         }
         auto* query = streamer->GetQuery(query_id);
+        if (!query) [[unlikely]] {
+            continue;
+        }
         auto [cont_addr, base] = gen_caching_indexing(query->guest_address);
         auto it1 = cached_queries.find(cont_addr);
         if (it1 != cached_queries.end()) {
@@ -347,6 +507,34 @@ void QueryCacheBase<Traits>::UnregisterPending() {
         streamer->Free(query_id);
     }
     impl->pending_unregister.clear();
+}
+
+template <typename Traits>
+void QueryCacheBase<Traits>::Unregister(QueryCacheBase<Traits>::QueryLocation loc) {
+    const auto gen_caching_indexing = [](VAddr cur_addr) {
+        return std::make_pair<u64, u32>(cur_addr >> Core::DEVICE_PAGEBITS,
+                                        static_cast<u32>(cur_addr & Core::DEVICE_PAGEMASK));
+    };
+    const auto [streamer_id, query_id] = loc.unpack();
+    auto* streamer = impl->streamers[streamer_id];
+    if (!streamer) [[unlikely]] {
+        return;
+    }
+    auto* query = streamer->GetQuery(query_id);
+    if (!query) [[unlikely]] {
+        return;
+    }
+    const auto [cont_addr, base] = gen_caching_indexing(query->guest_address);
+    {
+        std::scoped_lock lock(cache_mutex);
+        auto it1 = cached_queries.find(cont_addr);
+        if (it1 != cached_queries.end()) {
+            auto it2 = it1->second.find(base);
+            if (it2 != it1->second.end() && it2->second.raw == loc.raw) {
+                it1->second.erase(it2);
+            }
+        }
+    }
 }
 
 template <typename Traits>
@@ -377,30 +565,49 @@ void QueryCacheBase<Traits>::NotifySegment(bool resume) {
 
 template <typename Traits>
 bool QueryCacheBase<Traits>::AccelerateHostConditionalRendering() {
+    NotifyWFI();
     bool qc_dirty = false;
     const auto gen_lookup = [this, &qc_dirty](GPUVAddr address) -> VideoCommon::LookupData {
         auto cpu_addr_opt = gpu_memory->GpuToCpuAddress(address);
         if (!cpu_addr_opt) [[unlikely]] {
+            if (UltrahandTraceEnabled()) {
+                LOG_WARNING(HW_GPU, "UHTRACE hcr_lookup gpu=0x{:016X} cpu=<unmapped> found=0",
+                         address);
+            }
             return VideoCommon::LookupData{
                 .address = 0,
                 .found_query = nullptr,
             };
         }
         VAddr cpu_addr = *cpu_addr_opt;
+        const bool pass_trace_lookup =
+            UltrahandPassTraceEnabled() && IsUltrahandConditionCpuRange(cpu_addr, 24);
+        impl->TrackConditionPage(cpu_addr);
         std::scoped_lock lock(cache_mutex);
         auto it1 = cached_queries.find(cpu_addr >> Core::DEVICE_PAGEBITS);
         if (it1 == cached_queries.end()) {
+            if (UltrahandTraceEnabled() || pass_trace_lookup) {
+                LOG_WARNING(HW_GPU,
+                 "UHTRACE hcr_lookup gpu=0x{:016X} cpu=0x{:016X} found=0 reason=no_page",
+                         address, cpu_addr);
+            }
             return VideoCommon::LookupData{
                 .address = cpu_addr,
                 .found_query = nullptr,
             };
         }
         auto& sub_container = it1->second;
-        auto it_current = sub_container.find(cpu_addr & Core::DEVICE_PAGEMASK);
-
+        const u32 page_offset = static_cast<u32>(cpu_addr & Core::DEVICE_PAGEMASK);
+        auto it_current = sub_container.find(page_offset);
         if (it_current == sub_container.end()) {
-            auto it_current_2 = sub_container.find((cpu_addr & Core::DEVICE_PAGEMASK) + 4);
-            if (it_current_2 == sub_container.end()) {
+            it_current = sub_container.find(page_offset + sizeof(u32));
+            if (it_current == sub_container.end()) {
+                if (UltrahandTraceEnabled() || pass_trace_lookup) {
+                    LOG_WARNING(HW_GPU,
+                 "UHTRACE hcr_lookup gpu=0x{:016X} cpu=0x{:016X} found=0 "
+                             "reason=no_slot",
+                             address, cpu_addr);
+                }
                 return VideoCommon::LookupData{
                     .address = cpu_addr,
                     .found_query = nullptr,
@@ -408,8 +615,53 @@ bool QueryCacheBase<Traits>::AccelerateHostConditionalRendering() {
             }
         }
         auto* query = impl->ObtainQuery(it_current->second);
+        if (!query || True(query->flags & QueryFlagBits::IsInvalidated)) {
+            if (UltrahandTraceEnabled() || pass_trace_lookup) {
+                LOG_WARNING(HW_GPU,
+                            "UHTRACE hcr_lookup gpu=0x{:016X} cpu=0x{:016X} found=0 "
+                            "reason=invalidated",
+                            address, cpu_addr);
+            }
+            return VideoCommon::LookupData{
+                .address = cpu_addr,
+                .found_query = nullptr,
+            };
+        }
+        const size_t query_size = True(query->flags & QueryFlagBits::HasTimestamp)
+                                      ? sizeof(query->value)
+                                      : sizeof(u32);
+        u64 current{};
+        if (IsStaleGuestQueryWrite(*query,
+                                   impl->device_memory.template GetPointer<u8>(
+                                       query->guest_address),
+                                   query_size, &current)) {
+            if (UltrahandTraceEnabled() || pass_trace_lookup) {
+                LOG_WARNING(HW_GPU,
+                            "UHTRACE hcr_lookup gpu=0x{:016X} cpu=0x{:016X} found=0 "
+                            "reason=stale_snapshot flags=0x{:X} value=0x{:016X} "
+                            "snapshot=0x{:016X} current=0x{:016X}",
+                            address, cpu_addr, static_cast<u32>(query->flags), query->value,
+                            query->guest_snapshot, current);
+            }
+            query->flags |= QueryFlagBits::IsInvalidated;
+            sub_container.erase(it_current);
+            return VideoCommon::LookupData{
+                .address = cpu_addr,
+                .found_query = nullptr,
+            };
+        }
         qc_dirty |= True(query->flags & QueryFlagBits::IsHostManaged) &&
                     False(query->flags & QueryFlagBits::IsGuestSynced);
+        if (UltrahandTraceEnabled() || pass_trace_lookup) {
+            LOG_WARNING(HW_GPU,
+                 "UHTRACE hcr_lookup gpu=0x{:016X} cpu=0x{:016X} found=1 flags=0x{:X} "
+                     "host_managed={} guest_synced={} host_synced={} final_synced={} value=0x{:016X}",
+                     address, cpu_addr, static_cast<u32>(query->flags),
+                     True(query->flags & QueryFlagBits::IsHostManaged),
+                     True(query->flags & QueryFlagBits::IsGuestSynced),
+                     True(query->flags & QueryFlagBits::IsHostSynced),
+                     True(query->flags & QueryFlagBits::IsFinalValueSynced), query->value);
+        }
         return VideoCommon::LookupData{
             .address = cpu_addr,
             .found_query = query,
@@ -423,6 +675,28 @@ bool QueryCacheBase<Traits>::AccelerateHostConditionalRendering() {
     }
     const ComparisonMode mode = static_cast<ComparisonMode>(regs.render_enable.mode);
     const GPUVAddr address = regs.render_enable.Address();
+    const auto tag_render_enable_operand = [](VideoCommon::LookupData& object) {
+        if (object.found_query == nullptr ||
+            !IsUltrahandConditionCpuRange(object.address, sizeof(object.found_query->value))) {
+            return;
+        }
+        object.found_query->flags |= QueryFlagBits::IsRenderEnableReport;
+        if (UltrahandTraceEnabled() || UltrahandPassTraceEnabled()) {
+            LOG_WARNING(HW_GPU,
+                        "UHTRACE hcr_tag_render_enable cpu=0x{:016X} flags=0x{:X} "
+                        "value=0x{:016X}",
+                        object.address, static_cast<u32>(object.found_query->flags),
+                        object.found_query->value);
+        }
+    };
+    const auto address_cpu_opt = gpu_memory->GpuToCpuAddress(address);
+    const bool pass_trace_hcr =
+        address_cpu_opt && UltrahandPassTraceEnabled() &&
+        IsUltrahandConditionCpuRange(*address_cpu_opt, 24);
+    if (UltrahandTraceEnabled() || pass_trace_hcr) {
+        LOG_WARNING(HW_GPU, "UHTRACE hcr_start gpu=0x{:016X} override={} mode={}", address,
+                 static_cast<u32>(regs.render_enable_override), static_cast<u32>(mode));
+    }
     switch (mode) {
     case ComparisonMode::True:
         impl->runtime.EndHostConditionalRendering();
@@ -432,19 +706,38 @@ bool QueryCacheBase<Traits>::AccelerateHostConditionalRendering() {
         return false;
     case ComparisonMode::Conditional: {
         VideoCommon::LookupData object_1{gen_lookup(address)};
-        return impl->runtime.HostConditionalRenderingCompareValue(object_1, qc_dirty);
+        const bool result = impl->runtime.HostConditionalRenderingCompareValue(object_1, qc_dirty);
+        if (UltrahandTraceEnabled() || pass_trace_hcr) {
+            LOG_WARNING(HW_GPU, "UHTRACE hcr_result mode=conditional result={} qc_dirty={}", result,
+                     qc_dirty);
+        }
+        return result;
     }
     case ComparisonMode::IfEqual: {
+        impl->render_enable_compare_addresses.insert(address);
         VideoCommon::LookupData object_1{gen_lookup(address)};
+        tag_render_enable_operand(object_1);
         VideoCommon::LookupData object_2{gen_lookup(address + 16)};
-        return impl->runtime.HostConditionalRenderingCompareValues(object_1, object_2, qc_dirty,
-                                                                   true);
+        const bool result =
+            impl->runtime.HostConditionalRenderingCompareValues(object_1, object_2, qc_dirty, true);
+        if (UltrahandTraceEnabled() || pass_trace_hcr) {
+            LOG_WARNING(HW_GPU, "UHTRACE hcr_result mode=equal result={} qc_dirty={}", result,
+                     qc_dirty);
+        }
+        return result;
     }
     case ComparisonMode::IfNotEqual: {
+        impl->render_enable_compare_addresses.insert(address);
         VideoCommon::LookupData object_1{gen_lookup(address)};
+        tag_render_enable_operand(object_1);
         VideoCommon::LookupData object_2{gen_lookup(address + 16)};
-        return impl->runtime.HostConditionalRenderingCompareValues(object_1, object_2, qc_dirty,
-                                                                   false);
+        const bool result = impl->runtime.HostConditionalRenderingCompareValues(object_1, object_2,
+                                                                               qc_dirty, false);
+        if (UltrahandTraceEnabled() || pass_trace_hcr) {
+            LOG_WARNING(HW_GPU, "UHTRACE hcr_result mode=not_equal result={} qc_dirty={}", result,
+                     qc_dirty);
+        }
+        return result;
     }
     default:
         return false;
@@ -538,6 +831,12 @@ void QueryCacheBase<Traits>::InvalidateQuery(QueryCacheBase<Traits>::QueryLocati
     if (!query_base) {
         return;
     }
+    if (UltrahandTraceEnabled()) {
+        LOG_WARNING(HW_GPU,
+                    "UHTRACE qc_invalidate cpu=0x{:016X} flags=0x{:X} value=0x{:016X}",
+                    query_base->guest_address, static_cast<u32>(query_base->flags),
+                    query_base->value);
+    }
     query_base->flags |= QueryFlagBits::IsInvalidated;
 }
 
@@ -545,6 +844,10 @@ template <typename Traits>
 bool QueryCacheBase<Traits>::IsQueryDirty(QueryCacheBase<Traits>::QueryLocation location) {
     auto* query_base = impl->ObtainQuery(location);
     if (!query_base) {
+        return false;
+    }
+    if (True(query_base->flags & QueryFlagBits::IsInvalidated) ||
+        True(query_base->flags & QueryFlagBits::IsRewritten)) {
         return false;
     }
     return True(query_base->flags & QueryFlagBits::IsHostManaged) &&
@@ -561,11 +864,74 @@ bool QueryCacheBase<Traits>::SemiFlushQueryDirty(QueryCacheBase<Traits>::QueryLo
         False(query_base->flags & QueryFlagBits::IsGuestSynced)) {
         auto* ptr = impl->device_memory.template GetPointer<u8>(query_base->guest_address);
         if (True(query_base->flags & QueryFlagBits::HasTimestamp)) {
+            u64 current{};
+            if (IsStaleGuestQueryWrite(*query_base, ptr, sizeof(query_base->value), &current)) {
+                if ((UltrahandTraceEnabled() || UltrahandPassTraceEnabled()) &&
+                    IsUltrahandConditionCpuRange(query_base->guest_address,
+                                                 sizeof(query_base->value))) {
+                    LOG_WARNING(HW_GPU,
+                                "UHTRACE qc_semiflush_guest_skip_stale cpu=0x{:016X} size=8 "
+                                "flags=0x{:X} value=0x{:016X} snapshot=0x{:016X} "
+                                "current=0x{:016X}",
+                                query_base->guest_address, static_cast<u32>(query_base->flags),
+                                query_base->value, query_base->guest_snapshot, current);
+                }
+                query_base->flags |= QueryFlagBits::IsGuestSynced | QueryFlagBits::IsInvalidated;
+                Unregister(location);
+                return false;
+            }
+            if (IsUnsafeRenderEnableGuestWrite(*query_base, query_base->value, current)) {
+                if (UltrahandTraceEnabled()) {
+                    LOG_WARNING(HW_GPU,
+                                "UHTRACE qc_semiflush_guest_skip_render_enable cpu=0x{:016X} "
+                                "size=8 flags=0x{:X} value=0x{:016X} snapshot=0x{:016X} "
+                                "current=0x{:016X}",
+                                query_base->guest_address, static_cast<u32>(query_base->flags),
+                                query_base->value, query_base->guest_snapshot, current);
+                }
+                query_base->flags |= QueryFlagBits::IsGuestSynced | QueryFlagBits::IsInvalidated;
+                Unregister(location);
+                return false;
+            }
+            if ((UltrahandTraceEnabled() || UltrahandPassTraceEnabled()) &&
+                IsUltrahandConditionCpuRange(query_base->guest_address, sizeof(query_base->value))) {
+                LOG_WARNING(HW_GPU,
+                            "UHTRACE qc_semiflush_guest_write cpu=0x{:016X} size=8 "
+                            "flags=0x{:X} value=0x{:016X} snapshot=0x{:016X} "
+                            "current=0x{:016X} timestamp=1",
+                            query_base->guest_address, static_cast<u32>(query_base->flags),
+                            query_base->value, query_base->guest_snapshot, current);
+            }
             std::memcpy(ptr, &query_base->value, sizeof(query_base->value));
+            query_base->flags |= QueryFlagBits::IsGuestSynced;
+            Unregister(location);
             return false;
         }
         u32 value_l = static_cast<u32>(query_base->value);
+        u64 current{};
+        if (IsStaleGuestQueryWrite(*query_base, ptr, sizeof(value_l), &current)) {
+            if ((UltrahandTraceEnabled() || UltrahandPassTraceEnabled()) &&
+                IsUltrahandConditionCpuRange(query_base->guest_address, sizeof(value_l))) {
+                LOG_WARNING(HW_GPU,
+                            "UHTRACE qc_semiflush_guest_skip_stale cpu=0x{:016X} size=4 "
+                            "flags=0x{:X} value=0x{:08X} snapshot=0x{:016X} current=0x{:016X}",
+                            query_base->guest_address, static_cast<u32>(query_base->flags),
+                            value_l, query_base->guest_snapshot, current);
+            }
+            query_base->flags |= QueryFlagBits::IsGuestSynced | QueryFlagBits::IsInvalidated;
+            Unregister(location);
+            return false;
+        }
+        if ((UltrahandTraceEnabled() || UltrahandPassTraceEnabled()) &&
+            IsUltrahandConditionCpuRange(query_base->guest_address, sizeof(value_l))) {
+            LOG_WARNING(HW_GPU,
+                        "UHTRACE qc_semiflush_guest_write cpu=0x{:016X} size=4 "
+                        "flags=0x{:X} value=0x{:08X} timestamp=0",
+                        query_base->guest_address, static_cast<u32>(query_base->flags), value_l);
+        }
         std::memcpy(ptr, &value_l, sizeof(value_l));
+        query_base->flags |= QueryFlagBits::IsGuestSynced;
+        Unregister(location);
         return false;
     }
     return True(query_base->flags & QueryFlagBits::IsHostManaged) &&

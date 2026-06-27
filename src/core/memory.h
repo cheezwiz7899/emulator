@@ -474,6 +474,8 @@ public:
      *               marked as cached or uncached.
      */
     void RasterizerMarkRegionCached(Common::ProcessAddress vaddr, u64 size, bool cached);
+    void RasterizerMarkRegionCached(Common::ProcessAddress vaddr, u64 size, bool cached,
+                                    DAddr device_addr);
 
     /**
      * Marks each page within the specified address range as debug or non-debug.

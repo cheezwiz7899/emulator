@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 citron Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <array>
 #include <cstddef>
 #include <limits>
 #include <map>
@@ -1385,18 +1386,75 @@ void QueryCacheRuntime::HostConditionalRenderingCompareBCImpl(DAddr address, boo
 }
 
 bool QueryCacheRuntime::HostConditionalRenderingCompareValue(VideoCommon::LookupData object_1,
-                                                             [[maybe_unused]] bool qc_dirty) {
+                                                              [[maybe_unused]] bool qc_dirty) {
+    const bool hcr_trace =
+        VideoCommon::UltrahandTraceEnabled() ||
+        (VideoCommon::UltrahandPassTraceEnabled() &&
+         VideoCommon::IsUltrahandConditionCpuRange(object_1.address, 8));
     if (!impl->device.IsExtConditionalRendering()) {
+        if (hcr_trace) {
+            LOG_WARNING(Render_Vulkan, "UHTRACE hcr_value result=0 reason=no_ext addr=0x{:016X}",
+                     object_1.address);
+        }
+        return false;
+    }
+    if (!Settings::values.use_conditional_rendering.GetValue()) [[unlikely]] {
+        impl->hcr_is_set = false;
+        if (hcr_trace) {
+            LOG_WARNING(Render_Vulkan,
+                 "UHTRACE hcr_value result=0 reason=setting_off addr=0x{:016X}",
+                     object_1.address);
+        }
+        return false;
+    }
+    bool is_in_bc = false;
+    {
+        std::scoped_lock lk(impl->buffer_cache.mutex);
+        is_in_bc = object_1.found_query == nullptr &&
+                   impl->buffer_cache.IsRegionGpuModified(object_1.address, 8);
+    }
+    if (object_1.found_query == nullptr && !is_in_bc) {
+        EndHostConditionalRendering();
+        if (hcr_trace) {
+            LOG_WARNING(Render_Vulkan,
+                 "UHTRACE hcr_value result=0 reason=no_query_no_bc addr=0x{:016X}",
+                     object_1.address);
+        }
         return false;
     }
     HostConditionalRenderingCompareValueImpl(object_1, false);
+    if (hcr_trace) {
+        LOG_WARNING(Render_Vulkan,
+                 "UHTRACE hcr_value result=1 addr=0x{:016X} found_query={} is_in_bc={}",
+                 object_1.address, object_1.found_query != nullptr, is_in_bc);
+    }
     return true;
 }
 
 bool QueryCacheRuntime::HostConditionalRenderingCompareValues(VideoCommon::LookupData object_1,
                                                               VideoCommon::LookupData object_2,
                                                               bool qc_dirty, bool equal_check) {
+    const bool hcr_trace =
+        VideoCommon::UltrahandTraceEnabled() ||
+        (VideoCommon::UltrahandPassTraceEnabled() &&
+         (VideoCommon::IsUltrahandConditionCpuRange(object_1.address, 8) ||
+          VideoCommon::IsUltrahandConditionCpuRange(object_2.address, 8)));
     if (!impl->device.IsExtConditionalRendering()) {
+        if (hcr_trace) {
+            LOG_WARNING(Render_Vulkan,
+                 "UHTRACE hcr_values result=0 reason=no_ext addr0=0x{:016X} addr1=0x{:016X}",
+                     object_1.address, object_2.address);
+        }
+        return false;
+    }
+    if (!Settings::values.use_conditional_rendering.GetValue()) [[unlikely]] {
+        impl->hcr_is_set = false;
+        if (hcr_trace) {
+            LOG_WARNING(Render_Vulkan,
+                 "UHTRACE hcr_values result=0 reason=setting_off addr0=0x{:016X} "
+                     "addr1=0x{:016X}",
+                     object_1.address, object_2.address);
+        }
         return false;
     }
 
@@ -1427,12 +1485,32 @@ bool QueryCacheRuntime::HostConditionalRenderingCompareValues(VideoCommon::Looku
 
     if (!is_in_ac[0] && !is_in_ac[1]) {
         EndHostConditionalRendering();
+        if (hcr_trace) {
+            LOG_WARNING(Render_Vulkan,
+                 "UHTRACE hcr_values result=0 reason=no_active addr0=0x{:016X} "
+                     "addr1=0x{:016X}",
+                     object_1.address, object_2.address);
+        }
         return false;
     }
 
     if (!qc_dirty && !is_in_bc[0] && !is_in_bc[1]) {
         EndHostConditionalRendering();
+        if (hcr_trace) {
+            LOG_WARNING(Render_Vulkan,
+                 "UHTRACE hcr_values result=0 reason=clean_no_bc addr0=0x{:016X} "
+                     "addr1=0x{:016X} qc0={} qc1={}",
+                     object_1.address, object_2.address, is_in_qc[0], is_in_qc[1]);
+        }
         return false;
+    }
+
+    if (hcr_trace) {
+        LOG_WARNING(Render_Vulkan,
+                 "UHTRACE hcr_values state addr0=0x{:016X} addr1=0x{:016X} qc_dirty={} "
+                 "equal={} qc0={} qc1={} bc0={} bc1={} active0={} active1={}",
+                 object_1.address, object_2.address, qc_dirty, equal_check, is_in_qc[0],
+                 is_in_qc[1], is_in_bc[0], is_in_bc[1], is_in_ac[0], is_in_ac[1]);
     }
 
     const bool is_gpu_high = Settings::IsGPULevelNormal();

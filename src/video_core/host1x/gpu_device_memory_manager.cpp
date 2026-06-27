@@ -11,11 +11,11 @@ namespace Tegra {
 
 struct MaxwellDeviceMethods {
     static inline void MarkRegionCaching(Core::Memory::Memory* interface, VAddr address,
-                                         size_t size, bool caching) {
+                                         size_t size, bool caching, DAddr device_addr) {
         if (address < 0x1000) {
             return;
         }
-        interface->RasterizerMarkRegionCached(address, size, caching);
+        interface->RasterizerMarkRegionCached(address, size, caching, device_addr);
     }
 };
 

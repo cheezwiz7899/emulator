@@ -75,7 +75,7 @@ void ThreadManager::FlushRegion(DAddr addr, u64 size) {
         PushCommand(FlushRegionCommand(addr, size));
         return;
     }
-    if (!Settings::IsGPULevelExtreme()) {
+    if (!Settings::IsGPULevelNormal()) {
         return;
     }
     auto& gpu = system.GPU();

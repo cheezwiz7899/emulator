@@ -353,7 +353,9 @@ std::shared_ptr<Dynarmic::A64::Jit> ArmDynarmic64::MakeJit(Common::PageTable* pa
                 config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN;
             }
             if (Settings::values.cpuopt_unsafe_fastmem_check) {
+#ifndef _WIN32
                 config.fastmem_address_space_bits = 64;
+#endif
             }
             if (Settings::values.cpuopt_unsafe_ignore_global_monitor) {
                 config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_IgnoreGlobalMonitor;
@@ -368,14 +370,18 @@ std::shared_ptr<Dynarmic::A64::Jit> ArmDynarmic64::MakeJit(Common::PageTable* pa
             config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_IgnoreStandardFPCRValue;
             config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN;
             config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_IgnoreGlobalMonitor;
+#ifndef _WIN32
             config.fastmem_address_space_bits = 64;
+#endif
         }
 
         // Curated optimizations
         if (cpu_accuracy == Settings::CpuAccuracy::Auto) {
             config.unsafe_optimizations = true;
             config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_UnfuseFMA;
+#ifndef _WIN32
             config.fastmem_address_space_bits = 64;
+#endif
             config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_IgnoreGlobalMonitor;
         }
 

@@ -138,10 +138,6 @@ void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     thread_local boost::container::small_vector<VideoCommon::SamplerId, 64> samplers;
     views.clear();
     samplers.clear();
-    thread_local BindlessCache bindless_cache;
-    thread_local size_t bindless_cache_rr{0};
-    thread_local std::vector<u8> bindless_scratch;
-
     const auto& qmd{kepler_compute.launch_description};
     const auto& cbufs{qmd.const_buffer_config};
     const bool via_header_index{qmd.linked_tsc != 0};
@@ -181,71 +177,6 @@ void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         add_image(desc, false);
     }
     for (const auto& desc : info.texture_descriptors) {
-        if (desc.count > 1 && !desc.has_secondary) {
-            const GPUVAddr cbuf_addr =
-                cbufs[desc.cbuf_index].Address() + desc.cbuf_offset;
-            const u64 image_table_generation = texture_cache.ComputeImageTableGeneration();
-
-            // Fast path: if we have a valid cache entry whose generation matches,
-            // the TIC table hasn't been invalidated. Skip ReadBlockUnsafe + memcmp.
-            if (auto* fast = FindBindlessEntry(bindless_cache, cbuf_addr,
-                                               desc.count, image_table_generation);
-                fast != nullptr) {
-                for (const auto& v : fast->cached_views) {
-                    views.push_back(v);
-                }
-                for (const auto& s : fast->cached_samplers) {
-                    samplers.push_back(s);
-                }
-                continue;
-            }
-
-            const size_t byte_size = static_cast<size_t>(desc.count) << desc.size_shift;
-            bindless_scratch.resize(byte_size);
-            gpu_memory.ReadBlockUnsafe(cbuf_addr, bindless_scratch.data(), byte_size);
-            BindlessCacheEntry& entry = AcquireBindlessEntry(
-                bindless_cache, bindless_cache_rr, cbuf_addr, desc.count,
-                image_table_generation);
-            const bool hit = entry.valid &&
-                             entry.last_bytes.size() == byte_size &&
-                             std::memcmp(entry.last_bytes.data(),
-                                         bindless_scratch.data(), byte_size) == 0;
-            if (hit) {
-                for (const auto& v : entry.cached_views) {
-                    views.push_back(v);
-                }
-                for (const auto& s : entry.cached_samplers) {
-                    samplers.push_back(s);
-                }
-                continue;
-            }
-            const size_t views_start = views.size();
-            const size_t samplers_start = samplers.size();
-            for (u32 index = 0; index < desc.count; ++index) {
-                const size_t slot_offset =
-                    static_cast<size_t>(index) << desc.size_shift;
-                u32 raw;
-                std::memcpy(&raw, bindless_scratch.data() + slot_offset, sizeof(u32));
-                const auto handle = TexturePair(raw, via_header_index);
-                views.push_back({handle.first});
-                samplers.push_back(handle.first == 0
-                                       ? VideoCommon::NULL_SAMPLER_ID
-                                       : texture_cache.GetComputeSamplerId(handle.second));
-            }
-            entry.last_bytes.assign(bindless_scratch.begin(), bindless_scratch.end());
-            auto resolved_views =
-                std::span(views.data() + views_start, views.size() - views_start);
-            texture_cache.FillComputeImageViews(resolved_views);
-            for (auto& view : resolved_views) {
-                view.id_cached = true;
-            }
-            entry.cached_views.assign(views.data() + views_start,
-                                      views.data() + views.size());
-            entry.cached_samplers.assign(samplers.data() + samplers_start,
-                                         samplers.data() + samplers.size());
-            entry.valid = true;
-            continue;
-        }
         for (u32 index = 0; index < desc.count; ++index) {
             const auto handle{read_handle(desc, index)};
             views.push_back({handle.first});
@@ -312,11 +243,15 @@ void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         const u64 data_hash = HashDescriptorBlock(descriptor_data, upload_entries);
         auto& semaphore = scheduler.GetMasterSemaphore();
         // Strict per-CB cache - see GraphicsPipeline::ConfigureDraw.
+        // Include set_index so split uniform/resource sets cannot collide.
         const u64 current_tick = semaphore.CurrentTick();
         const auto get_or_alloc = [&](DescriptorAllocator& alloc,
-                                      const vk::DescriptorUpdateTemplate& tpl) -> VkDescriptorSet {
+                                      const vk::DescriptorUpdateTemplate& tpl,
+                                      u32 set_index) -> VkDescriptorSet {
+            const u64 keyed_hash =
+                data_hash ^ (static_cast<u64>(set_index) * 0x9e3779b97f4a7c15ULL);
             for (auto& e : descriptor_set_cache) {
-                if (e.set != VK_NULL_HANDLE && e.hash == data_hash &&
+                if (e.set != VK_NULL_HANDLE && e.hash == keyed_hash &&
                     e.cb_tick == current_tick) {
                     return e.set;
                 }
@@ -328,7 +263,7 @@ void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                     e.set = VK_NULL_HANDLE;
                 }
             }
-            descriptor_set_cache[descriptor_set_cache_rr] = {data_hash, current_tick, fresh};
+            descriptor_set_cache[descriptor_set_cache_rr] = {keyed_hash, current_tick, fresh};
             descriptor_set_cache_rr =
                 (descriptor_set_cache_rr + 1) % DESC_SET_CACHE_SIZE;
             return fresh;
@@ -339,14 +274,14 @@ void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                                                         *pipeline_layout, 0, descriptor_data);
             } else {
                 const VkDescriptorSet ds = get_or_alloc(descriptor_allocator,
-                                                        descriptor_update_template);
+                                                        descriptor_update_template, 0);
                 cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout, 0,
                                           ds, nullptr);
             }
         }
         if (resource_set_layout) {
             const VkDescriptorSet rs = get_or_alloc(resource_descriptor_allocator,
-                                                    resource_update_template);
+                                                    resource_update_template, 1);
             cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout, 1,
                                       rs, nullptr);
         }
