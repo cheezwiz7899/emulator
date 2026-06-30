@@ -68,6 +68,13 @@ enum class ImageDirectoryId : u32 {
     SdCard,
 };
 
+enum class InitStage : u8 {
+    NONE,
+    SETTINGS_READY,
+    FS_READY,
+    CONTENT_READY,
+};
+
 using ProcessId = u64;
 using ProgramId = u64;
 
@@ -130,9 +137,11 @@ public:
 
     void RefreshExternalContentProvider();
 
-    // Creates the SaveData, SDMC, and BIS Factories. Should be called once and before any function
-    // above is called.
-    void CreateFactories(FileSys::VfsFilesystem& vfs, bool overwrite = true);
+    // Single public entry for creating the SaveData, SDMC, BIS, and content providers.
+    // Should be called once and before any function above is called.
+    void InitializeContentSystem(FileSys::VfsFilesystem& vfs, bool overwrite = true);
+    void SetInitStage(InitStage stage);
+    InitStage GetInitStage() const;
 
     // getter for main.cpp to trigger the sync between custom game paths for separate emulators
     FileSys::SaveDataFactory& GetSaveDataFactory() {
@@ -143,6 +152,7 @@ public:
 
 private:
     std::shared_ptr<FileSys::SaveDataFactory> CreateSaveDataFactory(ProgramId program_id);
+    void CreateFactories(FileSys::VfsFilesystem& vfs, bool overwrite);
 
     struct Registration {
         ProgramId program_id;
@@ -164,6 +174,12 @@ private:
 
     // Global factory for startup tasks and mirroring
     std::shared_ptr<FileSys::SaveDataFactory> global_save_data_factory;
+
+#ifdef ANDROID
+    InitStage init_stage{InitStage::NONE};
+#else
+    InitStage init_stage{InitStage::FS_READY};
+#endif
 
     Core::System& system;
 };

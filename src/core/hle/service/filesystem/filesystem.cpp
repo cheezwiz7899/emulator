@@ -803,45 +803,84 @@ FileSys::VirtualDir FileSystemController::GetBCATDirectory(u64 title_id) const {
     return bis_factory->GetBCATDirectory(title_id);
 }
 
+void FileSystemController::SetInitStage(InitStage stage) {
+    init_stage = stage;
+}
+
+InitStage FileSystemController::GetInitStage() const {
+    return init_stage;
+}
+
+void FileSystemController::InitializeContentSystem(FileSys::VfsFilesystem& vfs, bool overwrite) {
+    if (init_stage < InitStage::FS_READY) {
+        LOG_ERROR(Service_FS, "InitializeContentSystem called too early: init_stage={}",
+                  static_cast<u8>(init_stage));
+        return;
+    }
+
+    CreateFactories(vfs, overwrite);
+}
+
 void FileSystemController::CreateFactories(FileSys::VfsFilesystem& vfs, bool overwrite) {
-    if (overwrite) {
-        bis_factory = nullptr;
-        sdmc_factory = nullptr;
-        external_provider = nullptr;
+    if (init_stage < InitStage::FS_READY) {
+        LOG_ERROR(Service_FS, "CreateFactories called too early: init_stage={}",
+                  static_cast<u8>(init_stage));
+        return;
     }
 
     using CitronPath = Common::FS::CitronPath;
     const auto sdmc_dir_path = Common::FS::GetCitronPath(CitronPath::SDMCDir);
     const auto sdmc_load_dir_path = sdmc_dir_path / "atmosphere/contents";
     const auto rw_mode = FileSys::OpenMode::ReadWrite;
+    const auto nand_dir_path = Common::FS::GetCitronPathString(CitronPath::NANDDir);
+    const auto load_dir_path = Common::FS::GetCitronPathString(CitronPath::LoadDir);
+    const auto dump_dir_path = Common::FS::GetCitronPathString(CitronPath::DumpDir);
 
-    auto nand_directory =
-        vfs.OpenDirectory(Common::FS::GetCitronPathString(CitronPath::NANDDir), rw_mode);
+    LOG_INFO(Service_FS, "CreateFactories: overwrite={}, NANDDir={}, SDMCDir={}, LoadDir={}",
+             overwrite, nand_dir_path, Common::FS::PathToUTF8String(sdmc_dir_path), load_dir_path);
+
+    auto nand_directory = vfs.OpenDirectory(nand_dir_path, rw_mode);
     auto sd_directory = vfs.OpenDirectory(Common::FS::PathToUTF8String(sdmc_dir_path), rw_mode);
-    auto load_directory = vfs.OpenDirectory(Common::FS::GetCitronPathString(CitronPath::LoadDir),
-                                            FileSys::OpenMode::Read);
+    auto load_directory = vfs.OpenDirectory(load_dir_path, FileSys::OpenMode::Read);
     auto sd_load_directory = vfs.OpenDirectory(Common::FS::PathToUTF8String(sdmc_load_dir_path),
                                                FileSys::OpenMode::Read);
-    auto dump_directory =
-        vfs.OpenDirectory(Common::FS::GetCitronPathString(CitronPath::DumpDir), rw_mode);
+    auto dump_directory = vfs.OpenDirectory(dump_dir_path, rw_mode);
 
-    if (bis_factory == nullptr) {
-        bis_factory = std::make_unique<FileSys::BISFactory>(
+    LOG_INFO(Service_FS,
+             "CreateFactories: opened NAND={}, SDMC={}, Load={}, Dump={}",
+             nand_directory ? nand_directory->GetFullPath() : "<null>",
+             sd_directory ? sd_directory->GetFullPath() : "<null>",
+             load_directory ? load_directory->GetFullPath() : "<null>",
+             dump_directory ? dump_directory->GetFullPath() : "<null>");
+
+    std::unique_ptr<FileSys::BISFactory> new_bis_factory;
+    auto* active_bis_factory = bis_factory.get();
+    if (overwrite || active_bis_factory == nullptr) {
+        new_bis_factory = std::make_unique<FileSys::BISFactory>(
             nand_directory, std::move(load_directory), std::move(dump_directory));
-        system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::SysNAND,
-                                       bis_factory->GetSystemNANDContents());
-        system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::UserNAND,
-                                       bis_factory->GetUserNANDContents());
+        active_bis_factory = new_bis_factory.get();
     }
 
-    if (sdmc_factory == nullptr) {
-        sdmc_factory = std::make_unique<FileSys::SDMCFactory>(std::move(sd_directory),
-                                                              std::move(sd_load_directory));
-        system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::SDMC,
-                                       sdmc_factory->GetSDMCContents());
+    if (active_bis_factory != nullptr) {
+        const auto* sysnand = active_bis_factory->GetSystemNANDContents();
+        const auto* usernand = active_bis_factory->GetUserNANDContents();
+        LOG_INFO(Service_FS,
+                 "CreateFactories: prepared NAND providers, sys_entries={}, user_entries={}",
+                 sysnand ? sysnand->ListEntriesFilter().size() : 0,
+                 usernand ? usernand->ListEntriesFilter().size() : 0);
     }
 
-    if (external_provider == nullptr) {
+    std::unique_ptr<FileSys::SDMCFactory> new_sdmc_factory;
+    auto* active_sdmc_factory = sdmc_factory.get();
+    if (overwrite || active_sdmc_factory == nullptr) {
+        new_sdmc_factory = std::make_unique<FileSys::SDMCFactory>(std::move(sd_directory),
+                                                                  std::move(sd_load_directory));
+        active_sdmc_factory = new_sdmc_factory.get();
+    }
+
+    std::unique_ptr<FileSys::ExternalContentProvider> new_external_provider;
+    auto* active_external_provider = external_provider.get();
+    if (overwrite || active_external_provider == nullptr) {
         std::vector<FileSys::VirtualDir> load_dirs;
         for (const auto& path : Settings::values.external_content_dirs) {
             auto dir = vfs.OpenDirectory(path, FileSys::OpenMode::Read);
@@ -849,16 +888,36 @@ void FileSystemController::CreateFactories(FileSys::VfsFilesystem& vfs, bool ove
                 load_dirs.push_back(std::move(dir));
             }
         }
-        external_provider =
+        new_external_provider =
             std::make_unique<FileSys::ExternalContentProvider>(std::move(load_dirs));
-        system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::External,
-                                       external_provider.get());
+        active_external_provider = new_external_provider.get();
+    }
+
+    system.GetContentProviderUnion().SetSlots(
+        {{FileSys::ContentProviderUnionSlot::SysNAND,
+          active_bis_factory != nullptr ? active_bis_factory->GetSystemNANDContents() : nullptr},
+         {FileSys::ContentProviderUnionSlot::UserNAND,
+          active_bis_factory != nullptr ? active_bis_factory->GetUserNANDContents() : nullptr},
+         {FileSys::ContentProviderUnionSlot::SDMC,
+          active_sdmc_factory != nullptr ? active_sdmc_factory->GetSDMCContents() : nullptr},
+         {FileSys::ContentProviderUnionSlot::External, active_external_provider}});
+
+    if (new_bis_factory != nullptr) {
+        bis_factory = std::move(new_bis_factory);
+    }
+    if (new_sdmc_factory != nullptr) {
+        sdmc_factory = std::move(new_sdmc_factory);
+    }
+    if (new_external_provider != nullptr) {
+        external_provider = std::move(new_external_provider);
     }
 
     // factory that handles sync tasks before a game is even selected
     if (global_save_data_factory == nullptr || overwrite) {
         global_save_data_factory = CreateSaveDataFactory(ProgramId{});
     }
+
+    init_stage = InitStage::CONTENT_READY;
 }
 
 void FileSystemController::RefreshExternalContentProvider() {
@@ -871,9 +930,11 @@ void FileSystemController::RefreshExternalContentProvider() {
         }
     }
 
-    external_provider = std::make_unique<FileSys::ExternalContentProvider>(std::move(load_dirs));
+    auto new_external_provider =
+        std::make_unique<FileSys::ExternalContentProvider>(std::move(load_dirs));
     system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::External,
-                                   external_provider.get());
+                                   new_external_provider.get());
+    external_provider = std::move(new_external_provider);
 }
 
 void FileSystemController::Reset() {

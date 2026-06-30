@@ -360,7 +360,7 @@ int main(int argc, char** argv) {
 
     system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
     system.SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
-    system.GetFileSystemController().CreateFactories(*system.GetFilesystem());
+    system.GetFileSystemController().InitializeContentSystem(*system.GetFilesystem());
     system.GetUserChannel().clear();
 
     Service::AM::FrontendAppletParameters load_parameters{

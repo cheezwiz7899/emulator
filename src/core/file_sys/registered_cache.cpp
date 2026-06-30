@@ -3,8 +3,10 @@
 
 #include <algorithm>
 #include <array>
+#include <mutex>
 #include <random>
 #include <regex>
+#include <shared_mutex>
 #include <vector>
 #include <fmt/format.h>
 #include <openssl/evp.h>
@@ -71,7 +73,7 @@ static bool FollowsNcaIdFormat(std::string_view name) {
 static std::string GetRelativePathFromNcaID(const std::array<u8, 16>& nca_id, bool second_hex_upper,
                                             bool within_two_digit, bool cnmt_suffix) {
     if (!within_two_digit) {
-        const auto format_str = fmt::runtime(cnmt_suffix ? "{}.cnmt.nca" : "/{}.nca");
+        const auto format_str = fmt::runtime(cnmt_suffix ? "/{}.cnmt.nca" : "/{}.nca");
         return fmt::format(format_str, Common::HexToString(nca_id, second_hex_upper));
     }
 
@@ -424,32 +426,87 @@ std::vector<NcaID> RegisteredCache::AccumulateFiles() const {
     return ids;
 }
 
-void RegisteredCache::ProcessFiles(const std::vector<NcaID>& ids) {
+void RegisteredCache::ProcessFiles(const std::vector<NcaID>& ids, std::map<u64, CNMT>& out_meta,
+                                   std::map<u64, NcaID>& out_meta_id) const {
     for (const auto& id : ids) {
         const auto file = GetFileAtID(id);
 
-        if (file == nullptr)
+        if (file == nullptr) {
+            LOG_WARNING(Service_FS, "RegisteredCache ProcessFiles: missing file for nca_id={}",
+                        Common::HexToString(id, false));
             continue;
+        }
         const auto nca = std::make_shared<NCA>(parser(file, id));
-        if (nca->GetStatus() != Loader::ResultStatus::Success ||
-            nca->GetType() != NCAContentType::Meta || nca->GetSubdirectories().empty()) {
+        if (nca->GetStatus() != Loader::ResultStatus::Success) {
+            LOG_WARNING(Service_FS,
+                        "RegisteredCache ProcessFiles: failed nca_id={}, status={}",
+                        Common::HexToString(id, false), static_cast<u16>(nca->GetStatus()));
+            continue;
+        }
+
+        const auto nca_type = nca->GetType();
+        if (nca_type != NCAContentType::Meta) {
+            LOG_INFO(Service_FS,
+                     "RegisteredCache ProcessFiles: skipped non-meta nca_id={}, title_id={:016X}, "
+                     "type={:02X}",
+                     Common::HexToString(id, false), nca->GetTitleId(), static_cast<u32>(nca_type));
+            continue;
+        }
+
+        if (nca->GetSubdirectories().empty()) {
+            LOG_WARNING(Service_FS,
+                        "RegisteredCache ProcessFiles: meta has no sections nca_id={}, "
+                        "title_id={:016X}",
+                        Common::HexToString(id, false), nca->GetTitleId());
             continue;
         }
 
         const auto section0 = nca->GetSubdirectories()[0];
+        bool found_cnmt = false;
 
         for (const auto& section0_file : section0->GetFiles()) {
             if (section0_file->GetExtension() != "cnmt")
                 continue;
 
-            meta.insert_or_assign(nca->GetTitleId(), CNMT(section0_file));
-            meta_id.insert_or_assign(nca->GetTitleId(), id);
+            CNMT cnmt(section0_file);
+            const auto title_id = cnmt.GetTitleID();
+            LOG_INFO(Service_FS,
+                     "RegisteredCache ProcessFiles: parsed meta nca_id={}, nca_title_id={:016X}, "
+                     "cnmt_title_id={:016X}, title_type={:02X}, records={}",
+                     Common::HexToString(id, false), nca->GetTitleId(), title_id,
+                     static_cast<u32>(cnmt.GetType()), cnmt.GetContentRecords().size());
+
+            if (cnmt.GetType() == TitleType::AOC || cnmt.GetType() == TitleType::Update) {
+                const auto& content_records = cnmt.GetContentRecords();
+                for (std::size_t record_index = 0; record_index < content_records.size();
+                     ++record_index) {
+                    const auto& record = content_records[record_index];
+                    LOG_INFO(Service_FS,
+                             "RegisteredCache ProcessFiles: meta record title_id={:016X}, "
+                             "record_index={}, record_type={:02X}, record_nca_id={}, "
+                             "record_file_found={}",
+                             title_id, record_index, static_cast<u32>(record.type),
+                             Common::HexToString(record.nca_id, false),
+                             GetFileAtID(record.nca_id) != nullptr);
+                }
+            }
+
+            out_meta.insert_or_assign(title_id, std::move(cnmt));
+            out_meta_id.insert_or_assign(title_id, id);
+            found_cnmt = true;
             break;
+        }
+
+        if (!found_cnmt) {
+            LOG_WARNING(Service_FS,
+                        "RegisteredCache ProcessFiles: meta section lacks cnmt nca_id={}, "
+                        "title_id={:016X}",
+                        Common::HexToString(id, false), nca->GetTitleId());
         }
     }
 }
 
-void RegisteredCache::AccumulateCitronMeta() {
+void RegisteredCache::AccumulateCitronMeta(std::map<u64, CNMT>& out_citron_meta) const {
     const auto meta_dir = dir->GetSubdirectory("citron_meta");
     if (meta_dir == nullptr) {
         return;
@@ -461,7 +518,7 @@ void RegisteredCache::AccumulateCitronMeta() {
         }
 
         CNMT cnmt(file);
-        citron_meta.insert_or_assign(cnmt.GetTitleID(), std::move(cnmt));
+        out_citron_meta.insert_or_assign(cnmt.GetTitleID(), std::move(cnmt));
     }
 }
 
@@ -471,8 +528,20 @@ void RegisteredCache::Refresh() {
     }
 
     const auto ids = AccumulateFiles();
-    ProcessFiles(ids);
-    AccumulateCitronMeta();
+    std::map<u64, CNMT> new_meta;
+    std::map<u64, NcaID> new_meta_id;
+    std::map<u64, CNMT> new_citron_meta;
+
+    ProcessFiles(ids, new_meta, new_meta_id);
+    AccumulateCitronMeta(new_citron_meta);
+
+    meta.swap(new_meta);
+    meta_id.swap(new_meta_id);
+    citron_meta.swap(new_citron_meta);
+
+    LOG_INFO(Service_FS,
+             "RegisteredCache refreshed: path={}, nca_ids={}, meta_entries={}, citron_meta={}",
+             dir->GetFullPath(), ids.size(), meta.size(), citron_meta.size());
 }
 
 RegisteredCache::RegisteredCache(VirtualDir dir_, ContentProviderParsingFunction parsing_function)
@@ -846,6 +915,7 @@ bool RegisteredCache::RawInstallCitronMeta(const CNMT& cnmt) {
 ContentProviderUnion::~ContentProviderUnion() = default;
 
 const ExternalContentProvider* ContentProviderUnion::GetExternalProvider() const {
+    std::shared_lock lock{providers_mutex};
     auto it = providers.find(ContentProviderUnionSlot::External);
     if (it != providers.end()) {
         return static_cast<const ExternalContentProvider*>(it->second);
@@ -854,6 +924,7 @@ const ExternalContentProvider* ContentProviderUnion::GetExternalProvider() const
 }
 
 const ContentProvider* ContentProviderUnion::GetSlotProvider(ContentProviderUnionSlot slot) const {
+    std::shared_lock lock{providers_mutex};
     auto it = providers.find(slot);
     if (it != providers.end()) {
         return it->second;
@@ -862,14 +933,25 @@ const ContentProvider* ContentProviderUnion::GetSlotProvider(ContentProviderUnio
 }
 
 void ContentProviderUnion::SetSlot(ContentProviderUnionSlot slot, ContentProvider* provider) {
+    std::unique_lock lock{providers_mutex};
     providers[slot] = provider;
 }
 
+void ContentProviderUnion::SetSlots(
+    std::initializer_list<std::pair<ContentProviderUnionSlot, ContentProvider*>> slots) {
+    std::unique_lock lock{providers_mutex};
+    for (const auto& [slot, provider] : slots) {
+        providers[slot] = provider;
+    }
+}
+
 void ContentProviderUnion::ClearSlot(ContentProviderUnionSlot slot) {
+    std::unique_lock lock{providers_mutex};
     providers[slot] = nullptr;
 }
 
 void ContentProviderUnion::Refresh() {
+    std::unique_lock lock{providers_mutex};
     for (auto& provider : providers) {
         if (provider.second == nullptr)
             continue;
@@ -879,6 +961,7 @@ void ContentProviderUnion::Refresh() {
 }
 
 bool ContentProviderUnion::HasEntry(u64 title_id, ContentRecordType type) const {
+    std::shared_lock lock{providers_mutex};
     for (const auto& provider : providers) {
         if (provider.second == nullptr)
             continue;
@@ -891,6 +974,7 @@ bool ContentProviderUnion::HasEntry(u64 title_id, ContentRecordType type) const 
 }
 
 std::optional<u32> ContentProviderUnion::GetEntryVersion(u64 title_id) const {
+    std::shared_lock lock{providers_mutex};
     for (const auto& provider : providers) {
         if (provider.second == nullptr)
             continue;
@@ -904,6 +988,7 @@ std::optional<u32> ContentProviderUnion::GetEntryVersion(u64 title_id) const {
 }
 
 VirtualFile ContentProviderUnion::GetEntryUnparsed(u64 title_id, ContentRecordType type) const {
+    std::shared_lock lock{providers_mutex};
     for (const auto& provider : providers) {
         if (provider.second == nullptr)
             continue;
@@ -917,6 +1002,7 @@ VirtualFile ContentProviderUnion::GetEntryUnparsed(u64 title_id, ContentRecordTy
 }
 
 VirtualFile ContentProviderUnion::GetEntryRaw(u64 title_id, ContentRecordType type) const {
+    std::shared_lock lock{providers_mutex};
     for (const auto& provider : providers) {
         if (provider.second == nullptr)
             continue;
@@ -930,6 +1016,7 @@ VirtualFile ContentProviderUnion::GetEntryRaw(u64 title_id, ContentRecordType ty
 }
 
 std::unique_ptr<NCA> ContentProviderUnion::GetEntry(u64 title_id, ContentRecordType type) const {
+    std::shared_lock lock{providers_mutex};
     for (const auto& provider : providers) {
         if (provider.second == nullptr)
             continue;
@@ -947,6 +1034,7 @@ std::vector<ContentProviderEntry> ContentProviderUnion::ListEntriesFilter(
     std::optional<u64> title_id) const {
     std::vector<ContentProviderEntry> out;
 
+    std::shared_lock lock{providers_mutex};
     for (const auto& provider : providers) {
         if (provider.second == nullptr)
             continue;
@@ -967,6 +1055,7 @@ ContentProviderUnion::ListEntriesFilterOrigin(std::optional<ContentProviderUnion
                                               std::optional<u64> title_id) const {
     std::vector<std::pair<ContentProviderUnionSlot, ContentProviderEntry>> out;
 
+    std::shared_lock lock{providers_mutex};
     for (const auto& provider : providers) {
         if (provider.second == nullptr)
             continue;
@@ -988,6 +1077,7 @@ ContentProviderUnion::ListEntriesFilterOrigin(std::optional<ContentProviderUnion
 
 std::optional<ContentProviderUnionSlot> ContentProviderUnion::GetSlotForEntry(
     u64 title_id, ContentRecordType type) const {
+    std::shared_lock lock{providers_mutex};
     const auto iter =
         std::find_if(providers.begin(), providers.end(), [title_id, type](const auto& provider) {
             return provider.second != nullptr && provider.second->HasEntry(title_id, type);
@@ -998,6 +1088,29 @@ std::optional<ContentProviderUnionSlot> ContentProviderUnion::GetSlotForEntry(
     }
 
     return iter->first;
+}
+
+VirtualFile ContentProviderUnion::GetExternalEntryForVersion(u64 title_id, ContentRecordType type,
+                                                             u32 version) const {
+    std::shared_lock lock{providers_mutex};
+    auto it = providers.find(ContentProviderUnionSlot::External);
+    if (it == providers.end() || it->second == nullptr) {
+        return nullptr;
+    }
+
+    return static_cast<const ExternalContentProvider*>(it->second)
+        ->GetEntryForVersion(title_id, type, version);
+}
+
+std::vector<ExternalUpdateEntry> ContentProviderUnion::ListExternalUpdateVersions(
+    u64 title_id) const {
+    std::shared_lock lock{providers_mutex};
+    auto it = providers.find(ContentProviderUnionSlot::External);
+    if (it == providers.end() || it->second == nullptr) {
+        return {};
+    }
+
+    return static_cast<const ExternalContentProvider*>(it->second)->ListUpdateVersions(title_id);
 }
 
 ManualContentProvider::~ManualContentProvider() = default;

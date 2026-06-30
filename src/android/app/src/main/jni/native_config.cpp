@@ -12,10 +12,23 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "frontend_common/config.h"
+#include "core/hle/service/filesystem/filesystem.h"
 #include "native.h"
 
 std::unique_ptr<AndroidConfig> global_config;
 std::unique_ptr<AndroidConfig> per_game_config;
+
+namespace {
+
+void SetFilesystemInitStage(Service::FileSystem::InitStage stage) {
+    EmulationSession::GetInstance().SetFilesystemInitStage(stage);
+}
+
+void PromoteFilesystemInitStage(Service::FileSystem::InitStage stage) {
+    EmulationSession::GetInstance().PromoteFilesystemInitStage(stage);
+}
+
+} // namespace
 
 template <typename T>
 Settings::Setting<T>* getSetting(JNIEnv* env, jstring jkey) {
@@ -36,14 +49,17 @@ extern "C" {
 
 void Java_org_citron_citron_1emu_utils_NativeConfig_initializeGlobalConfig(JNIEnv* env, jobject obj) {
     global_config = std::make_unique<AndroidConfig>();
+    PromoteFilesystemInitStage(Service::FileSystem::InitStage::SETTINGS_READY);
 }
 
 void Java_org_citron_citron_1emu_utils_NativeConfig_unloadGlobalConfig(JNIEnv* env, jobject obj) {
     global_config.reset();
+    SetFilesystemInitStage(Service::FileSystem::InitStage::NONE);
 }
 
 void Java_org_citron_citron_1emu_utils_NativeConfig_reloadGlobalConfig(JNIEnv* env, jobject obj) {
     global_config->AndroidConfig::ReloadAllValues();
+    PromoteFilesystemInitStage(Service::FileSystem::InitStage::SETTINGS_READY);
 }
 
 void Java_org_citron_citron_1emu_utils_NativeConfig_saveGlobalConfig(JNIEnv* env, jobject obj) {

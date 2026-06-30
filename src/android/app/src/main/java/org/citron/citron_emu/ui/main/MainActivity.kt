@@ -681,8 +681,8 @@ class MainActivity : AppCompatActivity(), ThemeProvider {
                 }
 
                 // Reinitialize relevant data
-                NativeLibrary.initializeSystem(true)
                 NativeConfig.initializeGlobalConfig()
+                NativeLibrary.initializeSystem(true)
                 gamesViewModel.reloadGames(false)
                 driverViewModel.reloadDriverData()
 

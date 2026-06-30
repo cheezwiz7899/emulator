@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 citron Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cinttypes>
 #include <cstring>
 #include <iterator>
@@ -16,12 +17,14 @@
 #include "common/settings.h"
 #include "common/string_util.h"
 #include "core/core.h"
+#include "core/file_sys/common_funcs.h"
 #include "core/file_sys/content_archive.h"
 #include "core/file_sys/errors.h"
 #include "core/file_sys/fs_directory.h"
 #include "core/file_sys/fs_filesystem.h"
 #include "core/file_sys/nca_metadata.h"
 #include "core/file_sys/patch_manager.h"
+#include "core/file_sys/registered_cache.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/romfs_factory.h"
 #include "core/file_sys/savedata_factory.h"
@@ -48,6 +51,21 @@
 #include "core/reporter.h"
 
 namespace Service::FileSystem {
+
+static std::vector<u64> GetAOCPhysicalTitleIDsForBase(const FileSys::ContentProvider& content_provider,
+                                                      u64 base) {
+    std::vector<u64> out;
+    const auto entries =
+        content_provider.ListEntriesFilter(FileSys::TitleType::AOC, FileSys::ContentRecordType::Data);
+    for (const auto& entry : entries) {
+        if (FileSys::GetBaseTitleID(entry.title_id) == base) {
+            out.push_back(entry.title_id);
+        }
+    }
+
+    std::sort(out.begin(), out.end());
+    return out;
+}
 
 FSP_SRV::FSP_SRV(Core::System& system_)
     : ServiceFramework{system_, "fsp-srv"}, fsc{system.GetFileSystemController()},
@@ -490,10 +508,35 @@ Result FSP_SRV::OpenDataStorageByCurrentProcess(OutInterface<IStorage> out_inter
 
 Result FSP_SRV::OpenDataStorageByDataId(OutInterface<IStorage> out_interface,
                                         FileSys::StorageId storage_id, u32 unknown, u64 title_id) {
-    LOG_DEBUG(Service_FS, "called with storage_id={:02X}, unknown={:08X}, title_id={:016X}",
-              storage_id, unknown, title_id);
+    LOG_WARNING(Service_FS,
+                "OpenDataStorageByDataId called with storage_id={:02X}, unknown={:08X}, "
+                "title_id={:016X}",
+                storage_id, unknown, title_id);
 
-    auto data = romfs_controller->OpenRomFS(title_id, storage_id, FileSys::ContentRecordType::Data);
+    u64 resolved_title_id = title_id;
+    const auto requested_base = FileSys::GetBaseTitleID(title_id);
+    const auto requested_aoc_base = FileSys::GetAOCBaseTitleID(title_id);
+    const auto requested_aoc_id = FileSys::GetAOCID(title_id);
+    const auto requested_is_aoc =
+        requested_aoc_id > 0 && title_id >= requested_aoc_base &&
+        title_id <= requested_aoc_base + FileSys::AOC_TITLE_ID_MASK;
+    std::vector<u64> matching_aocs;
+
+    if (requested_is_aoc) {
+        matching_aocs = GetAOCPhysicalTitleIDsForBase(content_provider, requested_base);
+        if (requested_aoc_id <= matching_aocs.size()) {
+            resolved_title_id = matching_aocs[static_cast<std::size_t>(requested_aoc_id) - 1];
+            if (resolved_title_id != title_id) {
+                LOG_WARNING(Service_FS,
+                            "OpenDataStorageByDataId resolved AOC guest index: "
+                            "requested_title_id={:016X}, guest_index={}, physical_title_id={:016X}",
+                            title_id, requested_aoc_id, resolved_title_id);
+            }
+        }
+    }
+
+    auto data =
+        romfs_controller->OpenRomFS(resolved_title_id, storage_id, FileSys::ContentRecordType::Data);
 
     if (!data) {
         const auto archive = FileSys::SystemArchive::SynthesizeSystemArchive(title_id);
@@ -503,16 +546,43 @@ Result FSP_SRV::OpenDataStorageByDataId(OutInterface<IStorage> out_interface,
             R_SUCCEED();
         }
 
+        if (requested_is_aoc) {
+            std::size_t matching_aoc_count = 0;
+            for (const auto entry_title_id : matching_aocs) {
+                ++matching_aoc_count;
+                LOG_WARNING(Service_FS,
+                            "OpenDataStorageByDataId miss context: installed_aoc_index={}, "
+                            "installed_title_id={:016X}",
+                            matching_aoc_count, entry_title_id);
+            }
+
+            LOG_WARNING(Service_FS,
+                        "OpenDataStorageByDataId AOC miss: requested_base={:016X}, "
+                        "requested_aoc_base={:016X}, requested_aoc_index={}, "
+                        "resolved_title_id={:016X}, matching_installed_aoc_count={}",
+                        requested_base, requested_aoc_base, requested_aoc_id, resolved_title_id,
+                        matching_aoc_count);
+        }
+
         LOG_ERROR(Service_FS,
                   "Could not open data storage with title_id={:016X}, storage_id={:02X}", title_id,
                   storage_id);
         R_RETURN(FileSys::ResultTargetNotFound);
     }
 
-    const FileSys::PatchManager pm{title_id, fsc, content_provider};
+    const auto opened_aoc_base = FileSys::GetAOCBaseTitleID(title_id);
+    if (title_id >= opened_aoc_base && title_id <= opened_aoc_base + FileSys::AOC_TITLE_ID_MASK) {
+        LOG_WARNING(Service_FS,
+                    "OpenDataStorageByDataId opened AOC: base={:016X}, addon_index={}, "
+                    "requested_title_id={:016X}, physical_title_id={:016X}",
+                    FileSys::GetBaseTitleID(title_id), FileSys::GetAOCID(title_id), title_id,
+                    resolved_title_id);
+    }
+
+    const FileSys::PatchManager pm{resolved_title_id, fsc, content_provider};
 
     auto base =
-        romfs_controller->OpenBaseNca(title_id, storage_id, FileSys::ContentRecordType::Data);
+        romfs_controller->OpenBaseNca(resolved_title_id, storage_id, FileSys::ContentRecordType::Data);
     auto storage = std::make_shared<IStorage>(
         system, pm.PatchRomFS(base.get(), std::move(data), FileSys::ContentRecordType::Data));
 

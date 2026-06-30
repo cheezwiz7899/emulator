@@ -71,7 +71,7 @@ Services::Services(std::shared_ptr<SM::ServiceManager>& sm, Core::System& system
                    std::stop_token token) {
     auto& kernel = system.Kernel();
 
-    system.GetFileSystemController().CreateFactories(*system.GetFilesystem(), false);
+    system.GetFileSystemController().InitializeContentSystem(*system.GetFilesystem(), false);
 
     // clang-format off
     kernel.RunOnHostCoreProcess("audio",      [&] { Audio::LoopProcess(system); }).detach();

@@ -195,6 +195,10 @@ void NSP::SetTicketKeys(const std::vector<VirtualFile>& files) {
             LOG_WARNING(Common_Filesystem, "Could not load NSP ticket {}", ticket_file->GetName());
             continue;
         }
+        if (!keys.PersistTicket(ticket)) {
+            LOG_WARNING(Common_Filesystem, "Could not persist NSP ticket {}",
+                        ticket_file->GetName());
+        }
     }
 }
 

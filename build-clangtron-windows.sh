@@ -2208,7 +2208,8 @@ stage_generate() {
         pgo_gen_flag="-fprofile-instr-generate=default-%p.profraw"
     fi
     local debug_flag=""
-    [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && debug_flag="-g"
+    # -gcodeview: see stage_use for why plain -g isn't enough on this MinGW target.
+    [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && debug_flag="-g -gcodeview"
     local c_flags="-O3 -DNDEBUG ${debug_flag} ${pgo_gen_flag}${lto_generate_flag:+ ${lto_generate_flag}}"
     local cxx_flags="${c_flags}"
 
@@ -2216,6 +2217,21 @@ stage_generate() {
     # -u,__llvm_profile_write_file: pulls InstrProfilingFile.o (write logic)
     # -u,__llvm_profile_runtime: pulls InstrProfilingRuntime.o whose constructor
 #   initializes __llvm_profile_write_file_internal.
+    # --pdb= (not -DEBUG/-Wl,-DEBUG, not /DEBUG): the MinGW driver invoked by
+    # -fuse-ld=lld on this target doesn't recognize -DEBUG at all (separate
+    # option table from lld-link) -- see stage_use's no-PGO block for the
+    # full explanation. --pdb is its actual recognized flag; empty value
+    # means auto-name the PDB per binary (this flag is shared across
+    # several executables built in this stage).
+    # --threads=1: combining --pdb= with -flto enables a known LLD COFF
+    # deadlock between PDB type/symbol-record merge threads and parallel LTO
+    # backend codegen threads (manifests as three ld.lld processes stuck at
+    # low CPU % indefinitely). --threads=N is the MinGW driver's own spelling
+    # of this option (per LLVM D76885); /threads:N is the COFF/lld-link form.
+    # Unlike order/ignore, "threads" IS in the MinGW driver's option table, so
+    # it does NOT need -Xlink= wrapping. Slower link, but only RelWithDebInfo.
+    local linker_debug_flag=""
+    [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && linker_debug_flag="-Wl,--pdb= -Wl,--threads=1"
     local extra_link_flags="-Wl,-u,__llvm_profile_write_file,-u,__llvm_profile_runtime"
 
     # Qt via aqt
@@ -2299,7 +2315,7 @@ stage_generate() {
         "-DCITRON_ENABLE_LTO=${generate_lto_cmake}"
         "-DCMAKE_C_FLAGS_${bt_upper}=${c_flags}"
         "-DCMAKE_CXX_FLAGS_${bt_upper}=${cxx_flags}"
-        "-DCMAKE_EXE_LINKER_FLAGS_${bt_upper}=${c_flags} ${PROFILE_RUNTIME_LIB:+${PROFILE_RUNTIME_LIB}} ${extra_link_flags}"
+        "-DCMAKE_EXE_LINKER_FLAGS_${bt_upper}=${c_flags} ${PROFILE_RUNTIME_LIB:+${PROFILE_RUNTIME_LIB}} ${extra_link_flags} ${linker_debug_flag}"
         "-DCITRON_PGO_PROFILE_DIR=${PROFILE_DIR}"
     )
     cmake "${SOURCE_DIR}" "${_CMAKE_ARGS[@]}" \
@@ -2532,7 +2548,8 @@ stage_csgenerate() {
     local cs_gen_flag="-fcs-profile-generate=cs-default-%p.profraw"
     local pgo_use_flag="-fprofile-use=\"${stage1_pd_compiler}\""
     local debug_flag=""
-    [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && debug_flag="-g"
+    # -gcodeview: see stage_use for why plain -g isn't enough on this MinGW target.
+    [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && debug_flag="-g -gcodeview"
     local c_flags="-O3 -DNDEBUG ${debug_flag} ${pgo_use_flag} ${cs_gen_flag}${lto_generate_flag:+ ${lto_generate_flag}}"
     local cxx_flags="${c_flags}"
     local bt_upper; bt_upper=$(echo "${BUILD_TYPE}" | tr '[:lower:]' '[:upper:]')
@@ -2543,6 +2560,21 @@ stage_csgenerate() {
     # lives in archived libraries that are not directly referenced from main().
     # -u,__llvm_profile_runtime ensures InstrProfilingRuntime.o's constructor
     # fires on startup, initializing the write-file machinery.
+    # --pdb= (not -DEBUG/-Wl,-DEBUG, not /DEBUG): the MinGW driver invoked by
+    # -fuse-ld=lld on this target doesn't recognize -DEBUG at all (separate
+    # option table from lld-link) -- see stage_use's no-PGO block for the
+    # full explanation. --pdb is its actual recognized flag; empty value
+    # means auto-name the PDB per binary (this flag is shared across
+    # several executables built in this stage).
+    # --threads=1: combining --pdb= with -flto enables a known LLD COFF
+    # deadlock between PDB type/symbol-record merge threads and parallel LTO
+    # backend codegen threads (manifests as three ld.lld processes stuck at
+    # low CPU % indefinitely). --threads=N is the MinGW driver's own spelling
+    # of this option (per LLVM D76885); /threads:N is the COFF/lld-link form.
+    # Unlike order/ignore, "threads" IS in the MinGW driver's option table, so
+    # it does NOT need -Xlink= wrapping. Slower link, but only RelWithDebInfo.
+    local linker_debug_flag=""
+    [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && linker_debug_flag="-Wl,--pdb= -Wl,--threads=1"
     local extra_link_flags="-Wl,-u,__llvm_profile_write_file,-u,__llvm_profile_runtime"
 
     ensure_profile_runtime_mingw
@@ -2576,7 +2608,7 @@ stage_csgenerate() {
         "-DCITRON_ENABLE_LTO=${generate_lto_cmake}"
         "-DCMAKE_C_FLAGS_RELEASE=${c_flags}"
         "-DCMAKE_CXX_FLAGS_RELEASE=${cxx_flags}"
-        "-DCMAKE_EXE_LINKER_FLAGS_RELEASE=${c_flags} ${PROFILE_RUNTIME_LIB:+${PROFILE_RUNTIME_LIB}} ${extra_link_flags}"
+        "-DCMAKE_EXE_LINKER_FLAGS_RELEASE=${c_flags} ${PROFILE_RUNTIME_LIB:+${PROFILE_RUNTIME_LIB}} ${extra_link_flags} ${linker_debug_flag}"
         "-DCITRON_PGO_PROFILE_DIR=${PROFILE_DIR}"
     )
     cmake "${SOURCE_DIR}" "${_CMAKE_ARGS[@]}" \
@@ -2810,7 +2842,28 @@ stage_use() {
         [[ -n "${qt_host_dir}" ]] && info "Qt host dir:         ${qt_host_dir}"
 
         local debug_flag=""
-        [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && debug_flag="-g"
+        # -gcodeview (not just -g): on x86_64-w64-mingw32, clang defaults to DWARF
+        # debug info even with lld-link as the linker. Without -gcodeview, lld-link
+        # has nothing CodeView-formatted to convert, and emits no .pdb at all.
+        [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && debug_flag="-g -gcodeview"
+        local linker_debug_flag=""
+        # --pdb= (not -DEBUG/-Wl,-DEBUG, and not /DEBUG): -fuse-ld=lld on this
+        # x86_64-w64-mingw32 target invokes LLD's MinGW driver, not lld-link
+        # directly. That driver has its own small option table and translates
+        # a few of its own flags into "-debug -pdb:<path>" internally for the
+        # real COFF linker — but -DEBUG itself isn't in that table, so passing
+        # it directly fails with "unknown argument: -DEBUG".
+        # --pdb is the MinGW driver's own recognized flag; an empty value
+        # (the trailing "=") makes it name the PDB after each output binary
+        # automatically, which matters since this flag is shared across
+        # shader_tool.exe/citron-room.exe/citron-cmd.exe/citron.exe.
+        # --threads=1: combining --pdb= with -flto triggers a known LLD COFF
+        # deadlock between PDB type/symbol-record merge threads and parallel
+        # LTO backend codegen threads — manifests as ld.lld stuck at low CPU
+        # indefinitely. --threads=N is the MinGW driver's own recognized
+        # spelling (LLVM D76885); unlike order/ignore, it does NOT need
+        # -Xlink= wrapping. Slower link, but only affects RelWithDebInfo.
+        [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && linker_debug_flag="-Wl,--pdb= -Wl,--threads=1"
         local bt_upper; bt_upper=$(echo "${BUILD_TYPE}" | tr '[:lower:]' '[:upper:]')
         local lto_flag; lto_flag="$(lto_clang_flag)"
 
@@ -2829,6 +2882,7 @@ stage_use() {
             "-DCITRON_PGO_FLAGS_MANAGED_BY_SCRIPT=ON"
             "-DCMAKE_C_FLAGS_${bt_upper}=-O3 -DNDEBUG ${debug_flag} ${lto_flag}"
             "-DCMAKE_CXX_FLAGS_${bt_upper}=-O3 -DNDEBUG ${debug_flag} ${lto_flag}"
+            "-DCMAKE_EXE_LINKER_FLAGS_${bt_upper}=${linker_debug_flag}"
         )
         [[ -n "${qt6_cmake_dir}" ]] && _CMAKE_ARGS+=("-DQt6_DIR=${qt6_cmake_dir}")
         [[ -n "${qt_host_dir}"   ]] && _CMAKE_ARGS+=("-DQT_HOST_PATH=${qt_host_dir}")
@@ -3002,7 +3056,23 @@ stage_use() {
     # --emit-relocs flag for the ELF-proxy BOLT path.
 
     local debug_flag=""
-    [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && debug_flag="-g"
+    # -gcodeview: see the no-PGO block above for why plain -g isn't enough here.
+    [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && debug_flag="-g -gcodeview"
+    local linker_debug_flag=""
+    # --pdb= (not -DEBUG/-Wl,-DEBUG, not /DEBUG): the MinGW driver invoked by
+    # -fuse-ld=lld on this target doesn't recognize -DEBUG at all (separate
+    # option table from lld-link) -- see stage_use's no-PGO block for the
+    # full explanation. --pdb is its actual recognized flag; empty value
+    # means auto-name the PDB per binary (this flag is shared across
+    # several executables built in this stage).
+    # --threads=1: combining --pdb= with -flto enables a known LLD COFF
+    # deadlock between PDB type/symbol-record merge threads and parallel LTO
+    # backend codegen threads (manifests as three ld.lld processes stuck at
+    # low CPU % indefinitely). --threads=N is the MinGW driver's own spelling
+    # of this option (per LLVM D76885); /threads:N is the COFF/lld-link form.
+    # Unlike order/ignore, "threads" IS in the MinGW driver's option table, so
+    # it does NOT need -Xlink= wrapping. Slower link, but only RelWithDebInfo.
+    [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && linker_debug_flag="-Wl,--pdb= -Wl,--threads=1"
     local bt_upper; bt_upper=$(echo "${BUILD_TYPE}" | tr '[:lower:]' '[:upper:]')
     build_common_cmake_args
     _CMAKE_ARGS+=(
@@ -3010,7 +3080,7 @@ stage_use() {
         "-DCITRON_PGO_FLAGS_MANAGED_BY_SCRIPT=ON"
         "-DCMAKE_C_FLAGS_${bt_upper}=-O3 -DNDEBUG ${debug_flag} ${lto_pgo_flag}"
         "-DCMAKE_CXX_FLAGS_${bt_upper}=-O3 -DNDEBUG ${debug_flag} ${lto_pgo_flag}"
-        "-DCMAKE_EXE_LINKER_FLAGS_${bt_upper}=-O3 -DNDEBUG ${debug_flag} ${lto_pgo_flag}"
+        "-DCMAKE_EXE_LINKER_FLAGS_${bt_upper}=-O3 -DNDEBUG ${debug_flag} ${lto_pgo_flag} ${linker_debug_flag}"
         "-DCITRON_PGO_PROFILE_DIR=${PROFILE_DIR}"
     )
     [[ -n "${qt6_cmake_dir}" ]] && _CMAKE_ARGS+=("-DQt6_DIR=${qt6_cmake_dir}")
@@ -3837,7 +3907,23 @@ BOLT_ORDER_EOF
     # LTO on top — PGO profiles and BOLT ordering are already baked in,
     # and full LTO's whole-program inlining yields better runtime performance.
     local debug_flag=""
-    [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && debug_flag="-g"
+    # -gcodeview: see stage_use for why plain -g isn't enough on this MinGW target.
+    [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && debug_flag="-g -gcodeview"
+    local linker_debug_flag=""
+    # --pdb= (not -DEBUG/-Wl,-DEBUG, not /DEBUG): the MinGW driver invoked by
+    # -fuse-ld=lld on this target doesn't recognize -DEBUG at all (separate
+    # option table from lld-link) -- see stage_use's no-PGO block for the
+    # full explanation. --pdb is its actual recognized flag; empty value
+    # means auto-name the PDB per binary (this flag is shared across
+    # several executables built in this stage).
+    # --threads=1: combining --pdb= with -flto enables a known LLD COFF
+    # deadlock between PDB type/symbol-record merge threads and parallel LTO
+    # backend codegen threads (manifests as three ld.lld processes stuck at
+    # low CPU % indefinitely). --threads=N is the MinGW driver's own spelling
+    # of this option (per LLVM D76885); /threads:N is the COFF/lld-link form.
+    # Unlike order/ignore, "threads" IS in the MinGW driver's option table, so
+    # it does NOT need -Xlink= wrapping. Slower link, but only RelWithDebInfo.
+    [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && linker_debug_flag="-Wl,--pdb= -Wl,--threads=1"
     local bt_upper; bt_upper=$(echo "${BUILD_TYPE}" | tr '[:lower:]' '[:upper:]')
     local lto_flag; lto_flag="$(lto_clang_flag)"
     local _bolt_merged="${PROFILE_DIR}/merged.profdata"
@@ -3863,7 +3949,16 @@ BOLT_ORDER_EOF
     #   the three executables that share CMAKE_EXE_LINKER_FLAGS_RELEASE.
     local order_linker_flag=""
     if [[ -n "${order_file}" ]]; then
-        order_linker_flag="-Wl,/order:@${order_file} -Wl,/ignore:4037"
+        # -Xlink=<arg>: the MinGW driver invoked by -fuse-ld=lld on this target
+        # doesn't recognize "order" or "ignore" in its own option table at all
+        # (unlike --pdb, which it does) — passing -Wl,-order:... directly fails
+        # with "unknown argument", same failure mode as the -DEBUG issue above.
+        # -Xlink is its documented escape hatch for passing a flag straight
+        # through to the underlying COFF linker (lld-link), which does
+        # understand /order and /ignore. This also sidesteps MSYS2's path
+        # mangling for free: the token starts with "-Xlink=", not "/", so the
+        # embedded "/order:..." is never a leading character MSYS2 rewrites.
+        order_linker_flag="-Wl,-Xlink=/order:@${order_file} -Wl,-Xlink=/ignore:4037"
     fi
 
     local qt_install_dir="${BUILD_GENERATE}/externals/qt/6.9.3/llvm-mingw_64"
@@ -3884,7 +3979,7 @@ BOLT_ORDER_EOF
         "-DCITRON_PGO_FLAGS_MANAGED_BY_SCRIPT=ON"
         "-DCMAKE_C_FLAGS_${bt_upper}=-O3 -DNDEBUG ${debug_flag} ${lto_pgo_flag}"
         "-DCMAKE_CXX_FLAGS_${bt_upper}=-O3 -DNDEBUG ${debug_flag} ${lto_pgo_flag}"
-        "-DCMAKE_EXE_LINKER_FLAGS_${bt_upper}=-O3 -DNDEBUG ${debug_flag} ${lto_pgo_flag}${order_linker_flag:+ ${order_linker_flag}}"
+        "-DCMAKE_EXE_LINKER_FLAGS_${bt_upper}=-O3 -DNDEBUG ${debug_flag} ${lto_pgo_flag}${order_linker_flag:+ ${order_linker_flag}} ${linker_debug_flag}"
         "-DCITRON_PGO_PROFILE_DIR=${PROFILE_DIR}"
     )
     [[ -n "${qt6_cmake_dir}" ]] && _CMAKE_ARGS+=("-DQt6_DIR=${qt6_cmake_dir}")
@@ -4310,7 +4405,23 @@ stage_propeller() {
 
 
     local debug_flag=""
-    [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && debug_flag="-g"
+    # -gcodeview: see stage_use for why plain -g isn't enough on this MinGW target.
+    [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && debug_flag="-g -gcodeview"
+    local linker_debug_flag=""
+    # --pdb= (not -DEBUG/-Wl,-DEBUG, not /DEBUG): the MinGW driver invoked by
+    # -fuse-ld=lld on this target doesn't recognize -DEBUG at all (separate
+    # option table from lld-link) -- see stage_use's no-PGO block for the
+    # full explanation. --pdb is its actual recognized flag; empty value
+    # means auto-name the PDB per binary (this flag is shared across
+    # several executables built in this stage).
+    # --threads=1: combining --pdb= with -flto enables a known LLD COFF
+    # deadlock between PDB type/symbol-record merge threads and parallel LTO
+    # backend codegen threads (manifests as three ld.lld processes stuck at
+    # low CPU % indefinitely). --threads=N is the MinGW driver's own spelling
+    # of this option (per LLVM D76885); /threads:N is the COFF/lld-link form.
+    # Unlike order/ignore, "threads" IS in the MinGW driver's option table, so
+    # it does NOT need -Xlink= wrapping. Slower link, but only RelWithDebInfo.
+    [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && linker_debug_flag="-Wl,--pdb= -Wl,--threads=1"
     local bt_upper; bt_upper=$(echo "${BUILD_TYPE}" | tr '[:lower:]' '[:upper:]')
     local lto_flag; lto_flag="$(lto_clang_flag)"
     local _prop_merged="${PROFILE_DIR}/merged.profdata"
@@ -4331,9 +4442,14 @@ stage_propeller() {
     #   build (e.g. inlined away by LTO) — those entries are silently ignored.
     # /order:@<symorder>: COFF/PE lld function placement (same mechanism as BOLT).
     # /ignore:4037: suppress LNK4037 for symorder entries absent from the PE.
+    # -Xlink=<arg>: required wrapper — see stage_bolt for the full explanation.
+    # The MinGW driver from -fuse-ld=lld doesn't recognize order/ignore in its
+    # own option table; -Xlink passes them through to the real COFF linker
+    # (and incidentally sidesteps MSYS2 path-mangling too, since the token
+    # starts with "-Xlink=" rather than "/").
     local propeller_linker_flag=""
     if [[ ${have_sym} -eq 1 ]]; then
-        propeller_linker_flag="-Wl,/order:@${symorder} -Wl,/ignore:4037"
+        propeller_linker_flag="-Wl,-Xlink=/order:@${symorder} -Wl,-Xlink=/ignore:4037"
     fi
 
     local qt_install_dir="${BUILD_GENERATE}/externals/qt/6.9.3/llvm-mingw_64"
@@ -4354,7 +4470,7 @@ stage_propeller() {
         "-DCITRON_PGO_FLAGS_MANAGED_BY_SCRIPT=ON"
         "-DCMAKE_C_FLAGS_${bt_upper}=-O3 -DNDEBUG ${debug_flag} ${lto_pgo_flag}"
         "-DCMAKE_CXX_FLAGS_${bt_upper}=-O3 -DNDEBUG ${debug_flag} ${lto_pgo_flag}"
-        "-DCMAKE_EXE_LINKER_FLAGS_${bt_upper}=-O3 -DNDEBUG ${debug_flag} ${lto_pgo_flag}${propeller_linker_flag:+ ${propeller_linker_flag}}"
+        "-DCMAKE_EXE_LINKER_FLAGS_${bt_upper}=-O3 -DNDEBUG ${debug_flag} ${lto_pgo_flag}${propeller_linker_flag:+ ${propeller_linker_flag}} ${linker_debug_flag}"
         "-DCITRON_PGO_PROFILE_DIR=${PROFILE_DIR}"
     )
     [[ -n "${qt6_cmake_dir}" ]] && _CMAKE_ARGS+=("-DQt6_DIR=${qt6_cmake_dir}")

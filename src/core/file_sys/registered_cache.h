@@ -6,11 +6,14 @@
 
 #include <array>
 #include <functional>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 #include <boost/container/flat_map.hpp>
 #include "common/common_types.h"
@@ -76,6 +79,8 @@ bool operator!=(const ContentProviderEntry& lhs, const ContentProviderEntry& rhs
 class ContentProvider {
 public:
     virtual ~ContentProvider();
+
+    virtual bool IsUnionProvider() const { return false; }
 
     virtual void Refresh() = 0;
 
@@ -195,8 +200,9 @@ private:
                             std::function<T(const CNMT&, const ContentRecord&)> proc,
                             std::function<bool(const CNMT&, const ContentRecord&)> filter) const;
     std::vector<NcaID> AccumulateFiles() const;
-    void ProcessFiles(const std::vector<NcaID>& ids);
-    void AccumulateCitronMeta();
+    void ProcessFiles(const std::vector<NcaID>& ids, std::map<u64, CNMT>& out_meta,
+                      std::map<u64, NcaID>& out_meta_id) const;
+    void AccumulateCitronMeta(std::map<u64, CNMT>& out_citron_meta) const;
     std::optional<NcaID> GetNcaIDFromMetadata(u64 title_id, ContentRecordType type) const;
     VirtualFile GetFileAtID(NcaID id) const;
     VirtualFile OpenFileOrDirectoryConcat(const VirtualDir& open_dir, std::string_view path) const;
@@ -230,7 +236,11 @@ class ContentProviderUnion : public ContentProvider {
 public:
     ~ContentProviderUnion() override;
 
+    bool IsUnionProvider() const override { return true; }
+    
     void SetSlot(ContentProviderUnionSlot slot, ContentProvider* provider);
+    void SetSlots(
+        std::initializer_list<std::pair<ContentProviderUnionSlot, ContentProvider*>> slots);
     void ClearSlot(ContentProviderUnionSlot slot);
 
     void Refresh() override;
@@ -251,10 +261,15 @@ public:
     std::optional<ContentProviderUnionSlot> GetSlotForEntry(u64 title_id,
                                                             ContentRecordType type) const;
 
+    VirtualFile GetExternalEntryForVersion(u64 title_id, ContentRecordType type,
+                                           u32 version) const;
+    std::vector<ExternalUpdateEntry> ListExternalUpdateVersions(u64 title_id) const;
+
     const class ExternalContentProvider* GetExternalProvider() const;
     const ContentProvider* GetSlotProvider(ContentProviderUnionSlot slot) const;
 
 private:
+    mutable std::shared_mutex providers_mutex;
     std::map<ContentProviderUnionSlot, ContentProvider*> providers;
 };
 

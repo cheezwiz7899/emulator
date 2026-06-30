@@ -291,6 +291,7 @@ public:
     const std::map<u128, Ticket>& GetPersonalizedTickets() const;
 
     bool AddTicket(const Ticket& ticket);
+    bool PersistTicket(const Ticket& ticket);
 
     void ReloadKeys();
     bool AreKeysLoaded() const;

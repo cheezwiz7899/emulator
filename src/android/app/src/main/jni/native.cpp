@@ -209,7 +209,22 @@ void EmulationSession::ConfigureFilesystemProvider(const std::string& filepath) 
 }
 
 void EmulationSession::InitializeSystem(bool reload) {
+    std::scoped_lock lock(m_mutex);
+
+    if (m_is_running || m_load_result == Core::SystemResultStatus::Success) {
+        LOG_ERROR(Frontend, "Refusing to initialize system while emulation is active");
+        return;
+    }
+
+    auto& fs_controller = m_system.GetFileSystemController();
+    if (fs_controller.GetInitStage() < Service::FileSystem::InitStage::SETTINGS_READY) {
+        LOG_ERROR(Frontend, "Refusing to initialize system before settings are ready");
+        return;
+    }
+
     if (!reload) {
+        m_system.Initialize();
+
         // Initialize logging system
         Common::Log::Initialize();
         Common::Log::SetColorConsoleBackendEnabled(true);
@@ -218,6 +233,11 @@ void EmulationSession::InitializeSystem(bool reload) {
         m_input_subsystem.Initialize();
     }
 
+    Core::Crypto::KeyManager::Instance().ReloadKeys();
+    Core::Crypto::KeyManager::Instance().PopulateTickets();
+    LOG_INFO(Frontend, "InitializeSystem: keys_loaded_before_content={}",
+             Core::Crypto::KeyManager::Instance().AreKeysLoaded());
+
     // Initialize filesystem.
     m_system.SetFilesystem(m_vfs);
     m_system.GetUserChannel().clear();
@@ -225,7 +245,52 @@ void EmulationSession::InitializeSystem(bool reload) {
     m_system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
     m_system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::FrontendManual,
                                      m_manual_provider.get());
-    m_system.GetFileSystemController().CreateFactories(*m_vfs);
+    fs_controller.SetInitStage(Service::FileSystem::InitStage::FS_READY);
+    fs_controller.InitializeContentSystem(*m_vfs);
+}
+
+
+void EmulationSession::RefreshContentSystemUnlocked()
+{
+    auto& fs = m_system.GetFileSystemController();
+    if (auto filesystem = m_system.GetFilesystem()) {
+        fs.InitializeContentSystem(*filesystem);
+    }
+}
+
+
+void EmulationSession::RefreshContentSystem() {
+    std::scoped_lock lock(m_mutex);
+    RefreshContentSystemUnlocked();
+}
+
+
+bool EmulationSession::RefreshContentIfIdle(bool keys_loaded)
+{
+    if (!keys_loaded) {
+        return false;
+    }
+
+    std::scoped_lock lock(m_mutex);
+    if (m_is_running || m_load_result == Core::SystemResultStatus::Success) {
+        return false;
+    }
+
+    RefreshContentSystemUnlocked();
+    return true;
+}
+
+void EmulationSession::SetFilesystemInitStage(Service::FileSystem::InitStage stage) {
+    std::scoped_lock lock(m_mutex);
+    m_system.GetFileSystemController().SetInitStage(stage);
+}
+
+void EmulationSession::PromoteFilesystemInitStage(Service::FileSystem::InitStage stage) {
+    std::scoped_lock lock(m_mutex);
+    auto& controller = m_system.GetFileSystemController();
+    if (controller.GetInitStage() < stage) {
+        controller.SetInitStage(stage);
+    }
 }
 
 void EmulationSession::SetAppletId(int applet_id) {
@@ -561,8 +626,16 @@ jobjectArray Java_org_citron_citron_1emu_utils_GpuDriverHelper_getSystemDriverIn
 }
 
 jboolean Java_org_citron_citron_1emu_NativeLibrary_reloadKeys(JNIEnv* env, jclass clazz) {
+    auto& session = EmulationSession::GetInstance();
     Core::Crypto::KeyManager::Instance().ReloadKeys();
-    return static_cast<jboolean>(Core::Crypto::KeyManager::Instance().AreKeysLoaded());
+    const bool keys_loaded = Core::Crypto::KeyManager::Instance().AreKeysLoaded();
+
+    const bool refreshed_content = session.RefreshContentIfIdle(keys_loaded);
+    LOG_INFO(Frontend,
+         "reloadKeys: keys_loaded={}, refreshed_content={}",
+         keys_loaded, refreshed_content);
+
+    return static_cast<jboolean>(keys_loaded);
 }
 
 void Java_org_citron_citron_1emu_NativeLibrary_unpauseEmulation(JNIEnv* env, jclass clazz) {
@@ -588,9 +661,6 @@ jboolean Java_org_citron_citron_1emu_NativeLibrary_isPaused(JNIEnv* env, jclass 
 void Java_org_citron_citron_1emu_NativeLibrary_initializeSystem(JNIEnv* env, jclass clazz,
                                                             jboolean reload) {
     // Initialize the emulated system.
-    if (!reload) {
-        EmulationSession::GetInstance().System().Initialize();
-    }
     EmulationSession::GetInstance().InitializeSystem(reload);
 }
 
@@ -893,9 +963,16 @@ void Java_org_citron_citron_1emu_NativeLibrary_clearFilesystemProvider(JNIEnv* e
 }
 
 jboolean Java_org_citron_citron_1emu_NativeLibrary_areKeysPresent(JNIEnv* env, jobject jobj) {
-    auto& system = EmulationSession::GetInstance().System();
-    system.GetFileSystemController().CreateFactories(*system.GetFilesystem());
+    auto& session = EmulationSession::GetInstance();
+
     Core::Crypto::KeyManager::Instance().ReloadKeys();
+    const bool keys_loaded =
+        Core::Crypto::KeyManager::Instance().AreKeysLoaded();
+
+    const bool refreshed_content = session.RefreshContentIfIdle(keys_loaded);
+
+    LOG_INFO(Frontend, "areKeysPresent: refreshed_content={}", refreshed_content);
+
     return ContentManager::AreKeysPresent();
 }
 
