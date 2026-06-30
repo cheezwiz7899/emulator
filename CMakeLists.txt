@@ -606,7 +606,17 @@ if (ENABLE_QT AND NOT CITRON_USE_CPM)
         message(STATUS "Using host Qt at ${QT_HOST_PATH}")
     endif()
 
-    find_package(Qt6 REQUIRED COMPONENTS Widgets Multimedia Concurrent)
+    # Early Qt6 discovery: find Widgets and Concurrent unconditionally; add
+    # Multimedia only when CITRON_USE_QT_MULTIMEDIA is ON.  This makes the
+    # cmake flag actually functional: with CITRON_USE_QT_MULTIMEDIA=OFF the
+    # Multimedia module and its shared FFmpeg backend (libffmpegmediaplugin.so,
+    # libavcodec.so.61 ~80 MB, etc.) are not linked at all.
+    set(_qt_probe_components Widgets Concurrent)
+    if (CITRON_USE_QT_MULTIMEDIA)
+        list(APPEND _qt_probe_components Multimedia)
+    endif()
+    find_package(Qt6 REQUIRED COMPONENTS ${_qt_probe_components})
+    unset(_qt_probe_components)
 
     if (UNIX AND NOT APPLE)
         find_package(Qt6 REQUIRED COMPONENTS DBus)

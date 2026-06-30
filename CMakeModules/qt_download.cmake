@@ -9,7 +9,8 @@
 #
 # Target variants:
 #   Windows (native or cross-compile target)  →  win64_llvm_mingw
-#   Linux native                              →  linux_gcc_64
+#   Linux native x86-64                       →  linux_gcc_64 (via aqt)
+#   Linux native aarch64                      →  linux_gcc_arm64 (host: linux_arm64)
 #
 # Cross-compilation (Linux host → Windows target):
 #   QT_HOST_PATH is set to a Linux Qt install so moc/rcc/uic run on the host.
@@ -70,12 +71,22 @@ else()
         set(_QT_DIR_NAME  "macos")
         set(_QT_CMAKE_SUB "lib/cmake/Qt6")
     else()
-        # Native Linux
-        set(_QT_OS        "linux")
-        set(_QT_TARGET    "desktop")
-        set(_QT_ARCH      "linux_gcc_64")
-        set(_QT_DIR_NAME  "gcc_64")
+        # Native Linux — pick host/arch variant to match the build processor so
+        # moc/rcc/uic (which run on the build host) are the correct ELF arch.
+        # aqt uses separate host-OS strings for x86-64 ("linux") and arm64
+        # ("linux_arm64"); the arch token is then linux_gcc_64 or linux_gcc_arm64.
         set(_QT_CMAKE_SUB "lib/cmake/Qt6")
+        if (CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "aarch64|arm64" OR ARCHITECTURE_arm64)
+            set(_QT_OS        "linux_arm64")
+            set(_QT_TARGET    "desktop")
+            set(_QT_ARCH      "linux_gcc_arm64")
+            set(_QT_DIR_NAME  "gcc_arm64")
+        else()
+            set(_QT_OS        "linux")
+            set(_QT_TARGET    "desktop")
+            set(_QT_ARCH      "linux_gcc_64")
+            set(_QT_DIR_NAME  "gcc_64")
+        endif()
     endif()
 endif()
 
@@ -112,23 +123,29 @@ else()
         message(STATUS "[Qt] Qt ${CITRON_QT_VERSION} target downloaded")
     endif()
 
-    # Download additional modules (multimedia, imageformats, svg)
-    set(_QT_MM_CMAKE   "${_QT_TARGET_DIR}/lib/cmake/Qt6Multimedia/Qt6MultimediaConfig.cmake")
+    # Download additional modules (imageformats, svg, tools).
+    # qtmultimedia is intentionally excluded: all Qt Multimedia camera code in
+    # citron is guarded by (QT_VERSION < 6.0.0) && CITRON_USE_QT_MULTIMEDIA,
+    # so it is permanently dead code under Qt6.  CITRON_USE_QT_MULTIMEDIA=OFF
+    # is set in build-citron-linux.sh, but the Qt5-only guard makes it a no-op
+    # regardless.  Including qtmultimedia in --modules was the sole cause of the
+    # recurring "[Qt] Additional module install failed" CI warning: aqt silently
+    # rejects module name mismatches for certain arch/version combos.
     set(_QT_SVG_CMAKE  "${_QT_TARGET_DIR}/lib/cmake/Qt6Svg/Qt6SvgConfig.cmake")
     set(_QT_TOOL_CMAKE "${_QT_TARGET_DIR}/lib/cmake/Qt6CoreTools/Qt6CoreToolsConfig.cmake")
-    if (NOT EXISTS "${_QT_MM_CMAKE}" OR NOT EXISTS "${_QT_SVG_CMAKE}" OR NOT EXISTS "${_QT_TOOL_CMAKE}")
-        message(STATUS "[Qt] Downloading Qt ${CITRON_QT_VERSION} additional modules...")
+    if (NOT EXISTS "${_QT_SVG_CMAKE}" OR NOT EXISTS "${_QT_TOOL_CMAKE}")
+        message(STATUS "[Qt] Downloading Qt ${CITRON_QT_VERSION} additional modules (qttools, qtimageformats)...")
         execute_process(
             COMMAND ${_AQT_EXECUTABLE} install-qt
                     ${_QT_OS} ${_QT_TARGET}
                     ${CITRON_QT_VERSION} ${_QT_ARCH}
                     --outputdir "${CITRON_QT_BASE_DIR}"
-                    --modules qttools qtmultimedia qtimageformats
-            RESULT_VARIABLE _qt_mm_result
+                    --modules qttools qtimageformats
+            RESULT_VARIABLE _qt_addl_result
             OUTPUT_QUIET ERROR_QUIET
         )
-        if (NOT _qt_mm_result EQUAL 0)
-            message(WARNING "[Qt] Additional module install failed — build may fail")
+        if (NOT _qt_addl_result EQUAL 0)
+            message(WARNING "[Qt] Additional module install failed (qttools/qtimageformats) — build may fail")
         endif()
     endif()
 
@@ -172,14 +189,7 @@ if (CMAKE_HOST_UNIX AND WIN32)
             if (NOT _qt_host_result EQUAL 0)
                 message(WARNING "[Qt] Host Qt download failed — cross-compile may fail")
             endif()
-
-            execute_process(
-                COMMAND ${_AQT_EXECUTABLE} install-qt linux desktop
-                        ${CITRON_QT_VERSION} linux_gcc_64
-                        --outputdir "${CITRON_QT_BASE_DIR}"
-                        --modules qtmultimedia
-                OUTPUT_QUIET ERROR_QUIET
-            )
+            # qtmultimedia not downloaded for host Qt — dead code under Qt6 (see target Qt comment above)
         endif()
 
         if (EXISTS "${_QT_HOST_CMAKE}")

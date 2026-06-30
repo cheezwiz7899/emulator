@@ -20,7 +20,16 @@ if (MINGW OR (${CMAKE_SYSTEM_NAME} MATCHES "Linux") OR APPLE)
     endif()
 
     set(LIBUSB_PREFIX "${CMAKE_CURRENT_BINARY_DIR}/libusb")
-    set(LIBUSB_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libusb")
+    # Source comes exclusively from CPM (libusb_src declared in dependencies.cmake).
+    # LIBUSB_CPM_SOURCE_DIR is the CACHE INTERNAL bridge set there; libusb_src_SOURCE_DIR
+    # is CPM's own auto-set and is always present even on a cache hit where _ADDED is false.
+    if (DEFINED LIBUSB_CPM_SOURCE_DIR)
+        set(LIBUSB_SRC_DIR "${LIBUSB_CPM_SOURCE_DIR}")
+    elseif (DEFINED libusb_src_SOURCE_DIR)
+        set(LIBUSB_SRC_DIR "${libusb_src_SOURCE_DIR}")
+    else()
+        set(LIBUSB_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libusb")
+    endif()
 
     # Workarounds for MSYS/MinGW
     if (MSYS)
