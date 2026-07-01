@@ -51,9 +51,17 @@ bool IsUltrahandConditionCpuRange(VAddr addr, u64 size) {
 }
 
 bool IsUltrahandConditionGpuRange(GPUVAddr addr, u64 size) {
+#ifndef _WIN32
+    // Linux is the known-good reference run. Its guest GPU allocation differs from Windows,
+    // so collect one broad diagnostic run to discover the corresponding pass addresses.
+    (void)addr;
+    (void)size;
+    return true;
+#else
     constexpr GPUVAddr condition_begin = 0x0000000503200000ULL;
     constexpr GPUVAddr condition_end = 0x0000000503400000ULL;
     return addr < condition_end && addr + size > condition_begin;
+#endif
 }
 
 bool UltrahandBreakProbeEnabled(GPUVAddr address) {
@@ -662,6 +670,17 @@ void Maxwell3D::ProcessQueryCondition() {
     const bool trace = UltrahandTraceEnabled();
     const bool break_probe = UltrahandBreakProbeEnabled(condition_address);
     const bool pass_trace = UltrahandPassTraceEnabled();
+    static bool pass_trace_announced = false;
+    if (pass_trace && !pass_trace_announced) {
+        pass_trace_announced = true;
+        LOG_WARNING(HW_GPU, "UHTRACE pass_trace_active platform={}",
+#ifdef _WIN32
+                    "windows"
+#else
+                    "linux"
+#endif
+        );
+    }
     const auto condition_cpu_addr = memory_manager.GpuToCpuAddress(condition_address);
     const bool pass_condition =
         (condition_cpu_addr &&

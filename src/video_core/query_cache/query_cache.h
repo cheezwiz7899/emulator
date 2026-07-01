@@ -47,9 +47,15 @@ inline bool IsUltrahandConditionCpuRange(VAddr addr, u64 size) {
 }
 
 inline bool IsUltrahandConditionGpuRange(GPUVAddr addr, u64 size) {
+#ifndef _WIN32
+    (void)addr;
+    (void)size;
+    return true;
+#else
     constexpr GPUVAddr condition_begin = 0x0000000503200000ULL;
     constexpr GPUVAddr condition_end = 0x0000000503400000ULL;
     return addr < condition_end && addr + size > condition_begin;
+#endif
 }
 
 inline bool IsStaleGuestQueryWrite(const QueryBase& query, const void* pointer, size_t size,
