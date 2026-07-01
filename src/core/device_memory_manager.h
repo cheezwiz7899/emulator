@@ -191,7 +191,7 @@ private:
     }
 
     using CounterType = u8;
-    using CounterAtomicType = std::atomic_uint8_t;
+    using CounterAtomicType = std::atomic_ref<CounterType>;
     static constexpr size_t subentries = 8 / sizeof(CounterType);
     static constexpr size_t subentries_mask = subentries - 1;
     static constexpr size_t subentries_shift =
@@ -200,16 +200,12 @@ private:
     public:
         CounterEntry() = default;
 
-        CounterAtomicType& Count(std::size_t page) {
-            return values[page & subentries_mask];
-        }
-
-        const CounterAtomicType& Count(std::size_t page) const {
-            return values[page & subentries_mask];
+        CounterAtomicType Count(std::size_t page) {
+            return CounterAtomicType{values[page & subentries_mask]};
         }
 
     private:
-        std::array<CounterAtomicType, subentries> values{};
+        std::array<CounterType, subentries> values{};
     };
     static_assert(sizeof(CounterEntry) == subentries * sizeof(CounterType),
                   "CounterEntry should be 8 bytes!");
