@@ -392,6 +392,16 @@ public:
                 }
             });
             query->value = total;
+            if (VideoCommon::UltrahandPassTraceEnabled() &&
+                VideoCommon::IsUltrahandConditionCpuRange(query->guest_address,
+                                                          sizeof(query->value))) {
+                LOG_WARNING(Render_Vulkan,
+                            "UHTRACE pass_resolved cpu=0x{:016X} id={} flags=0x{:X} "
+                            "start_bank={} start_slot={} slots={} value=0x{:016X}",
+                            query->guest_address, q, static_cast<u32>(query->flags),
+                            query->start_bank_id, query->start_slot, query->size_slots,
+                            query->value);
+            }
             query->flags |= VideoCommon::QueryFlagBits::IsFinalValueSynced;
         }
     }

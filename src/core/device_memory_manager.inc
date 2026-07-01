@@ -545,7 +545,7 @@ void DeviceMemoryManager<Traits>::PinPagesCached(DAddr addr, size_t size) {
     const size_t page_end = Common::DivCeil(addr + size, Memory::CITRON_PAGESIZE);
     for (size_t page = addr >> Memory::CITRON_PAGEBITS; page != page_end; ++page) {
         pinned_cached_pages.insert(page);
-        CounterAtomicType count = cached_pages[page >> subentries_shift].Count(page);
+        CounterAtomicType& count = cached_pages[page >> subentries_shift].Count(page);
         const CounterType old_count = count.load(std::memory_order_relaxed);
         if (old_count == 0) {
             count.store(1, std::memory_order_release);
@@ -641,7 +641,7 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCount(DAddr addr, size_t size
     };
     size_t old_vpage = (base_vaddress >> Memory::CITRON_PAGEBITS) - 1;
     for (; page != page_end; ++page) {
-        CounterAtomicType count = cached_pages[page >> subentries_shift].Count(page);
+        CounterAtomicType& count = cached_pages[page >> subentries_shift].Count(page);
         auto [asid_2, vpage] = ExtractCPUBacking(page);
         vpage >>= Memory::CITRON_PAGEBITS;
 
