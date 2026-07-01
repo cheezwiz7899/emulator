@@ -45,23 +45,25 @@ bool UltrahandPassTraceEnabled() {
 }
 
 bool IsUltrahandConditionCpuRange(VAddr addr, u64 size) {
+#ifndef _WIN32
+    constexpr VAddr condition_begin = 0x1FEE0000;
+    constexpr VAddr condition_end = 0x1FF00000;
+#else
     constexpr VAddr condition_begin = 0x1B200000;
     constexpr VAddr condition_end = 0x1B220000;
+#endif
     return addr < condition_end && addr + size > condition_begin;
 }
 
 bool IsUltrahandConditionGpuRange(GPUVAddr addr, u64 size) {
 #ifndef _WIN32
-    // Linux is the known-good reference run. Its guest GPU allocation differs from Windows,
-    // so collect one broad diagnostic run to discover the corresponding pass addresses.
-    (void)addr;
-    (void)size;
-    return true;
+    constexpr GPUVAddr condition_begin = 0x000000050CC00000ULL;
+    constexpr GPUVAddr condition_end = 0x000000050CD00000ULL;
 #else
     constexpr GPUVAddr condition_begin = 0x0000000503200000ULL;
     constexpr GPUVAddr condition_end = 0x0000000503400000ULL;
-    return addr < condition_end && addr + size > condition_begin;
 #endif
+    return addr < condition_end && addr + size > condition_begin;
 }
 
 bool UltrahandBreakProbeEnabled(GPUVAddr address) {
