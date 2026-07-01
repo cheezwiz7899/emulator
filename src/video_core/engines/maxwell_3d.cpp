@@ -50,6 +50,12 @@ bool IsUltrahandConditionCpuRange(VAddr addr, u64 size) {
     return addr < condition_end && addr + size > condition_begin;
 }
 
+bool IsUltrahandConditionGpuRange(GPUVAddr addr, u64 size) {
+    constexpr GPUVAddr condition_begin = 0x0000000503200000ULL;
+    constexpr GPUVAddr condition_end = 0x0000000503400000ULL;
+    return addr < condition_end && addr + size > condition_begin;
+}
+
 bool UltrahandBreakProbeEnabled(GPUVAddr address) {
     static const bool enabled = std::getenv("CITRON_UH_BREAK_ON_COND_DIFF") != nullptr;
     if (!enabled) {
@@ -581,11 +587,11 @@ void Maxwell3D::ProcessQueryGet() {
     }
     const auto sequence_cpu_addr = memory_manager.GpuToCpuAddress(sequence_address);
     const auto render_cpu_addr = memory_manager.GpuToCpuAddress(regs.render_enable.Address());
+    const u64 query_size =
+        regs.report_semaphore.query.short_query != 0 ? sizeof(u32) : sizeof(u64);
     const bool pass_query =
-        sequence_cpu_addr &&
-        IsUltrahandConditionCpuRange(*sequence_cpu_addr,
-                                     regs.report_semaphore.query.short_query != 0 ? sizeof(u32)
-                                                                                  : sizeof(u64));
+        (sequence_cpu_addr && IsUltrahandConditionCpuRange(*sequence_cpu_addr, query_size)) ||
+        IsUltrahandConditionGpuRange(sequence_address, query_size);
     const bool pass_render =
         render_cpu_addr && IsUltrahandConditionCpuRange(*render_cpu_addr,
                                                         sizeof(Regs::ReportSemaphore::Compare));
@@ -658,9 +664,10 @@ void Maxwell3D::ProcessQueryCondition() {
     const bool pass_trace = UltrahandPassTraceEnabled();
     const auto condition_cpu_addr = memory_manager.GpuToCpuAddress(condition_address);
     const bool pass_condition =
-        condition_cpu_addr &&
-        IsUltrahandConditionCpuRange(*condition_cpu_addr,
-                                     sizeof(Regs::ReportSemaphore::Compare));
+        (condition_cpu_addr &&
+         IsUltrahandConditionCpuRange(*condition_cpu_addr,
+                                      sizeof(Regs::ReportSemaphore::Compare))) ||
+        IsUltrahandConditionGpuRange(condition_address, sizeof(Regs::ReportSemaphore::Compare));
     const bool accelerated = rasterizer->AccelerateConditionalRendering();
     const auto read_compare = [&](const char* mode_name) {
         Regs::ReportSemaphore::Compare before{};

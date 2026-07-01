@@ -46,6 +46,12 @@ inline bool IsUltrahandConditionCpuRange(VAddr addr, u64 size) {
     return addr < condition_end && addr + size > condition_begin;
 }
 
+inline bool IsUltrahandConditionGpuRange(GPUVAddr addr, u64 size) {
+    constexpr GPUVAddr condition_begin = 0x0000000503200000ULL;
+    constexpr GPUVAddr condition_end = 0x0000000503400000ULL;
+    return addr < condition_end && addr + size > condition_begin;
+}
+
 inline bool IsStaleGuestQueryWrite(const QueryBase& query, const void* pointer, size_t size,
                                    u64* current_value = nullptr) {
     if (pointer == nullptr || True(query.flags & QueryFlagBits::IsHostManaged)) {
@@ -329,7 +335,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     if (pointer) {
         std::memcpy(&query->guest_snapshot, pointer, snapshot_size);
     }
-    if (UltrahandPassTraceEnabled() && IsUltrahandConditionCpuRange(cpu_addr, snapshot_size)) {
+    if (UltrahandPassTraceEnabled() &&
+        (IsUltrahandConditionCpuRange(cpu_addr, snapshot_size) ||
+         IsUltrahandConditionGpuRange(original_addr, snapshot_size))) {
         LOG_WARNING(HW_GPU,
                     "UHTRACE pass_report gpu=0x{:016X} cpu=0x{:016X} type={} streamer={} "
                     "id={} flags=0x{:X} fence={} timestamp={} payload=0x{:08X} "
