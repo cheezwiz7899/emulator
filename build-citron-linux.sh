@@ -382,10 +382,15 @@ _setup_apt() {
         glslang-tools \
         patchelf \
         lsb-release software-properties-common gnupg \
-        libelf-dev libssl-dev libzstd-dev libudev-dev \
+        libelf-dev libssl-dev libzstd-dev libudev-dev zstd \
         libgl-dev libopengl-dev \
-        libxkbcommon-dev \
-        linux-tools-common linux-tools-generic 2>/dev/null || true
+        libxkbcommon-dev
+    # linux-tools-common/generic are best-effort: the versioned
+    # linux-tools-$(uname -r) package frequently doesn't exist on the runner's
+    # kernel and is intentionally optional.  Keeping them in a separate call
+    # (not grouped with the mandatory packages above) ensures a missing
+    # perf/tools package never masks a failure in the required deps.
+    sudo apt-get install -y linux-tools-common linux-tools-generic 2>/dev/null || true
     sudo apt-get install -y "linux-tools-$(uname -r)" 2>/dev/null || true
     # NOTE: libgl-dev and libopengl-dev are MANDATORY even though citron is
     # Vulkan-only and never calls any OpenGL API at runtime.  The aqt-downloaded
@@ -497,7 +502,7 @@ _setup_pacman() {
         python python-pip curl wget \
         nasm yasm perl \
         autoconf automake make \
-        glslang clang lld llvm \
+        glslang clang lld llvm zstd \
         patchelf perf 2>/dev/null || true
 
     # Hardware video acceleration for bundled FFmpeg (VAAPI / VDPAU)
@@ -543,7 +548,7 @@ _setup_dnf() {
         nasm yasm perl \
         autoconf automake make \
         glslang clang lld patchelf \
-        elfutils-libelf-devel openssl-devel libudev-devel \
+        elfutils-libelf-devel openssl-devel libudev-devel zstd \
         perf 2>/dev/null || true
     sudo dnf install -y "clang${CLANG_VERSION}" "llvm${CLANG_VERSION}" 2>/dev/null \
         || warn "Versioned LLVM ${CLANG_VERSION} not in repos — using default clang."
@@ -582,7 +587,7 @@ _setup_yum() {
         nasm yasm perl \
         autoconf automake make \
         clang lld patchelf \
-        elfutils-libelf-devel openssl-devel libudev-devel \
+        elfutils-libelf-devel openssl-devel libudev-devel zstd \
         perf 2>/dev/null || true
     warn "yum/CentOS: LLVM ${CLANG_VERSION} may not be in repos. Check SCL or llvm.org."
 
@@ -603,7 +608,7 @@ _setup_zypper() {
         nasm yasm perl \
         autoconf automake make \
         glslang clang lld llvm patchelf \
-        libelf-devel libopenssl-devel libudev-devel \
+        libelf-devel libopenssl-devel libudev-devel zstd \
         perf 2>/dev/null || true
 
     # Hardware video acceleration for bundled FFmpeg (VAAPI / VDPAU)
@@ -611,7 +616,8 @@ _setup_zypper() {
         libva-devel \
         libdrm-devel \
         libvdpau-devel \
-        libX11-devel 2>/dev/null || warn "Hardware acceleration libraries unavailable — FFmpeg will be software-decode only"
+        libX11-devel \
+        libXext-devel 2>/dev/null || warn "Hardware acceleration libraries unavailable — FFmpeg will be software-decode only"
 
     # Optional: bundled into the AppImage by package-citron-linux.sh if present.
     sudo zypper install -y --no-recommends gamemode 2>/dev/null || true
@@ -631,7 +637,7 @@ _setup_emerge() {
         dev-build/autoconf dev-build/automake \
         media-libs/glslang \
         dev-util/patchelf \
-        dev-libs/elfutils dev-libs/openssl sys-apps/util-linux 2>/dev/null || true
+        dev-libs/elfutils dev-libs/openssl sys-apps/util-linux app-arch/zstd 2>/dev/null || true
 
     # Optional: bundled into the AppImage by package-citron-linux.sh if present.
     sudo emerge --ask=n games-util/gamemode 2>/dev/null || true
@@ -1057,11 +1063,16 @@ _patch_binary_rpaths() {
     # LD_LIBRARY_PATH.
     for bin in "citron" "citron-cmd" "citron-room"; do
         if [[ -f "${bin_dir}/${bin}" ]]; then
-            # We prepend the custom RPATH to any existing one
+            # Always re-apply --force-rpath to convert any DT_RUNPATH tag to
+            # DT_RPATH. Even when existing_rpath already contains our path, a
+            # DT_RUNPATH tag would still be searched AFTER LD_LIBRARY_PATH,
+            # letting a system Qt shadow the CPM-built one. --force-rpath
+            # ensures we always end up with DT_RPATH regardless of the linker's
+            # default tag choice.
             local existing_rpath; existing_rpath="$(patchelf --print-rpath "${bin_dir}/${bin}" 2>/dev/null || echo "")"
-            if [[ -z "${existing_rpath}" ]]; then
-                patchelf --force-rpath --set-rpath "${rpath}" "${bin_dir}/${bin}"
-            elif [[ "${existing_rpath}" != *"${rpath}"* ]]; then
+            if [[ -z "${existing_rpath}" ]] || [[ "${existing_rpath}" == *"${rpath}"* ]]; then
+                patchelf --force-rpath --set-rpath "${rpath}${existing_rpath:+:${existing_rpath}}" "${bin_dir}/${bin}"
+            else
                 patchelf --force-rpath --set-rpath "${rpath}:${existing_rpath}" "${bin_dir}/${bin}"
             fi
         fi
@@ -1181,8 +1192,8 @@ build_appimage_stage() {
     # directly from the aqt-downloaded Qt under CPM_SOURCE_CACHE/qt-bin
     # (see CMakeModules/qt_download.cmake) if present.
     local qt_translations
-    qt_translations="$(find "${CPM_SOURCE_CACHE}/qt-bin" -maxdepth 3 -type d \
-        -path '*/gcc_64/translations' 2>/dev/null | head -1)"
+    qt_translations="$(find "${CPM_SOURCE_CACHE}/qt-bin" -maxdepth 4 -type d \
+        -name 'translations' 2>/dev/null | head -1)"
     if [[ -n "${qt_translations}" ]]; then
         mkdir -p "${install_root}/usr/share/qt6"
         cp -r "${qt_translations}" "${install_root}/usr/share/qt6/translations"
@@ -1216,6 +1227,9 @@ build_appimage_stage() {
     local qt_path=""
     if [[ -f "${config_file}" ]]; then
         qt_path="$(grep -oP '(?<=export CITRON_QT_PATH=")[^"]+' "${config_file}" || true)"
+    fi
+    if [[ -z "${qt_path}" ]]; then
+        error "CITRON_QT_PATH not found in ${config_file} — cannot package AppImage with correct Qt plugins. Ensure the build completed successfully and config.sh was written."
     fi
 
     APP_VERSION="${version}" \

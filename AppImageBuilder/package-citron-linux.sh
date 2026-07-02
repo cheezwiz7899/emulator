@@ -252,7 +252,7 @@ _appdir="${PWD}/AppDir"
 # section that encodes PT_INTERP, causing sharun -g to find no interpreter and
 # skip the copy.  We do it here from the original install-root binary (never
 # touched by sed) so it is guaranteed present regardless of sharun -g's outcome.
-_interp=$(patchelf --print-interpreter "${DESTDIR}/usr/bin/citron" 2>/dev/null)
+_interp=$(patchelf --print-interpreter "${DESTDIR}/usr/bin/citron" 2>/dev/null || true)
 if [ -z "${_interp}" ]; then
     # patchelf fallback: parse readelf output
     _interp=$(readelf -l "${DESTDIR}/usr/bin/citron" 2>/dev/null \
@@ -342,7 +342,7 @@ Prefix = ..
 Plugins = lib
 Imports = lib/qt6/qml
 Qml2Imports = lib/qt6/qml
-Translations = ../usr/share/qt6/translations
+Translations = lib/qt6/translations
 QTCONF_EOF
 
 # Rename app in desktop file if building a devel/nightly AppImage
@@ -383,6 +383,11 @@ mv -v ./*.AppImage.* "${OUTPATH}/" 2>/dev/null || true
 # (e.g. a CI artifact upload step) drags along every loose unpacked library a
 # second time alongside the AppImage that already contains them compressed.
 if [ -d ./AppDir ]; then
+    if ! command -v zstd >/dev/null 2>&1; then
+        printf 'ERROR: zstd is not installed — cannot produce %s.tar.zst\n' "${OUTNAME_BASE}" >&2
+        printf 'Install zstd (e.g. apt-get install zstd) and re-run.\n' >&2
+        exit 1
+    fi
     tar -c --zstd -f "${OUTPATH}/${OUTNAME_BASE}.tar.zst" -C ./AppDir .
     rm -rf ./AppDir
 fi
