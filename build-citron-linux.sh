@@ -447,6 +447,31 @@ _setup_apt() {
     sudo apt-get install -y libvdpau-dev \
         || warn "libvdpau-dev unavailable — FFmpeg will build with --disable-vdpau"
 
+    # ── Linux audio output (ALSA + PulseAudio) — REQUIRED, not optional ─────
+    # SDL2's CheckALSA()/CheckPulseAudio() configure-time checks look for
+    # alsa/asoundlib.h and pulse/pulseaudio.h. If either header is missing,
+    # SDL2 silently disables that backend (SDL_ALSA / SDL_PULSEAUDIO → OFF)
+    # rather than hard-failing the build — the same "quiet fallback" pattern
+    # as the VAAPI/VDPAU checks above, except here the fallback is SDL2's
+    # SDL_DUMMYAUDIO/SDL_DISKAUDIO drivers, neither of which produces any
+    # actual sound. A machine missing both dev packages therefore still
+    # builds and packages successfully, but ships an AppImage with no
+    # functioning Linux audio output at all — a failure mode with no build
+    # warning to catch it, which is why this group is REQUIRED (unlike the
+    # --ignore-missing X11/XCB extras below).
+    #
+    # This also solves packaging determinism: package-citron-linux.sh finds
+    # libasound.so.2 and libpulse.so.0 to bundle into the AppImage via
+    # `ldconfig -p` against whatever happens to be installed on the machine
+    # running the packaging step (see comments there). Installing the -dev
+    # packages here pulls in their runtime libs (libasound2, libpulse0) as
+    # apt dependencies, so that probe now succeeds identically on every
+    # machine that runs this script — CI included — instead of depending on
+    # whether that machine happens to already have a desktop audio stack.
+    info "Installing ALSA + PulseAudio dev packages (required for audio output)..."
+    sudo apt-get install -y libasound2-dev libpulse-dev \
+        || error "ALSA/PulseAudio dev packages failed to install — Linux builds would have no audio output"
+
     # ── X11 / XCB optional extras (SDL2 Xi/XSS/XCB, Qt XCB platform plugin) ─
     # These extend the X11 install above with input, screensaver, and XCB
     # extension headers.  All are optional — their cmake checks produce soft
@@ -496,6 +521,10 @@ _setup_pacman() {
     # Optional: bundled into the AppImage by package-citron-linux.sh if present.
     sudo pacman -S --needed --noconfirm gamemode 2>/dev/null || true
 
+    # ── Linux audio output (ALSA + PulseAudio) —
+    sudo pacman -S --needed --noconfirm alsa-lib libpulse \
+        || error "ALSA/PulseAudio packages failed to install — Linux builds would have no audio output"
+
     # Arch ships unversioned tools — symlink to versioned names
     for tool in clang clang++ lld llvm-profdata llvm-bolt merge-fdata; do
         local versioned="/usr/local/bin/${tool}-${CLANG_VERSION}"
@@ -538,6 +567,10 @@ _setup_dnf() {
 
     # Optional: bundled into the AppImage by package-citron-linux.sh if present.
     sudo dnf install -y gamemode 2>/dev/null || true
+
+    # ── Linux audio output (ALSA + PulseAudio) —
+    sudo dnf install -y alsa-lib-devel pulseaudio-libs-devel \
+        || error "ALSA/PulseAudio dev packages failed to install — Linux builds would have no audio output"
 }
 
 _setup_yum() {
@@ -556,6 +589,10 @@ _setup_yum() {
     # Optional: bundled into the AppImage by package-citron-linux.sh if present.
     # May require EPEL or an RPM Fusion-style repo on RHEL-based distros.
     sudo yum install -y gamemode 2>/dev/null || true
+
+    # ── Linux audio output (ALSA + PulseAudio) —
+    sudo yum install -y alsa-lib-devel pulseaudio-libs-devel \
+        || error "ALSA/PulseAudio dev packages failed to install — Linux builds would have no audio output"
 }
 
 _setup_zypper() {
@@ -578,6 +615,10 @@ _setup_zypper() {
 
     # Optional: bundled into the AppImage by package-citron-linux.sh if present.
     sudo zypper install -y --no-recommends gamemode 2>/dev/null || true
+
+    # ── Linux audio output (ALSA + PulseAudio) — 
+    sudo zypper install -y --no-recommends alsa-devel libpulse-devel \
+        || error "ALSA/PulseAudio dev packages failed to install — Linux builds would have no audio output"
 }
 
 _setup_emerge() {
@@ -594,6 +635,10 @@ _setup_emerge() {
 
     # Optional: bundled into the AppImage by package-citron-linux.sh if present.
     sudo emerge --ask=n games-util/gamemode 2>/dev/null || true
+
+    # ── Linux audio output (ALSA + PulseAudio) — 
+    sudo emerge --ask=n media-libs/alsa-lib media-libs/libpulse \
+        || error "ALSA/PulseAudio packages failed to install — Linux builds would have no audio output"
 }
 
 _install_llvm_clang() {
