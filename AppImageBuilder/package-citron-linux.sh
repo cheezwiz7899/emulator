@@ -111,7 +111,7 @@ export STRACE_MODE="${STRACE_MODE:-0}"
 #   all DT_NEEDED of citron / Qt plugins and are captured by ldd regardless.
 #   SHARUN_ALLOW_SYS_VK_ICD=1 (set in .env below) makes sharun prefer the
 #   host GPU ICD at runtime, so we never need to bundle GPU-vendor drivers.
-export DEPLOY_VULKAN="${DEPLOY_VULKAN:-0}"
+export DEPLOY_VULKAN="1"
 export DEPLOY_OPENGL="${DEPLOY_OPENGL:-0}"
 #
 # DEPLOY_PIPEWIRE=0 — suppress the PipeWire/SPA/ALSA plugin staging block.
