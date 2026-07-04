@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+
+#include "common/logging.h"
 #include "common/settings.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/draw_manager.h"
@@ -265,6 +268,34 @@ void DrawManager::ProcessDraw(bool draw_indexed, u32 instance_count) {
               draw_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count);
 
     UpdateTopology();
+
+    static const bool trace_ultrahand_draw =
+        std::getenv("CITRON_UH_CBUF_TRACE") != nullptr;
+    if (trace_ultrahand_draw) {
+        constexpr auto pixel_type = Maxwell3D::Regs::ShaderType::Pixel;
+        constexpr auto pixel_index = static_cast<std::size_t>(pixel_type);
+        const auto& regs = maxwell3d->regs;
+        const u32 pixel_shader = regs.IsShaderConfigEnabled(pixel_index)
+                                     ? regs.pipelines[pixel_index].offset
+                                     : 0;
+        if (pixel_shader == 0x00A35830 || pixel_shader == 0x0309C030 ||
+            pixel_shader == 0x0309CB30) {
+            const auto& rt0 = regs.rt[0];
+            const auto& zeta = regs.zeta;
+            LOG_WARNING(HW_GPU,
+                        "UHTRACE target_draw sh_fs=0x{:08X} execute={} render=0x{:016X} "
+                        "override={} mode={} indexed={} count={} inst={} "
+                        "rt0=0x{:016X}/{}x{}/fmt{} zeta=0x{:016X}/fmt{}",
+                        pixel_shader, maxwell3d->ShouldExecute(), regs.render_enable.Address(),
+                        static_cast<u32>(regs.render_enable_override),
+                        static_cast<u32>(regs.render_enable.mode), draw_indexed,
+                        draw_indexed ? draw_state.index_buffer.count
+                                     : draw_state.vertex_buffer.count,
+                        instance_count, rt0.Address(), rt0.width, rt0.height,
+                        static_cast<u32>(rt0.format), zeta.Address(),
+                        static_cast<u32>(zeta.format));
+        }
+    }
 
     if (maxwell3d->ShouldExecute()) {
         maxwell3d->rasterizer->Draw(draw_indexed, instance_count);

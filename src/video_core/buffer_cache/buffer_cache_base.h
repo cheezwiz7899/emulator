@@ -311,6 +311,10 @@ public:
     Runtime& runtime;
 
 private:
+    [[nodiscard]] bool UltrahandOwnershipTraceEnabled() const;
+    [[nodiscard]] bool IsUltrahandOwnershipRange(DAddr device_addr, u64 size);
+    void LearnUltrahandOwnershipRange(DAddr device_addr, u64 size);
+
     template <typename Func>
     static void ForEachEnabledBit(u32 enabled_mask, Func&& func) {
         for (u32 index = 0; enabled_mask != 0; ++index, enabled_mask >>= 1) {
@@ -494,6 +498,8 @@ public:
     MemoryTracker memory_tracker;
     Common::RangeSet<DAddr> uncommitted_gpu_modified_ranges;
     Common::RangeSet<DAddr> gpu_modified_ranges;
+    Common::RangeSet<DAddr> ultrahand_ownership_trace_ranges;
+    u64 ultrahand_ownership_trace_sequence = 0;
     std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
 
     // Async Buffers

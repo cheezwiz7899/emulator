@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: Copyright 2025 citron Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+
 #include <dynarmic/interface/code_page.h>
 #include "common/settings.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
@@ -66,16 +68,111 @@ public:
         }
     }
     void MemoryWrite32(u64 vaddr, u32 value) override {
+        static const bool trace_ultrahand_cbuf =
+            std::getenv("CITRON_UH_CBUF_TRACE") != nullptr;
+        if (trace_ultrahand_cbuf &&
+            (value == 0x3F931313 || value == 0x3F9B1B1B || value == 0x3F9F1F1F ||
+             value == 0x3FBB3B3B || value == 0x3FBF3F3F)) {
+            const u64 pc = m_parent.m_jit->GetPC();
+            const u64 source_va = m_parent.m_jit->GetRegister(1);
+            Kernel::KPhysicalAddress source_phys{};
+            Kernel::KPhysicalAddress destination_phys{};
+            const bool source_mapped = m_process->GetPageTable().GetPhysicalAddress(
+                &source_phys, Kernel::KProcessAddress(source_va));
+            const bool destination_mapped = m_process->GetPageTable().GetPhysicalAddress(
+                &destination_phys, Kernel::KProcessAddress(vaddr));
+            const void* source_host =
+                m_memory.GetPointer(Common::ProcessAddress(source_va));
+            LOG_WARNING(Core_ARM,
+                        "UHTRACE cbuf_guest_store32 pc=0x{:016X} vaddr=0x{:016X} "
+                        "value=0x{:08X} insn=0x{:08X} source_va=0x{:016X} "
+                        "source_value=0x{:08X} source_host={} source_mapped={} "
+                        "source_phys=0x{:016X} "
+                        "destination_mapped={} destination_phys=0x{:016X}",
+                        pc, vaddr, value, m_memory.Read32(pc), source_va,
+                        m_memory.Read32(source_va), source_host, source_mapped,
+                        source_mapped ? GetInteger(source_phys) : 0, destination_mapped,
+                        destination_mapped ? GetInteger(destination_phys) : 0);
+            LOG_WARNING(Core_ARM,
+                        "UHTRACE cbuf_guest_regs_a "
+                        "x0={:016X} x1={:016X} x2={:016X} x3={:016X} "
+                        "x4={:016X} x5={:016X} x6={:016X} x7={:016X}",
+                        m_parent.m_jit->GetRegister(0), m_parent.m_jit->GetRegister(1),
+                        m_parent.m_jit->GetRegister(2), m_parent.m_jit->GetRegister(3),
+                        m_parent.m_jit->GetRegister(4), m_parent.m_jit->GetRegister(5),
+                        m_parent.m_jit->GetRegister(6), m_parent.m_jit->GetRegister(7));
+            LOG_WARNING(Core_ARM,
+                        "UHTRACE cbuf_guest_regs_b "
+                        "x8={:016X} x9={:016X} x10={:016X} x11={:016X} "
+                        "x12={:016X} x13={:016X} x14={:016X} x15={:016X} "
+                        "sp={:016X}",
+                        m_parent.m_jit->GetRegister(8), m_parent.m_jit->GetRegister(9),
+                        m_parent.m_jit->GetRegister(10), m_parent.m_jit->GetRegister(11),
+                        m_parent.m_jit->GetRegister(12), m_parent.m_jit->GetRegister(13),
+                        m_parent.m_jit->GetRegister(14), m_parent.m_jit->GetRegister(15),
+                        m_parent.m_jit->GetSP());
+            LOG_WARNING(Core_ARM,
+                        "UHTRACE cbuf_guest_regs_c "
+                        "x16={:016X} x17={:016X} x18={:016X} x19={:016X} "
+                        "x20={:016X} x21={:016X} x22={:016X} x23={:016X}",
+                        m_parent.m_jit->GetRegister(16), m_parent.m_jit->GetRegister(17),
+                        m_parent.m_jit->GetRegister(18), m_parent.m_jit->GetRegister(19),
+                        m_parent.m_jit->GetRegister(20), m_parent.m_jit->GetRegister(21),
+                        m_parent.m_jit->GetRegister(22), m_parent.m_jit->GetRegister(23));
+            LOG_WARNING(Core_ARM,
+                        "UHTRACE cbuf_guest_regs_d "
+                        "x24={:016X} x25={:016X} x26={:016X} x27={:016X} "
+                        "x28={:016X} x29={:016X} x30={:016X}",
+                        m_parent.m_jit->GetRegister(24), m_parent.m_jit->GetRegister(25),
+                        m_parent.m_jit->GetRegister(26), m_parent.m_jit->GetRegister(27),
+                        m_parent.m_jit->GetRegister(28), m_parent.m_jit->GetRegister(29),
+                        m_parent.m_jit->GetRegister(30));
+        }
         if (CheckMemoryAccess(vaddr, 4, Kernel::DebugWatchpointType::Write)) {
             m_memory.Write32(vaddr, value);
         }
     }
     void MemoryWrite64(u64 vaddr, u64 value) override {
+        static const bool trace_ultrahand_cbuf =
+            std::getenv("CITRON_UH_CBUF_TRACE") != nullptr;
+        const auto is_target_id = [](u32 word) {
+            return word == 0x3F931313 || word == 0x3F9B1B1B || word == 0x3F9F1F1F ||
+                   word == 0x3FBB3B3B || word == 0x3FBF3F3F;
+        };
+        if (trace_ultrahand_cbuf &&
+            (is_target_id(static_cast<u32>(value)) ||
+             is_target_id(static_cast<u32>(value >> 32)))) {
+            LOG_WARNING(Core_ARM,
+                        "UHTRACE cbuf_guest_store64 pc=0x{:016X} vaddr=0x{:016X} "
+                        "value=0x{:016X} insn=0x{:08X} lr=0x{:016X}",
+                        m_parent.m_jit->GetPC(), vaddr, value,
+                        m_memory.Read32(m_parent.m_jit->GetPC()),
+                        m_parent.m_jit->GetRegister(30));
+        }
         if (CheckMemoryAccess(vaddr, 8, Kernel::DebugWatchpointType::Write)) {
             m_memory.Write64(vaddr, value);
         }
     }
     void MemoryWrite128(u64 vaddr, Vector value) override {
+        static const bool trace_ultrahand_cbuf =
+            std::getenv("CITRON_UH_CBUF_TRACE") != nullptr;
+        const auto is_target_id = [](u32 word) {
+            return word == 0x3F931313 || word == 0x3F9B1B1B || word == 0x3F9F1F1F ||
+                   word == 0x3FBB3B3B || word == 0x3FBF3F3F;
+        };
+        const bool contains_target_id =
+            is_target_id(static_cast<u32>(value[0])) ||
+            is_target_id(static_cast<u32>(value[0] >> 32)) ||
+            is_target_id(static_cast<u32>(value[1])) ||
+            is_target_id(static_cast<u32>(value[1] >> 32));
+        if (trace_ultrahand_cbuf && contains_target_id) {
+            LOG_WARNING(Core_ARM,
+                        "UHTRACE cbuf_guest_store128 pc=0x{:016X} vaddr=0x{:016X} "
+                        "value=0x{:016X}{:016X} insn=0x{:08X} lr=0x{:016X}",
+                        m_parent.m_jit->GetPC(), vaddr, value[1], value[0],
+                        m_memory.Read32(m_parent.m_jit->GetPC()),
+                        m_parent.m_jit->GetRegister(30));
+        }
         if (CheckMemoryAccess(vaddr, 16, Kernel::DebugWatchpointType::Write)) {
             m_memory.Write64(vaddr, value[0]);
             m_memory.Write64(vaddr + 8, value[1]);

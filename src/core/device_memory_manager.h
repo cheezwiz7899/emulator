@@ -10,6 +10,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <unordered_set>
 
 #include "common/common_types.h"
@@ -96,6 +97,15 @@ public:
             return 0;
         }
         return (static_cast<PAddr>(paddr - 1) << page_bits) + subbits;
+    }
+
+    std::optional<VAddr> GetCpuBackingAddress(DAddr address) {
+        const size_t page_index = address >> page_bits;
+        const auto [asid, page_address] = ExtractCPUBacking(page_index);
+        if (asid.id >= registered_processes.size() || registered_processes[asid.id] == nullptr) {
+            return std::nullopt;
+        }
+        return page_address + (address & page_mask);
     }
 
     template <typename T>

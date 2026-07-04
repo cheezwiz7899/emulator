@@ -5,9 +5,12 @@
 #pragma once
 
 #include <algorithm>
+#include <bit>
+#include <cstdlib>
 #include <memory>
 #include <numeric>
 
+#include "common/logging.h"
 #include "common/range_sets.inc"
 #include "citron/util/title_ids.h"
 #include "video_core/buffer_cache/buffer_cache_base.h"
@@ -133,7 +136,44 @@ void BufferCache<P>::TickFrame() {
 }
 
 template <class P>
+bool BufferCache<P>::UltrahandOwnershipTraceEnabled() const {
+    static const bool enabled = std::getenv("CITRON_UH_OWNERSHIP_TRACE") != nullptr ||
+                                std::getenv("CITRON_UH_CBUF_TRACE") != nullptr;
+    return enabled;
+}
+
+template <class P>
+bool BufferCache<P>::IsUltrahandOwnershipRange(DAddr device_addr, u64 size) {
+    if (!UltrahandOwnershipTraceEnabled() || size == 0) {
+        return false;
+    }
+    bool overlaps = false;
+    ultrahand_ownership_trace_ranges.ForEachInRange(
+        device_addr, size, [&](DAddr, DAddr) { overlaps = true; });
+    return overlaps;
+}
+
+template <class P>
+void BufferCache<P>::LearnUltrahandOwnershipRange(DAddr device_addr, u64 size) {
+    if (!UltrahandOwnershipTraceEnabled() || size == 0) {
+        return;
+    }
+    const DAddr start = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
+    const DAddr end = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE);
+    ultrahand_ownership_trace_ranges.Add(start, end - start);
+}
+
+template <class P>
 void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size) {
+    if (IsUltrahandOwnershipRange(device_addr, size)) {
+        LOG_WARNING(HW_GPU,
+                    "UHTRACE own seq={} op=write_memory addr=0x{:016X} size={} "
+                    "cpu_before={} gpu_page_before={} gpu_exact_before={}",
+                    ++ultrahand_ownership_trace_sequence, device_addr, size,
+                    memory_tracker.IsRegionCpuModified(device_addr, size),
+                    memory_tracker.IsRegionGpuModified(device_addr, size),
+                    IsRegionGpuModified(device_addr, size));
+    }
     if (memory_tracker.IsRegionGpuModified(device_addr, size)) {
         ClearDownload(device_addr, size);
         gpu_modified_ranges.Subtract(device_addr, size);
@@ -143,6 +183,10 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size) {
 
 template <class P>
 void BufferCache<P>::CachedWriteMemory(DAddr device_addr, u64 size) {
+    if (IsUltrahandOwnershipRange(device_addr, size)) {
+        LOG_WARNING(HW_GPU, "UHTRACE own seq={} op=cached_write addr=0x{:016X} size={}",
+                    ++ultrahand_ownership_trace_sequence, device_addr, size);
+    }
     const bool is_dirty = IsRegionRegistered(device_addr, size);
     if (!is_dirty) {
         return;
@@ -162,6 +206,29 @@ void BufferCache<P>::CachedWriteMemory(DAddr device_addr, u64 size) {
 
 template <class P>
 bool BufferCache<P>::OnCPUWrite(DAddr device_addr, u64 size) {
+    if (IsUltrahandOwnershipRange(device_addr, size)) {
+        static const bool trace_ultrahand_cbuf =
+            std::getenv("CITRON_UH_CBUF_TRACE") != nullptr;
+        if (trace_ultrahand_cbuf) {
+            const DAddr page = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
+            for (u32 offset = 0x54; offset < DEVICE_PAGESIZE; offset += 0x100) {
+                u32 raw_value{};
+                device_memory.ReadBlockUnsafe(page + offset, &raw_value, sizeof(raw_value));
+                const float value = std::bit_cast<float>(raw_value);
+                if (value >= 1.0f && value < 1.5f) {
+                    LOG_WARNING(HW_GPU,
+                                "UHTRACE cbuf_page_before_write page=0x{:016X} "
+                                "fault=0x{:016X}+{} slot=0x{:03X} raw=0x{:08X} value={}",
+                                page, device_addr, size, offset, raw_value, value);
+                }
+            }
+        }
+        LOG_WARNING(HW_GPU,
+                    "UHTRACE own seq={} op=cpu_write_fault addr=0x{:016X} size={} "
+                    "gpu_page={}",
+                    ++ultrahand_ownership_trace_sequence, device_addr, size,
+                    memory_tracker.IsRegionGpuModified(device_addr, size));
+    }
     const bool is_dirty = IsRegionRegistered(device_addr, size);
     if (!is_dirty) {
         return false;
@@ -195,6 +262,10 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
 
 template <class P>
 void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size) {
+    if (IsUltrahandOwnershipRange(device_addr, size)) {
+        LOG_WARNING(HW_GPU, "UHTRACE own seq={} op=download addr=0x{:016X} size={}",
+                    ++ultrahand_ownership_trace_sequence, device_addr, size);
+    }
     ForEachBufferInRange(device_addr, size, [&](BufferId, Buffer& buffer) {
         DownloadBufferMemory(buffer, device_addr, size);
     });
@@ -202,6 +273,10 @@ void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size) {
 
 template <class P>
 void BufferCache<P>::ClearDownload(DAddr device_addr, u64 size) {
+    if (IsUltrahandOwnershipRange(device_addr, size)) {
+        LOG_WARNING(HW_GPU, "UHTRACE own seq={} op=clear_gpu_owner addr=0x{:016X} size={}",
+                    ++ultrahand_ownership_trace_sequence, device_addr, size);
+    }
     async_downloads.DeleteAll(device_addr, size);
     uncommitted_gpu_modified_ranges.Subtract(device_addr, size);
     for (auto& interval_set : committed_gpu_modified_ranges) {
@@ -213,6 +288,12 @@ template <class P>
 bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount) {
     const std::optional<DAddr> cpu_src_address = gpu_memory->GpuToCpuAddress(src_address);
     const std::optional<DAddr> cpu_dest_address = gpu_memory->GpuToCpuAddress(dest_address);
+    if (cpu_dest_address && IsUltrahandOwnershipRange(*cpu_dest_address, amount)) {
+        LOG_WARNING(HW_GPU,
+                    "UHTRACE own seq={} op=dma_copy_dst addr=0x{:016X} size={} "
+                    "gpu_src=0x{:016X}",
+                    ++ultrahand_ownership_trace_sequence, *cpu_dest_address, amount, src_address);
+    }
     if (!cpu_src_address || !cpu_dest_address) {
         return false;
     }
@@ -342,6 +423,42 @@ template <class P>
 void BufferCache<P>::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr,
                                                u32 size) {
     const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
+    static const bool trace_ultrahand_cbuf =
+        std::getenv("CITRON_UH_CBUF_TRACE") != nullptr;
+    if (trace_ultrahand_cbuf) {
+        static bool reported_active = false;
+        if (!reported_active) {
+            reported_active = true;
+            LOG_WARNING(HW_GPU, "UHTRACE cbuf_trace_active");
+        }
+    }
+    if (trace_ultrahand_cbuf && stage == 4 && size >= 0x258) {
+        u32 raw_value{};
+        device_memory.ReadBlockUnsafe(*device_addr + 0x254, &raw_value, sizeof(raw_value));
+        const float value = std::bit_cast<float>(raw_value);
+        if (value >= 1.0f && value < 1.5f) {
+            constexpr auto pixel_type = Maxwell::ShaderType::Pixel;
+            constexpr auto pixel_index = static_cast<std::size_t>(pixel_type);
+            const u32 pixel_shader = maxwell3d->regs.IsShaderConfigEnabled(pixel_index)
+                                         ? maxwell3d->regs.pipelines[pixel_index].offset
+                                         : 0;
+            if (pixel_shader == 0x012F4730 && index == 11) {
+                LearnUltrahandOwnershipRange(*device_addr, size);
+                const auto cpu_backing = device_memory.GetCpuBackingAddress(*device_addr);
+                LOG_WARNING(
+                    HW_GPU,
+                    "UHTRACE cbuf_target_id stage={} index={} gpu=0x{:016X} "
+                    "device=0x{:016X} cpu=0x{:016X} cpu_mapped={} size={} "
+                    "raw=0x{:08X} value={} sh_fs=0x{:08X} cpu_dirty={} "
+                    "gpu_page={} gpu_exact={}",
+                    stage, index, gpu_addr, *device_addr, cpu_backing.value_or(0),
+                    cpu_backing.has_value(), size, raw_value, value, pixel_shader,
+                    memory_tracker.IsRegionCpuModified(*device_addr, size),
+                    memory_tracker.IsRegionGpuModified(*device_addr, size),
+                    IsRegionGpuModified(*device_addr, size));
+            }
+        }
+    }
     const Binding binding{
         .device_addr = *device_addr,
         .size = size,
@@ -737,10 +854,55 @@ void BufferCache<P>::BindHostVertexBuffers() {
     HostBindings<typename P::Buffer> host_bindings;
     bool any_valid{false};
     auto& flags = maxwell3d->dirty.flags;
+    static const bool force_ultrahand_selector_upload =
+        std::getenv("CITRON_UH_FORCE_SELECTOR_UPLOAD") != nullptr;
+    constexpr auto pixel_type = Maxwell::ShaderType::Pixel;
+    constexpr auto pixel_index = static_cast<std::size_t>(pixel_type);
+    const u32 pixel_shader = maxwell3d->regs.IsShaderConfigEnabled(pixel_index)
+                                 ? maxwell3d->regs.pipelines[pixel_index].offset
+                                 : 0;
+    static u32 selector_trace_calls = 0;
+    const bool trace_selector_streams =
+        force_ultrahand_selector_upload && pixel_shader == 0x00A35830 &&
+        selector_trace_calls++ < 12;
     for (u32 index = 0; index < NUM_VERTEX_BUFFERS; ++index) {
         const Binding& binding = channel_state->vertex_buffers[index];
         Buffer& buffer = slot_buffers[binding.buffer_id];
         TouchBuffer(buffer, binding.buffer_id);
+        const bool selector_instance_stream =
+            index >= 2 && index <= 8 && index != 5 && pixel_shader == 0x00A35830;
+        if (pixel_shader == 0x00A35830 && index >= 2 && index <= 8) {
+            LearnUltrahandOwnershipRange(binding.device_addr, binding.size);
+        }
+        const bool gpu_modified =
+            selector_instance_stream &&
+            memory_tracker.IsRegionGpuModified(binding.device_addr, binding.size);
+        const bool cpu_modified =
+            selector_instance_stream &&
+            memory_tracker.IsRegionCpuModified(binding.device_addr, binding.size);
+        const bool force_upload =
+            force_ultrahand_selector_upload && selector_instance_stream && !gpu_modified;
+        if (trace_selector_streams && selector_instance_stream) {
+            LOG_WARNING(HW_GPU,
+                        "UHTRACE selector_stream index={} device=0x{:016X} size={} "
+                        "cpu_dirty={} gpu_dirty={} force={}",
+                        index, binding.device_addr, binding.size, cpu_modified, gpu_modified,
+                        force_upload);
+        }
+        if (force_upload) {
+            memory_tracker.MarkRegionAsCpuModified(binding.device_addr, binding.size);
+        }
+        if (pixel_shader == 0x00A35830 && index >= 2 && index <= 8 &&
+            UltrahandOwnershipTraceEnabled()) {
+            LOG_WARNING(
+                HW_GPU,
+                "UHTRACE own seq={} op=selector_bind index={} addr=0x{:016X} size={} "
+                "cpu={} gpu_page={} gpu_exact={}",
+                ++ultrahand_ownership_trace_sequence, index, binding.device_addr, binding.size,
+                memory_tracker.IsRegionCpuModified(binding.device_addr, binding.size),
+                memory_tracker.IsRegionGpuModified(binding.device_addr, binding.size),
+                IsRegionGpuModified(binding.device_addr, binding.size));
+        }
         SynchronizeBuffer(buffer, binding.device_addr, binding.size);
         if (!flags[Dirty::VertexBuffer0 + index]) {
             continue;
@@ -1282,6 +1444,10 @@ void BufferCache<P>::UpdateComputeTextureBuffers() {
 
 template <class P>
 void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size) {
+    if (IsUltrahandOwnershipRange(device_addr, size)) {
+        LOG_WARNING(HW_GPU, "UHTRACE own seq={} op=mark_gpu_written addr=0x{:016X} size={}",
+                    ++ultrahand_ownership_trace_sequence, device_addr, size);
+    }
     memory_tracker.MarkRegionAsGpuModified(device_addr, size);
     gpu_modified_ranges.Add(device_addr, size);
     uncommitted_gpu_modified_ranges.Add(device_addr, size);
@@ -1488,15 +1654,37 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
     boost::container::small_vector<BufferCopy, 4> copies;
     u64 total_size_bytes = 0;
     u64 largest_copy = 0;
-    DAddr buffer_start = buffer.CpuAddr();
-    memory_tracker.ForEachUploadRange(device_addr, size, [&](u64 device_addr_out, u64 range_size) {
+    const DAddr buffer_start = buffer.CpuAddr();
+    const auto add_upload = [&](DAddr start, DAddr end) {
+        if (start >= end) {
+            return;
+        }
+        const u64 range_size = end - start;
+        if (IsUltrahandOwnershipRange(start, range_size)) {
+            LOG_WARNING(
+                HW_GPU,
+                "UHTRACE own seq={} op=queue_upload request=0x{:016X}+{} "
+                "copy=0x{:016X}+{} buffer_base=0x{:016X}",
+                ++ultrahand_ownership_trace_sequence, device_addr, size, start, range_size,
+                buffer_start);
+        }
         copies.push_back(BufferCopy{
             .src_offset = total_size_bytes,
-            .dst_offset = device_addr_out - buffer_start,
+            .dst_offset = start - buffer_start,
             .size = range_size,
         });
         total_size_bytes += range_size;
         largest_copy = std::max(largest_copy, range_size);
+    };
+    memory_tracker.ForEachUploadRange(device_addr, size, [&](u64 device_addr_out, u64 range_size) {
+        const DAddr upload_end = device_addr_out + range_size;
+        DAddr cursor = device_addr_out;
+        gpu_modified_ranges.ForEachInRange(device_addr_out, range_size,
+                                           [&](DAddr gpu_start, DAddr gpu_end) {
+            add_upload(cursor, gpu_start);
+            cursor = std::max(cursor, gpu_end);
+        });
+        add_upload(cursor, upload_end);
     });
     if (total_size_bytes == 0) {
         return true;
@@ -1567,7 +1755,32 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
             // Apply the staging offset
             copy.src_offset += upload_staging.offset;
         }
-        const bool can_reorder = runtime.CanReorderUpload(buffer, copies);
+        bool has_mixed_ownership_page = false;
+        for (const BufferCopy& copy : copies) {
+            const DAddr copy_start = buffer.CpuAddr() + copy.dst_offset;
+            const DAddr page_start = Common::AlignDown(copy_start, DEVICE_PAGESIZE);
+            const DAddr page_end =
+                Common::AlignUp(copy_start + copy.size, DEVICE_PAGESIZE);
+            gpu_modified_ranges.ForEachInRange(
+                page_start, page_end - page_start,
+                [&](DAddr, DAddr) { has_mixed_ownership_page = true; });
+            if (has_mixed_ownership_page) {
+                break;
+            }
+        }
+        const bool can_reorder =
+            !has_mixed_ownership_page && runtime.CanReorderUpload(buffer, copies);
+        for (const BufferCopy& copy : copies) {
+            const DAddr copy_start = buffer.CpuAddr() + copy.dst_offset;
+            if (IsUltrahandOwnershipRange(copy_start, copy.size)) {
+                LOG_WARNING(
+                    HW_GPU,
+                    "UHTRACE own seq={} op=submit_upload addr=0x{:016X} size={} "
+                    "mixed_page={} reorder={}",
+                    ++ultrahand_ownership_trace_sequence, copy_start, copy.size,
+                    has_mixed_ownership_page, can_reorder);
+            }
+        }
         runtime.CopyBuffer(buffer, upload_staging.buffer, copies, true, can_reorder);
     }
 }
@@ -1609,7 +1822,14 @@ void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_
         }};
         u8* const src_pointer = upload_staging.mapped_span.data();
         std::memcpy(src_pointer, inlined_buffer.data(), copy_size);
-        const bool can_reorder = runtime.CanReorderUpload(buffer, copies);
+        bool has_mixed_ownership_page = false;
+        const DAddr page_start = Common::AlignDown(dest_address, DEVICE_PAGESIZE);
+        const DAddr page_end = Common::AlignUp(dest_address + copy_size, DEVICE_PAGESIZE);
+        gpu_modified_ranges.ForEachInRange(
+            page_start, page_end - page_start,
+            [&](DAddr, DAddr) { has_mixed_ownership_page = true; });
+        const bool can_reorder =
+            !has_mixed_ownership_page && runtime.CanReorderUpload(buffer, copies);
         runtime.CopyBuffer(buffer, upload_staging.buffer, copies, true, can_reorder);
     } else {
         buffer.ImmediateUpload(buffer.Offset(dest_address), inlined_buffer.first(copy_size));
