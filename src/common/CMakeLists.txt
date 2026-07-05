@@ -227,9 +227,11 @@ endif()
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
   target_compile_options(common PRIVATE
-    -fsized-deallocation
     -Werror=unreachable-code-aggressive
   )
+  if (NOT MSVC)
+    target_compile_options(common PRIVATE -fsized-deallocation)
+  endif()
   target_compile_definitions(common PRIVATE
     # Clang 14 and earlier have errors when explicitly instantiating Settings::Setting
     $<$<VERSION_LESS:$<CXX_COMPILER_VERSION>,15>:CANNOT_EXPLICITLY_INSTANTIATE>

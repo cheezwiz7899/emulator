@@ -21,7 +21,7 @@ public:
 
 private:
     // Initializer intentionally skipped
-    std::array<u8, PageSize> m_buffer;
+    [[maybe_unused]] std::array<u8, PageSize> m_buffer;
 };
 static_assert(sizeof(PageTablePage) == PageSize);
 

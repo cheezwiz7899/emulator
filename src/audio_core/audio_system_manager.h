@@ -120,7 +120,6 @@ public:
 private:
     static constexpr size_t MaxAppletResourceUserIds = 8;
 
-    Core::System& system;
     std::mutex mutex;
 
     std::array<u64, MaxAppletResourceUserIds> registered_ids{};

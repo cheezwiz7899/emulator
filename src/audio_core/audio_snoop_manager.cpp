@@ -8,7 +8,7 @@
 
 namespace AudioCore {
 
-AudioSnoopManager::AudioSnoopManager(Core::System& system_) : system{system_} {}
+AudioSnoopManager::AudioSnoopManager(Core::System&) {}
 AudioSnoopManager::~AudioSnoopManager() = default;
 
 Result AudioSnoopManager::GetDspStatistics(DspStatistics& statistics_out) {

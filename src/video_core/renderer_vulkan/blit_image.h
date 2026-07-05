@@ -114,7 +114,7 @@ private:
 
     const Device& device;
     Scheduler& scheduler;
-    StateTracker& state_tracker;
+    [[maybe_unused]] StateTracker& state_tracker;
 
     vk::DescriptorSetLayout one_texture_set_layout;
     vk::DescriptorSetLayout two_textures_set_layout;

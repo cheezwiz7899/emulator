@@ -1021,9 +1021,13 @@ void MacroJITx64Impl::Compile_Read(Macro::Opcode opcode) {
         int3();
         L(pass_range_check);
     }
+    // Use pointer-based offset calculation since Maxwell3D is non-standard-layout (has virtual base)
+    // Not constexpr under clang-cl: reinterpret_cast is not allowed in constant expressions
+    const std::size_t regs_offset =
+        reinterpret_cast<std::size_t>(&reinterpret_cast<const Engines::Maxwell3D*>(0x0)->regs);
     mov(rax, qword[STATE]);
     mov(RESULT,
-        dword[rax + offsetof(Engines::Maxwell3D, regs) +
+        dword[rax + regs_offset +
               offsetof(Engines::Maxwell3D::Regs, reg_array) + RESULT.cvt64() * sizeof(u32)]);
 
     Compile_ProcessResult(opcode.result_operation, opcode.dst);

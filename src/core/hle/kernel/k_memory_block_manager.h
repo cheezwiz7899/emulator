@@ -154,7 +154,7 @@ public:
     ~KScopedMemoryBlockManagerAuditor() = default;
 
 private:
-    KMemoryBlockManager* m_manager;
+    [[maybe_unused]] KMemoryBlockManager* m_manager;
 };
 
 } // namespace Kernel

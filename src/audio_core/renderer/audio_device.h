@@ -126,8 +126,6 @@ private:
 private:
     /// Backend output sink for the device
     Sink::Sink& output_sink;
-    /// Resource id this device is used for
-    const u64 applet_resource_user_id;
     /// User audio renderer revision
     const u32 user_revision;
     /// Last volume value requested by the game (before clamping).

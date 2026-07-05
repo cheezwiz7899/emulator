@@ -189,11 +189,11 @@ private:
             std::pair<std::conditional_t<is_gpu_address, GPUVAddr, DAddr>, std::size_t>, 32>&
             result) const;
 
-    Core::System& system;
+    [[maybe_unused]] Core::System& system;
     MaxwellDeviceMemoryManager& memory;
 
     const u64 address_space_bits;
-    GPUVAddr split_address;
+    [[maybe_unused]] GPUVAddr split_address;
     const u64 page_bits;
     u64 address_space_size;
     u64 page_size;

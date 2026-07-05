@@ -100,8 +100,6 @@ private:
     bool has_new_connection{true};
     /// Pointer to the destinations of this splitter
     SplitterDestinationData* destinations{};
-    /// Number of channels this splitter manages
-    u32 channel_count{};
 };
 
 } // namespace AudioCore::Renderer

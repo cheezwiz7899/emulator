@@ -96,7 +96,7 @@ public:
     size_t next_bank;
 
 private:
-    const Device& device;
+    [[maybe_unused]] const Device& device;
     const size_t index;
     vk::QueryPool query_pool;
     std::array<u64, BANK_SIZE> host_results;
@@ -675,7 +675,7 @@ public:
     explicit TFBCounterStreamer(size_t id_, QueryCacheRuntime& runtime_, const Device& device_,
                                 Scheduler& scheduler_, const MemoryAllocator& memory_allocator_,
                                 StagingBufferPool& staging_pool_)
-        : BaseStreamer(id_), runtime{runtime_}, device{device_}, scheduler{scheduler_},
+        : BaseStreamer(id_), runtime{runtime_}, scheduler{scheduler_},
           memory_allocator{memory_allocator_}, staging_pool{staging_pool_} {
         buffers_count = 0;
         current_bank = nullptr;
@@ -990,7 +990,6 @@ private:
     static constexpr size_t NUM_STREAMS = 4;
 
     QueryCacheRuntime& runtime;
-    const Device& device;
     Scheduler& scheduler;
     const MemoryAllocator& memory_allocator;
     StagingBufferPool& staging_pool;

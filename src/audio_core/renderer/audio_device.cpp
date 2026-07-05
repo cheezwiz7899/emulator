@@ -37,7 +37,9 @@ constexpr std::array output_device_names{
 AudioDevice::AudioDevice(Core::System& system, const u64 applet_resource_user_id_,
                          const u32 revision)
     : output_sink{system.AudioCore().GetOutputSink()},
-      applet_resource_user_id{applet_resource_user_id_}, user_revision{revision} {}
+      user_revision{revision} {
+    (void)applet_resource_user_id_;
+}
 
 u32 AudioDevice::ListAudioDeviceName(std::span<AudioDeviceName> out_buffer) const {
     std::span<const AudioDeviceName> names{};

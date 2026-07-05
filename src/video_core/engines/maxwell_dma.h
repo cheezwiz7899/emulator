@@ -263,7 +263,7 @@ private:
 
     void ConsumeSinkImpl() override;
 
-    Core::System& system;
+    [[maybe_unused]] Core::System& system;
 
     MemoryManager& memory_manager;
     VideoCore::RasterizerInterface* rasterizer = nullptr;

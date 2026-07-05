@@ -72,7 +72,7 @@ private:
 
     BufferCache& buffer_cache;
     TextureCache& texture_cache;
-    Scheduler& scheduler;
+    [[maybe_unused]] Scheduler& scheduler;
 };
 
 class RasterizerVulkan final : public VideoCore::RasterizerInterface,

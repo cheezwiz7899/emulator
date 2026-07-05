@@ -126,9 +126,9 @@ public:
 
 private:
     Scheduler& scheduler;
-    StagingBufferPool& staging_buffer_pool;
+    [[maybe_unused]] StagingBufferPool& staging_buffer_pool;
     ComputePassDescriptorQueue& compute_pass_descriptor_queue;
-    MemoryAllocator& memory_allocator;
+    [[maybe_unused]] MemoryAllocator& memory_allocator;
 };
 
 class MSAACopyPass final : public ComputePass {
@@ -143,7 +143,7 @@ public:
 
 private:
     Scheduler& scheduler;
-    StagingBufferPool& staging_buffer_pool;
+    [[maybe_unused]] StagingBufferPool& staging_buffer_pool;
     ComputePassDescriptorQueue& compute_pass_descriptor_queue;
     std::array<vk::ShaderModule, 2> modules;
     std::array<vk::Pipeline, 2> pipelines;

@@ -52,15 +52,9 @@ if (MSVC)
         /std:c++20
         /utf-8
         /volatile:iso
-        /Zc:externConstexpr
         /Zc:inline
         /Zc:preprocessor
-        /Zc:throwingNew
-        /GT
         # causes crashes on windows probably? /GR-
-
-        # Modules
-        /experimental:module- # Explicitly disable module support due to conflicts with precompiled headers.
 
         # External headers diagnostics
         /external:anglebrackets # Treats all headers included by #include <header>, where the header file is enclosed in angle brackets (< >), as external headers
@@ -94,6 +88,26 @@ if (MSVC)
         /wd4702 # unreachable code (when used with LTO)
         /wd4127 # if constexpr bullshit
     )
+    if (NOT CITRON_CLANGCL_DIAGNOSTIC)
+        add_compile_options(
+            /Zc:externConstexpr
+            /Zc:throwingNew
+            /GT
+            /experimental:module-
+        )
+    else()
+        add_compile_options(
+            /clang:-Wno-unknown-attributes
+            /clang:-Wno-unused-parameter
+            /clang:-Wno-missing-field-initializers
+            /clang:-Wno-ignored-pragmas
+            /clang:-Wno-braced-scalar-init
+            /clang:-Wno-unused-private-field
+            /clang:-Wno-c++11-narrowing
+            /clang:-Wno-cast-function-type-mismatch
+            /clang:-mcx16
+        )
+    endif()
 
     if (USE_CCACHE OR CITRON_USE_PRECOMPILED_HEADERS)
     # when caching, we need to use /Z7 to downgrade debug info to use an older but more cacheable format

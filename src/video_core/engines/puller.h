@@ -84,8 +84,7 @@ public:
     void CallEngineMultiMethod(u32 method, u32 subchannel, const u32* base_start, u32 amount,
                                u32 methods_pending);
 
-private:
-    Tegra::GPU& gpu;
+    [[maybe_unused]] Tegra::GPU& gpu;
 
     MemoryManager& memory_manager;
     DmaPusher& dma_pusher;

@@ -5,14 +5,14 @@
 
 #include <utility>
 
-#ifdef _MSC_VER
+#if defined(_MSC_VER)
 #include <intrin.h>
 #pragma intrinsic(__umulh)
 #pragma intrinsic(_umul128)
 #pragma intrinsic(_udiv128)
-#else
-#include <cstring>
 #endif
+
+#include <cstring>
 
 #include "common/common_types.h"
 
@@ -20,7 +20,7 @@ namespace Common {
 
 // This function multiplies 2 u64 values and divides it by a u64 value.
 [[nodiscard]] static inline u64 MultiplyAndDivide64(u64 a, u64 b, u64 d) {
-#ifdef _MSC_VER
+#if defined(_MSC_VER) && !defined(__clang__)
     u128 r{};
     r[0] = _umul128(a, b, &r[1]);
     u64 remainder;
@@ -41,7 +41,7 @@ namespace Common {
 // This function multiplies 2 u64 values and produces a u128 value;
 [[nodiscard]] static inline u128 Multiply64Into128(u64 a, u64 b) {
     u128 result;
-#ifdef _MSC_VER
+#if defined(_MSC_VER) && !defined(__clang__)
     result[0] = _umul128(a, b, &result[1]);
 #else
     unsigned __int128 tmp = a;
@@ -52,16 +52,22 @@ namespace Common {
 }
 
 [[nodiscard]] static inline u64 GetFixedPoint64Factor(u64 numerator, u64 divisor) {
-#ifdef __SIZEOF_INT128__
+#if defined(__SIZEOF_INT128__) && !(defined(_MSC_VER) && defined(__clang__))
     const auto base = static_cast<unsigned __int128>(numerator) << 64ULL;
     return static_cast<u64>(base / divisor);
 #elif defined(_M_X64) || defined(_M_ARM64)
+#if defined(_MSC_VER) && defined(__clang__)
+    const long double base = static_cast<long double>(numerator) *
+                              static_cast<long double>(18446744073709551616.0L);
+    return static_cast<u64>(base / static_cast<long double>(divisor));
+#else
     std::array<u64, 2> r = {0, numerator};
     u64 remainder;
-#if _MSC_VER < 1923
+#if defined(_MSC_VER) && !defined(__clang__) && _MSC_VER < 1923
     return udiv128(r[1], r[0], divisor, &remainder);
 #else
     return _udiv128(r[1], r[0], divisor, &remainder);
+#endif
 #endif
 #else
     // This one is bit more inaccurate.

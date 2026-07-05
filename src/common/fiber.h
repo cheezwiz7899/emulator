@@ -6,9 +6,13 @@
 #include <functional>
 #include <memory>
 
+#if !defined(WIN32)
 namespace boost::context::detail {
 struct transfer_t;
 }
+#else
+#include <Windows.h>
+#endif
 
 namespace Common {
 
@@ -53,10 +57,15 @@ public:
 private:
     Fiber();
 
+#if !defined(WIN32)
     void OnRewind(boost::context::detail::transfer_t& transfer);
     void Start(boost::context::detail::transfer_t& transfer);
     static void FiberStartFunc(boost::context::detail::transfer_t transfer);
     static void RewindStartFunc(boost::context::detail::transfer_t transfer);
+#else
+    static VOID CALLBACK FiberStartFunc(LPVOID param);
+    static VOID CALLBACK RewindStartFunc(LPVOID param);
+#endif
 
     struct FiberImpl;
     std::unique_ptr<FiberImpl> impl;

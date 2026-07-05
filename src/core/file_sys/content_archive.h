@@ -97,8 +97,6 @@ private:
     VirtualFile file;
 
     Loader::ResultStatus status{};
-
-    bool encrypted = false;
     bool is_update = false;
 
     Core::Crypto::KeyManager& keys;

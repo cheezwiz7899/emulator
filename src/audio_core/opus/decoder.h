@@ -34,7 +34,6 @@ public:
                                            std::span<u8> output_data, bool reset);
 
 private:
-    Core::System& system;
     HardwareOpus& hardware_opus;
     std::unique_ptr<u8[]> shared_buffer{};
     u64 shared_buffer_size;

@@ -324,6 +324,13 @@ endif()
 
 # Enforce the search mode of non-required packages for better and shorter failure messages
 
+# clang-cl diagnostic builds should avoid Boost.Context's asm fcontext backend on Windows.
+# The winfib implementation is more compatible with this toolchain and keeps the
+# diagnostic build moving without altering release configuration.
+if(CITRON_CLANGCL_DIAGNOSTIC AND WIN32)
+    set(BOOST_CONTEXT_IMPLEMENTATION winfib CACHE STRING "" FORCE)
+endif()
+
 # Find Boost and its components.
 # 'process' is optional. The build will continue if it's not found.
 if (NOT TARGET Boost::context)

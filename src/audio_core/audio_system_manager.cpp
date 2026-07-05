@@ -11,7 +11,7 @@
 
 namespace AudioCore {
 
-AudioSystemManager::AudioSystemManager(Core::System& system_) : system{system_} {}
+AudioSystemManager::AudioSystemManager(Core::System&) {}
 AudioSystemManager::~AudioSystemManager() = default;
 
 Result AudioSystemManager::RegisterAppletResourceUserId(u64 applet_resource_user_id) {

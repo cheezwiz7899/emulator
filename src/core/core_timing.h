@@ -18,6 +18,10 @@
 #include "common/thread.h"
 #include "common/wall_clock.h"
 
+#ifdef CreateEvent
+#undef CreateEvent
+#endif
+
 namespace Core::Timing {
 
 /// A callback that may be scheduled for a particular core timing event.

@@ -75,7 +75,7 @@ public:
 private:
     void ConsumeSinkImpl() override;
 
-    Core::System& system;
+    [[maybe_unused]] Core::System& system;
     Upload::State upload_state;
 };
 

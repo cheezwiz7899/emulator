@@ -18,7 +18,7 @@ class KDynamicPageManager {
 public:
     class PageBuffer {
     private:
-        u8 m_buffer[PageSize];
+        [[maybe_unused]] u8 m_buffer[PageSize];
     };
     static_assert(sizeof(PageBuffer) == PageSize);
 

@@ -125,6 +125,11 @@ if (NOT TARGET ZLIB::ZLIB)
         set(ZLIB_FOUND TRUE CACHE BOOL "" FORCE)
         set(ZLIB_INCLUDE_DIRS "${ZLIB_SOURCE_DIR};${ZLIB_BINARY_DIR}" CACHE PATH "" FORCE)
     endif()
+    if (CITRON_CLANGCL_DIAGNOSTIC AND TARGET zlib)
+        # Only zlibstatic is consumed. Avoid rc.exe parsing Clang's stddef.h
+        # while compiling the unused shared-library version resource.
+        set_target_properties(zlib PROPERTIES EXCLUDE_FROM_ALL TRUE)
+    endif()
 endif()
 
 # ── zstd ──────────────────────────────────────────────────────────────────────
@@ -342,6 +347,11 @@ if (NOT TARGET Opus::opus)
             "OPUS_INSTALL_PKG_CONFIG_MODULE OFF"
             "OPUS_INSTALL_CMAKE_CONFIG_MODULE OFF"
     )
+    if (CITRON_CLANGCL_DIAGNOSTIC AND TARGET opus)
+        # Opus' SSE4.1 source also uses SSSE3 intrinsics. clang-cl requires
+        # that implied feature to be stated explicitly.
+        target_compile_options(opus PRIVATE /clang:-msse4.1 /clang:-mssse3)
+    endif()
 endif()
 
 # ── cubeb ─────────────────────────────────────────────────────────────────────
@@ -441,6 +451,13 @@ if (NOT TARGET sirit)
         GITHUB_REPOSITORY yuzu-mirror/sirit
         GIT_TAG ab75463999f4f3291976b079d42d52ee91eebf3f
     )
+    if (CITRON_CLANGCL_DIAGNOSTIC AND TARGET sirit)
+        get_target_property(_sirit_compile_options sirit COMPILE_OPTIONS)
+        if (_sirit_compile_options)
+            list(REMOVE_ITEM _sirit_compile_options /Zc:throwingNew)
+            set_property(TARGET sirit PROPERTY COMPILE_OPTIONS "${_sirit_compile_options}")
+        endif()
+    endif()
 endif()
 
 # ── dynarmic (xinitrcn1 fork) ─────────────────────────────────────────────────

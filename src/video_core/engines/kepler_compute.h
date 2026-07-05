@@ -220,7 +220,7 @@ private:
     /// Retrieves information about a specific TSC entry from the TSC buffer.
     Texture::TSCEntry GetTSCEntry(u32 tsc_index) const;
 
-    Core::System& system;
+    [[maybe_unused]] Core::System& system;
     MemoryManager& memory_manager;
     VideoCore::RasterizerInterface* rasterizer = nullptr;
     Upload::State upload_state;

@@ -13,8 +13,7 @@ class MemoryResourceBufferHoldStorage : public IStorage {
 
 public:
     MemoryResourceBufferHoldStorage(VirtualFile storage, size_t buffer_size)
-        : m_storage(std::move(storage)), m_buffer(::operator new(buffer_size)),
-          m_buffer_size(buffer_size) {}
+        : m_storage(std::move(storage)), m_buffer(::operator new(buffer_size)) {}
 
     virtual ~MemoryResourceBufferHoldStorage() {
         // If we have a buffer, deallocate it.
@@ -55,7 +54,6 @@ public:
 private:
     VirtualFile m_storage;
     void* m_buffer;
-    size_t m_buffer_size;
 };
 
 } // namespace FileSys

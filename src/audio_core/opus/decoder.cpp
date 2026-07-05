@@ -19,8 +19,8 @@ OpusPacketHeader ReverseHeader(OpusPacketHeader header) {
 }
 } // namespace
 
-OpusDecoder::OpusDecoder(Core::System& system_, HardwareOpus& hardware_opus_)
-    : system{system_}, hardware_opus{hardware_opus_} {}
+OpusDecoder::OpusDecoder(Core::System&, HardwareOpus& hardware_opus_)
+    : hardware_opus{hardware_opus_} {}
 
 OpusDecoder::~OpusDecoder() {
     if (decode_object_initialized) {

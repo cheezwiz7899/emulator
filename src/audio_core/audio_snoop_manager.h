@@ -90,7 +90,6 @@ public:
     void UpdateStatistics(u64 cycles_elapsed, u32 active_voices, u32 dropped_commands);
 
 private:
-    Core::System& system;
     std::mutex mutex;
 
     DspStatistics statistics{};

@@ -38,6 +38,6 @@ private:
     Core::HID::LedPattern led_blinking{0, 0, 0, 0};
     Core::HID::LedPattern left_pattern{0, 0, 0, 0};
     Core::HID::LedPattern right_pattern{0, 0, 0, 0};
-    u64 led_interval{};
+    [[maybe_unused]] u64 led_interval{};
 };
 } // namespace Service::HID

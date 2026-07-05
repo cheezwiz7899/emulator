@@ -268,6 +268,15 @@ set -euo pipefail
 # =============================================================================
 
 CLANG_VERSION="${CLANG_VERSION:-21}"
+COMPILER_MODE="${COMPILER_MODE:-llvm-mingw}"
+CLANG_OPT_LEVEL="${CITRON_CLANG_OPT_LEVEL:-3}"
+case "${CLANG_OPT_LEVEL}" in
+    0|1|2|3) ;;
+    *)
+        echo "CITRON_CLANG_OPT_LEVEL must be 0, 1, 2, or 3" >&2
+        exit 2
+        ;;
+esac
 
 
 # llvm-mingw release tag — cross-compilation toolchain (Clang+libc++/compiler-rt)
@@ -1461,9 +1470,15 @@ ensure_vulkan_import_lib() {
     local dlltool="${LLVM_MINGW_DIR}/bin/llvm-dlltool"
     if [[ ! -x "${dlltool}" ]]; then
         warn "llvm-mingw dlltool not found at ${dlltool}, trying system fallback"
-        dlltool="x86_64-w64-mingw32-dlltool"
-        command -v "${dlltool}" &>/dev/null \
-            || error "No dlltool available. Run setup or ensure llvm-mingw is extracted."
+        if command -v llvm-dlltool &>/dev/null; then
+            dlltool="llvm-dlltool"
+        elif command -v x86_64-w64-mingw32-dlltool &>/dev/null; then
+            dlltool="x86_64-w64-mingw32-dlltool"
+        elif command -v dlltool &>/dev/null; then
+            dlltool="dlltool"
+        else
+            error "No dlltool available. Run setup or install a MinGW binutils package."
+        fi
     fi
 
     info "  Running ${dlltool##*/} to generate libvulkan-1.a..."
@@ -1952,6 +1967,12 @@ write_toolchain_file() {
     local CMAKE_BUILD_ROOT="${BUILD_ROOT}"
     if [[ "${_HOST_OS}" == "windows" ]]; then
         CMAKE_BUILD_ROOT="$(cygpath -m "${BUILD_ROOT}")"
+        local msys_cxx_compat_flags=""
+        local msys_linker_flags="-Wl,--allow-multiple-definition"
+        if [[ "${MSYS2_PREFIX}" == "/clang64" ]]; then
+            msys_cxx_compat_flags="-U__GLIBCXX__"
+            msys_linker_flags="-fuse-ld=lld ${msys_linker_flags}"
+        fi
 
         # MSYS2/Windows: native compilation — CMAKE_SYSTEM_NAME is auto-detected
         # as Windows; no cross-compile sysroot is needed.  The MSYS2 clang64
@@ -1967,10 +1988,10 @@ set(CMAKE_C_COMPILER   "${MINGW_CLANG}")
 set(CMAKE_CXX_COMPILER "${MINGW_CLANGPP}")
 set(CMAKE_RC_COMPILER  "windres.exe")
 set(CMAKE_C_FLAGS_INIT   "-D__INTRINSIC_DEFINED___cpuidex -D__USE_MINGW_STAT64 -Wno-unknown-pragmas")
-set(CMAKE_CXX_FLAGS_INIT "-D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -D__INTRINSIC_DEFINED___cpuidex -D__USE_MINGW_STAT64 -U__GLIBCXX__ -Wno-unknown-pragmas")
-set(CMAKE_EXE_LINKER_FLAGS_INIT    "-fuse-ld=lld -Wl,--allow-multiple-definition")
-set(CMAKE_SHARED_LINKER_FLAGS_INIT "-fuse-ld=lld -Wl,--allow-multiple-definition")
-set(CMAKE_MODULE_LINKER_FLAGS_INIT "-fuse-ld=lld -Wl,--allow-multiple-definition")
+set(CMAKE_CXX_FLAGS_INIT "-D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -D__INTRINSIC_DEFINED___cpuidex -D__USE_MINGW_STAT64 ${msys_cxx_compat_flags} -Wno-unknown-pragmas")
+set(CMAKE_EXE_LINKER_FLAGS_INIT    "${msys_linker_flags}")
+set(CMAKE_SHARED_LINKER_FLAGS_INIT "${msys_linker_flags}")
+set(CMAKE_MODULE_LINKER_FLAGS_INIT "${msys_linker_flags}")
 set(CMAKE_CXX_STANDARD_LIBRARIES "${_COMSUPP_TC_PATH} -loleaut32")
 set(CMAKE_AUTORCC_OPTIONS "--compress-algo;zlib")
 MSYS2_TC_EOF
@@ -2176,7 +2197,7 @@ stage_generate() {
     fi
     local debug_flag=""
     [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && debug_flag="-g"
-    local c_flags="-O3 -DNDEBUG ${debug_flag} ${pgo_gen_flag}${lto_generate_flag:+ ${lto_generate_flag}}"
+    local c_flags="-O${CLANG_OPT_LEVEL} -DNDEBUG ${debug_flag} ${pgo_gen_flag}${lto_generate_flag:+ ${lto_generate_flag}}"
     local cxx_flags="${c_flags}"
 
     # Force-keep the profile runtime symbols so lld does not dead-strip them.
@@ -2500,7 +2521,7 @@ stage_csgenerate() {
     local pgo_use_flag="-fprofile-use=\"${stage1_pd_compiler}\""
     local debug_flag=""
     [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && debug_flag="-g"
-    local c_flags="-O3 -DNDEBUG ${debug_flag} ${pgo_use_flag} ${cs_gen_flag}${lto_generate_flag:+ ${lto_generate_flag}}"
+    local c_flags="-O${CLANG_OPT_LEVEL} -DNDEBUG ${debug_flag} ${pgo_use_flag} ${cs_gen_flag}${lto_generate_flag:+ ${lto_generate_flag}}"
     local cxx_flags="${c_flags}"
     local bt_upper; bt_upper=$(echo "${BUILD_TYPE}" | tr '[:lower:]' '[:upper:]')
 
@@ -2699,7 +2720,12 @@ stage_use() {
         }
 
         local qt6_cmake_dir="" qt_host_dir=""
-        qt6_cmake_dir="$(_nopgo_find_qt_target "${BUILD_GENERATE}" 2>/dev/null || true)"
+        if [[ "${_HOST_OS}" == "windows" && "${MSYS2_PREFIX}" == "/mingw64" &&
+              -f "/mingw64/lib/cmake/Qt6/Qt6Config.cmake" ]]; then
+            qt6_cmake_dir="/mingw64/lib/cmake/Qt6"
+        fi
+        [[ -z "${qt6_cmake_dir}" ]] && \
+            qt6_cmake_dir="$(_nopgo_find_qt_target "${BUILD_GENERATE}" 2>/dev/null || true)"
         [[ -z "${qt6_cmake_dir}" ]] && \
             qt6_cmake_dir="$(_nopgo_find_qt_target "${nopgo_dir}" 2>/dev/null || true)"
 
@@ -2794,8 +2820,8 @@ stage_use() {
         _CMAKE_ARGS+=(
             "-DCITRON_ENABLE_PGO_USE=OFF"
             "-DCITRON_PGO_FLAGS_MANAGED_BY_SCRIPT=ON"
-            "-DCMAKE_C_FLAGS_${bt_upper}=-O3 -DNDEBUG ${debug_flag} ${lto_flag}"
-            "-DCMAKE_CXX_FLAGS_${bt_upper}=-O3 -DNDEBUG ${debug_flag} ${lto_flag}"
+            "-DCMAKE_C_FLAGS_${bt_upper}=-O${CLANG_OPT_LEVEL} -DNDEBUG ${debug_flag} ${lto_flag}"
+            "-DCMAKE_CXX_FLAGS_${bt_upper}=-O${CLANG_OPT_LEVEL} -DNDEBUG ${debug_flag} ${lto_flag}"
         )
         [[ -n "${qt6_cmake_dir}" ]] && _CMAKE_ARGS+=("-DQt6_DIR=${qt6_cmake_dir}")
         [[ -n "${qt_host_dir}"   ]] && _CMAKE_ARGS+=("-DQT_HOST_PATH=${qt_host_dir}")
@@ -2975,9 +3001,9 @@ stage_use() {
     _CMAKE_ARGS+=(
         "-DCITRON_ENABLE_PGO_USE=ON"
         "-DCITRON_PGO_FLAGS_MANAGED_BY_SCRIPT=ON"
-        "-DCMAKE_C_FLAGS_${bt_upper}=-O3 -DNDEBUG ${debug_flag} ${lto_pgo_flag}"
-        "-DCMAKE_CXX_FLAGS_${bt_upper}=-O3 -DNDEBUG ${debug_flag} ${lto_pgo_flag}"
-        "-DCMAKE_EXE_LINKER_FLAGS_${bt_upper}=-O3 -DNDEBUG ${debug_flag} ${lto_pgo_flag}"
+        "-DCMAKE_C_FLAGS_${bt_upper}=-O${CLANG_OPT_LEVEL} -DNDEBUG ${debug_flag} ${lto_pgo_flag}"
+        "-DCMAKE_CXX_FLAGS_${bt_upper}=-O${CLANG_OPT_LEVEL} -DNDEBUG ${debug_flag} ${lto_pgo_flag}"
+        "-DCMAKE_EXE_LINKER_FLAGS_${bt_upper}=-O${CLANG_OPT_LEVEL} -DNDEBUG ${debug_flag} ${lto_pgo_flag}"
         "-DCITRON_PGO_PROFILE_DIR=${PROFILE_DIR}"
     )
     [[ -n "${qt6_cmake_dir}" ]] && _CMAKE_ARGS+=("-DQt6_DIR=${qt6_cmake_dir}")
@@ -3296,7 +3322,7 @@ QTGPEOF
     local debug_flag=""
     [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && debug_flag="-g"
     local bt_upper; bt_upper=$(echo "${BUILD_TYPE}" | tr '[:lower:]' '[:upper:]')
-    local elf_compile_flags="-O3 -DNDEBUG ${debug_flag} -D_stat64=stat ${elf_pgo_flag} -fbasic-block-address-map -Wno-error=backend-plugin"
+    local elf_compile_flags="-O${CLANG_OPT_LEVEL} -DNDEBUG ${debug_flag} -D_stat64=stat ${elf_pgo_flag} -fbasic-block-address-map -Wno-error=backend-plugin"
     local elf_linker_flags="-fuse-ld=lld-${CLANG_VERSION} -Wl,--emit-relocs"
 
     # ── Flag-change detection: wipe stale object cache if compile flags changed ──
@@ -3849,9 +3875,9 @@ BOLT_ORDER_EOF
     _CMAKE_ARGS+=(
         "-DCITRON_ENABLE_PGO_USE=ON"
         "-DCITRON_PGO_FLAGS_MANAGED_BY_SCRIPT=ON"
-        "-DCMAKE_C_FLAGS_${bt_upper}=-O3 -DNDEBUG ${debug_flag} ${lto_pgo_flag}"
-        "-DCMAKE_CXX_FLAGS_${bt_upper}=-O3 -DNDEBUG ${debug_flag} ${lto_pgo_flag}"
-        "-DCMAKE_EXE_LINKER_FLAGS_${bt_upper}=-O3 -DNDEBUG ${debug_flag} ${lto_pgo_flag}${order_linker_flag:+ ${order_linker_flag}}"
+        "-DCMAKE_C_FLAGS_${bt_upper}=-O${CLANG_OPT_LEVEL} -DNDEBUG ${debug_flag} ${lto_pgo_flag}"
+        "-DCMAKE_CXX_FLAGS_${bt_upper}=-O${CLANG_OPT_LEVEL} -DNDEBUG ${debug_flag} ${lto_pgo_flag}"
+        "-DCMAKE_EXE_LINKER_FLAGS_${bt_upper}=-O${CLANG_OPT_LEVEL} -DNDEBUG ${debug_flag} ${lto_pgo_flag}${order_linker_flag:+ ${order_linker_flag}}"
         "-DCITRON_PGO_PROFILE_DIR=${PROFILE_DIR}"
     )
     [[ -n "${qt6_cmake_dir}" ]] && _CMAKE_ARGS+=("-DQt6_DIR=${qt6_cmake_dir}")
@@ -4319,9 +4345,9 @@ stage_propeller() {
     _CMAKE_ARGS+=(
         "-DCITRON_ENABLE_PGO_USE=ON"
         "-DCITRON_PGO_FLAGS_MANAGED_BY_SCRIPT=ON"
-        "-DCMAKE_C_FLAGS_${bt_upper}=-O3 -DNDEBUG ${debug_flag} ${lto_pgo_flag}"
-        "-DCMAKE_CXX_FLAGS_${bt_upper}=-O3 -DNDEBUG ${debug_flag} ${lto_pgo_flag}"
-        "-DCMAKE_EXE_LINKER_FLAGS_${bt_upper}=-O3 -DNDEBUG ${debug_flag} ${lto_pgo_flag}${propeller_linker_flag:+ ${propeller_linker_flag}}"
+        "-DCMAKE_C_FLAGS_${bt_upper}=-O${CLANG_OPT_LEVEL} -DNDEBUG ${debug_flag} ${lto_pgo_flag}"
+        "-DCMAKE_CXX_FLAGS_${bt_upper}=-O${CLANG_OPT_LEVEL} -DNDEBUG ${debug_flag} ${lto_pgo_flag}"
+        "-DCMAKE_EXE_LINKER_FLAGS_${bt_upper}=-O${CLANG_OPT_LEVEL} -DNDEBUG ${debug_flag} ${lto_pgo_flag}${propeller_linker_flag:+ ${propeller_linker_flag}}"
         "-DCITRON_PGO_PROFILE_DIR=${PROFILE_DIR}"
     )
     [[ -n "${qt6_cmake_dir}" ]] && _CMAKE_ARGS+=("-DQt6_DIR=${qt6_cmake_dir}")
@@ -4446,6 +4472,82 @@ stage_clean() {
     success "Build directories removed."
 }
 
+stage_use_clangcl_diagnostic() {
+    header "Stage 2: clang-cl Diagnostic Build (no PGO, no LTO)"
+
+    [[ "${_HOST_OS}" == "windows" ]] ||
+        error "clang-cl mode requires a native Windows/MSYS2 host."
+    [[ "${PGO_MODE}" == "none" ]] ||
+        error "clang-cl diagnostic mode currently requires --pgo none."
+    [[ "${LTO_MODE}" == "none" ]] ||
+        error "clang-cl diagnostic mode currently requires --lto none."
+
+    local vs_root="/c/Program Files/Microsoft Visual Studio/2022/Community"
+    local vsdev="${vs_root}/Common7/Tools/VsDevCmd.bat"
+    local clang_cl="${vs_root}/VC/Tools/Llvm/x64/bin/clang-cl.exe"
+    [[ -f "${vsdev}" ]] || error "Visual Studio VsDevCmd.bat not found at ${vsdev}"
+    [[ -f "${clang_cl}" ]] || error "clang-cl not found at ${clang_cl}"
+
+    local build_dir="${BUILD_ROOT}/clangcl-diagnostic"
+    mkdir -p "${build_dir}"
+    local clangcl_config="${BUILD_TYPE}"
+    if [[ "${clangcl_config}" == "RelWithDebInfo" ]]; then
+        clangcl_config="Release"
+    fi
+
+    local source_win build_win batch_win cpm_win
+    source_win="$(cygpath -am "${SOURCE_DIR}")"
+    build_win="$(cygpath -am "${build_dir}")"
+    batch_win="$(cygpath -am "${build_dir}/build-clangcl.cmd")"
+    cpm_win="$(cygpath -am "${CPM_SOURCE_CACHE}")"
+
+    cat > "${build_dir}/build-clangcl.cmd" <<CLANGCL_CMD_EOF
+@echo off
+setlocal
+call "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+if errorlevel 1 exit /b %errorlevel%
+set "CPATH="
+set "C_INCLUDE_PATH="
+set "CPLUS_INCLUDE_PATH="
+set "CFLAGS="
+set "CXXFLAGS="
+set "CPPFLAGS="
+set "INCLUDE="
+set "LIB="
+set "LIBPATH="
+set "PKG_CONFIG_PATH="
+set "PKG_CONFIG_LIBDIR="
+set "CPM_SOURCE_CACHE=${cpm_win}"
+cmake -S "${source_win}" -B "${build_win}" -G "Visual Studio 17 2022" -A x64 -T ClangCL ^
+  -DCITRON_USE_CPM=ON ^
+  -DCITRON_USE_BUNDLED_VCPKG=OFF ^
+  -DCITRON_CHECK_SUBMODULES=OFF ^
+  -DCITRON_CLANGCL_DIAGNOSTIC=ON ^
+  -DCITRON_USE_BUNDLED_QT=ON ^
+  -DCITRON_USE_BUNDLED_FFMPEG=ON ^
+  -DBOOST_CONTEXT_IMPLEMENTATION=winfib ^
+  -DFFmpeg_VERSION=8.0 ^
+  -DPython3_EXECUTABLE=C:/msys64/clang64/bin/python.exe ^
+  -DENABLE_OPENAL=OFF ^
+  -DENABLE_CUBEB=OFF ^
+  -DENABLE_LIBUSB=OFF ^
+  -DCITRON_ENABLE_LTO=OFF ^
+  -DCITRON_ENABLE_PGO_GENERATE=OFF ^
+  -DCITRON_ENABLE_PGO_USE=OFF ^
+  -DCITRON_USE_PRECOMPILED_HEADERS=OFF ^
+  -DCMAKE_DISABLE_FIND_PACKAGE_LLVM=ON ^
+  -DBUILD_TESTING=OFF ^
+  -DCITRON_TESTS=OFF
+if errorlevel 1 exit /b %errorlevel%
+cmake --build "${build_win}" --config ${clangcl_config} --parallel ${JOBS}
+exit /b %errorlevel%
+CLANGCL_CMD_EOF
+
+    cmd.exe //D //C call "${batch_win}" ||
+        error "clang-cl diagnostic build failed"
+    success "clang-cl diagnostic binary: ${build_dir}/bin/${clangcl_config}/citron.exe"
+}
+
 # =============================================================================
 # Argument parsing
 # =============================================================================
@@ -4506,6 +4608,11 @@ while [[ $# -gt 0 ]]; do
             shift 2 ;;
         --llvm-mingw-version)
             LLVM_MINGW_VERSION="$2"; shift 2 ;;
+        --compiler)
+            case "$2" in
+                llvm-mingw|clang-cl) COMPILER_MODE="$2"; shift 2 ;;
+                *) echo "[ERROR] --compiler requires: llvm-mingw or clang-cl"; exit 1 ;;
+            esac ;;
         --help|-h)
             sed -n '/^# USAGE/,/^# ====/p' "$0"
             exit 0 ;;
@@ -4515,6 +4622,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$STAGE" ]] || error "No stage specified. Run with --help for usage."
+
+if [[ "${COMPILER_MODE}" == "clang-cl" ]]; then
+    [[ "${STAGE}" == "use" ]] ||
+        error "clang-cl diagnostic mode currently supports only the use stage."
+    stage_use_clangcl_diagnostic
+    exit 0
+fi
 
 case "$STAGE" in
     setup)       stage_setup ;;
