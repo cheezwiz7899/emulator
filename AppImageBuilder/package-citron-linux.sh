@@ -24,7 +24,9 @@
 #                 genuine host runtime libraries, not part of citron's install.
 #   STRACE_MODE   Enable dlopen/LD_DEBUG scan when citron starts up (default: 0)
 #                 Set to 1 only if xvfb-run is installed; see comment below.
-#   DEPLOY_VULKAN Deploy Mesa/Vulkan DRI driver collection (default: 0)
+#   DEPLOY_VULKAN Deploy Vulkan loader + dependency chain into AppImage
+#                 (default: 1). See the DEPLOY_VULKAN comment further below
+#                 for the libLLVM interaction this can pull in.
 #   DEPLOY_OPENGL Deploy OpenGL/EGL/GLX libs into AppImage (default: 0)
 #   DEPLOY_PIPEWIRE Deploy PipeWire SPA/ALSA plugin trees (default: 0)
 #   DEPLOY_GTK    Deploy GTK modules and gvfs into AppImage (default: 0)
@@ -103,15 +105,20 @@ fi
 #   (explicit Qt plugins + libpulse + libgamemode).
 export STRACE_MODE="${STRACE_MODE:-0}"
 #
-# DEPLOY_VULKAN=0 / DEPLOY_OPENGL=0 — do not stage Mesa DRI or the OpenGL set.
-#   NOTE: DEPLOY_VULKAN=0 does NOT suppress Vulkan ICDs captured by the dlopen
-#   scan (that requires STRACE_MODE=0 above); it only suppresses the separate
-#   static DEPLOY_VULKAN staging block (libVkLayer_*.so, etc.).
-#   libvulkan.so.1, libgbm.so, libdrm.so, libxcb-dri3.so, libxcb-glx.so are
-#   all DT_NEEDED of citron / Qt plugins and are captured by ldd regardless.
-#   SHARUN_ALLOW_SYS_VK_ICD=1 (set in .env below) makes sharun prefer the
-#   host GPU ICD at runtime, so we never need to bundle GPU-vendor drivers.
-export DEPLOY_VULKAN="1"
+# DEPLOY_VULKAN=1 — stage libvulkan.so.1 (the loader) and its dependency
+#   chain via the static ldd scan. This does NOT bundle GPU-vendor ICD
+#   drivers (libvulkan_radeon.so, etc.) — those stay host-provided regardless
+#   of this flag; SHARUN_ALLOW_SYS_VK_ICD=1 (set in .env below) makes sharun
+#   prefer the host GPU ICD at runtime. On some Mesa/Vulkan builds, the
+#   loader's own dependency chain has a hard DT_NEEDED on libLLVM*.so — see
+#   the post-dep-scan cleanup guard below, which used to strip this
+#   unconditionally and broke citron's ability to even start once this flag
+#   was turned on.
+#
+# DEPLOY_OPENGL=0 — do not stage Mesa DRI or the OpenGL set.
+#   libgbm.so, libdrm.so, libxcb-dri3.so, libxcb-glx.so are all DT_NEEDED of
+#   citron / Qt plugins and are captured by ldd regardless of this flag.
+export DEPLOY_VULKAN="${DEPLOY_VULKAN:-1}"
 export DEPLOY_OPENGL="${DEPLOY_OPENGL:-0}"
 #
 # DEPLOY_PIPEWIRE=0 — suppress the PipeWire/SPA/ALSA plugin staging block.
@@ -252,7 +259,7 @@ _appdir="${PWD}/AppDir"
 # section that encodes PT_INTERP, causing sharun -g to find no interpreter and
 # skip the copy.  We do it here from the original install-root binary (never
 # touched by sed) so it is guaranteed present regardless of sharun -g's outcome.
-_interp=$(patchelf --print-interpreter "${DESTDIR}/usr/bin/citron" 2>/dev/null || true)
+_interp=$(patchelf --print-interpreter "${DESTDIR}/usr/bin/citron" 2>/dev/null)
 if [ -z "${_interp}" ]; then
     # patchelf fallback: parse readelf output
     _interp=$(readelf -l "${DESTDIR}/usr/bin/citron" 2>/dev/null \
@@ -266,10 +273,56 @@ else
     printf 'WARNING: could not determine PT_INTERP of citron; AppImage may fail with "Interpreter not found!"\n' >&2
 fi
 
-find "${_appdir}" -name 'libvulkan_*.so'                    -delete 2>/dev/null || true
-find "${_appdir}" -name 'libLLVM*.so*'                      -delete 2>/dev/null || true
-find "${_appdir}" -path '*/vulkan/icd.d/*'                  -delete 2>/dev/null || true
-find "${_appdir}" -path '*/vulkan/implicit_layer.d/*'       -delete 2>/dev/null || true
+# These four rules assume Vulkan bundling was never wanted in the first
+# place (true when DEPLOY_VULKAN=0: the only source of Vulkan-related files
+# in AppDir would then be an accidental leak from ldd's transitive chain or
+# the dlopen scan). That assumption breaks when DEPLOY_VULKAN=1: quick-sharun
+# then *deliberately* stages libvulkan.so.1 and its own dependency chain via
+# the static ldd scan (see the "legitimate runtime deps" note above) — and on
+# some Mesa/Vulkan builds that chain has a genuine, hard DT_NEEDED on
+# libLLVM*.so (not merely a lazy dlopen() from an ICD at vkCreateInstance()
+# time). Deleting it unconditionally here would produce a citron binary that
+# fails to even start with "error while loading shared libraries:
+# libLLVM-17.so.1: cannot open shared object file" — exactly undoing what
+# enabling DEPLOY_VULKAN was meant to accomplish. So: only run this cleanup
+# group when Vulkan bundling is actually disabled.
+if [ "${DEPLOY_VULKAN}" != "1" ]; then
+    find "${_appdir}" -name 'libvulkan_*.so'                    -delete 2>/dev/null || true
+    find "${_appdir}" -name 'libLLVM*.so*'                      -delete 2>/dev/null || true
+    find "${_appdir}" -path '*/vulkan/icd.d/*'                  -delete 2>/dev/null || true
+    find "${_appdir}" -path '*/vulkan/implicit_layer.d/*'       -delete 2>/dev/null || true
+fi
+
+# Mesa's OpenGL/Gallium megadriver chain — a *separate* consumer from the
+# Vulkan/RADV one above, and one DEPLOY_OPENGL=0 does not stop: Qt's
+# xcb-egl-integration / xcb-glx-integration platform plugins pull in a full
+# OpenGL dependency chain via the static ldd scan regardless of that flag
+# (same "captured by ldd regardless" behavior already noted for
+# libgbm/libdrm/libxcb-dri3/libxcb-glx above) — except here it goes much
+# further than that small glue-library baseline, dragging in the entire
+# Gallium codegen backend (libgallium-*.so, 100+ MB) plus its own full
+# LLVM copy plus GPU-vendor-specific DRM userspace libs.
+#
+# This is a different library from the one the comment above documents:
+# distro Mesa packages commonly ship two independently-versioned LLVM
+# copies — a hyphenated one (libLLVM-17.so.1) that Gallium/radeonsi links
+# against, and a dotted one (libLLVM.so.20.1) that the Vulkan/RADV ICD
+# loads instead. The naming difference is real, not cosmetic, and lets
+# find target only the Gallium/OpenGL one:
+#   libLLVM-17.so.1   → hyphen-versioned  → Gallium/OpenGL-side → safe to cut
+#   libLLVM.so.20.1   → dot-versioned     → Vulkan/RADV-side    → keep (see above)
+# 'libLLVM-*' matches only the former; it cannot match the latter.
+#
+# citron renders via Vulkan; if Qt's GL platform-integration plugins are
+# never actually invoked at runtime (only present because lib4bin's static
+# scan can't tell "linked" from "loadable"), none of this should be
+# reachable. Real-hardware verification (Steam Deck) is still the only way
+# to be fully sure — same caveat as the Vulkan fix above.
+find "${_appdir}" -name 'libgallium-*.so'                   -delete 2>/dev/null || true
+find "${_appdir}" -name 'libLLVM-*.so*'                     -delete 2>/dev/null || true
+find "${_appdir}" -name 'libdrm_amdgpu.so*'                 -delete 2>/dev/null || true
+find "${_appdir}" -name 'libdrm_radeon.so*'                 -delete 2>/dev/null || true
+
 find "${_appdir}" -path '*/pipewire-*/*'          -type f   -delete 2>/dev/null || true
 find "${_appdir}" -path '*/spa-*/*'               -type f   -delete 2>/dev/null || true
 find "${_appdir}" -path '*/alsa-lib/*'            -type f   -delete 2>/dev/null || true
@@ -342,7 +395,7 @@ Prefix = ..
 Plugins = lib
 Imports = lib/qt6/qml
 Qml2Imports = lib/qt6/qml
-Translations = lib/qt6/translations
+Translations = ../usr/share/qt6/translations
 QTCONF_EOF
 
 # Rename app in desktop file if building a devel/nightly AppImage
@@ -361,6 +414,15 @@ fi
 
 # Build the AppImage
 ./quick-sharun --make-appimage
+
+# Defensive: appimagetool already produces an executable file (an AppImage
+# has to be +x to function as a self-mounting ELF binary at all), and mv
+# below preserves that bit since it's a same-filesystem rename. Nothing in
+# this script's own flow can strip it. This chmod costs nothing and changes
+# nothing today, but guards against some future release/mirror/CDN step
+# outside this script silently dropping the bit without anyone noticing
+# until a user hits "Permission denied".
+chmod +x ./*.AppImage 2>/dev/null || true
 
 mkdir -p "${OUTPATH}"
 mv -v ./*.AppImage "${OUTPATH}/" 2>/dev/null || true
@@ -383,11 +445,6 @@ mv -v ./*.AppImage.* "${OUTPATH}/" 2>/dev/null || true
 # (e.g. a CI artifact upload step) drags along every loose unpacked library a
 # second time alongside the AppImage that already contains them compressed.
 if [ -d ./AppDir ]; then
-    if ! command -v zstd >/dev/null 2>&1; then
-        printf 'ERROR: zstd is not installed — cannot produce %s.tar.zst\n' "${OUTNAME_BASE}" >&2
-        printf 'Install zstd (e.g. apt-get install zstd) and re-run.\n' >&2
-        exit 1
-    fi
     tar -c --zstd -f "${OUTPATH}/${OUTNAME_BASE}.tar.zst" -C ./AppDir .
     rm -rf ./AppDir
 fi
