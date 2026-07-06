@@ -293,35 +293,34 @@ if [ "${DEPLOY_VULKAN}" != "1" ]; then
     find "${_appdir}" -path '*/vulkan/implicit_layer.d/*'       -delete 2>/dev/null || true
 fi
 
-# Mesa's OpenGL/Gallium megadriver chain — a *separate* consumer from the
-# Vulkan/RADV one above, and one DEPLOY_OPENGL=0 does not stop: Qt's
-# xcb-egl-integration / xcb-glx-integration platform plugins pull in a full
-# OpenGL dependency chain via the static ldd scan regardless of that flag
-# (same "captured by ldd regardless" behavior already noted for
-# libgbm/libdrm/libxcb-dri3/libxcb-glx above) — except here it goes much
-# further than that small glue-library baseline, dragging in the entire
-# Gallium codegen backend (libgallium-*.so, 100+ MB) plus its own full
-# LLVM copy plus GPU-vendor-specific DRM userspace libs.
+# Mesa's OpenGL/Gallium megadriver chain (libgallium-*.so, libLLVM-17.so.1,
+# libdrm_amdgpu.so*, libdrm_radeon.so*) was previously stripped here on the
+# theory that it was dead weight from Qt's xcb-egl/xcb-glx platform-
+# integration plugins, distinct from the Vulkan/RADV-side libLLVM.so.20.1
+# documented above. That theory was WRONG: stripping libLLVM-17.so.1
+# specifically reproduced the exact same Steam Deck failure this whole
+# section exists to prevent —
+#   "error while loading shared libraries: libLLVM-17.so.1: cannot open
+#   shared object file" — meaning something in citron's own EAGER (not
+# lazy-dlopen) dependency chain genuinely needs it, not merely an optional
+# GL fallback plugin. Do not delete it, or libgallium-*.so /
+# libdrm_amdgpu.so* / libdrm_radeon.so*, until the diagnostic block below
+# has actually shown what's safe to cut — guessing from naming conventions
+# and old comments cost two Steam Deck round-trips already.
 #
-# This is a different library from the one the comment above documents:
-# distro Mesa packages commonly ship two independently-versioned LLVM
-# copies — a hyphenated one (libLLVM-17.so.1) that Gallium/radeonsi links
-# against, and a dotted one (libLLVM.so.20.1) that the Vulkan/RADV ICD
-# loads instead. The naming difference is real, not cosmetic, and lets
-# find target only the Gallium/OpenGL one:
-#   libLLVM-17.so.1   → hyphen-versioned  → Gallium/OpenGL-side → safe to cut
-#   libLLVM.so.20.1   → dot-versioned     → Vulkan/RADV-side    → keep (see above)
-# 'libLLVM-*' matches only the former; it cannot match the latter.
-#
-# citron renders via Vulkan; if Qt's GL platform-integration plugins are
-# never actually invoked at runtime (only present because lib4bin's static
-# scan can't tell "linked" from "loadable"), none of this should be
-# reachable. Real-hardware verification (Steam Deck) is still the only way
-# to be fully sure — same caveat as the Vulkan fix above.
-find "${_appdir}" -name 'libgallium-*.so'                   -delete 2>/dev/null || true
-find "${_appdir}" -name 'libLLVM-*.so*'                     -delete 2>/dev/null || true
-find "${_appdir}" -name 'libdrm_amdgpu.so*'                 -delete 2>/dev/null || true
-find "${_appdir}" -name 'libdrm_radeon.so*'                 -delete 2>/dev/null || true
+# Diagnostic only, not a cut: log the real DT_NEEDED chain for citron and
+# for every bundled Gallium/Vulkan/LLVM library, so the *next* debloat
+# attempt is based on actual dependency data instead of another guess.
+# Grep this build's log for "=== ldd-diag ===" to find this block's output.
+echo "=== ldd-diag: citron binary ==="
+ldd "${_appdir}/bin/citron"* 2>&1 || true
+for _lib in libgallium-*.so libLLVM-17.so* libLLVM.so.* libvulkan.so.* libdrm_amdgpu.so* libdrm_radeon.so*; do
+    for _f in "${_appdir}"/lib/${_lib}; do
+        [ -e "${_f}" ] || continue
+        echo "=== ldd-diag: ${_f##*/} ==="
+        ldd "${_f}" 2>&1 || true
+    done
+done
 
 find "${_appdir}" -path '*/pipewire-*/*'          -type f   -delete 2>/dev/null || true
 find "${_appdir}" -path '*/spa-*/*'               -type f   -delete 2>/dev/null || true
