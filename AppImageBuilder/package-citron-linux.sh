@@ -293,28 +293,47 @@ if [ "${DEPLOY_VULKAN}" != "1" ]; then
     find "${_appdir}" -path '*/vulkan/implicit_layer.d/*'       -delete 2>/dev/null || true
 fi
 
-# Mesa's OpenGL/Gallium megadriver chain (libgallium-*.so, libLLVM-17.so.1,
-# libdrm_amdgpu.so*, libdrm_radeon.so*) was previously stripped here on the
-# theory that it was dead weight from Qt's xcb-egl/xcb-glx platform-
-# integration plugins, distinct from the Vulkan/RADV-side libLLVM.so.20.1
-# documented above. That theory was WRONG: stripping libLLVM-17.so.1
-# specifically reproduced the exact same Steam Deck failure this whole
-# section exists to prevent —
-#   "error while loading shared libraries: libLLVM-17.so.1: cannot open
-#   shared object file" — meaning something in citron's own EAGER (not
-# lazy-dlopen) dependency chain genuinely needs it, not merely an optional
-# GL fallback plugin. Do not delete it, or libgallium-*.so /
-# libdrm_amdgpu.so* / libdrm_radeon.so*, until the diagnostic block below
-# has actually shown what's safe to cut — guessing from naming conventions
-# and old comments cost two Steam Deck round-trips already.
+# Qt's xcb-egl-integration / xcb-glx-integration platform plugins — real
+# files shipped in Qt's official gcc_64 plugin distribution regardless of
+# whether an app ever uses OpenGL, since Qt ships both the Vulkan-capable and
+# OpenGL-capable window-system-integration paths as independently-loadable
+# plugins. citron has no OpenGL renderer at all (confirmed: no
+# renderer_opengl source tree, no OpenGL CMake target in video_core, Vulkan
+# only) — so these two plugins are the only thing in this AppImage that ever
+# has a reason to touch Mesa's OpenGL stack.
 #
-# Diagnostic only, not a cut: log the real DT_NEEDED chain for citron and
-# for every bundled Gallium/Vulkan/LLVM library, so the *next* debloat
-# attempt is based on actual dependency data instead of another guess.
-# Grep this build's log for "=== ldd-diag ===" to find this block's output.
+# Confirmed via the ldd-diag block's actual output (not a naming-convention
+# guess this time, after two of those went wrong):
+#   libvulkan.so.1 (the real Vulkan loader, what DEPLOY_VULKAN=1 exists for)
+#       → libm.so.6, libc.so.6 only. Zero LLVM dependency of its own.
+#   libgallium-*.so (Mesa's OpenGL driver backend)
+#       → libLLVM.so.20.1. Nothing else in this bundled set touches it.
+# So Gallium's presence, and libLLVM.so.20.1 with it, traces entirely back
+# to these two Qt plugins — not to Vulkan/RADV as the original comment above
+# assumed. Deleting the plugins is the actual root-cause fix; deleting
+# Gallium/libLLVM.so.20.1 here too is redundant follow-through now that nothing
+# else needs them, kept for the same "don't leave 100+ MB of dead weight
+# lying around" reasons as the rest of this section.
+#
+# Caveat: this removes the plugin *files*, which is safe because Qt is
+# designed to gracefully skip missing optional platform-integration plugins.
+# It does NOT touch libLLVM-17.so.1 (dot-vs-hyphen: unrelated library, see
+# above) or anything Vulkan/RADV actually uses. Still needs one more real
+# Steam Deck confirmation before this is fully trusted — "citron never
+# creates an OpenGL context" is inferred from the absence of renderer
+# source, not from a runtime trace of what Qt actually probes at startup.
+find "${_appdir}" -name 'libqxcb-egl-integration.so'        -delete 2>/dev/null || true
+find "${_appdir}" -name 'libqxcb-glx-integration.so'        -delete 2>/dev/null || true
+find "${_appdir}" -name 'libgallium-*.so'                   -delete 2>/dev/null || true
+find "${_appdir}" -name 'libLLVM.so.*'                      -delete 2>/dev/null || true
+
+# Diagnostic only, not a cut: log the real DT_NEEDED chain for citron and for
+# whatever Vulkan/LLVM libraries remain after the cut above, so the next
+# build confirms this actually held (nothing broke, and libLLVM.so.20.1 no
+# longer gets re-bundled). Grep this build's log for "=== ldd-diag ===".
 echo "=== ldd-diag: citron binary ==="
 ldd "${_appdir}/bin/citron"* 2>&1 || true
-for _lib in libgallium-*.so libLLVM-17.so* libLLVM.so.* libvulkan.so.* libdrm_amdgpu.so* libdrm_radeon.so*; do
+for _lib in libLLVM-17.so* libLLVM.so.* libvulkan.so.*; do
     for _f in "${_appdir}"/lib/${_lib}; do
         [ -e "${_f}" ] || continue
         echo "=== ldd-diag: ${_f##*/} ==="
