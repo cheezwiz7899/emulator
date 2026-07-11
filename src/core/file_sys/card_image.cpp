@@ -323,7 +323,10 @@ Loader::ResultStatus XCI::TryReadHeader() {
         }
 
         // Ensure the header magic matches. If it doesn't, this isn't a card image header.
-        if (header.magic != Common::MakeMagic('H', 'E', 'A', 'D')) {
+        // "DXCI" is accepted as well, identifying a pre-decrypted gamecard image that needs
+        // no keys to read (see GamecardHeader::MagicDecrypted).
+        if (header.magic != GamecardHeader::Magic &&
+            header.magic != GamecardHeader::MagicDecrypted) {
             return Loader::ResultStatus::ErrorBadXCIHeader;
         }
 

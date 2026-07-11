@@ -45,38 +45,47 @@ NCA::NCA(VirtualFile file_, const NCA* base_nca)
         return;
     }
 
-    // Ensure we have the proper key area keys to continue.
-    const u8 master_key_id = MasterKeyIdForKeyGeneration(reader->GetKeyGeneration());
-    if (!keys.HasKey(Core::Crypto::S128KeyType::KeyArea, master_key_id, reader->GetKeyIndex())) {
-        status = Loader::ResultStatus::ErrorMissingKeyAreaKey;
-        return;
-    }
+    // Pre-decrypted "DNCA" content (DXCI/DNSP packages) has every FS section's encryption
+    // type forced to None, so none of the titlekey/keyarea key machinery below is ever
+    // actually used to decrypt anything. Skip requiring keys for it entirely, mirroring how
+    // its header was already accepted without needing the NCA header key.
+    const bool is_pre_decrypted = reader->GetMagic() == NcaHeader::MagicDecrypted;
 
-    RightsId rights_id{};
-    reader->GetRightsId(rights_id.data(), rights_id.size());
-    if (rights_id != RightsId{}) {
-        // External decryption key required; provide it here.
-        u128 rights_id_u128;
-        std::memcpy(rights_id_u128.data(), rights_id.data(), sizeof(rights_id));
-
-        auto titlekey =
-            keys.GetKey(Core::Crypto::S128KeyType::Titlekey, rights_id_u128[1], rights_id_u128[0]);
-        if (titlekey == Core::Crypto::Key128{}) {
-            status = Loader::ResultStatus::ErrorMissingTitlekey;
+    if (!is_pre_decrypted) {
+        // Ensure we have the proper key area keys to continue.
+        const u8 master_key_id = MasterKeyIdForKeyGeneration(reader->GetKeyGeneration());
+        if (!keys.HasKey(Core::Crypto::S128KeyType::KeyArea, master_key_id,
+                         reader->GetKeyIndex())) {
+            status = Loader::ResultStatus::ErrorMissingKeyAreaKey;
             return;
         }
 
-        if (!keys.HasKey(Core::Crypto::S128KeyType::Titlekek, master_key_id)) {
-            status = Loader::ResultStatus::ErrorMissingTitlekek;
-            return;
+        RightsId rights_id{};
+        reader->GetRightsId(rights_id.data(), rights_id.size());
+        if (rights_id != RightsId{}) {
+            // External decryption key required; provide it here.
+            u128 rights_id_u128;
+            std::memcpy(rights_id_u128.data(), rights_id.data(), sizeof(rights_id));
+
+            auto titlekey = keys.GetKey(Core::Crypto::S128KeyType::Titlekey, rights_id_u128[1],
+                                        rights_id_u128[0]);
+            if (titlekey == Core::Crypto::Key128{}) {
+                status = Loader::ResultStatus::ErrorMissingTitlekey;
+                return;
+            }
+
+            if (!keys.HasKey(Core::Crypto::S128KeyType::Titlekek, master_key_id)) {
+                status = Loader::ResultStatus::ErrorMissingTitlekek;
+                return;
+            }
+
+            auto titlekek = keys.GetKey(Core::Crypto::S128KeyType::Titlekek, master_key_id);
+            Core::Crypto::AESCipher<Core::Crypto::Key128> cipher(titlekek, Core::Crypto::Mode::ECB);
+            cipher.Transcode(titlekey.data(), titlekey.size(), titlekey.data(),
+                             Core::Crypto::Op::Decrypt);
+
+            reader->SetExternalDecryptionKey(titlekey.data(), titlekey.size());
         }
-
-        auto titlekek = keys.GetKey(Core::Crypto::S128KeyType::Titlekek, master_key_id);
-        Core::Crypto::AESCipher<Core::Crypto::Key128> cipher(titlekek, Core::Crypto::Mode::ECB);
-        cipher.Transcode(titlekey.data(), titlekey.size(), titlekey.data(),
-                         Core::Crypto::Op::Decrypt);
-
-        reader->SetExternalDecryptionKey(titlekey.data(), titlekey.size());
     }
 
     const s32 fs_count = reader->GetFsCount();
@@ -111,7 +120,13 @@ NCA::NCA(VirtualFile file_, const NCA* base_nca)
             }
         }
 
-        if (header_reader.GetEncryptionType() == NcaFsHeader::EncryptionType::AesCtrEx) {
+        // A section is part of a BKTR-style patch (an update) if it carries an AesCtrEx
+        // relocation table. Checking patch_info directly (rather than only
+        // encryption_type == AesCtrEx) means this is still detected correctly for
+        // pre-decrypted DNCA content, whose FS headers report EncryptionType::None
+        // even though the section is structurally still a patch section.
+        if (header_reader.GetEncryptionType() == NcaFsHeader::EncryptionType::AesCtrEx ||
+            header_reader.GetPatchInfo().HasAesCtrExTable()) {
             is_update = true;
         }
     }

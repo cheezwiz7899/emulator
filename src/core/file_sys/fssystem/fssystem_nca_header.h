@@ -73,6 +73,12 @@ struct NcaHeader {
     static constexpr u32 Magic2 = Common::MakeMagic('N', 'C', 'A', '2');
     static constexpr u32 Magic3 = Common::MakeMagic('N', 'C', 'A', '3');
 
+    // Used by pre-decrypted "DNCA" content (e.g. NxEmu-style DXCI/DNSP packages). These
+    // are bit-identical to a normal NCA3 file except the header magic is changed and every
+    // FS header's encryption_type is forced to None, so the content can be parsed and used
+    // without any titlekeys/keyarea keys at all.
+    static constexpr u32 MagicDecrypted = Common::MakeMagic('D', 'N', 'C', 'A');
+
     static constexpr u32 Magic = Magic3;
 
     static constexpr std::size_t Size = 1_KiB;

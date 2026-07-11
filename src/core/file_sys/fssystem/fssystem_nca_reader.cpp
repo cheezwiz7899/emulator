@@ -19,8 +19,10 @@ constexpr Result CheckNcaMagic(u32 magic) {
     R_UNLESS(magic != NcaHeader::Magic1, ResultUnsupportedSdkVersion);
     R_UNLESS(magic != NcaHeader::Magic2, ResultUnsupportedSdkVersion);
 
-    // Verify the magic is the current one.
-    R_UNLESS(magic == NcaHeader::Magic3, ResultInvalidNcaSignature);
+    // Verify the magic is the current one, or the pre-decrypted "DNCA" variant used by
+    // DXCI/DNSP packages.
+    R_UNLESS(magic == NcaHeader::Magic3 || magic == NcaHeader::MagicDecrypted,
+             ResultInvalidNcaSignature);
 
     R_SUCCEED();
 }

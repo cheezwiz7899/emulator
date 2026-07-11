@@ -448,6 +448,18 @@ Result NcaFileSystemDriver::CreateAesCtrStorage(
     ASSERT(out != nullptr);
     ASSERT(base_storage != nullptr);
 
+    // Pre-decrypted "DNCA" content (DXCI/DNSP) needs zero AES operations anywhere in the
+    // file, not just for the main per-section body (which the EncryptionType::None case
+    // in CreateStorageByRawStorage's caller already handles). This function is also the
+    // primitive behind the sparse-storage bucket-tree meta layer, the AesCtrEx/BKTR meta
+    // layer, and the compressed-storage meta layer, all of which call it unconditionally
+    // regardless of the section's declared encryption_type. Short-circuiting here, rather
+    // than at each of those call sites individually, covers all of them at once.
+    if (m_reader->GetMagic() == NcaHeader::MagicDecrypted) {
+        *out = std::move(base_storage);
+        R_SUCCEED();
+    }
+
     // Create the iv.
     std::array<u8, AesCtrStorage::IvSize> iv{};
     AesCtrStorage::MakeIv(iv.data(), sizeof(iv), upper_iv.value, offset);
@@ -484,6 +496,14 @@ Result NcaFileSystemDriver::CreateAesXtsStorage(VirtualFile* out, VirtualFile ba
     // Check pre-conditions.
     ASSERT(out != nullptr);
     ASSERT(base_storage != nullptr);
+
+    // See the matching check in CreateAesCtrStorage: pre-decrypted DNCA content needs no
+    // AES operations at all, including the legacy AesXts body encryption used by
+    // older-generation NCAs.
+    if (m_reader->GetMagic() == NcaHeader::MagicDecrypted) {
+        *out = std::move(base_storage);
+        R_SUCCEED();
+    }
 
     // Create the iv.
     std::array<u8, AesXtsStorage::IvSize> iv{};

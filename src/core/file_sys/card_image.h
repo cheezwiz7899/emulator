@@ -6,6 +6,7 @@
 #include <array>
 #include <memory>
 #include <vector>
+#include "common/common_funcs.h"
 #include "common/common_types.h"
 #include "common/swap.h"
 #include "core/file_sys/vfs/vfs.h"
@@ -50,6 +51,13 @@ struct GamecardInfo {
 static_assert(sizeof(GamecardInfo) == 0x70, "GamecardInfo has incorrect size.");
 
 struct GamecardHeader {
+    static constexpr u32 Magic = Common::MakeMagic('H', 'E', 'A', 'D');
+
+    // Used by pre-decrypted "DXCI" gamecard images (e.g. NxEmu-style packages), which are
+    // laid out identically to a normal XCI but with all content decrypted and this magic
+    // in place of "HEAD" to signal that no keys are required to read them.
+    static constexpr u32 MagicDecrypted = Common::MakeMagic('D', 'X', 'C', 'I');
+
     std::array<u8, 0x100> signature;
     u32_le magic;
     u32_le secure_area_start;
