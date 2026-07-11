@@ -3670,9 +3670,10 @@ void GMainWindow::IncrementInstallProgress() {
 
 void GMainWindow::OnMenuInstallToNAND() {
     const QString file_filter =
-        tr("Installable Switch File (*.nca *.nsp *.xci);;Nintendo Content Archive "
+        tr("Installable Switch File (*.nca *.nsp *.xci *.dnsp *.dxci);;Nintendo Content Archive "
            "(*.nca);;Nintendo Submission Package (*.nsp);;NX Cartridge "
-           "Image (*.xci)");
+           "Image (*.xci);;Decrypted Nintendo Submission Package (*.dnsp);;Decrypted NX "
+           "Cartridge Image (*.dxci)");
 
     QStringList filenames = QFileDialog::getOpenFileNames(
         this, tr("Install Files"), QString::fromStdString(UISettings::values.roms_path),
@@ -3800,7 +3801,7 @@ void GMainWindow::OnMenuInstallToNAND() {
 }
 
 void GMainWindow::OnMenuTrimXCI() {
-    const QString file_filter = tr("NX Cartridge Image (*.xci)");
+    const QString file_filter = tr("NX Cartridge Image (*.xci *.dxci)");
 
     const QString filename = QFileDialog::getOpenFileName(
         this, tr("Select XCI File to Trim"), QString::fromStdString(UISettings::values.roms_path),
@@ -3878,7 +3879,8 @@ void GMainWindow::OnMenuTrimXCI() {
         const QString suggested_name = QDir(file_info.path()).filePath(new_filename);
 
         const QString output_filename = QFileDialog::getSaveFileName(
-            this, tr("Save Trimmed XCI File As"), suggested_name, tr("NX Cartridge Image (*.xci)"));
+            this, tr("Save Trimmed XCI File As"), suggested_name,
+            tr("NX Cartridge Image (*.xci *.dxci)"));
 
         if (output_filename.isEmpty()) {
             return;

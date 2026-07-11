@@ -59,7 +59,8 @@ private:
     static constexpr u32 HEADER_FILE_POS = 0x100;
     static constexpr u32 CART_SIZE_FILE_POS = 0x10D;
     static constexpr u32 DATA_SIZE_FILE_POS = 0x118;
-    static constexpr u32 MAGIC_VALUE = 0x44414548; // "HEAD"
+    static constexpr u32 MAGIC_VALUE = 0x44414548;           // "HEAD"
+    static constexpr u32 MAGIC_VALUE_DECRYPTED = 0x49435844; // "DXCI" (pre-decrypted gamecard)
 
     std::filesystem::path filename;
     u64 offset_bytes{0};

@@ -100,7 +100,7 @@ bool XCITrimmer::ReadHeader() {
                 return false;
             }
 
-            if (magic != MAGIC_VALUE) {
+            if (magic != MAGIC_VALUE && magic != MAGIC_VALUE_DECRYPTED) {
                 return false;
             }
 
@@ -414,7 +414,8 @@ XCITrimmer::OperationOutcome XCITrimmer::Trim(ProgressCallback progress_callback
 
 bool XCITrimmer::CanTrim(const std::filesystem::path& path) {
     const auto extension = path.extension().string();
-    if (extension != ".xci" && extension != ".XCI") {
+    if (extension != ".xci" && extension != ".XCI" && extension != ".dxci" &&
+        extension != ".DXCI") {
         return false;
     }
 
