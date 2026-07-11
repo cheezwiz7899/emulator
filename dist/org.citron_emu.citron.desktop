@@ -12,6 +12,6 @@ Icon=org.citron_emu.citron
 TryExec=citron
 Exec=citron %f
 Categories=Game;Emulator;Qt;
-MimeType=application/x-nx-nro;application/x-nx-nso;application/x-nx-nsp;application/x-nx-xci;
+MimeType=application/x-nx-nro;application/x-nx-nso;application/x-nx-nsp;application/x-nx-xci;application/x-nx-dnsp;application/x-nx-dxci;
 Keywords=Nintendo;Switch;
 StartupWMClass=org.citron_emu.citron

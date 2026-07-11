@@ -36,4 +36,19 @@ SPDX-License-Identifier: GPL-2.0-or-later
         <icon name="org.citron_emu.citron"/>
         <glob pattern="*.xci"/>
     </mime-type>
+
+    <mime-type type="application/x-nx-dnsp">
+        <comment>Decrypted Nintendo Switch Package</comment>
+        <acronym>DNSP</acronym>
+        <icon name="org.citron_emu.citron"/>
+        <glob pattern="*.dnsp"/>
+        <magic><match value="PFS" type="string" offset="0"/></magic>
+    </mime-type>
+
+    <mime-type type="application/x-nx-dxci">
+        <comment>Decrypted Nintendo Switch Card Image</comment>
+        <acronym>DXCI</acronym>
+        <icon name="org.citron_emu.citron"/>
+        <glob pattern="*.dxci"/>
+    </mime-type>
 </mime-info>
