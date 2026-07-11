@@ -1251,10 +1251,10 @@ void ExternalContentProvider::ScanDirectory(const VirtualDir& dir) {
 
     for (const auto& file : dir->GetFiles()) {
         const auto extension = file->GetExtension();
-        if (extension == "nsp") {
+        if (extension == "nsp" || extension == "dnsp") {
             LOG_INFO(Service_FS, "Found NSP: {}", file->GetName());
             ProcessNSP(file);
-        } else if (extension == "xci") {
+        } else if (extension == "xci" || extension == "dxci") {
             LOG_INFO(Service_FS, "Found XCI: {}", file->GetName());
             ProcessXCI(file);
         }

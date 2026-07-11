@@ -76,6 +76,12 @@ FileType GuessFromFilename(const std::string& name) {
         return FileType::XCI;
     if (extension == "nsp")
         return FileType::NSP;
+    // Pre-decrypted "DXCI"/"DNSP" packages (see GamecardHeader::MagicDecrypted and
+    // NcaHeader::MagicDecrypted) use the same container formats as XCI/NSP respectively.
+    if (extension == "dxci")
+        return FileType::XCI;
+    if (extension == "dnsp")
+        return FileType::NSP;
     if (extension == "kip")
         return FileType::KIP;
 

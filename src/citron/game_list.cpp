@@ -3892,8 +3892,9 @@ void GameList::LoadInterfaceLayout() {
 }
 
 const QStringList GameList::supported_file_extensions = {
-    QStringLiteral("xci"), QStringLiteral("nsp"), QStringLiteral("nso"), QStringLiteral("nro"),
-    QStringLiteral("kip")};
+    QStringLiteral("xci"),  QStringLiteral("nsp"),  QStringLiteral("nso"),
+    QStringLiteral("nro"),  QStringLiteral("kip"),  QStringLiteral("dxci"),
+    QStringLiteral("dnsp")};
 void GameList::RefreshGameDirectory() {
     if (!UISettings::values.game_dirs.empty() && current_worker != nullptr) {
         LOG_INFO(Frontend, "Change detected in the games directory. Reloading game list.");
