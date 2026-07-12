@@ -45,6 +45,10 @@
 #include "core/hle/service/sm/sm.h"
 #include "core/memory.h"
 
+#ifdef CreateEvent
+#undef CreateEvent
+#endif
+
 namespace Kernel {
 
 struct KernelCore::Impl {
@@ -240,7 +244,7 @@ struct KernelCore::Impl {
     }
 
     void InitializePreemption(KernelCore& kernel) {
-        preemption_event = Core::Timing::CreateEvent(
+        preemption_event = (Core::Timing::CreateEvent)(
             "PreemptionCallback",
             [this, &kernel](s64 time,
                             std::chrono::nanoseconds) -> std::optional<std::chrono::nanoseconds> {

@@ -15,7 +15,10 @@ set_property(DIRECTORY APPEND PROPERTY
 
 # Set compilation flags
 if (MSVC)
-    set(CMAKE_CONFIGURATION_TYPES Debug Release CACHE STRING "" FORCE)
+    if (CITRON_CLANGCL)
+        add_compile_definitions(CITRON_CLANGCL=1)
+        set(CMAKE_CONFIGURATION_TYPES Debug Release RelWithDebInfo CACHE STRING "" FORCE)
+    endif()
 
     # Silence "deprecation" warnings
     add_definitions(-D_CRT_SECURE_NO_WARNINGS -D_CRT_NONSTDC_NO_DEPRECATE -D_SCL_SECURE_NO_WARNINGS)
@@ -44,7 +47,6 @@ if (MSVC)
     # /Zc:throwingNew     - Let codegen assume `operator new` (without std::nothrow) will never return null
     # /GT                 - Supports fiber safety for data allocated using static thread-local storage
     add_compile_options(
-        /MP
         /Zm200
         /Zo
         /permissive-
@@ -52,19 +54,8 @@ if (MSVC)
         /std:c++20
         /utf-8
         /volatile:iso
-        /Zc:externConstexpr
         /Zc:inline
-        /Zc:preprocessor
-        /Zc:throwingNew
-        /GT
         # causes crashes on windows probably? /GR-
-
-        # Modules
-        /experimental:module- # Explicitly disable module support due to conflicts with precompiled headers.
-
-        # External headers diagnostics
-        /external:anglebrackets # Treats all headers included by #include <header>, where the header file is enclosed in angle brackets (< >), as external headers
-        /external:W0            # Sets the default warning level to 0 for external headers, effectively disabling warnings for them.
 
         # Warnings
         /W4
@@ -94,6 +85,32 @@ if (MSVC)
         /wd4702 # unreachable code (when used with LTO)
         /wd4127 # if constexpr bullshit
     )
+    if (NOT CITRON_CLANGCL)
+        add_compile_options(
+            /MP
+            /Zc:preprocessor
+            /external:anglebrackets
+            /external:W0
+            /Zc:externConstexpr
+            /Zc:throwingNew
+            /GT
+            /experimental:module-
+        )
+    else()
+        add_compile_options(
+            /clang:-Wno-unknown-attributes
+            /clang:-Wno-unused-parameter
+            /clang:-Wno-missing-field-initializers
+            /clang:-Wno-ignored-pragmas
+            /clang:-Wno-braced-scalar-init
+            /clang:-Wno-unused-private-field
+            /clang:-Wno-c++11-narrowing
+            /clang:-Wno-cast-function-type-mismatch
+        )
+        if (ARCHITECTURE_x86_64)
+            add_compile_options(/clang:-mcx16)
+        endif()
+    endif()
 
     if (USE_CCACHE OR CITRON_USE_PRECOMPILED_HEADERS)
     # when caching, we need to use /Z7 to downgrade debug info to use an older but more cacheable format
@@ -208,8 +225,23 @@ add_subdirectory(input_common)
 add_subdirectory(frontend_common)
 add_subdirectory(shader_recompiler)
 
+function(add_subdirectory_without_clangcl_pgo subdir)
+    if (CITRON_CLANGCL)
+        foreach(config DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+            foreach(variable
+                    CMAKE_C_FLAGS_${config}
+                    CMAKE_CXX_FLAGS_${config}
+                    CMAKE_EXE_LINKER_FLAGS_${config})
+                string(REGEX REPLACE "(^| )/clang:-fprofile(-instr)?-use(=\"[^\"]+\"|=[^ ]+)" "" ${variable} "${${variable}}")
+            endforeach()
+        endforeach()
+    endif()
+
+    add_subdirectory(${subdir})
+endfunction()
+
 if (CITRON_ROOM)
-     add_subdirectory(dedicated_room)
+     add_subdirectory_without_clangcl_pgo(dedicated_room)
 endif()
 
 if (CITRON_TESTS)
@@ -222,7 +254,7 @@ if (CITRON_SHADER_TOOL)
 endif()
 
 if (ENABLE_SDL2)
-    add_subdirectory(citron_cmd)
+    add_subdirectory_without_clangcl_pgo(citron_cmd)
 endif()
 
 if (ENABLE_QT)

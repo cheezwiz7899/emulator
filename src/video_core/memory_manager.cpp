@@ -296,7 +296,7 @@ const u8* MemoryManager::GetPointer(GPUVAddr gpu_addr) const {
     return memory.GetPointer<u8>(*address);
 }
 
-#ifdef _MSC_VER // no need for gcc / clang but msvc's compiler is more conservative with inlining.
+#if defined(_MSC_VER) && !defined(__clang__) // MSVC-specific pragma, ignored by clang-cl
 #pragma inline_recursion(on)
 #endif
 

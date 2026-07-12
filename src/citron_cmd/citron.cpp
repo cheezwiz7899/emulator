@@ -30,7 +30,7 @@
 #include "frontend_common/config.h"
 #include "input_common/main.h"
 #include "network/network.h"
-#include "sdl_config.h"
+#include "citron_sdl_config.h"
 #include "video_core/renderer_base.h"
 #include "citron_cmd/emu_window/emu_window_sdl2.h"
 #include "citron_cmd/emu_window/emu_window_sdl2_null.h"

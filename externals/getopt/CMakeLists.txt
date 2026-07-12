@@ -8,5 +8,5 @@ add_library(getopt
 
 create_target_directory_groups(getopt)
 
-target_compile_definitions(getopt PUBLIC STATIC_GETOPT)
+target_compile_definitions(getopt PUBLIC STATIC_GETOPT GETOPT_SUPPRESS_STATIC_LINK_WARNING)
 target_include_directories(getopt INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})

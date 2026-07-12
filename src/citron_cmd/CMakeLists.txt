@@ -20,8 +20,8 @@ add_executable(citron-cmd
     emu_window/emu_window_sdl2_vk.cpp
     emu_window/emu_window_sdl2_vk.h
     precompiled_headers.h
-    sdl_config.cpp
-    sdl_config.h
+    citron_sdl_config.cpp
+    citron_sdl_config.h
     citron.cpp
     citron.rc
 )
@@ -75,7 +75,7 @@ if(WIN32)
     endif()
 endif()
 
-if (MSVC)
+if (MSVC AND CITRON_USE_BUNDLED_SDL2)
     include(CopyCitronSDLDeps)
     copy_citron_SDL_deps(citron-cmd)
 elseif(MINGW)

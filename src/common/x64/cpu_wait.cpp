@@ -20,11 +20,13 @@ namespace {
 // At 1 GHz, 100K cycles is 100us
 // At 2 GHz, 100K cycles is 50us
 // At 4 GHz, 100K cycles is 25us
+#if !(defined(_MSC_VER) && defined(__clang__))
 constexpr auto PauseCycles = 100'000U;
+#endif
 
 } // Anonymous namespace
 
-#ifdef _MSC_VER
+#if defined(_MSC_VER) && !defined(__clang__)
 __forceinline static void TPAUSE() {
     static constexpr auto RequestC02State = 0U;
     _tpause(RequestC02State, FencedRDTSC() + PauseCycles);
@@ -38,6 +40,14 @@ __forceinline static void MWAITX() {
     alignas(64) u64 monitor_var{};
     _mm_monitorx(&monitor_var, 0, 0);
     _mm_mwaitx(EnableWaitTimeFlag, RequestC1State, PauseCycles);
+}
+#elif defined(_MSC_VER) && defined(__clang__)
+static void TPAUSE() {
+    std::this_thread::yield();
+}
+
+static void MWAITX() {
+    std::this_thread::yield();
 }
 #else
 static void TPAUSE() {

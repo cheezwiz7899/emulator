@@ -264,7 +264,10 @@ elseif(ANDROID)
     set(FFmpeg_LIBRARIES "${FFmpeg_LIBRARIES}" PARENT_SCOPE)
     set(FFmpeg_INCLUDE_DIR "${FFmpeg_INCLUDE_DIR}" PARENT_SCOPE)
 elseif(WIN32)
-    if(MSVC)
+    if(CITRON_CLANGCL)
+        include(BuildClangClFFmpeg)
+        citron_build_clangcl_ffmpeg()
+    elseif(MSVC)
         # ── MSVC / vcpkg path ─────────────────────────────────────────────────
         # FFmpeg is built and installed by vcpkg (guarded by "!mingw & windows"
         # in vcpkg.json). FindFFmpeg.cmake locates it via CMAKE_PREFIX_PATH,

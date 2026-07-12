@@ -9,6 +9,14 @@ set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
 project(citron)
 
+# clang-cl + Ninja needs an explicit generic ASM rule for .s/.S sources.
+if(CITRON_CLANGCL AND CMAKE_GENERATOR MATCHES "Ninja")
+    set(CMAKE_ASM_SOURCE_FILE_EXTENSIONS "s;S")
+    set(CMAKE_INCLUDE_FLAG_ASM "/I")
+    set(CMAKE_ASM_COMPILE_OBJECT
+        "<CMAKE_ASM_COMPILER> <DEFINES> <INCLUDES> <FLAGS> /c <SOURCE> /Fo<OBJECT>")
+endif()
+
 # Define the build type, defaulting to "Nightly" for development and CI builds.
 set(CITRON_BUILD_TYPE "Stable" CACHE STRING "The build type for the emulator (e.g., Stable, Nightly)")
 
@@ -43,8 +51,8 @@ endif()
 
 # Set bundled sdl2/qt as dependent options.
 option(ENABLE_SDL2 "Enable the SDL2 frontend" ON)
-CMAKE_DEPENDENT_OPTION(CITRON_USE_BUNDLED_SDL2 "Download bundled SDL2 binaries" ON "ENABLE_SDL2;MSVC" OFF)
-CMAKE_DEPENDENT_OPTION(CITRON_USE_EXTERNAL_SDL2 "Compile external SDL2" ON "ENABLE_SDL2;NOT MSVC" OFF)
+CMAKE_DEPENDENT_OPTION(CITRON_USE_BUNDLED_SDL2 "Download bundled SDL2 binaries" ON "ENABLE_SDL2;MSVC;NOT CITRON_CLANGCL" OFF)
+CMAKE_DEPENDENT_OPTION(CITRON_USE_EXTERNAL_SDL2 "Compile external SDL2" ON "ENABLE_SDL2;NOT MSVC OR CITRON_CLANGCL" OFF)
 
 cmake_dependent_option(ENABLE_LIBUSB "Enable the use of LibUSB" ON "NOT ANDROID" OFF)
 
@@ -93,6 +101,14 @@ CMAKE_DEPENDENT_OPTION(CITRON_CRASH_DUMPS "Compile crash dump (Minidump) support
 # vcpkg is supported primarily for native MSVC and Android builds.
 option(CITRON_USE_BUNDLED_VCPKG "Use vcpkg for citron dependencies" "${MSVC}")
 option(CITRON_USE_CPM "Use CPM.cmake to fetch dependencies" OFF)
+option(CITRON_CLANGCL "Build natively on Windows with clang-cl and the MSVC ABI" OFF)
+
+# Avoid per-project /MP oversubscription under MSBuild.
+if(CITRON_CLANGCL AND MSVC AND CMAKE_GENERATOR MATCHES "Visual Studio")
+    list(APPEND CMAKE_VS_GLOBALS
+        "UseMultiToolTask=true"
+        "EnforceProcessCountAcrossBuilds=true")
+endif()
 
 option(CITRON_CHECK_SUBMODULES "Check if submodules are present" ON)
 
@@ -307,6 +323,32 @@ endif()
 # System imported libraries
 # =======================================================================
 
+# Set runtime library to MD/MDd for all configurations.
+# This MUST run before CPM dependencies are configured below: CMAKE_MSVC_RUNTIME_LIBRARY
+# is captured per-target at add_library()/add_executable() time (CMP0091), not
+# re-evaluated later. Some CPM packages (e.g. SDL2) have their own
+# `if(NOT DEFINED CMAKE_MSVC_RUNTIME_LIBRARY)` fallback that bakes in a
+# different (static) default if this variable isn't already set by the time
+# their CMakeLists.txt runs -- so this has to be set before include(dependencies.cmake),
+# not after it.
+if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+
+    # Force all projects (including external dependencies) to use the same runtime
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /MD")
+    set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /MDd")
+    set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} /MD")
+    set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} /MDd")
+
+    # Add this to ensure Cubeb uses the same runtime
+    add_compile_options(
+        $<$<CONFIG:Debug>:/MDd>
+        $<$<CONFIG:Release>:/MD>
+        $<$<CONFIG:RelWithDebInfo>:/MD>
+        $<$<CONFIG:MinSizeRel>:/MD>
+    )
+endif()
+
 # ── CPM (Clangtron / cross-compile builds) ───────────────────────────────────
 # When CITRON_USE_CPM is ON, fetch all dependencies via CPM.cmake at configure
 # time instead of requiring git submodules or vcpkg.  This must run BEFORE
@@ -390,7 +432,10 @@ if (NOT CITRON_USE_EXTERNAL_VULKAN_UTILITY_LIBRARIES)
 endif()
 
 if (ENABLE_LIBUSB AND NOT ${CMAKE_SYSTEM_NAME} STREQUAL "FreeBSD")
-    find_package(libusb 1.0.24 MODULE)
+    # Avoid MinGW libusb archives in MSVC ABI builds.
+    if(NOT CITRON_CLANGCL)
+        find_package(libusb 1.0.24 MODULE)
+    endif()
 endif()
 
 if (ARCHITECTURE_x86 OR ARCHITECTURE_x86_64)
@@ -854,7 +899,7 @@ if (MSVC AND CMAKE_GENERATOR STREQUAL "Ninja")
     )
 endif()
 
-if (NOT APPLE AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR (CITRON_USE_FASTER_LD AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")))
+if (NOT APPLE AND NOT MSVC AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR (CITRON_USE_FASTER_LD AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")))
     # We will assume that if the compiler is GCC, it will attempt to use ld.bfd by default.
     # Try to pick a faster linker.
     find_program(LLD lld)
@@ -869,26 +914,68 @@ if (NOT APPLE AND (CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR (CITRON_USE_FASTER_L
     endif()
 endif()
 
-# Set runtime library to MD/MDd for all configurations
-if(MSVC)
-    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
-
-    # Force all projects (including external dependencies) to use the same runtime
-    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /MD")
-    set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /MDd")
-    set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} /MD")
-    set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} /MDd")
-
-    # Add this to ensure Cubeb uses the same runtime
-    add_compile_options(
-        $<$<CONFIG:Debug>:/MDd>
-        $<$<CONFIG:Release>:/MD>
-        $<$<CONFIG:RelWithDebInfo>:/MD>
-        $<$<CONFIG:MinSizeRel>:/MD>
-    )
-endif()
-
 add_subdirectory(src)
+
+# Build all shipped executables in one graph.
+if(CITRON_CLANGCL)
+    set(_citron_runtime_deps citron)
+    if(TARGET citron-cmd)
+        list(APPEND _citron_runtime_deps citron-cmd)
+    endif()
+    if(TARGET citron-room)
+        list(APPEND _citron_runtime_deps citron-room)
+    endif()
+
+    # PGO flags applied per-target to first-party targets only — never via global
+    # CMAKE_C/CXX_FLAGS, which SDL2 and other CPM sub-targets inherit. A PGO-instrumented
+    # citron.exe linked against plain SDL2 under the same LTO link fails with:
+    # "linking module flags 'ProfileSummary': IDs have conflicting values".
+    # CITRON_CLANGCL_PGO_COMPILE_FLAGS/_LINK_FLAGS are empty by default;
+    # only set by build-clangtron-windows.sh's clang-cl stage.
+    #
+    # The target list must include the core libraries (core, video_core, etc.)
+    # not just the executables — citron.exe itself is mostly Qt UI glue;
+    # the emulator logic lives in the static libraries it links.
+    set(_citron_pgo_targets ${_citron_runtime_deps})
+    foreach(_citron_pgo_lib IN ITEMS
+            common core video_core audio_core shader_recompiler
+            input_common frontend_common hid_core network web_service
+            dynarmic)
+        if(TARGET ${_citron_pgo_lib})
+            list(APPEND _citron_pgo_targets ${_citron_pgo_lib})
+        endif()
+    endforeach()
+    unset(_citron_pgo_lib)
+
+    set(CITRON_CLANGCL_PGO_COMPILE_FLAGS "" CACHE STRING
+        "clang-cl PGO/LTO compiler flags, applied only to citron's own first-party targets")
+    set(CITRON_CLANGCL_PGO_LINK_FLAGS "" CACHE STRING
+        "clang-cl PGO/LTO linker flags, applied only to citron's own first-party targets")
+    # CITRON_CLANGCL_PGO_LINK_FLAGS must be native lld-link syntax only (e.g. /INCLUDE:).
+    # CMake's Ninja Multi-Config generator invokes lld-link.exe directly for the final link
+    # (not via clang-cl), so /clang:-prefixed tokens would be treated as input file paths.
+    if(CITRON_CLANGCL_PGO_COMPILE_FLAGS OR CITRON_CLANGCL_PGO_LINK_FLAGS)
+        separate_arguments(_citron_pgo_compile_flags UNIX_COMMAND "${CITRON_CLANGCL_PGO_COMPILE_FLAGS}")
+        separate_arguments(_citron_pgo_link_flags UNIX_COMMAND "${CITRON_CLANGCL_PGO_LINK_FLAGS}")
+        foreach(_citron_pgo_target IN LISTS _citron_pgo_targets)
+            if(_citron_pgo_compile_flags)
+                target_compile_options(${_citron_pgo_target} PRIVATE ${_citron_pgo_compile_flags})
+            endif()
+            # Link flags only apply to executables, not static libraries.
+            if(_citron_pgo_link_flags AND "${_citron_pgo_target}" IN_LIST _citron_runtime_deps)
+                target_link_options(${_citron_pgo_target} PRIVATE ${_citron_pgo_link_flags})
+            endif()
+        endforeach()
+        unset(_citron_pgo_compile_flags)
+        unset(_citron_pgo_link_flags)
+        unset(_citron_pgo_target)
+    endif()
+    unset(_citron_pgo_targets)
+
+    add_custom_target(citron-runtime
+        DEPENDS ${_citron_runtime_deps})
+    unset(_citron_runtime_deps)
+endif()
 
 # Add the compile definition for Dynarmic
 if(CITRON_HAS_DYNARMIC) # This variable is set by the find_package call at the top

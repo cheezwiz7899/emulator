@@ -2,263 +2,200 @@
 # SPDX-FileCopyrightText: 2026 citron Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 # =============================================================================
-# build-clangtron-windows.sh — PGO + LTO + PLO optimized cross-compilation build script
+# build-clangtron-windows.sh — PGO + LTO + PLO cross-compilation build script
 #
-# Builds Citron (Nintendo Switch emulator) for Windows (x86_64-w64-mingw32)
-# from a Linux host, using a multi-stage compiler optimization pipeline:
+# Builds Citron for Windows (x86_64-w64-mingw32) from Linux using a
+# multi-stage optimization pipeline:
 #
-#   Stage 1 (generate):    Build with Clang PGO instrumentation (FE or IR).
-#   Stage 1b (csgenerate): [IR PGO only] Build with context-sensitive IR
-#                          instrumentation layered on stage1 profile data.
-#                          Requires a second Windows profiling session.
-#   Stage 2 (use):         Rebuild using collected profile(s) + LTO.
-#                          Auto-merges CS profraw if pgo-profiles/cs/ is
-#                          populated. Builds the Windows PE only.
-#   Stage 2b (build-elf):  Build native Linux ELF with BBAddrMap sections
-#                          for BOLT/Propeller profiling. Invoked on-demand
-#                          by bolt/propeller if not already present.
+#   Stage 1  (generate):   PGO-instrumented PE (FE or IR PGO)
+#   Stage 1b (csgenerate): [IR only] CS-instrumented PE; needs stage1 profile
+#   Stage 2  (use):        PGO+LTO PE; auto-merges CS profiles if present
+#   Stage 2b (build-elf):  Native Linux ELF with BBAddrMap for BOLT/Propeller
 #   Stage 3 (choose one):
-#     bolt       BOLT ELF-proxy: instruments the Linux ELF, profiles it natively,
-#                extracts hot function order, re-links the Windows PE with /order:@
-#     propeller  Propeller: collects perf LBR data from the Linux ELF, generates
-#                a BB+function layout profile, rebuilds the Windows PE with /order:@
+#     bolt       Instruments ELF, extracts hot order, relinks PE with /order:@
+#     propeller  perf LBR on ELF → BB+function layout → relinks PE with /order:@
 #
 # PGO MODES (--pgo-type):
 #
-#   fe — Frontend PGO (-fprofile-instr-generate / -fprofile-instr-use):
-#     Counters are inserted before LLVM optimization passes, at the AST/frontend
-#     level. More robust to flag changes between generate and use. CS-IRPGO is
-#     not available with fe.
+#   fe  Frontend PGO (-fprofile-instr-generate / -fprofile-instr-use).
+#       Counters before optimization passes. More tolerant of flag changes.
+#       CS-IRPGO not available with fe.
 #
-#   ir — LLVM IR PGO (-fprofile-generate / -fprofile-use):  [DEFAULT]
-#     Counters are inserted at the LLVM IR level, after early optimization passes
-#     (SRO, SROA, etc.). The profile reflects the code structure that the
-#     optimizer actually sees, making inlining and branch decisions more accurate.
-#     For an emulator with complex JIT/dispatch paths, IR PGO typically yields
-#     2-5% better runtime performance than FE PGO.
-#
-#     CRITICAL: IR PGO profiles are tied to the LLVM IR produced at generate
-#     time. The --lto value and optimization flags MUST be identical between
-#     generate, csgenerate, and use. Only the propeller/bolt final relink
-#     may use a different --lto value.
+#   ir  LLVM IR PGO (-fprofile-generate / -fprofile-use). [DEFAULT]
+#       Counters after early IR passes; better inlining decisions (~2-5% faster).
+#       CRITICAL: --lto and optimization flags MUST be identical across
+#       generate, csgenerate, and use. Only the bolt/propeller relink may differ.
 #
 #   CS-IRPGO (ir + csgenerate stage):
-#     Context-Sensitive IR PGO adds a second instrumentation pass on top of an
-#     already-PGO-optimized binary. The CS layer captures per-call-site counter
-#     data rather than per-function-definition data, giving the compiler separate
-#     profiles for each inlined instance of a function. For an emulator where
-#     the same JIT/memory/GPU functions are called from both inner loops and cold
-#     init paths, this provides substantially better inlining decisions.
+#       Second instrumentation pass on an already-PGO-optimized binary.
+#       Captures per-call-site counts for better inlining of hot/cold paths.
+#       Requires two Windows profiling sessions (stage1, then csgenerate).
+#       The use stage auto-detects pgo-profiles/cs/ and merges both profiles.
 #
-#     CS-IRPGO requires two Windows profiling sessions:
-#       Session 1: run the generate binary (stage1, standard IR instrumentation)
-#       Session 2: run the csgenerate binary (CS instrumentation built on top of
-#                  the stage1 profile — the binary is already PGO-optimized at
-#                  stage1 quality before the CS counters are applied)
-#     The use stage auto-detects pgo-profiles/cs/ and merges both profiles.
+#       CRITICAL: csgenerate must use default.profdata (stage1 only), never
+#       merged.profdata. Using merged.profdata causes the new CS counters to
+#       key against a doubly-CS-influenced IR, producing hash mismatches at
+#       the use stage. The script enforces this and errors if only
+#       merged.profdata is present.
 #
-#     CRITICAL INVARIANT — csgenerate must always use default.profdata (stage1
-#     only) as the input to -fprofile-use, never merged.profdata (which contains
-#     CS records from a prior CS cycle). If merged.profdata were used:
-#       - The compiler applies stale CS data (keyed to the previous csgenerate
-#         binary's IR) during the new csgenerate build
-#       - Inlining decisions change relative to the plain stage1 baseline,
-#         restructuring the IR the new CS counters are keyed to
-#       - The new CS profraw then hash-mismatches during the use stage because
-#         the use stage builds on the plain stage1 IR, not the doubly-CS-
-#         influenced one
-#     This invariant is enforced by the script: csgenerate always requires
-#     default.profdata and refuses to run if only merged.profdata is present.
-#
-# PROFILE RUNTIME (applies to ALL PGO modes — FE, IR, and CS-IRPGO):
-#   All three instrumentation modes write .profraw files using the same LLVM
-#   InstrProfiling runtime library (libclang_rt.profile.a). On a Windows PE
-#   cross-compiled with llvm-mingw, this runtime must be present and must include
-#   POSIX stubs for symbols (mmap, flock, etc.) that the MinGW runtime does not
-#   provide. The ensure_profile_runtime_mingw() function verifies and rebuilds
-#   this library if needed. The -u,__llvm_profile_write_file and
-#   -u,__llvm_profile_runtime linker flags prevent lld from dead-stripping the
-#   runtime entry points. These mechanisms apply equally to FE, IR, and
-#   CS-IRPGO generate/csgenerate binaries.
+# PROFILE RUNTIME (llvm-mingw path, all PGO modes):
+#   All modes use libclang_rt.profile.a. On llvm-mingw PEs this must include
+#   POSIX stubs (mmap, flock, etc.) missing from MinGW. ensure_profile_runtime_mingw()
+#   verifies and rebuilds it if needed. -u,__llvm_profile_write_file and
+#   -u,__llvm_profile_runtime prevent lld from stripping the runtime entry points.
+#   (clang-cl equivalent: /INCLUDE: — see LINKER FORCE-KEEP FLAGS below.)
 #
 # LTO + PGO LINKER FLAGS (use stage):
-#   For full LTO (-flto), Clang/LLD re-runs the optimization backend at link
-#   time across all merged bitcode modules. The -fprofile-use=... flag must be
-#   present on the LINKER command line (CMAKE_EXE_LINKER_FLAGS_RELEASE) as well
-#   as the compile flags, so the LTO backend can apply the profile during link-
-#   time code generation. Without this, cross-TU inlining and hot-path layout
-#   decisions made during LTO run without profile guidance, negating the main
-#   benefit of full LTO. The use stage sets CMAKE_EXE_LINKER_FLAGS_RELEASE to
-#   include both the LTO flag and -fprofile-use.
+#   -fprofile-use must appear on the linker line too (CMAKE_EXE_LINKER_FLAGS_RELEASE),
+#   otherwise LTO's cross-TU inlining runs without profile guidance.
 #
-# HOW BOLT WORKS HERE:
-#   BOLT operates on ELF binaries natively — PE/COFF support does not exist.
-#   Instead, a native Linux ELF is built alongside the PE, profiled under BOLT
-#   instrumentation, and the resulting hot function order is fed to lld's /order:@
-#   flag when re-linking the final Windows PE. Agreement rate ~38-64%: many ELF
-#   hot functions are inlined away by full LTO in the PE.
+# BOLT:
+#   BOLT is ELF-only. A native Linux ELF is built (build-elf), profiled, and its
+#   hot function order is fed to lld's /order:@ when relinking the PE.
+#   Agreement rate ~38-64% (many ELF hot functions are inlined away by full LTO).
 #
-# HOW PROPELLER WORKS HERE:
-#   Propeller uses Linux perf with LBR (Last Branch Record) to collect a
-#   branch-trace profile of the native Linux ELF, then runs
-#   generate_propeller_profiles (google/llvm-propeller) to produce:
-#     - propeller_cc.prof       Basic-block layout profile (ELF-only, not used for PE)
-#     - propeller_symorder.txt  Hot function order (fed to lld /order:@ for PE)
-#   The PE rebuild uses PGO + LTO + /order:@ function ordering. Basic-block
-#   layout (the CC profile) cannot currently be applied to COFF/PE targets
-#   because -fbasic-block-sections=list is ELF-only.
-#
-#   FUTURE: COFF/Windows BBAddrMap support is being added to LLVM. When merged
-#   into llvm-mingw, the CC profile can be applied to the PE build as well,
-#   recovering the intra-function BB layout benefit currently limited to ELF.
-#   Track progress at:
-#     PR:  https://github.com/llvm/llvm-project/pull/187268
-#     RFC: https://discourse.llvm.org/t/rfc-extend-bbaddrmap-support-to-coff-windows/90232
+# PROPELLER:
+#   perf LBR on the Linux ELF → generate_propeller_profiles produces:
+#     propeller_cc.prof      BB layout (ELF-only, not applied to PE)
+#     propeller_symorder.txt hot function order (→ /order:@ for PE relink)
+#   Basic-block layout for PE is blocked pending COFF BBAddrMap support in LLVM.
+#   Track: https://github.com/llvm/llvm-project/pull/187268
 #
 # TOOLCHAIN:
-#   Cross-compilation uses llvm-mingw — a self-contained Clang/LLD/libc++/
-#   compiler-rt MinGW-w64 toolchain. Both the toolchain and project dependencies
-#   are cached globally in CPM_SOURCE_CACHE (default: ~/.cache/cpm) to speed up
-#   builds across repository clones. The host LLVM install (clang-21,
-#   llvm-profdata, llvm-bolt) is used for PGO merging, BOLT, and the Linux ELF.
+#   llvm-mingw — self-contained Clang/LLD/libc++/compiler-rt for Windows targets.
+#   Cached in CPM_SOURCE_CACHE (default: ~/.cache/cpm). Host LLVM (clang-21,
+#   llvm-profdata, llvm-bolt) handles PGO merging, BOLT, and the Linux ELF.
+#
+# =============================================================================
+# CLANG-CL PATH (--compiler clang-cl)
+# =============================================================================
+#   Native Windows build using VS's clang-cl + lld-link (MSVC ABI, COFF/PDB).
+#   Linux-only stages (build-elf, bolt, propeller) are NOT available.
+#   To use BOLT/Propeller with clang-cl profiles, run this path's use stage
+#   first, then feed pgo-profiles/ into the llvm-mingw bolt/propeller stages.
+#
+#   HOST REQUIREMENTS (native Windows, MSYS2 CLANG64 shell):
+#     - Visual Studio 2022 + "C++ Clang tools for Windows" (provides clang-cl.exe,
+#       lld-link.exe, llvm-profdata.exe under VC/Tools/Llvm/x64/bin) + Win11 SDK
+#     - MSYS2 CLANG64: nasm, yasm, glslang, ninja, sccache, jom
+#     - Native Strawberry Perl + Python 3.12 (OpenSSL/FFmpeg need real Win32 tools)
+#     - aqtinstall in the native Python (for CMake's Qt download step)
+#     Run setup --compiler clang-cl once per machine.
+#
+#   COMPILE VS LINK FLAGS:
+#     CMake invokes lld-link.exe directly (not via clang-cl) for the final link.
+#     /clang:-prefixed tokens are a clang-cl driver escape hatch; lld-link treats
+#     them as input file paths and fails. So PGO flags (/clang:-fprofile-*) go
+#     only in compile flags (CITRON_CLANGCL_PGO_COMPILE_FLAGS), never in linker
+#     flags. The LTO flag is also omitted from CMAKE_EXE_LINKER_FLAGS — lld-link
+#     auto-detects bitcode .obj files. stage_clangcl() keeps pgo_flags and
+#     pgo_link_flags as separate variables throughout for this reason.
+#
+#   PROFRAW NAMING:
+#     Binaries bake in a relative filename pattern (no directory prefix):
+#       generate:   citron-generate-<pgo-mode>-%p.profraw
+#       csgenerate: citron-csgenerate-<pgo-mode>-%p.profraw
+#     %p is per-process, so repeated runs never collide. LLVM_PROFILE_FILE
+#     overrides this if set.
+#
+#     GOTCHA: in the generated build-clang-cl.cmd heredoc, %p must be written
+#     as %%p — cmd.exe pairs bare % tokens as env-var references, silently
+#     mangling the filename. The script builds _batch-suffixed copies of flags
+#     strings with %p→%%p just before the heredoc write.
+#
+#   LINKER FORCE-KEEP FLAGS:
+#     /OPT:REF can strip the CS profiling runtime's static initializer, causing
+#     the binary to run cleanly but never write a .profraw. -fcs-profile-generate
+#     does not get the automatic reference that -fprofile-generate does.
+#     generate and csgenerate both pass /INCLUDE:__llvm_profile_runtime
+#     /INCLUDE:__llvm_profile_write_file via pgo_link_flags to prevent this.
+#     (llvm-mingw equivalent: -Wl,-u,__llvm_profile_write_file,...)
+#     The use stage needs neither — no instrumentation runtime is linked.
+#
+#   SENTINEL: build/.citron-clangcl-gen-config records --lto and --pgo-type
+#     used by generate. csgenerate/use error out if invoked with different values.
+#
+#   OUTPUT:
+#     build/clang-cl/generate/   Stage 1 instrumented PE
+#     build/clang-cl/csgenerate/ Stage 1b CS-instrumented PE
+#     build/clang-cl/use/        Final PGO+LTO PE
+#     (CMake work dirs: build/clang-cl/.work/<stage>/)
+#
+#   EXAMPLE (MSYS2 CLANG64):
+#     ./build-clangtron-windows.sh setup      --compiler clang-cl
+#     ./build-clangtron-windows.sh generate   --compiler clang-cl --pgo-type ir --lto full
+#     # Run build/clang-cl/generate/citron.exe, copy .profraw → build/pgo-profiles/
+#     ./build-clangtron-windows.sh use        --compiler clang-cl --pgo-type ir --lto full
+#     # Optional CS pass:
+#     ./build-clangtron-windows.sh csgenerate --compiler clang-cl --pgo-type ir --lto full
+#     # Run csgenerate/citron.exe, copy .profraw → pgo-profiles/cs/, then re-run use
+#     # Final binary: build/clang-cl/use/citron.exe
 #
 # USAGE:
 #   ./build-clangtron-windows.sh [stage] [options]
 #
 #   Stages:
-#     setup       Install all dependencies (run once on a new machine)
-#     generate    Stage 1:  Build PGO-instrumented Windows PE (FE or IR PGO)
-#     csgenerate  Stage 1b: [IR PGO only] Build CS-instrumented Windows PE.
-#                           Requires default.profdata from a prior generate run.
-#                           Produces build/cs-generate/bin/citron.exe; CS profraw
-#                           goes to pgo-profiles/cs/ after the Windows session.
-#     use         Stage 2:  Build PGO+LTO Windows PE only.
-#                           Auto-merges CS profraw in pgo-profiles/cs/ if present.
-#     build-elf   Stage 2b: Build native Linux ELF with BBAddrMap sections
-#                           (-fbasic-block-address-map) for BOLT/Propeller profiling.
-#                           Built on-demand by bolt/propeller if not already present.
-#                           Use --pgo none to build a baseline ELF without PGO:
-#                             ./build-clangtron-windows.sh build-elf --pgo none
+#     setup       Install dependencies (run once per machine)
+#     generate    Stage 1:  PGO-instrumented PE
+#     csgenerate  Stage 1b: [IR only] CS-instrumented PE; needs default.profdata
+#     use         Stage 2:  PGO+LTO PE; auto-merges pgo-profiles/cs/ if present
+#     build-elf   Stage 2b: Linux ELF with -fbasic-block-address-map for BOLT/Propeller
+#                           (built on-demand; use --pgo none for a baseline ELF)
 #     bolt        Stage 3A: BOLT function-order optimization (ELF-proxy → PE)
 #     propeller   Stage 3B: Propeller BB+function layout (perf LBR → PE)
 #     clean       Remove build directory
 #
+#     NOTE: build-elf/bolt/propeller require --compiler llvm-mingw (the default).
+#
 #   Options:
-#     --source DIR             Path to citron source tree (default: cwd)
-#     --build DIR              Path to build directory (default: ./build)
+#     --source DIR             Citron source tree (default: cwd)
+#     --build DIR              Build directory (default: ./build)
+#     --compiler llvm-mingw|clang-cl  Toolchain (default: llvm-mingw)
 #     --jobs N                 Parallel jobs (default: nproc)
-#     --lto thin|full|none     LTO mode (default: full)
-#                              MUST match between generate, csgenerate, and use.
-#                              Only propeller/bolt (final relink) may differ.
+#     --lto thin|full|none     LTO mode (default: full); MUST match across stages 1-2
 #     --lite-lto               Alias for --lto thin
 #     --no-lto                 Alias for --lto none
-#     --pgo-type ir|fe|none    PGO instrumentation mode (default: ir)
-#                              ir   = LLVM IR PGO (-fprofile-generate / -fprofile-use).
-#                                     Counters at the optimized-IR level. More accurate
-#                                     for inlining decisions. Required for CS-IRPGO.
-#                                     LTO and flag set MUST match across all stages.
-#                              fe   = Frontend PGO (-fprofile-instr-generate / -use).
-#                                     Counters before optimizations. More robust to
-#                                     flag changes. CS-IRPGO not available with fe.
-#                              none = No PGO. Baseline build (use and build-elf stages).
-#                                     use:       outputs to build/use-nopgo/.
-#                                     build-elf: outputs to build/use-nopgo-elf/.
-#                                     LTO still applies for use; build-elf always
-#                                     disables LTO (required for BBAddrMap sections).
-#                                     Use --lto none for a fully unoptimized PE:
-#                                       ./build-clangtron-windows.sh use --pgo none --lto none
-#                              MUST match between generate, csgenerate, and use
-#                              (except none, which skips profdata entirely).
-#     --unity                  Enable unity builds (passes ENABLE_UNITY_BUILD=ON)
-#                              ~30-90% faster compilation; no runtime effect.
+#     --pgo-type ir|fe|none    PGO mode (default: ir); MUST match across stages 1-2
+#                              ir   = IR PGO; required for CS-IRPGO; LTO/flags must match
+#                              fe   = Frontend PGO; more flag-change tolerant; no CS-IRPGO
+#                              none = No PGO; use → build/use-nopgo/, LTO still applies
+#     --release                Release build (default)
+#     --relwithdebinfo         RelWithDebInfo (adds -g, keeps O3/LTO/PGO)
+#     --unity                  Unity builds (~30-90% faster compile, no runtime effect)
 #     --clang-version N        Host Clang version (default: 21)
-#     --relwithdebinfo         Enable RelWithDebInfo build (Release with debug symbols).
-#                              Injects -g into all build stages while keeping O3/LTO/PGO.
 #     --llvm-mingw-version VER llvm-mingw release tag (default: 20260224)
 #
-#   LTO mode details:
-#     full → Full LTO (-flto). Best runtime performance; most aggressive inlining
-#            reduces BOLT/Propeller agreement rates (~38-44%).
-#     thin → ThinLTO (-flto=thin). Faster builds, slightly higher agreement rates.
-#     none → No LTO. Not recommended; significantly reduced performance.
+#   LTO notes:
+#     full  Best performance; ~38-44% BOLT/Propeller agreement (aggressive inlining)
+#     thin  Faster builds; slightly higher agreement rates
+#     none  Not recommended; use build-elf (always disables LTO for BBAddrMap)
 #
-#     Stage 1 (generate/csgenerate): instruments the Windows PE.
-#       IR PGO: LTO mode affects which IR is instrumented — must match use.
-#       FE PGO: LTO does not affect counter placement — more forgiving.
-#     Stage 2 (use): builds PGO+LTO Windows PE only.
-#     Stage 2b (build-elf): builds the native Linux ELF for BOLT/Propeller.
-#       The Linux ELF always omits LTO to allow -fbasic-block-address-map
-#       to emit BBAddrMap sections (LTO prevents this at the TU level).
-#     Stage 3A (bolt):      re-links Windows PE with BOLT function order.
-#     Stage 3B (propeller): rebuilds Windows PE with Propeller function order.
-#       Both stage 3 variants may use a different --lto than stages 1-2.
+# REQUIREMENTS (installed by setup):
+#   clang/clang++ 21+, lld, llvm-profdata, llvm-bolt, perf, llvm-mingw, cmake, ninja
 #
-# REQUIREMENTS (installed by the setup stage):
-#   - clang/clang++ 21+      Host compiler (PGO merge, BOLT/Propeller ELF build)
-#   - lld                    Linker (LTO)
-#   - llvm-profdata          Merges .profraw -> .profdata
-#   - llvm-bolt              Binary optimization tool (ELF only)
-#   - perf                   Linux perf with LBR support (for Propeller)
-#   - llvm-mingw             Self-contained Clang+libc++/compiler-rt MinGW toolchain
-#   - cmake + ninja-build    Build system
-#
-# EXAMPLE FULL PIPELINE — IR PGO (recommended):
+# EXAMPLE — IR PGO + Propeller (recommended):
 #   ./build-clangtron-windows.sh setup
-#   ./build-clangtron-windows.sh generate --pgo-type ir --lto full
-#   # Copy build/generate/bin/ to Windows, run citron.exe for 15-30 min.
-#   # default-<pid>.profraw appears next to citron.exe on exit.
-#   # Copy the .profraw file(s) to build/pgo-profiles/
-#   ./build-clangtron-windows.sh use --pgo-type ir --lto full
-#   # Then propeller or bolt (may use a different --lto for the relink):
-#   ./build-clangtron-windows.sh propeller --pgo-type ir --lto full
-#   # Final binary: build/propeller/bin/citron.exe
+#   ./build-clangtron-windows.sh generate   --pgo-type ir --lto full
+#   # Copy build/generate/bin/ to Windows, run citron.exe 15-30 min, copy .profraw → build/pgo-profiles/
+#   ./build-clangtron-windows.sh use        --pgo-type ir --lto full
+#   ./build-clangtron-windows.sh propeller  --pgo-type ir --lto full
+#   # Final: build/propeller/bin/citron.exe
 #
-# EXAMPLE FULL PIPELINE — CS-IRPGO (two Windows sessions, best quality):
+# EXAMPLE — CS-IRPGO (two profiling sessions, best quality):
 #   ./build-clangtron-windows.sh setup
-#
-#   # --- Session 1: Standard IR instrumentation ---
-#   ./build-clangtron-windows.sh generate --pgo-type ir --lto full
-#   # Copy build/generate/bin/ to Windows. Run citron.exe for 15-30 min.
-#   # Copy default-<pid>.profraw back to build/pgo-profiles/
-#
-#   # Merge stage1 profraw → default.profdata (required before csgenerate).
-#   # This also gives you a usable PGO+LTO binary without the CS layer.
-#   ./build-clangtron-windows.sh use --pgo-type ir --lto full
-#
-#   # --- Session 2: Context-sensitive instrumentation ---
-#   # csgenerate builds a NEW binary using ONLY default.profdata for -fprofile-use
-#   # (never merged.profdata — see CRITICAL INVARIANT above) and adds CS counters.
+#   ./build-clangtron-windows.sh generate   --pgo-type ir --lto full
+#   # Session 1: run generate/citron.exe, copy .profraw → pgo-profiles/
+#   ./build-clangtron-windows.sh use        --pgo-type ir --lto full
 #   ./build-clangtron-windows.sh csgenerate --pgo-type ir --lto full
-#   # Copy build/cs-generate/bin/ to Windows. Run citron.exe for 15-30 min.
-#   # cs-default-<pid>.profraw is written next to citron.exe on exit.
-#   # Copy cs-default-*.profraw to build/pgo-profiles/cs/
+#   # Session 2: run csgenerate/citron.exe, copy .profraw → pgo-profiles/cs/
+#   ./build-clangtron-windows.sh use        --pgo-type ir --lto full   # merges CS profiles
+#   ./build-clangtron-windows.sh propeller  --pgo-type ir --lto full
+#   # Final: build/propeller/bin/citron.exe
 #
-#   # --- Final build: use auto-detects CS profiles and merges them ---
-#   # With pgo-profiles/cs/ populated, use:
-#   #   1. Merges cs-default-*.profraw → cs-only.profdata
-#   #   2. Merges default.profdata + cs-only.profdata → merged.profdata
-#   #   3. Rebuilds the PE with -fprofile-use=merged.profdata + LTO
-#   #      (linker also gets -fprofile-use for LTO backend LTCG)
-#   ./build-clangtron-windows.sh use --pgo-type ir --lto full
-#
-#   # Propeller or BOLT (final relink; --lto here may differ):
-#   ./build-clangtron-windows.sh propeller --pgo-type ir --lto full
-#   # Final binary: build/propeller/bin/citron.exe
-#
-# EXAMPLE FULL PIPELINE — Frontend PGO (simpler, flag-change tolerant):
-#   ./build-clangtron-windows.sh setup
-#   ./build-clangtron-windows.sh generate --pgo-type fe --lto full
-#   # Copy build/generate/bin/ to Windows, collect default-*.profraw
-#   # Copy profraw to build/pgo-profiles/
-#   ./build-clangtron-windows.sh use --pgo-type fe --lto full
-#   ./build-clangtron-windows.sh propeller --pgo-type fe --lto full
-#   # Final binary: build/propeller/bin/citron.exe
-#
-#   Option A — BOLT ELF-proxy (function-level reordering):
+# EXAMPLE — BOLT:
 #   ./build-clangtron-windows.sh bolt --pgo-type ir --lto full
-#   # bolt pauses: run build/use-elf/bin/citron-bolt-instrumented on Linux
-#   # Play for 15-30 minutes, exit cleanly, then press Enter
-#   # Final binary: build/bolt/bin/citron.exe
+#   # Script pauses: run build/use-elf/bin/citron-bolt-instrumented on Linux, then Enter
+#   # Final: build/bolt/bin/citron.exe
 # =============================================================================
 
 set -euo pipefail
@@ -268,6 +205,8 @@ set -euo pipefail
 # =============================================================================
 
 CLANG_VERSION="${CLANG_VERSION:-21}"
+COMPILER_MODE="${COMPILER_MODE:-llvm-mingw}"
+VS_INSTALL_PATH="${VS_INSTALL_PATH:-}"
 
 
 # llvm-mingw release tag — cross-compilation toolchain (Clang+libc++/compiler-rt)
@@ -278,15 +217,12 @@ SOURCE_DIR="${SOURCE_DIR:-$(pwd)}"
 BUILD_ROOT="${BUILD_ROOT:-$(pwd)/build}"
 JOBS="${JOBS:-$(nproc)}"
 LTO_MODE="${LTO_MODE:-full}"
-PGO_MODE="${PGO_MODE:-ir}"     # ir = LLVM IR PGO (-fprofile-generate/-fprofile-use)
-                               # fe = Frontend PGO (-fprofile-instr-generate/-fprofile-instr-use)
-UNITY_BUILD="${UNITY_BUILD:-OFF}"   # ENABLE_UNITY_BUILD: batch TUs to speed up compilation
-BUILD_TYPE="${BUILD_TYPE:-Release}" # Release, RelWithDebInfo
+PGO_MODE="${PGO_MODE:-ir}"          # ir|fe|none
+UNITY_BUILD="${UNITY_BUILD:-OFF}"   # ENABLE_UNITY_BUILD
+BUILD_TYPE="${BUILD_TYPE:-Release}" # Release|RelWithDebInfo
 CPM_SOURCE_CACHE="${CPM_SOURCE_CACHE:-${HOME}/.cache/cpm}"
-# Expand ~ to $HOME if present
 CPM_SOURCE_CACHE="${CPM_SOURCE_CACHE/#\~/$HOME}"
-# Uncomment to optimize for this machine's CPU — produces a non-portable binary
-# MARCH_NATIVE="-march=native"
+# MARCH_NATIVE="-march=native"  # non-portable, host-tuned build
 MARCH_NATIVE="${MARCH_NATIVE:-}"
 
 # =============================================================================
@@ -299,11 +235,8 @@ case "$(uname -s 2>/dev/null)" in
     Darwin*)               _HOST_OS="macos" ;;
 esac
 
-# MSYS2 clang64 toolchain prefix.  On Windows/MSYS2 this replaces llvm-mingw:
-# the clang64 directory layout mirrors llvm-mingw exactly —
-#   bin/  x86_64-w64-mingw32-clang, -clang++, llvm-dlltool, -windres, llvm-ar …
-#   x86_64-w64-mingw32/{include,lib,bin}/  (sysroot headers + runtime DLLs)
-# Override with MSYS2_PREFIX env var when using ucrt64/clang32/etc.
+# MSYS2 clang64 toolchain prefix — mirrors llvm-mingw layout.
+# Override with MSYS2_PREFIX for ucrt64/clang32/etc.
 MSYS2_PREFIX="${MSYS2_PREFIX:-/clang64}"
 
 # =============================================================================
@@ -320,8 +253,7 @@ PROFILE_DIR="${BUILD_ROOT}/pgo-profiles"
 BOLT_PROFILE_DIR="${BUILD_ROOT}/bolt-profiles"
 PROPELLER_PROFILE_DIR="${BUILD_ROOT}/propeller-profiles"
 
-# On MSYS2/Windows the clang64 prefix IS the llvm-mingw equivalent.
-# On Linux we download a pre-built llvm-mingw release into the build root.
+# Windows: clang64 IS the llvm-mingw equivalent. Linux: downloaded into CPM cache.
 if [[ "${_HOST_OS}" == "windows" ]]; then
     LLVM_MINGW_DIR="${MSYS2_PREFIX}"
 else
@@ -334,7 +266,7 @@ LLVM_PROFDATA="llvm-profdata-${CLANG_VERSION}"
 LLVM_BOLT="llvm-bolt-${CLANG_VERSION}"
 MERGE_FDATA="merge-fdata-${CLANG_VERSION}"
 
-# On MSYS2/Windows, LLVM tools are unversioned; BOLT/Propeller are Linux-only.
+# On MSYS2/Windows LLVM tools are unversioned; BOLT/Propeller are Linux-only.
 if [[ "${_HOST_OS}" == "windows" ]]; then
     CLANG="clang"
     CLANGPP="clang++"
@@ -380,9 +312,7 @@ if [[ "${CPM_SOURCE_CACHE}" == *" "* ]]; then
 fi
 
 # download_with_retry URL OUTPUT_FILE [MAX_RETRIES]
-# Downloads URL to OUTPUT_FILE using wget, retrying on failure with
-# exponential back-off (5 s → 10 s → 20 s …).
-# Returns 0 on success, 1 after all attempts are exhausted.
+# wget with exponential back-off (5s→10s→20s…). Returns 1 after all attempts.
 download_with_retry() {
     local url="$1"
     local output="$2"
@@ -406,9 +336,7 @@ download_with_retry() {
     return 1
 }
 
-# _sudo — portable sudo wrapper.
-# On Windows/MSYS2, sudo is unavailable; run privileged commands directly.
-# On Linux, delegate to the real sudo as usual.
+# _sudo — on Windows/MSYS2 runs directly (no sudo); on Linux delegates to sudo.
 _sudo() {
     if [[ "${_HOST_OS}" == "windows" ]]; then
         "$@"
@@ -417,16 +345,9 @@ _sudo() {
     fi
 }
 
-# require_llvm_mingw — validate and activate the MinGW cross/native toolchain.
-#
-# On Linux  : verifies the downloaded llvm-mingw toolchain is present
-#             (downloading it if the sentinel is missing via ensure_llvm_mingw),
-#             then prepends its bin/ to PATH and sets MINGW_CLANG/MINGW_CLANGPP.
-#             Replaces the "ensure_llvm_mingw; setup_llvm_mingw_path" pair that
-#             formerly appeared verbatim at the top of every build stage.
-#
-# On Windows: resolves MINGW_CLANG/MINGW_CLANGPP from the MSYS2 clang64
-#             environment.  PATH is already configured by the MSYS2 shell.
+# require_llvm_mingw — ensure llvm-mingw is present and set MINGW_CLANG/MINGW_CLANGPP.
+# Linux: downloads via ensure_llvm_mingw if missing, then prepends bin/ to PATH.
+# Windows: resolves from MSYS2 clang64 (PATH already configured by shell).
 require_llvm_mingw() {
     if [[ "${_HOST_OS}" == "windows" ]]; then
         export CC=clang
@@ -484,14 +405,9 @@ lto_clang_flag() {
 # =============================================================================
 # llvm-mingw toolchain
 #
-# Downloads and extracts the llvm-mingw pre-built cross-compilation toolchain.
-# Provides Clang+LLD+libc++/compiler-rt for Windows targets.
-#
-# Eliminates all GCC runtime workarounds:
-#   - No std::__once_callable TLS/non-TLS ABI mismatch (libc++ doesn't use these)
-#   - No dual GCC variant detection (posix vs win32 threading model)
-#   - No --whole-archive libstdc++ hackery
-#   - No --gcc-toolchain flag or manual GCC include/lib paths
+# Pre-built Clang+LLD+libc++/compiler-rt for Windows targets. No GCC runtime
+# workarounds needed (no __once_callable TLS issues, no --whole-archive libstdc++).
+# https://github.com/mstorsjo/llvm-mingw/releases
 # =============================================================================
 ensure_llvm_mingw() {
     local tarball="llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-ubuntu-22.04-x86_64.tar.xz"
@@ -515,12 +431,11 @@ ensure_llvm_mingw() {
     tar -xf "${CPM_SOURCE_CACHE}/${tarball}" -C "${CPM_SOURCE_CACHE}"
     rm -f "${CPM_SOURCE_CACHE}/${tarball}"
 
-    # Find the extracted directory (name includes version and platform)
+    # Find extracted dir (name includes version and platform), move to stable path
     local extract_dir
     extract_dir="$(find "${CPM_SOURCE_CACHE}" -maxdepth 1 -type d -name "llvm-mingw-${LLVM_MINGW_VERSION}*" | head -1)"
     [[ -n "${extract_dir}" ]] || error "Could not find extracted llvm-mingw directory"
 
-    # Move to a version-independent path for stable toolchain file references
     if [[ "${extract_dir}" != "${LLVM_MINGW_DIR}" ]]; then
         rm -rf "${LLVM_MINGW_DIR}"
         mv "${extract_dir}" "${LLVM_MINGW_DIR}"
@@ -536,10 +451,9 @@ ensure_llvm_mingw() {
     info "  ${clang_ver}"
 }
 
-# Prepend llvm-mingw/bin to PATH so cmake and tools find the wrappers.
+# Prepend llvm-mingw/bin to PATH; also ensure ~/.local/bin for aqt.
 setup_llvm_mingw_path() {
     export PATH="${LLVM_MINGW_DIR}/bin:${PATH}"
-    # Ensure ~/.local/bin is in PATH for aqt
     if [[ -d "${HOME}/.local/bin" && ":${PATH}:" != *":${HOME}/.local/bin:"* ]]; then
         export PATH="${HOME}/.local/bin:${PATH}"
     fi
@@ -556,23 +470,16 @@ ensure_aqt() {
     python_mm="$(python3 -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")' 2>/dev/null || true)"
 
     if [[ "${_HOST_OS}" == "windows" && "${python_mm}" == "3.11" ]]; then
-        error "aqt is not installed, and auto-install is disabled on MSYS2 CLANG64 Python 3.11.\n" \
-              "       Reason: pip may try to build backports.zstd from source, which commonly fails\n" \
-              "       in this environment with: unknown file type '.s'.\n" \
-              "       Recommended next steps:\n" \
-              "         1. Update MSYS2 fully (pacman -Syu, restart shell, then pacman -Su)\n" \
-              "         2. Re-check python3 --version in the CLANG64 shell\n" \
-              "         3. If Python is still 3.11, install aqt via pacman if available, or use a\n" \
-              "            newer Python environment before re-running this script."
+        error "aqt auto-install disabled on MSYS2 CLANG64 Python 3.11.\n" \
+              "       pip may try to build backports.zstd from source (fails: 'unknown file type .s').\n" \
+              "       Fix: pacman -Syu && restart shell, or install aqt via pacman / newer Python."
     fi
 
     python3 -m pip install aqtinstall --break-system-packages --quiet
 }
 
 # =============================================================================
-# Build BOLT from source (LLVM subproject)
-# BOLT for current LLVM versions is not in the LLVM apt repo for noble
-# (only older stable versions ship the full bolt package) — must build from source.
+# build_bolt_from_source — BOLT is not in the LLVM apt repo for noble; build from source.
 # =============================================================================
 build_bolt_from_source() {
     header "Building BOLT ${CLANG_VERSION} from Source"
@@ -582,9 +489,7 @@ build_bolt_from_source() {
     local bolt_tag=""
     local install_dir="/usr/local/bin"
 
-    # Probe for the latest point-release tag with a single ls-remote call.
-    # Fetches all refs/tags/llvmorg-<VER>.* in one round-trip, then picks
-    # the highest version with sort -V.
+    # Single ls-remote call to find the latest point-release tag, then pick highest with sort -V.
     local found_tag=""
     local _all_tags
     _all_tags="$(git ls-remote --tags https://github.com/llvm/llvm-project.git \
@@ -639,7 +544,6 @@ build_bolt_from_source() {
     _sudo cp "${bolt_build}/bin/merge-fdata" "${install_dir}/merge-fdata-${CLANG_VERSION}"
     _sudo chmod +x "${install_dir}/llvm-bolt-${CLANG_VERSION}"
     _sudo chmod +x "${install_dir}/merge-fdata-${CLANG_VERSION}"
-    # Install the BOLT instrumentation runtime library where llvm-bolt expects it
     _sudo cp "${bolt_build}/lib/libbolt_rt_instr.a"  /usr/local/lib/libbolt_rt_instr.a
     _sudo cp "${bolt_build}/lib/libbolt_rt_hugify.a" /usr/local/lib/libbolt_rt_hugify.a 2>/dev/null || true
 
@@ -653,8 +557,132 @@ build_bolt_from_source() {
 # =============================================================================
 # Stage: setup
 # =============================================================================
+stage_setup_clangcl() {
+    header "Setting Up Native clang-cl Build Environment"
+    [[ "${_HOST_OS}" == "windows" ]] ||
+        error "--compiler clang-cl setup requires a native Windows/MSYS2 host."
+    command -v pacman &>/dev/null ||
+        error "pacman not found. Launch the MSYS2 CLANG64 terminal and re-run setup."
+
+    info "Installing MSYS2 shell and assembler prerequisites..."
+    pacman -S --needed --noconfirm base-devel git curl wget \
+        mingw-w64-clang-x86_64-nasm mingw-w64-clang-x86_64-yasm \
+        mingw-w64-clang-x86_64-glslang mingw-w64-clang-x86_64-ninja \
+        mingw-w64-clang-x86_64-sccache mingw-w64-clang-x86_64-jom \
+        2>/dev/null || error "Failed to install required MSYS2 packages."
+
+    # Locate Python 3.12 — pre-installed on CI runners, installed via winget on dev machines.
+    local setup_python=""
+    for setup_python_candidate in \
+            /c/hostedtoolcache/windows/Python/3.12.*/x64/python.exe \
+            /c/Python312/python.exe \
+            /c/Users/*/AppData/Local/Programs/Python/Python312/python.exe; do
+        if [[ -x "${setup_python_candidate}" ]]; then
+            setup_python="${setup_python_candidate}"
+            break
+        fi
+    done
+
+    local _need_winget=0
+    [[ -x /c/Strawberry/perl/bin/perl.exe ]]         || _need_winget=1
+    [[ -n "${setup_python}" ]]                        || _need_winget=1
+    [[ -x "/c/Program Files/CMake/bin/cmake.exe" ]]  || _need_winget=1
+    [[ -x "/c/Program Files/Git/cmd/git.exe" ]]      || _need_winget=1
+
+    if [[ "${_need_winget}" -eq 1 ]]; then
+        local winget
+        winget="$(command -v winget.exe 2>/dev/null || true)"
+        if [[ -z "${winget}" && -n "${LOCALAPPDATA:-}" ]]; then
+            local winget_candidate
+            winget_candidate="$(cygpath -au "${LOCALAPPDATA}")/Microsoft/WindowsApps/winget.exe"
+            [[ -x "${winget_candidate}" ]] && winget="${winget_candidate}"
+        fi
+        [[ -n "${winget}" ]] ||
+            error "winget.exe not found. Install Microsoft App Installer, then re-run setup."
+
+        winget_install() {
+            local id="$1"
+            info "Ensuring ${id} is installed..."
+            "${winget}" install --id "${id}" --exact --silent \
+                --accept-package-agreements --accept-source-agreements \
+                || warn "winget could not install ${id}; it may already be installed."
+        }
+
+        [[ -x /c/Strawberry/perl/bin/perl.exe ]]        || winget_install StrawberryPerl.StrawberryPerl
+        [[ -n "${setup_python}" ]]                       || winget_install Python.Python.3.12
+        [[ -x "/c/Program Files/CMake/bin/cmake.exe" ]] || winget_install Kitware.CMake
+        [[ -x "/c/Program Files/Git/cmd/git.exe" ]]     || winget_install Git.Git
+
+        # Re-probe Python after winget install.
+        if [[ -z "${setup_python}" ]]; then
+            for setup_python_candidate in /c/Python312/python.exe \
+                    /c/Users/*/AppData/Local/Programs/Python/Python312/python.exe; do
+                if [[ -x "${setup_python_candidate}" ]]; then
+                    setup_python="${setup_python_candidate}"
+                    break
+                fi
+            done
+        fi
+    else
+        info "All Windows prerequisites already present — skipping winget."
+    fi
+
+    # Install aqtinstall into native Windows Python so cmake's find_program locates aqt.exe.
+    local _pip_python=""
+    for _pip_candidate in \
+            /c/hostedtoolcache/windows/Python/3.12.*/x64/python.exe \
+            /c/Python312/python.exe \
+            "${setup_python}"; do
+        if [[ -x "${_pip_candidate}" ]]; then
+            _pip_python="${_pip_candidate}"
+            break
+        fi
+    done
+    if [[ -n "${_pip_python}" ]]; then
+        info "Installing aqtinstall into native Windows Python ($(basename "$(dirname "${_pip_python}")")/python)..."
+        "${_pip_python}" -m pip install aqtinstall --quiet \
+            || warn "aqtinstall install failed — Qt download during cmake configure may fail"
+    else
+        warn "No native Windows Python found — aqtinstall not installed. Qt may fail to download."
+    fi
+    local vswhere="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+    [[ -x "${vswhere}" ]] ||
+        error "Visual Studio Installer/vswhere missing. Install Visual Studio 2022 first."
+    local vs_install
+    vs_install="$("${vswhere}" -latest -products '*' \
+        -requires Microsoft.VisualStudio.Component.VC.Llvm.Clang \
+        -property installationPath | tr -d '\r')"
+    [[ -n "${vs_install}" ]] ||
+        error "Visual Studio clang-cl component missing. Add Desktop development with C++, C++ Clang tools for Windows, and Windows 11 SDK."
+
+    local vs_unix ok=1
+    vs_unix="$(cygpath -au "${vs_install}")"
+    for tool in \
+        "${vs_unix}/VC/Tools/Llvm/x64/bin/clang-cl.exe" \
+        "${vs_unix}/VC/Tools/Llvm/x64/bin/lld-link.exe" \
+        "${vs_unix}/VC/Tools/Llvm/x64/bin/llvm-profdata.exe" \
+        "/c/Strawberry/perl/bin/perl.exe" "${setup_python}" \
+        "/c/Program Files/CMake/bin/cmake.exe" "/c/Program Files/Git/cmd/git.exe" \
+        "/clang64/bin/nasm.exe" "/clang64/bin/ninja.exe" \
+        "/clang64/bin/sccache.exe" "/clang64/bin/jom.exe"; do
+        if [[ -x "${tool}" ]]; then
+            success "  ${tool}"
+        else
+            warn "  NOT FOUND: ${tool}"
+            ok=0
+        fi
+    done
+    [[ "${ok}" -eq 1 ]] ||
+        error "clang-cl setup incomplete. Restart MSYS2 after installs, then rerun setup."
+    success "Native clang-cl build environment ready."
+}
+
 stage_setup() {
     header "Setting Up Build Environment"
+    if [[ "${COMPILER_MODE}" == "clang-cl" ]]; then
+        stage_setup_clangcl
+        return
+    fi
 
     # ── MSYS2/Windows path ────────────────────────────────────────────────────
     if [[ "${_HOST_OS}" == "windows" ]]; then
@@ -685,7 +713,6 @@ stage_setup() {
         # Activate toolchain so shared setup steps below have MINGW_CLANG set.
         require_llvm_mingw
 
-        # ── Shared toolchain-dependent artifacts ─────────────────────────────
         mkdir -p "${BUILD_ROOT}"
         compile_comsupp_stubs
         setup_case_fixup_headers
@@ -725,12 +752,9 @@ stage_setup() {
         python3 python3-pip curl wget xz-utils \
         lsb-release software-properties-common gnupg
 
-    # Ensure aqt is available
     ensure_aqt
 
-    # ── Host LLVM (for PGO merging, BOLT, native ELF build) ─────────────────
-    # Cross-compilation uses llvm-mingw; these host tools are for profdata
-    # merging, BOLT instrumentation, and the Linux ELF build (build-elf stage).
+    # Host LLVM: used for profdata merging, BOLT, and the Linux ELF build.
     info "Installing host LLVM ${CLANG_VERSION}..."
     if ! command -v "clang-${CLANG_VERSION}" &>/dev/null; then
         wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
@@ -750,29 +774,22 @@ stage_setup() {
         "libclang-rt-${CLANG_VERSION}-dev" \
         || warn "Some LLVM packages failed to install."
 
-    # BOLT: not in the LLVM apt repo for noble on current versions, build from source
+    # BOLT not in LLVM apt repo for noble — build from source if missing
     if command -v "llvm-bolt-${CLANG_VERSION}" &>/dev/null; then
         info "llvm-bolt-${CLANG_VERSION} already installed, skipping."
     else
         build_bolt_from_source
     fi
 
-    # ── llvm-mingw cross-compilation toolchain ───────────────────────────────
-    # Clang + LLD + libc++ + compiler-rt for Windows x86_64.
-    # Replaces GCC MinGW packages for cross-compilation entirely.
     info "Setting up llvm-mingw cross-compilation toolchain..."
     mkdir -p "${BUILD_ROOT}"
     ensure_llvm_mingw
 
-    # ── Citron build dependencies ─────────────────────────────────────────────
     info "Installing citron build dependencies..."
     _sudo apt-get install -y \
         nasm yasm glslang-tools
 
-    # ── Toolchain-dependent artifacts ────────────────────────────────────────
     # Idempotent (sentinel-guarded) — fast no-ops on re-run.
-    # Running them here lets subsequent stages (csgenerate, use, bolt, propeller)
-    # skip redundant calls on a properly set-up machine.
     mkdir -p "${BUILD_ROOT}"
     compile_comsupp_stubs
     setup_case_fixup_headers
@@ -821,10 +838,8 @@ stage_setup() {
 }
 
 # =============================================================================
-# PGO profile runtime for Windows
-#
-# llvm-mingw ships libclang_rt.profile.a for Windows targets.
-# This function verifies it exists; if not, builds from LLVM sources as fallback.
+# ensure_profile_runtime_mingw — verify libclang_rt.profile.a for the MinGW target;
+# rebuild from LLVM sources if missing or incomplete.
 # =============================================================================
 ensure_profile_runtime_mingw() {
     [[ -x "${MINGW_CLANG}" ]] || error "MINGW_CLANG not set — call ensure_llvm_mingw first"
@@ -836,16 +851,13 @@ ensure_profile_runtime_mingw() {
         return 0
     fi
 
-    # The clang MinGW driver (lib/Driver/ToolChains/MinGW.cpp) resolves the
-    # profile runtime using ToolChain.getTriple().str() which for llvm-mingw is
-    # "x86_64-w64-mingw32", NOT "x86_64-w64-windows-gnu".
-    # We install to the mingw32 directory. A windows-gnu symlink is also created
-    # as a fallback for older clang versions that used that name.
-    local target_triple="${MINGW_TRIPLE}"           # x86_64-w64-mingw32
+    # clang MinGW driver resolves profile runtime by ToolChain.getTriple().str()
+    # which is "x86_64-w64-mingw32", not "x86_64-w64-windows-gnu".
+    local target_triple="${MINGW_TRIPLE}"
     local runtime_dir="${resource_dir}/lib/${target_triple}"
     local runtime_lib="${runtime_dir}/libclang_rt.profile.a"
 
-    # Also accept the old "windows" layout: libclang_rt.profile-x86_64.a
+    # Also accept the legacy "windows" layout (libclang_rt.profile-x86_64.a).
     local windows_dir="${resource_dir}/lib/windows"
     local windows_lib="${windows_dir}/libclang_rt.profile-x86_64.a"
 
@@ -858,20 +870,17 @@ _profile_rt_valid() {
         local nm_out
         nm_out=$("${nm_tool}" --defined-only "${lib}" 2>/dev/null || true)
 
-        # LLVM 17+ may internalize some runtime entry points, but the archive
-        # still must provide the Windows mmap/flock helpers used by
-        # InstrProfilingFile/Util.  The llvm-mingw 20260224 x86_64 archive can
-        # expose __llvm_profile_raw_version while still missing those helpers,
-        # which causes the exact undefined symbols seen during PE linking.
+        # llvm-mingw 20260224 x86_64 can expose __llvm_profile_raw_version while
+        # missing the Windows mmap/flock helpers — check both.
         echo "${nm_out}" | grep -q '__llvm_profile_raw_version' || return 1
 
         if [[ "${lib}" == *profile-x86_64.a || "${lib}" == *x86_64-w64-mingw32/libclang_rt.profile.a ]]; then
             local required=(
-                ' lprofProfileDumped$'
-                ' __llvm_profile_mmap$'
-                ' __llvm_profile_flock$'
-                ' __llvm_profile_munmap$'
-                ' __llvm_profile_madvise$'
+                'lprofProfileDumped$'
+                '__llvm_profile_mmap$'
+                '__llvm_profile_flock$'
+                '__llvm_profile_munmap$'
+                '__llvm_profile_madvise$'
             )
             local sym
             for sym in "${required[@]}"; do
@@ -919,8 +928,7 @@ _profile_rt_valid() {
     info "Building profile runtime from ${llvm_tag}..."
 
     local raw_base="https://raw.githubusercontent.com/llvm/llvm-project/${llvm_tag}"
-    # InstrProfilingRuntime was renamed from .c to .cpp in LLVM 16.
-    # Build the source list dynamically, probing for the correct extension.
+    # InstrProfilingRuntime: .cpp since LLVM 16, .c before.
     local profile_c_srcs=(
         InstrProfiling.c InstrProfilingBuffer.c InstrProfilingFile.c
         InstrProfilingMerge.c InstrProfilingMergeFile.c InstrProfilingNameVar.c
@@ -937,15 +945,13 @@ _profile_rt_valid() {
     local major_ver
     major_ver=$(echo "${clang_version}" | cut -d. -f1)
     if (( major_ver >= 16 )); then
-        # .cpp is canonical for LLVM 16+
         local stale="${src_dir}/InstrProfilingRuntime.c"
-        [[ -f "${stale}" ]] && rm -f "${stale}"   # remove stale fallback if it exists
+        [[ -f "${stale}" ]] && rm -f "${stale}"
         runtime_src="InstrProfilingRuntime.cpp"
     else
-        # Legacy: probe for correct extension
+        # Legacy: probe for .c or .cpp
         for ext in c cpp; do
             local candidate="InstrProfilingRuntime.${ext}"
-            # If a non-empty local copy exists, reuse it
             if [[ -s "${src_dir}/${candidate}" ]]; then
                 runtime_src="${candidate}"; break
             fi
@@ -956,8 +962,7 @@ _profile_rt_valid() {
         || { warn "Cannot determine InstrProfilingRuntime source for ${llvm_tag}"; return 1; }
     profile_c_srcs+=("${runtime_src}")
 
-    # Remove any zero-byte or partial files from previous failed attempts so
-    # the download loop doesn't skip them and silently use corrupt stubs.
+    # Remove zero-byte/partial files from previous failed attempts.
     find "${src_dir}" "${inc_dir}" -maxdepth 1 -type f -empty -delete 2>/dev/null || true
 
     _populate_profile_sources_from_git() {
@@ -1203,9 +1208,7 @@ STUBS_EOF
 
 
 # =============================================================================
-# comsupp stub
-# MSVC provides _com_util::ConvertStringToBSTR via comsuppw.lib.
-# llvm-mingw (and all MinGW toolchains) do not ship it.
+# comsupp stub — _com_util::ConvertStringToBSTR (MSVC comsuppw.lib); MinGW doesn't ship it.
 # =============================================================================
 compile_comsupp_stubs() {
     local stub_src="${BUILD_ROOT}/comsupp_stubs.cpp"
@@ -1250,17 +1253,13 @@ COMSUPP_CPP_EOF
         success "comsupp_stubs.o compiled: ${stub_obj}"
     fi
 
-    # CMAKE_CXX_STANDARD_LIBRARIES embeds this path directly into the toolchain
-    # file as a raw linker flag string.  CMake splits that string on spaces when
-    # building the link command, so a path like "C:/Users/Gaming PC/.../comsupp_stubs.o"
-    # gets torn in two.  When BUILD_ROOT contains spaces (common on Windows when
-    # the username has a space), copy the object to MSYS2's /tmp which is always
-    # space-free (C:\msys64\tmp), and record the safe path for write_toolchain_file.
+    # CMAKE_CXX_STANDARD_LIBRARIES embeds the path as a raw linker flag string; CMake splits
+    # on spaces, so a path with spaces (e.g. username "Gaming PC") breaks the link. If
+    # BUILD_ROOT has spaces, copy the .o to /tmp (always space-free on MSYS2).
     if [[ "${stub_obj}" == *' '* ]]; then
         local _safe_obj="/tmp/citron-comsupp_stubs.o"
         cp "${stub_obj}" "${_safe_obj}" \
             || error "Failed to copy comsupp_stubs.o to space-free path ${_safe_obj}"
-        # Export as a Windows mixed-path so the toolchain file sees a native path
         if [[ "${_HOST_OS}" == "windows" ]]; then
             _COMSUPP_TC_PATH="$(cygpath -m "${_safe_obj}")"
         else
@@ -1268,7 +1267,6 @@ COMSUPP_CPP_EOF
         fi
         info "comsupp_stubs.o staged to space-free path: ${_COMSUPP_TC_PATH}"
     else
-        # Path is already space-free; convert to Windows mixed-path for the toolchain
         if [[ "${_HOST_OS}" == "windows" ]]; then
             _COMSUPP_TC_PATH="$(cygpath -m "${stub_obj}")"
         else
@@ -1304,8 +1302,7 @@ setup_case_fixup_headers() {
         "ComUtil.h:comutil.h"
     )
 
-    # Search llvm-mingw's sysroot first, then fall back to system MinGW.
-    # On MSYS2 clang64, headers are directly in ${LLVM_MINGW_DIR}/include.
+    # Search llvm-mingw sysroot first; on MSYS2 clang64 headers are in ${LLVM_MINGW_DIR}/include.
     local mingw_inc="${LLVM_MINGW_DIR}/${MINGW_TRIPLE}/include"
     if [[ "${_HOST_OS}" == "windows" ]] && [[ ! -d "${mingw_inc}" ]]; then
         mingw_inc="${LLVM_MINGW_DIR}/include"
@@ -1325,75 +1322,8 @@ setup_case_fixup_headers() {
 }
 
 # =============================================================================
-# Patch: silence MSVC-only #pragma comment(lib, ...)
-
-# =============================================================================
-# patch_vfs_stat
-#
-# vfs_real.cpp has:
-#   #ifdef _MSC_VER
-#   #define stat _stat64
-#   #endif
-#
-# MinGW defines _WIN32 but NOT _MSC_VER, so the guard is wrong: _wstat64
-# expects a struct _stat64* but gets a POSIX struct stat*.  We broaden the
-# guard to also cover __MINGW32__.
-
-# =============================================================================
-# patch_bfd_linker
-#
-# New citron (post-3.1.2) sets target_link_options(... -fuse-ld=bfd) for all
-# non-MSVC non-Apple builds.  GNU ld.bfd cannot process llvm-mingw COFF objects.
-# This wraps -fuse-ld=bfd calls in a CMAKE_CXX_COMPILER_ID STREQUAL "GNU" check.
-
-# =============================================================================
-# Patch: suppress CS-IRPGO instrumentation on hot functions with high discard rates
-#
-# CS-IRPGO inserts per-call-site counters at the LLVM IR level AFTER the
-# stage1 PGO optimisation pass.  For functions that are extremely hot and
-# heavily inlined by full LTO (particularly inner-loop dispatch functions),
-# the post-optimisation IR seen by CS instrumentation differs substantially
-# from the IR the use-stage produces from the same stage1 profile — causing
-# pervasive hash mismatches and large profile discard counts.
-#
-# Two functions account for >86M discarded counts in the CSIR use stage:
-#
-#   Service::HID::NPad::OnUpdate      ~76M discarded  (src/hid_core/)
-#   Common::Log::FmtLogMessageImpl    ~10.8M discarded (src/common/)
-#
-# The correct fix is __attribute__((no_profile_instrument_function)), a
-# Clang/GCC attribute (also spelable as [[clang::no_profile_instrument_function]]
-# in C++11) that tells the compiler NOT to insert PGO counter code into that
-# specific function, while leaving -fprofile-use optimisation fully intact.
-# The function still gets profile-guided inlining/branch decisions; it simply
-# does not COLLECT new counters during the CS profiling run.
-#
-# This is applied ONLY during the csgenerate stage, before cmake configure.
-# It is idempotent (guarded by a marker comment) and reversible (plain text).
-#
-# Note: this cannot be done via target_compile_options() because the script
-# places -fcs-profile-generate in CMAKE_CXX_FLAGS_RELEASE globally; CMake
-# has no mechanism to subtract a flag from that variable per-target.
-
-
-# =============================================================================
-# Patch: make CMakeModules/PGO.cmake defer PGO flags to this script
-#
-# Fresh upstream clones may not yet contain the CITRON_PGO_FLAGS_MANAGED_BY_SCRIPT
-# guard in PGO.cmake. Without that guard, Clang builds can receive both the
-# script-managed IR/FE PGO flags and CMake's own frontend PGO flags, producing
-# invalid combinations such as:
-#   -fprofile-generate=... with -fprofile-instr-generate
-# This patch is idempotent and safe to run before any PGO configure stage.
-
-# =============================================================================
-# Normalize profraw directories produced by LLVM instrumentation.
-# Default IR/FE instrumentation produces:
-#   default-<pid>.profraw/ 
-#        default_<hash>_0.profraw
-# (same file-name inside every directory, collisions prevented by unique directories).
-# This helper flattens those directories into standalone .profraw files in the
-# same folder so later steps can glob "*.profraw" without walking directories.
+# normalize_profraw_dirs — flatten default-<pid>.profraw/ directories into
+# standalone .profraw files so later steps can glob "*.profraw" directly.
 # =============================================================================
 normalize_profraw_dirs() {
     local base_dir="$1"
@@ -1425,25 +1355,10 @@ normalize_profraw_dirs() {
 }
 
 # =============================================================================
-# Vulkan import library
-#
-# cmake's FindVulkan needs a libvulkan-1.a import library at configure time.
-# We generate it from the bundled Vulkan-Headers submodule — the same headers
-# citron is compiled against — so the symbol set is always correct and no
-# network access or hardcoded version string is required.
-#
-# WHY NOT gendef / downloading vulkan-1.dll:
-#   gendef extracts symbols from a pre-built Windows DLL. That DLL would be a
-#   specific Vulkan Loader release, potentially older than the Vulkan-Headers
-#   submodule citron uses, and the download URL breaks whenever a new loader
-#   version is released. Parsing the vendored headers directly is strictly
-#   more correct: it matches exactly the API surface citron is built against,
-#   requires no network, and stays in sync with submodule updates automatically.
-#
-# WHY NOT --kill-at:
-#   On x86_64, the Windows ABI uses cdecl for all functions (including those
-#   declared WINAPI/VKAPI_CALL). There is no @N stack-size decoration in
-#   64-bit PE exports. --kill-at is only meaningful for 32-bit stdcall.
+# ensure_vulkan_import_lib — generate libvulkan-1.a from the vendored
+# Vulkan-Headers submodule so cmake's FindVulkan has an import lib at configure time.
+# Uses the checked-in vulkan-1.def; no network access or hardcoded version needed.
+# x86_64 uses cdecl for all exports, so --kill-at is not needed.
 # =============================================================================
 ensure_vulkan_import_lib() {
     local out_dir="${BUILD_ROOT}/vulkan-stub"
@@ -1458,19 +1373,13 @@ ensure_vulkan_import_lib() {
     mkdir -p "${out_dir}"
     info "Building vulkan-1 MinGW import library from vendored headers..."
 
-    # Use the checked-in stub definition.
     local stub_def="${SOURCE_DIR}/externals/vulkan-stub/vulkan-1.def"
     if [[ -f "${stub_def}" ]]; then
-        info "  Using pre-generated Vulkan module definition from stub..."
         cp -f "${stub_def}" "${def_file}"
     else
         error "vulkan-1.def stub not found at ${stub_def}"
     fi
 
-    # Use llvm-mingw's llvm-dlltool.  It is always present in the llvm-mingw
-    # distribution and is the correct tool for the llvm-mingw toolchain.
-    # Fall back to system binutils dlltool only if llvm-mingw is not yet
-    # extracted (e.g. running ensure_vulkan_import_lib standalone).
     local dlltool="${LLVM_MINGW_DIR}/bin/llvm-dlltool"
     if [[ ! -x "${dlltool}" ]]; then
         warn "llvm-mingw dlltool not found at ${dlltool}, trying system fallback"
@@ -1479,9 +1388,6 @@ ensure_vulkan_import_lib() {
             || error "No dlltool available. Run setup or ensure llvm-mingw is extracted."
     fi
 
-    info "  Running ${dlltool##*/} to generate libvulkan-1.a..."
-    # -m i386:x86-64  — target machine (x86_64 PE)
-    # No --kill-at    — not needed for x86_64 cdecl exports (see function comment)
     "${dlltool}" \
         -m i386:x86-64 \
         --input-def "${def_file}" \
@@ -1494,45 +1400,28 @@ ensure_vulkan_import_lib() {
 }
 
 # =============================================================================
-# detect_ffmpeg_version — Read FFmpeg version from the submodule RELEASE file
-#   and export FFMPEG_VERSION plus per-library soname variables.
-#
-# Sets globals:
-#   FFMPEG_VERSION        e.g. "7.1.3"
-#   FFMPEG_AVCODEC_VER    e.g. "61"
-#   FFMPEG_AVFORMAT_VER   e.g. "61"
-#   FFMPEG_AVFILTER_VER   e.g. "10"
-#   FFMPEG_AVUTIL_VER     e.g. "59"
-#   FFMPEG_SWSCALE_VER    e.g. "8"
-#   FFMPEG_SWRESAMPLE_VER e.g. "5"
-#
-# The soname major numbers are NOT mechanically derivable from the package
-# version (7.1.3 → 61 is an upstream decision), so they live in a lookup table
-# keyed by FFmpeg major version.  Only one new entry is needed per major release.
+# detect_ffmpeg_version — read FFmpeg version from the submodule RELEASE file
+# and set FFMPEG_VERSION + per-library soname vars (FFMPEG_AVCODEC_VER, etc.).
+# Soname major numbers don't follow the package version; they're in a lookup
+# table keyed by FFmpeg major. Add one entry per new major release.
 # =============================================================================
 detect_ffmpeg_version() {
     local release_file="${SOURCE_DIR}/externals/ffmpeg/ffmpeg/RELEASE"
 
     if [[ -f "${release_file}" ]]; then
-        # Strip whitespace/newlines from the RELEASE file content
         FFMPEG_VERSION="$(tr -d '[:space:]' < "${release_file}")"
     else
-        # No submodule — use the version pinned in CMakeModules/dependencies.cmake (CPM tag n8.0)
+        # No submodule — fall back to CPM-pinned version (n8.0)
         FFMPEG_VERSION="8.0"
         info "[detect_ffmpeg_version] RELEASE file not found — using pinned version ${FFMPEG_VERSION}"
     fi
 
-    if [[ -z "${FFMPEG_VERSION}" ]]; then
-        error "[detect_ffmpeg_version] RELEASE file is empty: ${release_file}"
-    fi
+    [[ -n "${FFMPEG_VERSION}" ]] || error "[detect_ffmpeg_version] RELEASE file is empty: ${release_file}"
 
-    # Extract the upstream major version number (first component of X.Y.Z)
     local _major
     _major="$(echo "${FFMPEG_VERSION}" | cut -d. -f1)"
 
-    # Soname lookup table — one entry per FFmpeg major release.
-    # Library sonames are set independently by upstream FFmpeg and do not follow
-    # the package version number.  Update this table when a new major is released.
+    # Soname lookup — update when a new FFmpeg major is released.
     case "${_major}" in
         8)
             FFMPEG_AVCODEC_VER=62
@@ -1575,36 +1464,21 @@ detect_ffmpeg_version() {
     info "[ffmpeg] Detected FFmpeg ${FFMPEG_VERSION} (avcodec-${FFMPEG_AVCODEC_VER}, avutil-${FFMPEG_AVUTIL_VER}, swscale-${FFMPEG_SWSCALE_VER})"
 }
 
-# Pre-build FFmpeg for Windows (pthread-free, llvm-mingw, shared DLLs).
+# rebuild_ffmpeg_pthread_free — build static FFmpeg with llvm-mingw before cmake configure.
 #
-# WHY THIS EXISTS:
-#   The citron WIN32 cmake path calls download_bundled_external() which fetches
-#   a pre-built FFmpeg archive from yuzu-mirror/ext-windows-bin.  That repo is
-#   a frozen mirror of the original yuzu binaries and only carries FFmpeg 6.0
-#   (and earlier) archives; newer versions produce an HTTP 404 at cmake configure
-#   time, aborting the build.
+# The citron WIN32 cmake path fetches FFmpeg from yuzu-mirror/ext-windows-bin, which
+# only carries FFmpeg ≤6.0 (newer versions 404). The pre-built GCC DLLs also import
+# libwinpthread-1.dll, whose TLS init races with llvm-mingw's libc++ at game boot
+# (interval_map.hpp assertion crash). This function runs first, placing the built
+# libs at externals/ffmpeg-VERSION-static/ so cmake skips the download entirely,
+# and builds with --disable-pthreads --enable-w32threads to drop the pthread dep.
 #
-#   Additionally, the pre-built GCC DLLs import libwinpthread-1.dll, whose TLS
-#   initialiser races with llvm-mingw's libc++ at game boot and triggers an
-#   interval_map.hpp assertion crash.
-#
-#   This function solves both problems by:
-#     1. Running BEFORE cmake configure so the externals/ffmpeg-VERSION/ directory
-#        tree already exists and cmake's download_bundled_external() is skipped.
-#     2. Building FFmpeg with llvm-mingw using --disable-pthreads --enable-w32threads,
-#        eliminating the libwinpthread dependency entirely.
-#
-# PREREQUISITES:
-#   - detect_ffmpeg_version() has been called (sets FFMPEG_VERSION and soname vars)
-#   - require_llvm_mingw() has been called (sets LLVM_MINGW_DIR, MINGW_CLANG, etc.)
-#
-# ARGS:
-#   $1  build_dir  — e.g. BUILD_GENERATE, BUILD_USE, BUILD_BOLT, BUILD_PROPELLER
+# Prerequisites: detect_ffmpeg_version() and require_llvm_mingw() must be called first.
+# Args: $1 = build_dir (BUILD_GENERATE, BUILD_USE, etc.)
 # =============================================================================
 rebuild_ffmpeg_pthread_free() {
     local build_dir="$1"
 
-    # detect_ffmpeg_version must have been called by the caller.
     [[ -n "${FFMPEG_VERSION:-}" ]] \
         || error "[ffmpeg-rebuild] FFMPEG_VERSION not set — call detect_ffmpeg_version() first"
 
@@ -1614,23 +1488,17 @@ rebuild_ffmpeg_pthread_free() {
     local ffmpeg_bld="${BUILD_ROOT}/externals/ffmpeg-${FFMPEG_VERSION}-llvm-bld"
     local ffmpeg_src_dir="${CPM_SOURCE_CACHE}/ffmpeg-src/${FFMPEG_VERSION}"
 
-    # FFmpeg's configure script does bare `cd` calls and cannot handle spaces in
-    # either the source or build directory paths.  On Windows the username may
-    # contain spaces (e.g. "Gaming PC"), which propagates into CPM_SOURCE_CACHE
-    # and BUILD_ROOT.  Detect this and redirect both dirs to MSYS2's /tmp
-    # (C:\msys64\tmp — guaranteed to be space-free) so configure succeeds.
-    # Only the temporary source/build dirs move; ffmpeg_ext_dir (the installed
-    # .a + headers consumed by CMake) stays under BUILD_ROOT as before.
+    # FFmpeg's configure does bare `cd` calls and breaks on spaces in paths.
+    # On Windows, usernames with spaces propagate into CPM_SOURCE_CACHE/BUILD_ROOT.
+    # Redirect src/build to /tmp (guaranteed space-free on MSYS2) if needed.
+    # ffmpeg_ext_dir (the installed .a + headers) stays under BUILD_ROOT.
     if [[ "${ffmpeg_src_dir}" == *' '* || "${ffmpeg_bld}" == *' '* ]]; then
         local _ffmpeg_safe_root="/tmp/citron-ffmpeg/${FFMPEG_VERSION}"
-        warn "[ffmpeg-rebuild] Path contains spaces — redirecting FFmpeg source/build to ${_ffmpeg_safe_root}"
+        warn "[ffmpeg-rebuild] Path contains spaces — redirecting source/build to ${_ffmpeg_safe_root}"
         ffmpeg_src_dir="${_ffmpeg_safe_root}/src"
         ffmpeg_bld="${_ffmpeg_safe_root}/bld"
-        # Ensure clean directories in /tmp to avoid stale or recursive Makefiles
         rm -rf "${ffmpeg_src_dir}" "${ffmpeg_bld}"
     fi
-
-    # Define global cache location
     local ffmpeg_global_cache="${CPM_SOURCE_CACHE}/citron-ffmpeg-static/${FFMPEG_VERSION}-llvm-mingw"
 
     local sentinel="${ffmpeg_lib}/.llvm_static_built"
@@ -1650,11 +1518,10 @@ rebuild_ffmpeg_pthread_free() {
         return 0
     fi
 
-    # ── Locate or download FFmpeg source matching FFMPEG_VERSION ─────────────
+    # ── Locate FFmpeg source ─────────────────────────────────────────────────
     #
-    # _ffmpeg_abi_matches: verify that a source tree's library sonames match
-    # the version declared by detect_ffmpeg_version().  Uses the env vars set
-    # by detect_ffmpeg_version() so no version strings are hardcoded here.
+    # _ffmpeg_abi_matches: verify source sonames match detect_ffmpeg_version() vars.
+    # Uses awk — grep -oP lookbehinds not available in MSYS2/clang64.
     _ffmpeg_abi_matches() {
         local dir="$1"
         [[ -f "${dir}/configure" ]] || return 1
@@ -1663,9 +1530,7 @@ rebuild_ffmpeg_pthread_free() {
         [[ -f "${dir}/libswscale/version_major.h" ]]    || return 1
         [[ -f "${dir}/libswresample/version_major.h" ]] || return 1
 
-        # Use awk instead of grep -oP lookbehind — variable-length lookbehinds
-        # are not supported by the grep shipped in MSYS2/clang64 (and many other
-        # non-GNU environments), causing silent empty matches and false negatives.
+        # Use awk — grep -oP lookbehinds not available in MSYS2/clang64.
         local _codec _fmt _scale _resample
         _codec=$(awk '/^#define LIBAVCODEC_VERSION_MAJOR/{print $NF; exit}' \
                      "${dir}/libavcodec/version_major.h")
@@ -1684,10 +1549,8 @@ rebuild_ffmpeg_pthread_free() {
 
     local ffmpeg_src=""
 
-    # Priority 1: previously downloaded/extracted source tree.
-    # Requires the .ffmpeg_src_ready sentinel written after a clean extraction —
-    # a directory with configure but no sentinel means a partial/interrupted
-    # extraction from a prior run and must not be reused.
+    # Priority 1: previously downloaded source (.ffmpeg_src_ready sentinel required;
+    # a dir without it means a partial extraction — skip and re-download).
     if [[ -f "${ffmpeg_src_dir}/.ffmpeg_src_ready" && -f "${ffmpeg_src_dir}/configure" ]]; then
         if _ffmpeg_abi_matches "${ffmpeg_src_dir}"; then
             ffmpeg_src="${ffmpeg_src_dir}"
@@ -1696,7 +1559,7 @@ rebuild_ffmpeg_pthread_free() {
             warn "[ffmpeg-rebuild] Cached source ABI does not match FFmpeg ${FFMPEG_VERSION} — ignoring"
         fi
     elif [[ -d "${ffmpeg_src_dir}" ]]; then
-        warn "[ffmpeg-rebuild] Cached source dir exists but lacks .ffmpeg_src_ready sentinel — likely a partial extraction. Wiping and re-downloading."
+        warn "[ffmpeg-rebuild] Cached source dir missing .ffmpeg_src_ready sentinel — partial extraction; wiping."
         rm -rf "${ffmpeg_src_dir}"
     fi
 
@@ -1745,12 +1608,10 @@ rebuild_ffmpeg_pthread_free() {
         success "[ffmpeg-rebuild] FFmpeg ${FFMPEG_VERSION} source ready"
     fi
 
-    # Final safety check: if the source path still has spaces, we MUST copy it
-    # to a safe path for FFmpeg's configure to work (even if it's the submodule).
+    # If source path has spaces (e.g. from vendored submodule), copy to /tmp.
     if [[ "${ffmpeg_src}" == *' '* ]]; then
         local safe_src="/tmp/citron-ffmpeg/${FFMPEG_VERSION}/src"
         if [[ "${ffmpeg_src}" != "${safe_src}" ]]; then
-            info "[ffmpeg-rebuild] Copying source to space-free path: ${safe_src}..."
             mkdir -p "$(dirname "${safe_src}")"
             rm -rf "${safe_src}"
             cp -r "${ffmpeg_src}" "${safe_src}"
@@ -1769,8 +1630,7 @@ rebuild_ffmpeg_pthread_free() {
     local ranlib="${LLVM_MINGW_DIR}/bin/llvm-ranlib"
     local windres="${LLVM_MINGW_DIR}/bin/${MINGW_TRIPLE}-windres"
 
-    # On MSYS2/Windows the host and target are the same machine (both
-    # x86_64-w64-mingw32), so --enable-cross-compile must NOT be used.
+    # On MSYS2/Windows host == target, so --enable-cross-compile must NOT be used.
     local _ffmpeg_cross_flags=()
     if [[ "${_HOST_OS}" == "linux" || "${_HOST_OS}" == "macos" ]]; then
         _ffmpeg_cross_flags=(
@@ -1787,7 +1647,7 @@ rebuild_ffmpeg_pthread_free() {
     info "[ffmpeg-rebuild] Configuring FFmpeg (static, no pthreads, dxva2+d3d11va)..."
     (
         cd "${ffmpeg_bld}"
-        # Use relative path to configure to avoid absolute path inclusion bugs in Makefile
+        # Use relative path to configure to avoid Makefile absolute-path inclusion bugs.
         local _rel_cfg="../src/configure"
         if [[ ! -f "${_rel_cfg}" ]]; then
             _rel_cfg="${ffmpeg_src}/configure"
@@ -1962,11 +1822,9 @@ print_profiling_instructions() {
 }
 
 # =============================================================================
-# CMake toolchain file for llvm-mingw cross-compilation
-#
-# Uses llvm-mingw wrapper scripts which automatically set --target, --sysroot,
-# -stdlib=libc++, -rtlib=compiler-rt, and -fuse-ld=lld. No extra cross flags
-# are needed beyond pointing CMAKE_C/CXX_COMPILER at the wrappers.
+# write_toolchain_file — CMake toolchain for llvm-mingw cross-compilation.
+# llvm-mingw wrappers set --target, --sysroot, -stdlib=libc++, -rtlib=compiler-rt,
+# -fuse-ld=lld automatically; no extra cross flags needed.
 # =============================================================================
 write_toolchain_file() {
     local path="$1"
@@ -1976,11 +1834,8 @@ write_toolchain_file() {
     if [[ "${_HOST_OS}" == "windows" ]]; then
         CMAKE_BUILD_ROOT="$(cygpath -m "${BUILD_ROOT}")"
 
-        # MSYS2/Windows: native compilation — CMAKE_SYSTEM_NAME is auto-detected
-        # as Windows; no cross-compile sysroot is needed.  The MSYS2 clang64
-        # toolchain targets Windows natively with the same libc++/compiler-rt ABI
-        # as llvm-mingw.  On a case-insensitive Windows filesystem the
-        # mingw-case-fixups include dir is unnecessary.
+    # MSYS2/Windows: native build — CMAKE_SYSTEM_NAME auto-detected.
+    # Case-insensitive filesystem makes the case-fixup include dir unnecessary.
         cat > "$path" <<MSYS2_TC_EOF
 # CMake toolchain: native Windows x64 with MSYS2 clang64
 # Generated by build-clangtron-windows.sh — do not edit manually
@@ -2001,66 +1856,46 @@ MSYS2_TC_EOF
     fi
 
     cat > "$path" <<EOF
-# CMake toolchain: cross-compile for Windows x86_64 with llvm-mingw
-# (Clang + LLD + libc++ + compiler-rt — no GCC runtime dependency)
+# CMake toolchain: cross-compile Windows x86_64 with llvm-mingw
 # Generated by build-clangtron-windows.sh — do not edit manually
 
 set(CMAKE_SYSTEM_NAME Windows)
 set(CMAKE_SYSTEM_PROCESSOR x86_64)
 
-# llvm-mingw wrapper scripts handle: --target, --sysroot, -stdlib=libc++,
-# -rtlib=compiler-rt, -fuse-ld=lld. No additional cross flags needed.
 set(CMAKE_C_COMPILER   "${LLVM_MINGW_DIR}/bin/${MINGW_TRIPLE}-clang")
 set(CMAKE_CXX_COMPILER "${LLVM_MINGW_DIR}/bin/${MINGW_TRIPLE}-clang++")
 set(CMAKE_RC_COMPILER  "${LLVM_MINGW_DIR}/bin/${MINGW_TRIPLE}-windres")
 
-# Sysroot for cmake find_library / find_file / find_path
 set(CMAKE_FIND_ROOT_PATH "${LLVM_MINGW_DIR}/${MINGW_TRIPLE}")
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH)
 
-# -D__INTRINSIC_DEFINED___cpuidex: prevents MinGW intrin-impl.h from defining
-# __cpuidex with external linkage. Clang's cpuid.h has a static __inline
-# definition; the guard macro ensures it is the sole definer, eliminating
-# duplicate-symbol link errors from SDL2 and other libraries.
-# Applied to both C and C++ (SDL2 is compiled as C and triggers the duplicate).
+# -D__INTRINSIC_DEFINED___cpuidex: prevents MinGW intrin-impl.h from defining __cpuidex
+# with external linkage, eliminating duplicate-symbol errors from SDL2 and others.
 set(CMAKE_C_FLAGS_INIT   "-D__INTRINSIC_DEFINED___cpuidex -D__USE_MINGW_STAT64 -isystem \"${CMAKE_BUILD_ROOT}/mingw-case-fixups\" -Wno-unknown-pragmas")
 set(CMAKE_CXX_FLAGS_INIT "-D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -D__INTRINSIC_DEFINED___cpuidex -D__USE_MINGW_STAT64 -U__GLIBCXX__ -isystem \"${CMAKE_BUILD_ROOT}/mingw-case-fixups\" -Wno-unknown-pragmas")
 
-# --allow-multiple-definition: belt-and-suspenders for any residual __cpuidex
-# duplicates inside libSDL2.a (SDL_dynapi.c include-all mechanism).
+# --allow-multiple-definition: residual __cpuidex duplicates from libSDL2.a
 set(CMAKE_EXE_LINKER_FLAGS_INIT    "-Wl,--allow-multiple-definition")
 set(CMAKE_SHARED_LINKER_FLAGS_INIT "-Wl,--allow-multiple-definition")
 set(CMAKE_MODULE_LINKER_FLAGS_INIT "-Wl,--allow-multiple-definition")
 
-# Standard libraries (appended after all user archives by CMake):
-#   comsupp_stubs.o: _com_util::ConvertStringToBSTR (MSVC-specific, no MinGW equivalent)
-#   -loleaut32: COM/OLE Automation symbols (SysAllocString etc.) for WMI code
-#   libc++ and libunwind are linked automatically by the llvm-mingw wrappers.
+# comsupp_stubs.o: _com_util::ConvertStringToBSTR stub (not in MinGW)
+# -loleaut32: COM/OLE Automation (SysAllocString etc.) for WMI code
 set(CMAKE_CXX_STANDARD_LIBRARIES "${_COMSUPP_TC_PATH} -loleaut32")
 
-# Force Qt rcc to use zlib resource compression instead of zstd.
-# aqt's llvm_mingw Qt6Core lacks zstd resource support; default zstd calls
-# qResourceFeatureZstd() which is missing from Qt6Core.a.
+# Use zlib resource compression — aqt's llvm_mingw Qt6Core lacks zstd support
 set(CMAKE_AUTORCC_OPTIONS "--compress-algo;zlib")
 EOF
 }
 
 # =============================================================================
-# Common CMake arguments for cross-compilation to Windows
+# build_common_cmake_args — populate _CMAKE_ARGS with flags shared by all stages.
+# Callers append stage-specific flags, then pass the array to cmake.
+# Using an array avoids word-splitting on paths with spaces.
 # =============================================================================
-
-# build_common_cmake_args — populate the global _CMAKE_ARGS array with the
-# flags that every cmake configure invocation needs.  Callers append their
-# own stage-specific flags and then pass the whole array as:
-#
-#   cmake "${SOURCE_DIR}" "${_CMAKE_ARGS[@]}" [extra flags…]
-#
-# Using an array (rather than the old `echo`-based helper consumed via
-# $(common_cmake_args)) avoids bash word-splitting on paths that contain
-# spaces — e.g. when the Windows username or project folder has a space.
 build_common_cmake_args() {
     local lto_flag; lto_flag="$(lto_cmake_flag)"
     local toolchain_file="${BUILD_ROOT}/mingw-clang-toolchain.cmake"
@@ -2091,8 +1926,7 @@ build_common_cmake_args() {
         VULKAN_HEADERS_STUB_DIR="${CMAKE_SOURCE_DIR}/externals/vulkan-stub/include"
     fi
 
-    # Populate the global array — each element is a single cmake argument,
-    # so paths containing spaces are passed correctly.
+    # Populate the global array — one element per cmake arg (spaces in paths handled correctly).
     _CMAKE_ARGS=(
         "-G" "Ninja"
         "-DCMAKE_BUILD_TYPE=${BUILD_TYPE}"
@@ -2128,9 +1962,8 @@ build_common_cmake_args() {
         "-DVulkan_GLSLC_EXECUTABLE=${GLSLC_PATH}"
         "-DVulkan_GLSLANG_VALIDATOR_EXECUTABLE=${GLSLC_PATH}"
     )
-    # Static FFmpeg dir — only passed when the sentinel confirms rebuild_ffmpeg_pthread_free
-    # completed successfully.  Passing a nonexistent dir causes CMake to fall through to
-    # the legacy RELEASE-file path and then immediately fail with a fatal error.
+    # Only pass FFmpeg dir once rebuild_ffmpeg_pthread_free has completed (sentinel check).
+    # A missing dir causes CMake to fall through to the legacy download path and immediately fail.
     if [[ -n "${FFMPEG_VERSION:-}" ]]; then
         local _ffmpeg_ext_dir="${BUILD_ROOT}/externals/ffmpeg-${FFMPEG_VERSION}-static"
         local _ffmpeg_sentinel="${_ffmpeg_ext_dir}/lib/.llvm_static_built"
@@ -2152,8 +1985,7 @@ build_common_cmake_args() {
         "-DCMAKE_C_FLAGS=${MARCH_NATIVE}"
         "-DCMAKE_CXX_FLAGS=${MARCH_NATIVE}"
     )
-    # Ensure the function always returns 0: a trailing [[ ]] that evaluates false
-    # would otherwise return exit code 1, triggering set -e in the caller.
+    # Always return 0 — a trailing [[ ]] that evaluates false would trigger set -e in caller.
     :
 }
 
@@ -2189,18 +2021,11 @@ stage_generate() {
             ;;
     esac
 
-    # PGO instrumentation flag: IR PGO (-fprofile-generate) or Frontend PGO
-    # (-fprofile-instr-generate). Both write default-%p.profraw relative to
-    # the binary's working directory on clean exit. %p = PID.
-    # IR PGO inserts counters at the LLVM IR level after early optimizations,
-    # so the profile accurately reflects what the optimizer will see — but
-    # IR PGO inserts counters at the LLVM IR level after early optimizations.
-    # CRITICAL: generate and use must use the same -O level. IR PGO hashes
-    # are computed from the post-optimization IR — if generate uses -O2 and
-    # use uses -O3, the additional O3 passes (loop unrolling, vectorisation,
-    # extra inlining) restructure basic blocks and every affected function's
-    # hash mismatches, discarding its profile data entirely. With full LTO
-    # this affects nearly the entire program. Use -O3 here to match use stage.
+    # IR PGO: counters at LLVM IR level (-fprofile-generate).
+    # FE PGO: counters at AST level (-fprofile-instr-generate).
+    # Both write default-%p.profraw (%p=PID) next to the binary.
+    # -O3 here must match the use stage — IR PGO hashes are post-optimization,
+    # so a level mismatch causes widespread hash mismatches and discarded profile data.
     local pgo_gen_flag
     if [[ "${PGO_MODE}" == "ir" ]]; then
         pgo_gen_flag="-fprofile-generate=default-%p.profraw"
@@ -2213,23 +2038,7 @@ stage_generate() {
     local c_flags="-O3 -DNDEBUG ${debug_flag} ${pgo_gen_flag}${lto_generate_flag:+ ${lto_generate_flag}}"
     local cxx_flags="${c_flags}"
 
-    # Force-keep the profile runtime symbols so lld does not dead-strip them.
-    # -u,__llvm_profile_write_file: pulls InstrProfilingFile.o (write logic)
-    # -u,__llvm_profile_runtime: pulls InstrProfilingRuntime.o whose constructor
-#   initializes __llvm_profile_write_file_internal.
-    # --pdb= (not -DEBUG/-Wl,-DEBUG, not /DEBUG): the MinGW driver invoked by
-    # -fuse-ld=lld on this target doesn't recognize -DEBUG at all (separate
-    # option table from lld-link) -- see stage_use's no-PGO block for the
-    # full explanation. --pdb is its actual recognized flag; empty value
-    # means auto-name the PDB per binary (this flag is shared across
-    # several executables built in this stage).
-    # --threads=1: combining --pdb= with -flto enables a known LLD COFF
-    # deadlock between PDB type/symbol-record merge threads and parallel LTO
-    # backend codegen threads (manifests as three ld.lld processes stuck at
-    # low CPU % indefinitely). --threads=N is the MinGW driver's own spelling
-    # of this option (per LLVM D76885); /threads:N is the COFF/lld-link form.
-    # Unlike order/ignore, "threads" IS in the MinGW driver's option table, so
-    # it does NOT need -Xlink= wrapping. Slower link, but only RelWithDebInfo.
+    # Force-keep profile runtime symbols — lld dead-strips them without this.
     local linker_debug_flag=""
     [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && linker_debug_flag="-Wl,--pdb= -Wl,--threads=1"
     local extra_link_flags="-Wl,-u,__llvm_profile_write_file,-u,__llvm_profile_runtime"
@@ -2257,11 +2066,9 @@ stage_generate() {
             || error "Qt download failed."
     fi
 
-    # Qt host tools (Linux gcc_64) are only needed on Linux for cross-compilation.
-    # On Windows we are doing a native build — the target Qt IS the host Qt, and
-    # CMake must NOT receive QT_HOST_PATH (it would switch to cross-compile mode).
-    # The Linux Qt package contains Unix symlinks that Windows cannot create without
-    # Developer Mode enabled (OSError WinError 1314), so skip this entirely here.
+    # Qt host tools only needed on Linux for cross-compilation.
+    # On Windows, target Qt IS host Qt — do NOT pass QT_HOST_PATH (triggers cross-compile mode).
+    # Linux Qt package has Unix symlinks Windows can't create without Developer Mode.
     if [[ "${_HOST_OS}" != "windows" ]]; then
         if [[ ! -f "${qt_host_dir}/lib/cmake/Qt6/Qt6Config.cmake" ]]; then
             local _host_outdir="${CPM_SOURCE_CACHE}/qt-bin-host"
@@ -2272,8 +2079,8 @@ stage_generate() {
                 || warn "aqt Qt 6.9.3 linux download failed"
         fi
     else
-        info "Windows native build: skipping Linux host Qt download (not needed for native builds)."
-        qt_host_dir=""  # Ensure QT_HOST_PATH is NOT passed to CMake on Windows
+        info "Windows native build: skipping Linux host Qt (not needed)."
+        qt_host_dir=""
     fi
 
     info "Qt6 cmake dir: ${qt6_cmake_dir}"
@@ -2294,9 +2101,8 @@ stage_generate() {
             || warn "No Vulkan shader compiler found — install glslang-tools"
     fi
 
-    # Detect FFmpeg version from the submodule and pre-build pthread-free DLLs
-    # BEFORE cmake configure so download_bundled_external() finds them already
-    # present and skips the network download (yuzu-mirror lacks FFmpeg >= 7.x).
+    # Pre-build FFmpeg before cmake configure so download_bundled_external() finds
+    # it already present and skips the yuzu-mirror download (lacks FFmpeg >= 7.x).
     detect_ffmpeg_version
     rebuild_ffmpeg_pthread_free "${BUILD_GENERATE}"
 
@@ -2325,12 +2131,7 @@ stage_generate() {
 
     success "Instrumented build complete: ${BUILD_GENERATE}/bin/citron.exe"
 
-    # ── Verify instrumentation was actually linked into the binary ────────────
-    # A PGO-instrumented binary must export __llvm_profile_raw_version (marks
-    # the counters segment) and __llvm_profile_runtime (the atexit hook that
-    # flushes profile data on clean exit).  If either is absent the binary will
-    # run fine but produce no .profraw — exactly the silent failure mode we
-    # want to catch before the user spends 30 minutes profiling a bad build.
+    # Verify profile runtime symbols are present — if stripped, binary runs but writes no .profraw.
     local citron_exe="${BUILD_GENERATE}/bin/citron.exe"
     local nm_tool
     nm_tool="$(command -v "llvm-nm-${CLANG_VERSION}" 2>/dev/null                || command -v llvm-nm 2>/dev/null                || command -v nm 2>/dev/null || true)"
@@ -2343,7 +2144,6 @@ stage_generate() {
         has_raw_version=$(echo "${nm_out}" | grep -c '__llvm_profile_raw_version' || true)
         has_runtime=$(echo     "${nm_out}" | grep -c '__llvm_profile_runtime'     || true)
         has_write_file=$(echo  "${nm_out}" | grep -c '__llvm_profile_write_file'  || true)
-
         if [[ "${has_raw_version}" -gt 0 && "${has_runtime}" -gt 0 && "${has_write_file}" -gt 0 ]]; then
             success "Instrumentation check: OK"
             success "  __llvm_profile_raw_version  ✓"
@@ -2378,9 +2178,7 @@ stage_generate() {
         "${BUILD_GENERATE}/externals/qt/6.9.3/llvm-mingw_64" \
         "${BUILD_GENERATE}"
 
-    # Write sentinel recording this generate config.
-    # stage_use and stage_csgenerate verify LTO + PGO match to catch
-    # profile mismatches before a long build wastes time.
+    # Write sentinel so stage_use/stage_csgenerate can verify LTO+PGO match.
     printf "LTO=%s\nPGO=%s\n" "${LTO_MODE}" "${PGO_MODE}" \
         > "${BUILD_ROOT}/.citron-gen-config"
 
@@ -2388,40 +2186,19 @@ stage_generate() {
 }
 
 # =============================================================================
-# Stage 1b: csgenerate — Context-Sensitive IR PGO instrumented build
+# Stage 1b: csgenerate — Context-Sensitive IR PGO instrumented build.
 #
-# CS-IRPGO layers a context-sensitive instrumentation pass on top of a binary
-# that has already been optimized with stage1 IR PGO profiles. The resulting
-# binary collects per-call-site counter data rather than per-function-definition
-# data, letting the compiler make inlining and branch decisions with full context
-# for each inlined copy of a function.
+# Layers CS instrumentation on a binary already optimized with stage1 IR PGO.
+# Collects per-call-site counts for better inlining of shared hot/cold paths.
 #
 # Requirements:
-#   - --pgo-type ir must be set (CS-IRPGO requires IR PGO; not available for FE)
-#   - --lto and --pgo-type must match the prior generate run (enforced by sentinel)
-#   - default.profdata must exist in pgo-profiles/ (produced by 'use' or by
-#     merging the stage1 profraw from generate). merged.profdata is NOT accepted
-#     as a substitute — see CRITICAL INVARIANT in the script header.
+#   - --pgo-type ir (CS-IRPGO is IR-only)
+#   - --lto/--pgo-type must match the prior generate run (sentinel-enforced)
+#   - default.profdata must exist (from 'use' or manual merge of stage1 profraw)
+#     merged.profdata is NOT accepted — see CRITICAL INVARIANT in header
 #
-# Compile flags for the CS binary:
-#   -fprofile-use=default.profdata   Apply stage1 IR profile (optimizes this build)
-#   -fcs-profile-generate=...        Layer CS counters on top of the optimized IR
-#   (Both flags are passed together to C, C++, and linker command lines.)
-#
-# The CS-instrumented binary writes cs-default-<pid>.profraw next to itself on
-# exit (same mechanism as stage1). The user copies these to pgo-profiles/cs/,
-# then re-runs 'use' — which auto-detects pgo-profiles/cs/ and merges both
-# profiles into merged.profdata (stage1 + CS combined) before building.
-#
-# Profdata merging (performed by stage_use, not here):
-#   Step 1: llvm-profdata merge --sparse cs-default-*.profraw → cs-only.profdata
-#   Step 2: llvm-profdata merge --sparse default.profdata cs-only.profdata
-#              → merged.profdata
-#   Step 3: use builds with -fprofile-use=merged.profdata (compile + linker)
-#
-# Profile runtime:
-#   CS-IRPGO uses the same LLVM InstrProfiling runtime as standard IR/FE PGO.
-#   ensure_profile_runtime_mingw() and extra_link_flags apply identically here.
+# CS binary writes cs-default-<pid>.profraw next to itself on exit.
+# Copy to pgo-profiles/cs/, then re-run 'use' which auto-merges them.
 # =============================================================================
 stage_csgenerate() {
     header "Stage 1b: CS-IRPGO Instrumented Build"
@@ -2473,26 +2250,15 @@ stage_csgenerate() {
               "         printf 'LTO=${LTO_MODE}\\nPGO=ir\\n' > ${_gen_cfg}"
     fi
 
-    # ── Locate stage1 profdata (MUST be default.profdata, never merged.profdata) ─
-    #
-    # CRITICAL: csgenerate must use ONLY the plain stage1 default.profdata for
-    # -fprofile-use. merged.profdata (if it exists) contains CS records from a
-    # prior CS cycle keyed to the previous csgenerate binary's IR. Feeding those
-    # CS records through -fprofile-use during a new csgenerate changes inlining
-    # decisions relative to the plain stage1 baseline, restructuring the IR that
-    # the new CS counters are keyed to. When the use stage then compiles from the
-    # plain stage1 baseline (as it must), every function reshaped by the stale CS
-    # influence hash-mismatches — producing a CS binary that is worse than plain
-    # IR PGO rather than better. Always start the CS layer from the clean stage1
-    # profile only.
+    # CRITICAL: use ONLY default.profdata (plain stage1), never merged.profdata.
+    # merged.profdata has CS records keyed to the previous csgenerate IR; feeding
+    # those through -fprofile-use changes inlining relative to the stage1 baseline,
+    # causing hash mismatches at the use stage. See header for full explanation.
     local stage1_pd="${PROFILE_DIR}/default.profdata"
 
     if [[ ! -f "${stage1_pd}" ]]; then
-        # default.profdata is absent — try building it from profraw files.
-        # normalize_profraw_dirs must run first: LLVM IR PGO writes profraw
-        # *directories* named default-<pid>.profraw/ containing numbered chunk
-        # files; without normalization the glob below passes directory paths to
-        # llvm-profdata, which may silently skip or error on them.
+        # Try building default.profdata from profraw files.
+        # normalize_profraw_dirs first: IR PGO writes profraw directories, not flat files.
         normalize_profraw_dirs "${PROFILE_DIR}"
         local profraw_count
         profraw_count=$(find "${PROFILE_DIR}" -maxdepth 1 -name "*.profraw" 2>/dev/null | wc -l)
@@ -2535,14 +2301,9 @@ stage_csgenerate() {
         none) info "csgenerate: LTO disabled" ;;
     esac
 
-    # CS-IRPGO compile flags:
-    #   -fprofile-use=<stage1>       Apply stage1 IR profile (optimizes this build).
-    #   -fcs-profile-generate=...    Layer CS counters on top.
-    # Both flags are passed together. The compiler applies stage1 PGO optimizations
-    # first, then inserts CS counters into the optimized IR.
-    # cs-default-%p.profraw — %p expands to PID so parallel runs don't collide.
-    # The output is relative (no directory prefix) so it writes next to the .exe
-    # on Windows, where the Linux absolute path would be meaningless.
+    # CS compile flags: -fprofile-use applies stage1 optimizations, -fcs-profile-generate
+    # layers CS counters on the optimized IR. cs-default-%p.profraw uses %p (PID) so
+    # parallel runs don't collide; relative path writes next to .exe on Windows.
     local stage1_pd_compiler="${stage1_pd}"
     [[ "${_HOST_OS}" == "windows" ]] && stage1_pd_compiler="$(cygpath -m "${stage1_pd}")"
     local cs_gen_flag="-fcs-profile-generate=cs-default-%p.profraw"
@@ -2554,25 +2315,9 @@ stage_csgenerate() {
     local cxx_flags="${c_flags}"
     local bt_upper; bt_upper=$(echo "${BUILD_TYPE}" | tr '[:lower:]' '[:upper:]')
 
-    # Force-keep profile runtime entry points.
-    # CS-IRPGO uses the same LLVM InstrProfiling runtime as standard IR/FE PGO.
-    # lld may dead-strip __llvm_profile_write_file when instrumented counter code
-    # lives in archived libraries that are not directly referenced from main().
-    # -u,__llvm_profile_runtime ensures InstrProfilingRuntime.o's constructor
-    # fires on startup, initializing the write-file machinery.
-    # --pdb= (not -DEBUG/-Wl,-DEBUG, not /DEBUG): the MinGW driver invoked by
-    # -fuse-ld=lld on this target doesn't recognize -DEBUG at all (separate
-    # option table from lld-link) -- see stage_use's no-PGO block for the
-    # full explanation. --pdb is its actual recognized flag; empty value
-    # means auto-name the PDB per binary (this flag is shared across
-    # several executables built in this stage).
-    # --threads=1: combining --pdb= with -flto enables a known LLD COFF
-    # deadlock between PDB type/symbol-record merge threads and parallel LTO
-    # backend codegen threads (manifests as three ld.lld processes stuck at
-    # low CPU % indefinitely). --threads=N is the MinGW driver's own spelling
-    # of this option (per LLVM D76885); /threads:N is the COFF/lld-link form.
-    # Unlike order/ignore, "threads" IS in the MinGW driver's option table, so
-    # it does NOT need -Xlink= wrapping. Slower link, but only RelWithDebInfo.
+    # Force-keep profile runtime; same rationale as stage_generate.
+    # --pdb= / --threads=1: RelWithDebInfo only — PDB auto-naming + LLD COFF
+    # deadlock prevention (PDB merge threads vs LTO backend threads).
     local linker_debug_flag=""
     [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && linker_debug_flag="-Wl,--pdb= -Wl,--threads=1"
     local extra_link_flags="-Wl,-u,__llvm_profile_write_file,-u,__llvm_profile_runtime"
@@ -2589,7 +2334,7 @@ stage_csgenerate() {
     GLSLC_PATH="$(command -v glslc 2>/dev/null || true)"
     [[ -z "${GLSLC_PATH}" ]] && GLSLC_PATH="$(command -v glslangValidator 2>/dev/null || true)"
 
-    # Pre-build FFmpeg (sentinel makes this a fast no-op if already built for this dir)
+    # Pre-build FFmpeg (fast no-op if already built via sentinel check).
     detect_ffmpeg_version
     rebuild_ffmpeg_pthread_free "${BUILD_CSGENERATE}"
 
@@ -2639,9 +2384,6 @@ stage_csgenerate() {
 
         if [[ "${has_raw_version}" -gt 0 && "${has_runtime}" -gt 0 && "${has_write_file}" -gt 0 ]]; then
             success "CS instrumentation check: OK"
-            success "  __llvm_profile_raw_version  ✓"
-            success "  __llvm_profile_runtime      ✓"
-            success "  __llvm_profile_write_file   ✓"
         else
             warn "════════════════════════════════════════════════════════════════"
             warn "  CS INSTRUMENTATION CHECK FAILED — binary will NOT produce profraw"
@@ -2780,9 +2522,7 @@ stage_use() {
             fi
         fi
 
-        # If neither cache has Qt, download via aqt directly (same logic as generate).
-        # This avoids citron's CMakeLists.txt auto-downloading the wrong MinGW variant.
-        # Qt via aqt - use global cache if available
+        # If neither cache has Qt, download via aqt (avoids CMakeLists.txt pulling wrong MinGW variant).
         local _nopgo_qt_base="${CPM_SOURCE_CACHE}/qt-bin"
 
         if [[ -z "${qt6_cmake_dir}" ]]; then
@@ -2821,11 +2561,8 @@ stage_use() {
             else
                 ensure_aqt
                 local _aqt; _aqt="$(command -v aqt 2>/dev/null || echo "${HOME}/.local/bin/aqt")"
-                # Derive the Qt version from the target Qt we just located or downloaded
-                # Walk up from .../qt/<ver>/<variant>/lib/cmake/Qt6 to extract the version:
-                #   dirname x3 → .../qt/<ver>/<variant>  (variant dir)
-                #   dirname x1 → .../qt/<ver>             (version dir)
-                #   basename   → <ver>
+                # Extract Qt version from the target cmake dir path
+                # (.../qt/<ver>/<variant>/lib/cmake/Qt6 → 3 dirname calls → version dir → basename)
                 local _qt_variant_dir
                 _qt_variant_dir="$(dirname "$(dirname "$(dirname "${qt6_cmake_dir}")")")"
                 local _qt_ver
@@ -2842,27 +2579,14 @@ stage_use() {
         [[ -n "${qt_host_dir}" ]] && info "Qt host dir:         ${qt_host_dir}"
 
         local debug_flag=""
-        # -gcodeview (not just -g): on x86_64-w64-mingw32, clang defaults to DWARF
-        # debug info even with lld-link as the linker. Without -gcodeview, lld-link
-        # has nothing CodeView-formatted to convert, and emits no .pdb at all.
+        # -gcodeview: on x86_64-w64-mingw32 clang defaults to DWARF; without
+        # -gcodeview lld-link has nothing CodeView-formatted and emits no .pdb.
         [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && debug_flag="-g -gcodeview"
         local linker_debug_flag=""
-        # --pdb= (not -DEBUG/-Wl,-DEBUG, and not /DEBUG): -fuse-ld=lld on this
-        # x86_64-w64-mingw32 target invokes LLD's MinGW driver, not lld-link
-        # directly. That driver has its own small option table and translates
-        # a few of its own flags into "-debug -pdb:<path>" internally for the
-        # real COFF linker — but -DEBUG itself isn't in that table, so passing
-        # it directly fails with "unknown argument: -DEBUG".
-        # --pdb is the MinGW driver's own recognized flag; an empty value
-        # (the trailing "=") makes it name the PDB after each output binary
-        # automatically, which matters since this flag is shared across
-        # shader_tool.exe/citron-room.exe/citron-cmd.exe/citron.exe.
-        # --threads=1: combining --pdb= with -flto triggers a known LLD COFF
-        # deadlock between PDB type/symbol-record merge threads and parallel
-        # LTO backend codegen threads — manifests as ld.lld stuck at low CPU
-        # indefinitely. --threads=N is the MinGW driver's own recognized
-        # spelling (LLVM D76885); unlike order/ignore, it does NOT need
-        # -Xlink= wrapping. Slower link, but only affects RelWithDebInfo.
+        # --pdb=: MinGW lld driver's flag (not -DEBUG, which isn't in its table).
+        # Empty value auto-names PDB after each output binary.
+        # --threads=1: prevents LLD COFF deadlock between PDB merge and LTO backend
+        # threads (only affects RelWithDebInfo, which is slower anyway).
         [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && linker_debug_flag="-Wl,--pdb= -Wl,--threads=1"
         local bt_upper; bt_upper=$(echo "${BUILD_TYPE}" | tr '[:lower:]' '[:upper:]')
         local lto_flag; lto_flag="$(lto_clang_flag)"
@@ -2925,8 +2649,11 @@ stage_use() {
     ensure_vulkan_import_lib
 
     # ── Sentinel check: verify generate/use LTO and PGO modes match ─────────
+    # PGO_MODE=="none" is exempt: a --pgo none use build consumes no
+    # profraw/profdata from generate at all, so there is nothing that could
+    # actually be mismatched -- see the identical exemption in stage_clangcl().
     local _gen_cfg="${BUILD_ROOT}/.citron-gen-config"
-    if [[ -f "${_gen_cfg}" ]]; then
+    if [[ "${PGO_MODE}" != "none" && -f "${_gen_cfg}" ]]; then
         local _gen_lto _gen_pgo
         _gen_lto=$(awk -F= '/^LTO=/{print $2; exit}' "${_gen_cfg}" 2>/dev/null || true)
         _gen_pgo=$(awk -F= '/^PGO=/{print $2; exit}' "${_gen_cfg}" 2>/dev/null || true)
@@ -2988,7 +2715,9 @@ stage_use() {
         fi
     fi
 
-    # Auto-merge CS profraw if present and merged.profdata not yet written
+    # Auto-merge CS profraw if present and merged.profdata not yet written.
+    # Step 1: CS profraw → cs-only.profdata
+    # Step 2: default.profdata + cs-only.profdata → merged.profdata
     local cs_dir="${PROFILE_DIR}/cs"
     if [[ ! -f "${merged_pd}" && -d "${cs_dir}" ]]; then
         normalize_profraw_dirs "${cs_dir}"
@@ -2996,22 +2725,13 @@ stage_use() {
         cs_count=$(find "${cs_dir}" -name "*.profraw" 2>/dev/null | wc -l)
         if [[ "${cs_count}" -gt 0 ]]; then
             info "CS profraw detected (${cs_count} files) — merging with stage1..."
-            # Step 1: merge CS profraw files → cs-only.profdata
-            #   llvm-profdata auto-detects the CSIRInstr kind from the profraw header;
-            #   no special flag needed beyond --sparse.
             local cs_tmp="${PROFILE_DIR}/cs-only.profdata"
             "${LLVM_PROFDATA}" merge --sparse \
                 --output="${cs_tmp}" "${cs_dir}"/*.profraw
-            # Step 2: merge stage1 default.profdata + cs-only.profdata → merged.profdata
-            #   The result contains both regular IR records (from stage1) and CS records
-            #   (from csgenerate). -fprofile-use= in the use stage consumes both kinds.
             "${LLVM_PROFDATA}" merge --sparse \
                 --output="${merged_pd}" "${profdata}" "${cs_tmp}"
             rm -f "${cs_tmp}"
-            success "CS-IRPGO merged profile written: ${merged_pd}"
-            info "  Stage1 (IR)   : ${profdata}"
-            info "  CS layer      : ${cs_dir}/*.profraw  (${cs_count} file(s))"
-            info "  Merged output : ${merged_pd}"
+            success "CS-IRPGO merged profile: ${merged_pd}"
             profdata="${merged_pd}"
         fi
     fi
@@ -3038,9 +2758,7 @@ stage_use() {
     mkdir -p "${BUILD_USE}"; cd "${BUILD_USE}"
     rm -f CMakeCache.txt; rm -rf CMakeFiles
 
-    # Reuse generate's already-downloaded Qt — passing Qt6_DIR prevents citron's
-    # cmake from re-downloading Qt into use/externals/ with the wrong variant
-    # (win64_mingw → mingw_64 instead of win64_llvm_mingw → llvm-mingw_64).
+    # Reuse generate's Qt to avoid re-downloading the wrong variant.
     local qt_install_dir="${BUILD_GENERATE}/externals/qt/6.9.3/llvm-mingw_64"
     local qt_host_dir="${BUILD_GENERATE}/externals/qt-host/6.9.3/gcc_64"
     if [[ "${_HOST_OS}" == "windows" ]]; then
@@ -3048,30 +2766,12 @@ stage_use() {
     fi
     local qt6_cmake_dir="${qt_install_dir}/lib/cmake/Qt6"
 
-    # Note on BOLT PE relocation coverage:
-    # --emit-relocs is an ELF-only lld flag and has no equivalent in lld's MinGW
-    # COFF mode. This is fine: Windows PE binaries always contain a base relocation
-    # table (.reloc section) for ASLR, and BOLT's PE/COFF mode uses that table to
-    # locate and patch code references. The ELF build (use-elf) retains its own
-    # --emit-relocs flag for the ELF-proxy BOLT path.
-
     local debug_flag=""
-    # -gcodeview: see the no-PGO block above for why plain -g isn't enough here.
+    # -gcodeview: clang defaults to DWARF on x86_64-w64-mingw32; without it lld emits no .pdb.
     [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && debug_flag="-g -gcodeview"
     local linker_debug_flag=""
-    # --pdb= (not -DEBUG/-Wl,-DEBUG, not /DEBUG): the MinGW driver invoked by
-    # -fuse-ld=lld on this target doesn't recognize -DEBUG at all (separate
-    # option table from lld-link) -- see stage_use's no-PGO block for the
-    # full explanation. --pdb is its actual recognized flag; empty value
-    # means auto-name the PDB per binary (this flag is shared across
-    # several executables built in this stage).
-    # --threads=1: combining --pdb= with -flto enables a known LLD COFF
-    # deadlock between PDB type/symbol-record merge threads and parallel LTO
-    # backend codegen threads (manifests as three ld.lld processes stuck at
-    # low CPU % indefinitely). --threads=N is the MinGW driver's own spelling
-    # of this option (per LLVM D76885); /threads:N is the COFF/lld-link form.
-    # Unlike order/ignore, "threads" IS in the MinGW driver's option table, so
-    # it does NOT need -Xlink= wrapping. Slower link, but only RelWithDebInfo.
+    # --pdb=: MinGW lld driver's flag (not -DEBUG). --threads=1: prevents LLD COFF
+    # deadlock between PDB merge threads and LTO backend threads (RelWithDebInfo only).
     [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && linker_debug_flag="-Wl,--pdb= -Wl,--threads=1"
     local bt_upper; bt_upper=$(echo "${BUILD_TYPE}" | tr '[:lower:]' '[:upper:]')
     build_common_cmake_args
@@ -3210,47 +2910,22 @@ stage_build_elf() {
     rm -f CMakeCache.txt; rm -rf CMakeFiles
 
     # ── Qt for native ELF build ───────────────────────────────────────────────
-    #
-    # TWO PROBLEMS with DownloadExternals.cmake's Qt download for Linux:
-    #
-    # Problem 1 — aqt command uses wrong syntax with aqt 3.x:
-    #   DownloadExternals invokes aqt with 'qt_base' and 'qtmultimedia' as
-    #   package/module names. In aqt 3.x, 'qt_base' is not a valid module name
-    #   and the entire command errors:
-    #     ERROR: The packages ['qt_base', 'qtmultimedia'] were not found while
-    #            parsing XML of package information!
-    #   The base Qt is then NOT downloaded even though cmake prints
-    #   "Downloaded Qt binaries" (it prints that unconditionally).
-    #
-    # Problem 2 — Qt6_DIR is set to install root, not cmake subdir:
-    #   DownloadExternals sets Qt6_DIR via FORCE to the install root
-    #   (.../linux) rather than the cmake config subdir (.../linux/lib/cmake/Qt6).
-    #   find_package(Qt6) can't find Qt6Config.cmake at the install root →
-    #   falls back to system Qt 6.4.2 → no Qt6GuiPrivate cmake config → FAIL.
-    #
-    # FIX:
-    #   1. Pre-download Qt 6.9.3 linux via aqt using correct 3.x syntax.
-    #      The linux_gcc_64 base package INCLUDES Qt6GuiPrivate cmake configs,
-    #      unlike qt-host (downloaded with broken old syntax) which does not.
-    #   2. Qt6Multimedia: aqt cannot install it for linux desktop. Inject a
-    #      minimal stub + pass -DCITRON_USE_QT_MULTIMEDIA=OFF so it is never
-    #      actually linked.
-    #   3. Do NOT set QT_HOST_PATH — triggers cross-compilation mode on a native
-    #      build, causing cmake to ignore Qt6_DIR entirely.
-    #
+    # DownloadExternals.cmake has two issues with aqt 3.x:
+    #   1. Uses wrong module names ('qt_base') — aqt errors but cmake prints "Downloaded Qt" anyway.
+    #   2. Sets Qt6_DIR to install root instead of .../lib/cmake/Qt6, causing find_package fallback
+    #      to system Qt 6.4.2 which lacks Qt6GuiPrivate.
+    # Fix: pre-download via aqt with correct syntax. QT_HOST_PATH deliberately not set
+    # (would trigger cross-compile mode, making cmake ignore Qt6_DIR).
     local elf_qt_dir="${BUILD_USE_ELF}/externals/qt/6.9.3/linux"
     local elf_qt_cmake_dir="${elf_qt_dir}/lib/cmake/Qt6"
 
-    # Remove a stale symlink to qt-host (which lacks GuiPrivate) if present.
+    # Remove stale symlink to qt-host (lacks GuiPrivate).
     if [[ -L "${elf_qt_dir}" ]]; then
-        info "ELF build: removing qt-host symlink (qt-host lacks Qt6GuiPrivate)"
+        info "ELF build: removing qt-host symlink (lacks Qt6GuiPrivate)"
         rm -f "${elf_qt_dir}"
     fi
 
-    # Verify that the key Qt6 component cmake configs are all present.
-    # Qt6::Network, Qt6::Widgets, Qt6::Svg, Qt6::DBus must exist.
-    # If the cached dir is missing any of these (partial old download),
-    # wipe it and re-download with all required modules.
+    # Verify required Qt cmake configs are present; wipe and re-download if any are missing.
     local _elf_qt_ok=1
     for _qtmod in Qt6 Qt6Network Qt6Widgets Qt6Gui Qt6DBus Qt6Svg Qt6OpenGL; do
         if [[ ! -f "${elf_qt_dir}/lib/cmake/${_qtmod}/${_qtmod}Config.cmake" ]]; then
@@ -3260,15 +2935,13 @@ stage_build_elf() {
     done
 
     if [[ "${_elf_qt_ok}" -eq 0 || ! -f "${elf_qt_cmake_dir}/Qt6Config.cmake" ]]; then
-        info "ELF build: (re-)downloading Qt 6.9.3 linux via aqt (linux_gcc_64 + modules)..."
+        info "ELF build: (re-)downloading Qt 6.9.3 linux via aqt..."
         python3 -m pip install aqtinstall --break-system-packages --quiet 2>/dev/null || true
         local aqt_base_dir="${BUILD_USE_ELF}/externals/qt"
-        # Wipe any partial previous download
         rm -rf "${aqt_base_dir}/6.9.3"
         mkdir -p "${aqt_base_dir}"
-        # Base install: linux_gcc_64 includes Core/Gui/Widgets/Network/DBus/OpenGL/etc.
         python3 -m aqt install-qt             --outputdir "${aqt_base_dir}"             linux desktop 6.9.3 linux_gcc_64             || warn "aqt Qt 6.9.3 base download failed"
-        # Rename aqt output dir to 'linux' (what DownloadExternals.cmake expects)
+        # Rename arch dir to 'linux' (expected by DownloadExternals.cmake)
         for _arch in gcc_64 linux_gcc_64; do
             if [[ -d "${aqt_base_dir}/6.9.3/${_arch}" && "${_arch}" != "linux" ]]; then
                 rm -rf "${aqt_base_dir}/6.9.3/linux"
@@ -3277,7 +2950,6 @@ stage_build_elf() {
                 break
             fi
         done
-        # Install extra modules: qtsvg is required; qtnetwork is qtbase but add explicitly
         python3 -m aqt install-qt             --outputdir "${aqt_base_dir}"             linux desktop 6.9.3 linux_gcc_64             --modules qtsvg 2>/dev/null             || warn "aqt qtsvg module install failed (may already be present)"
         if [[ ! -f "${elf_qt_cmake_dir}/Qt6Config.cmake" ]]; then
             warn "ELF build: Qt6Config.cmake still missing after aqt download — check aqt output"
@@ -3286,9 +2958,8 @@ stage_build_elf() {
         info "ELF build: Qt 6.9.3 already present at ${elf_qt_dir}"
     fi
 
-    # Qt6Multimedia: aqt cannot install this for linux desktop (GStreamer dependency).
-    # Inject a stub so find_package(Qt6 REQUIRED COMPONENTS Multimedia) doesn't abort.
-    # -DCITRON_USE_QT_MULTIMEDIA=OFF (passed below) ensures it is never linked.
+    # Qt6Multimedia: aqt can't install for linux desktop (GStreamer dep).
+    # Inject a stub so find_package doesn't abort; CITRON_USE_QT_MULTIMEDIA=OFF prevents linking.
     local multimedia_cmake_dir="${elf_qt_dir}/lib/cmake/Qt6Multimedia"
     if [[ ! -f "${multimedia_cmake_dir}/Qt6MultimediaConfig.cmake" ]]; then
         info "ELF build: injecting Qt6Multimedia stub (aqt linux cannot install multimedia)"
@@ -3316,11 +2987,8 @@ endif()
 QTMEOF
     fi
 
-    # Qt6GuiPrivate: the aqt base package DOES ship private headers at
-    # include/QtGui/6.9.3/ but does NOT ship the cmake config that wraps them.
-    # Without a Qt6GuiPrivateConfig.cmake, find_package fails even though the
-    # headers are physically present. Inject a real stub that points cmake at
-    # the actual private headers in the aqt download.
+    # Qt6GuiPrivate: aqt base ships private headers but no cmake config for them.
+    # Inject a stub that points cmake at the actual headers in the aqt download.
     local guiprivate_cmake_dir="${elf_qt_dir}/lib/cmake/Qt6GuiPrivate"
     if [[ ! -f "${guiprivate_cmake_dir}/Qt6GuiPrivateConfig.cmake" ]]; then
         info "ELF build: injecting Qt6GuiPrivate stub (aqt base has headers, no cmake config)"
@@ -3356,22 +3024,13 @@ endif()
 QTGPEOF
     fi
 
-    # CMAKE_PREFIX_PATH must include Qt AND the pre-built Vulkan/SPIRV header
-    # installs. The generate stage builds these header-only packages into
-    # VULKAN_HEADERS_INSTALL and SPIRV_HEADERS_INSTALL; they have no Windows-
-    # specific binaries and work identically for the native ELF build.
-    # Not including them here causes VulkanHeaders version mismatch (system has
-    # 1.3.275, externals submodule requires 1.4.337+) and missing SPIRV-Headers.
+    # CMAKE_PREFIX_PATH includes Qt + Vulkan/SPIRV header installs from the generate stage.
     local elf_cmake_prefix="${elf_qt_dir};${VULKAN_HEADERS_INSTALL};${SPIRV_HEADERS_INSTALL}"
     info "ELF build: CMAKE_PREFIX_PATH → ${elf_cmake_prefix}"
 
-    # The ELF is the profiling target for both BOLT and Propeller stages.
-    # CITRON_ENABLE_LTO=OFF bypasses citron's cmake check_ipo_supported() path
-    # which fails silently on native Linux builds. No LTO is used for this ELF:
-    # LTO prevents -fbasic-block-address-map from emitting the .llvm_bb_addr_map
-    # section (ThinLTO backend in lld does not propagate the flag). Without LTO,
-    # every TU compiles to native code directly and the section is always present.
-    # PGO data alone provides representative hot-path guidance for profiling.
+    # LTO intentionally disabled: with -flto lld's ThinLTO backend doesn't propagate
+    # -fbasic-block-address-map, so the .llvm_bb_addr_map section never appears.
+    # Without LTO every TU compiles to native code directly and the section is always present.
     local elf_lto_flag
     case "${LTO_MODE}" in
         full) elf_lto_flag="-flto"      ;;
@@ -3386,26 +3045,13 @@ QTGPEOF
     else
         elf_pgo_flag="-fprofile-instr-use=\"${profdata}\" -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date"
     fi
-    # -fbasic-block-address-map: emit the .llvm_bb_addr_map section that
-    # create_llvm_prof reads to generate a Propeller BB+function layout profile.
-    #
-    # NOTE: LTO is intentionally DISABLED for the Propeller ELF build.
-    # With -flto=thin the compiler emits LLVM IR bitcode (not native code) per
-    # translation unit, and native code + section emission only happens in lld's
-    # ThinLTO backend at link time. lld's ThinLTO backend does not propagate
-    # -fbasic-block-address-map, so the section never appears in the final binary.
-    # Without LTO, every TU is compiled directly to native code and the section
-    # is always emitted. PGO data alone provides representative hot-path coverage.
     local debug_flag=""
     [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && debug_flag="-g"
     local bt_upper; bt_upper=$(echo "${BUILD_TYPE}" | tr '[:lower:]' '[:upper:]')
     local elf_compile_flags="-O3 -DNDEBUG ${debug_flag} -D_stat64=stat ${elf_pgo_flag} -fbasic-block-address-map -Wno-error=backend-plugin"
     local elf_linker_flags="-fuse-ld=lld-${CLANG_VERSION} -Wl,--emit-relocs"
 
-    # ── Flag-change detection: wipe stale object cache if compile flags changed ──
-    # Wiping CMakeCache.txt alone is not enough — ninja reuses cached .o files
-    # whose flags are baked in at compile time. Detect changes via md5 sentinel
-    # and wipe all build artifacts except externals/ (Qt/ffmpeg, ~500 MB).
+    # Wipe object cache if compile flags changed (ninja reuses .o files baked at compile time).
     local _elf_flags_hash _elf_flags_stored=""
     _elf_flags_hash=$(printf '%s' "${elf_compile_flags}" | md5sum | cut -d' ' -f1)
     local _elf_flags_sentinel="${BUILD_USE_ELF}/.elf_flags_hash"
@@ -3416,7 +3062,6 @@ QTGPEOF
         find "${BUILD_USE_ELF}" -mindepth 1 -maxdepth 1 \
             ! -name "externals" -exec rm -rf {} + 2>/dev/null || true
         mkdir -p "${BUILD_USE_ELF}"
-        success "ELF build cache wiped — full recompile will run with new flags"
     elif [[ -f "${BUILD_USE_ELF}/bin/citron" ]]; then
         success "ELF already built and flags unchanged — skipping rebuild."
         return 0
@@ -3690,8 +3335,7 @@ stage_bolt() {
     local merged_fdata="${BOLT_PROFILE_DIR}/citron-merged.fdata"
     local optimized_elf="${BUILD_BOLT}/citron-bolt-optimized"
 
-    # ── 3a. Instrument ELF ───────────────────────────────────────────────────
-    # Ensure the BOLT runtime library is in place before instrumenting
+    # Ensure the BOLT runtime library is present before instrumenting.
     if [[ ! -f /usr/local/lib/libbolt_rt_instr.a ]]; then
         local _bolt_build="/tmp/llvm-bolt-${CLANG_VERSION}-build"
         if [[ -f "${_bolt_build}/lib/libbolt_rt_instr.a" ]]; then
@@ -3763,18 +3407,10 @@ stage_bolt() {
     cp "${optimized_elf}" "${elf_output}"
     success "ELF preserved: ${elf_output}"
 
-    # ── 3d. Extract BOLT function order for PE linker ─────────────────────────
-    #
-    # BOLT cannot rewrite PE/COFF binaries directly, and its --symbol-ordering-file
-    # flag is ELF-lld only. However, lld's COFF/PE mode supports /order:@<file>,
-    # which controls the placement order of functions in .text — the same benefit
-    # at function granularity (not basic-block, but still meaningful i-cache gain).
-    #
-    # We recover BOLT's computed layout from the optimized ELF: symbols in the
-    # .text section sorted by address == the order BOLT placed them. We strip
-    # BOLT's own internal symbols and cold-clone suffixes, then write a /order
-    # file that lld-link will use to place functions in the same hot-first order
-    # in the PE's .text section.
+    # ── Extract BOLT function order for PE linker ─────────────────────────────
+    # BOLT can't rewrite PE/COFF directly. Instead, extract the hot function order
+    # from the optimized ELF (symbols sorted by address in .text) and pass it to
+    # lld via /order:@ when relinking the PE.
     local order_file="${BUILD_ROOT}/bolt-function-order.txt"
     info "Extracting BOLT function order from optimized ELF..."
 
@@ -3893,36 +3529,17 @@ BOLT_ORDER_EOF
         order_file=""
     fi
 
-    # ── 3e. Re-link Windows PE with BOLT function order ───────────────────────
+    # ── Re-link Windows PE with BOLT function order ────────────────────────────
     info "Re-linking final Windows PE (PGO + LTO + BOLT function order)..."
-    # Always wipe the cmake cache — stale CMAKE_EXE_LINKER_FLAGS can persist
-    # from a previous failed run and cause the compiler test to fail.
     rm -rf "${BUILD_BOLT}"
     mkdir -p "${BUILD_BOLT}"; cd "${BUILD_BOLT}"
 
-
-    # Use LTO_MODE (default: full) for the final PE re-link.
-    # generate and use stages ran with ThinLTO, giving BOLT a consistent
-    # profile and function-order file. The re-link is free to apply full
-    # LTO on top — PGO profiles and BOLT ordering are already baked in,
-    # and full LTO's whole-program inlining yields better runtime performance.
     local debug_flag=""
-    # -gcodeview: see stage_use for why plain -g isn't enough on this MinGW target.
+    # -gcodeview: clang defaults to DWARF on x86_64-w64-mingw32; without it no .pdb is emitted.
     [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && debug_flag="-g -gcodeview"
     local linker_debug_flag=""
-    # --pdb= (not -DEBUG/-Wl,-DEBUG, not /DEBUG): the MinGW driver invoked by
-    # -fuse-ld=lld on this target doesn't recognize -DEBUG at all (separate
-    # option table from lld-link) -- see stage_use's no-PGO block for the
-    # full explanation. --pdb is its actual recognized flag; empty value
-    # means auto-name the PDB per binary (this flag is shared across
-    # several executables built in this stage).
-    # --threads=1: combining --pdb= with -flto enables a known LLD COFF
-    # deadlock between PDB type/symbol-record merge threads and parallel LTO
-    # backend codegen threads (manifests as three ld.lld processes stuck at
-    # low CPU % indefinitely). --threads=N is the MinGW driver's own spelling
-    # of this option (per LLVM D76885); /threads:N is the COFF/lld-link form.
-    # Unlike order/ignore, "threads" IS in the MinGW driver's option table, so
-    # it does NOT need -Xlink= wrapping. Slower link, but only RelWithDebInfo.
+    # --pdb= / --threads=1: same rationale as stage_use — MinGW lld driver syntax,
+    # prevents LLD COFF deadlock between PDB merge and LTO backend threads.
     [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && linker_debug_flag="-Wl,--pdb= -Wl,--threads=1"
     local bt_upper; bt_upper=$(echo "${BUILD_TYPE}" | tr '[:lower:]' '[:upper:]')
     local lto_flag; lto_flag="$(lto_clang_flag)"
@@ -3937,27 +3554,11 @@ BOLT_ORDER_EOF
     fi
     local lto_pgo_flag="${lto_flag:+${lto_flag} }${pgo_flag}"
 
-    # /order:@<file> — COFF/PE lld flag for function placement order in .text.
-    # Functions listed first are placed at the start of .text (hot region).
-    # Functions not in the list keep their default LTO order after the listed ones.
-    # -Wl, prefix passes the flag through clang to lld-link.
-    # /ignore:4037 — suppress LNK4037 "missing symbol" warnings for /order entries.
-    #   These warnings are harmless: symbols absent from a given binary (because
-    #   ThinLTO inlined them, or because the binary is citron-room/citron-cmd which
-    #   doesn't contain emulator-core code) simply keep their default link order.
-    #   Without /ignore:4037 the 13k-entry order file produces ~28k warnings across
-    #   the three executables that share CMAKE_EXE_LINKER_FLAGS_RELEASE.
+    # /order:@<file>: hot function placement in .text. /ignore:4037 suppresses
+    # "missing symbol" warnings for entries absent from a given binary (inlined by LTO, etc.).
+    # -Xlink=: passthrough to lld-link — MinGW driver doesn't recognize order/ignore directly.
     local order_linker_flag=""
     if [[ -n "${order_file}" ]]; then
-        # -Xlink=<arg>: the MinGW driver invoked by -fuse-ld=lld on this target
-        # doesn't recognize "order" or "ignore" in its own option table at all
-        # (unlike --pdb, which it does) — passing -Wl,-order:... directly fails
-        # with "unknown argument", same failure mode as the -DEBUG issue above.
-        # -Xlink is its documented escape hatch for passing a flag straight
-        # through to the underlying COFF linker (lld-link), which does
-        # understand /order and /ignore. This also sidesteps MSYS2's path
-        # mangling for free: the token starts with "-Xlink=", not "/", so the
-        # embedded "/order:..." is never a leading character MSYS2 rewrites.
         order_linker_flag="-Wl,-Xlink=/order:@${order_file} -Wl,-Xlink=/ignore:4037"
     fi
 
@@ -3995,9 +3596,7 @@ BOLT_ORDER_EOF
         "${BUILD_GENERATE}/externals/qt/6.9.3/llvm-mingw_64" \
         "${BUILD_BOLT}"
 
-    # ── 3f. BOLT reorder summary ─────────────────────────────────────────────
-    # Cross-reference the order file against citron.exe's actual symbol table
-    # to report exactly how many hot functions were successfully placed.
+    # Cross-reference order file against citron.exe symbol table to report agreement rate.
     if [[ -n "${order_file}" && -f "${BUILD_BOLT}/bin/citron.exe" ]]; then
         local elf_lto_used="${LTO_MODE}"
         python3 - "${order_file}" "${BUILD_BOLT}/bin/citron.exe" "${nm_tool}" "${LTO_MODE}" "${elf_lto_used}" << 'BOLT_SUMMARY_EOF'
@@ -4102,19 +3701,11 @@ BOLT_SUMMARY_EOF
 }
 
 # =============================================================================
-# ensure_create_llvm_prof
-#
-# Builds generate_propeller_profiles from google/llvm-propeller and installs
-# it as /usr/local/bin/create_llvm_prof for use by the propeller stage.
-#
-# google/llvm-propeller is the correct modern repo (autofdo's README says the
-# Propeller codebase moved there as of 2025Q1). It has its own self-contained
-# cmake build with FetchContent — no LLVM_PATH, no ENABLE_TOOL, no bundled-LLVM
-# whack-a-mole. It natively understands BBAddrMap v3 (Clang 19+ format).
-#
-# Interface: --cc_profile / --ld_profile  (not --out/--format/--propeller_symorder)
-#
-# The installed binary is version-stamped; rebuilds on Clang version change.
+# ensure_create_llvm_prof — build generate_propeller_profiles from
+# google/llvm-propeller (autofdo moved there 2025Q1). Self-contained cmake
+# with FetchContent; understands BBAddrMap v3 (Clang 19+).
+# Interface: --cc_profile / --ld_profile
+# Rebuilt automatically on Clang version change.
 # =============================================================================
 ensure_create_llvm_prof() {
     local src_dir="/tmp/propeller-src"
@@ -4176,50 +3767,19 @@ ensure_create_llvm_prof() {
 }
 
 # =============================================================================
-# Stage: propeller — Propeller basic-block + function layout optimization
+# stage_propeller — Propeller BB+function layout optimization via perf LBR.
 #
-# Propeller is Google's feedback-directed optimization that operates at the
-# basic-block level, feeding profiles back into the compiler before LTO inlining
-# decisions are made. Unlike BOLT's post-link binary rewriting, Propeller works
-# at compile time, which means:
+# Collects branch-stack profiles from the native Linux ELF, then generates:
+#   propeller_cc.prof       — BB layout list (-fbasic-block-sections=list=)
+#   propeller_symorder.txt  — hot function order (/order:@ for PE)
+# The Windows PE is rebuilt with PGO+LTO plus both Propeller profiles.
 #
-#   - Inlined functions inherit layout guidance at their call sites (LTO-resilient)
-#   - Basic-block layout influences the compiler's register allocation and code
-#     generation, not just the final binary section placement
-#   - Profile collection uses the Linux ELF (same binary already built for BOLT)
-#     running under perf record -b (branch stack sampling)
+# Hardware: AMD Zen 4 (BRBS, kernel 6.1+) or Intel 13th gen (LBR) — both use
+# perf -b. Profile collection uses the same ELF as the BOLT stage.
 #
-# HARDWARE REQUIREMENTS:
-#   Branch-stack sampling requires hardware branch recording support:
-#     - AMD Zen 4 (Ryzen 7940HS): uses BRBS (Branch Record Buffer Stores)
-#       Requires kernel 6.1+ and linux-tools-$(uname -r)
-#     - Intel 13th gen (i9-13900H): uses LBR (Last Branch Records)
-#       Requires linux-tools-$(uname -r)
-#   Both work with the same perf -b flag — the kernel picks the right backend.
-#
-# WORKFLOW:
-#   1. The build-elf stage builds the ELF with -fbasic-block-address-map,
-#      which embeds a .llvm_bb_addr_map section mapping basic blocks to addresses.
-#   2. This stage runs citron under perf record -b to collect branch stacks.
-#   3. create_llvm_prof converts perf.data + ELF to two Propeller profile files:
-#        propeller_cc.prof    — basic-block layout list (passed via -fbasic-block-sections=list=)
-#        propeller_symorder.txt — hot function order (passed to linker /order:@)
-#   4. The Windows PE is rebuilt with:
-#        -fbasic-block-sections=list=propeller_cc.prof  (BB-level layout in PE — distinct flag, still valid)
-#        /order:@propeller_symorder.txt                 (function ordering)
-#      plus the same PGO+LTO flags as the use stage.
-#
-# NOTE on PE/COFF + -fbasic-block-sections=list (for the Propeller rebuild):
-#   This flag (which feeds a BB profile back to the compiler) is different from
-#   -fbasic-block-address-map (which annotates the ELF for profiling). It is
-#   primarily designed for ELF targets. For PE/COFF, the compiler
-#   still emits separate COFF sections per basic block, and lld's COFF mode will
-#   merge them per the order file. In practice the BB-level benefit may be partial
-#   (COFF section granularity is coarser than ELF). The function-order benefit
-#   from propeller_symorder.txt is identical to the BOLT /order:@ path.
-#
-# OUTPUT:
-#   build/propeller/bin/citron.exe   — Propeller-optimized Windows PE
+# Note: -fbasic-block-sections=list= for PE/COFF is compiler-level BB layout;
+# COFF section granularity is coarser than ELF but still provides i-cache gains.
+# The function-order benefit from propeller_symorder.txt is identical to BOLT's.
 # =============================================================================
 stage_propeller() {
     if [[ "${_HOST_OS}" == "windows" ]]; then
@@ -4354,9 +3914,7 @@ stage_propeller() {
     fi
 
     # ── 2. Convert perf.data to Propeller profiles ────────────────────────────
-    # generate_propeller_profiles (google/llvm-propeller) uses:
-    #   --cc_profile  = BB layout profile (was: --out --format=propeller)
-    #   --ld_profile  = function order     (was: --propeller_symorder)
+    # --cc_profile = BB layout, --ld_profile = function order
     info "Converting perf branch data to Propeller profiles..."
     info "  Binary:    ${elf_binary}"
     info "  Input:     ${perf_data}"
@@ -4403,24 +3961,11 @@ stage_propeller() {
     rm -rf "${BUILD_PROPELLER}"
     mkdir -p "${BUILD_PROPELLER}"; cd "${BUILD_PROPELLER}"
 
-
     local debug_flag=""
-    # -gcodeview: see stage_use for why plain -g isn't enough on this MinGW target.
+    # -gcodeview: clang defaults to DWARF on x86_64-w64-mingw32; without it no .pdb is emitted.
     [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && debug_flag="-g -gcodeview"
     local linker_debug_flag=""
-    # --pdb= (not -DEBUG/-Wl,-DEBUG, not /DEBUG): the MinGW driver invoked by
-    # -fuse-ld=lld on this target doesn't recognize -DEBUG at all (separate
-    # option table from lld-link) -- see stage_use's no-PGO block for the
-    # full explanation. --pdb is its actual recognized flag; empty value
-    # means auto-name the PDB per binary (this flag is shared across
-    # several executables built in this stage).
-    # --threads=1: combining --pdb= with -flto enables a known LLD COFF
-    # deadlock between PDB type/symbol-record merge threads and parallel LTO
-    # backend codegen threads (manifests as three ld.lld processes stuck at
-    # low CPU % indefinitely). --threads=N is the MinGW driver's own spelling
-    # of this option (per LLVM D76885); /threads:N is the COFF/lld-link form.
-    # Unlike order/ignore, "threads" IS in the MinGW driver's option table, so
-    # it does NOT need -Xlink= wrapping. Slower link, but only RelWithDebInfo.
+    # --pdb= / --threads=1: same rationale as stage_use.
     [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && linker_debug_flag="-Wl,--pdb= -Wl,--threads=1"
     local bt_upper; bt_upper=$(echo "${BUILD_TYPE}" | tr '[:lower:]' '[:upper:]')
     local lto_flag; lto_flag="$(lto_clang_flag)"
@@ -4435,18 +3980,10 @@ stage_propeller() {
     fi
     local lto_pgo_flag="${lto_flag:+${lto_flag} }${pgo_flag}"
 
-    # -fbasic-block-sections=list=<cc_profile>:
-    #   Compiler reads the Propeller CC profile and splits the listed basic blocks into
-    #   separate COFF sections. lld then orders those sections per the symorder.
-    #   Falls back gracefully if the profile references functions absent in this
-    #   build (e.g. inlined away by LTO) — those entries are silently ignored.
-    # /order:@<symorder>: COFF/PE lld function placement (same mechanism as BOLT).
-    # /ignore:4037: suppress LNK4037 for symorder entries absent from the PE.
-    # -Xlink=<arg>: required wrapper — see stage_bolt for the full explanation.
-    # The MinGW driver from -fuse-ld=lld doesn't recognize order/ignore in its
-    # own option table; -Xlink passes them through to the real COFF linker
-    # (and incidentally sidesteps MSYS2 path-mangling too, since the token
-    # starts with "-Xlink=" rather than "/").
+    # -fbasic-block-sections=list=<cc_profile>: compiler splits listed BBs into
+    # separate COFF sections; lld orders them per symorder.
+    # /order:@ + /ignore:4037: function placement via -Xlink= passthrough (MinGW
+    # lld driver doesn't recognize order/ignore directly; -Xlink passes to lld-link).
     local propeller_linker_flag=""
     if [[ ${have_sym} -eq 1 ]]; then
         propeller_linker_flag="-Wl,-Xlink=/order:@${symorder} -Wl,-Xlink=/ignore:4037"
@@ -4459,7 +3996,6 @@ stage_propeller() {
     fi
     local qt6_cmake_dir="${qt_install_dir}/lib/cmake/Qt6"
 
-    # Pre-build FFmpeg for this build directory
     detect_ffmpeg_version
     rebuild_ffmpeg_pthread_free "${BUILD_PROPELLER}"
 
@@ -4595,6 +4131,610 @@ stage_clean() {
     success "Build directories removed."
 }
 
+print_clangcl_stage_guidance() {
+    local stage_name="$1"
+    local binary="$2"
+    local config="$3"
+    local profile_win
+    profile_win="$(cygpath -am "${PROFILE_DIR}")"
+    local args="--compiler clang-cl --pgo ${PGO_MODE} --lto ${LTO_MODE} --build \"${BUILD_ROOT}\""
+    [[ "${UNITY_BUILD}" == "ON" ]] && args="${args} --unity"
+    [[ "${BUILD_TYPE}" == "RelWithDebInfo" ]] && args="${args} --relwithdebinfo"
+
+    echo ""
+    if [[ "${stage_name}" == "use" ]]; then
+        echo -e "${GREEN}================================================================${RESET}"
+        echo -e "${GREEN}  Stage use complete (native Windows clang-cl)${RESET}"
+        echo -e "${GREEN}================================================================${RESET}"
+        echo ""
+        echo -e "  ${BOLD}Binary  :${RESET} ${binary}"
+        echo -e "  ${BOLD}Config  :${RESET} ${config}"
+        echo -e "  ${BOLD}PGO     :${RESET} ${PGO_MODE}"
+        echo -e "  ${BOLD}LTO     :${RESET} ${LTO_MODE}"
+        echo -e "  ${BOLD}Artifacts:${RESET} ${binary%/*}/"
+        echo ""
+        echo "  Validate runtime deps, startup, gameplay, and clean shutdown."
+        echo -e "${GREEN}================================================================${RESET}"
+        echo ""
+        return
+    fi
+
+    local session profile_pattern next_title default_pattern
+    if [[ "${stage_name}" == "generate" ]]; then
+        session="Session 1"
+        profile_pattern="citron-generate-%p.profraw"
+        default_pattern="citron-generate-${PGO_MODE}-%p.profraw"
+        next_title="Build optimized binary"
+    else
+        session="Session 2 (context-sensitive IR)"
+        profile_pattern="citron-csgenerate-%p.profraw"
+        default_pattern="citron-csgenerate-${PGO_MODE}-%p.profraw"
+        next_title="Merge stage1 + CS profiles and rebuild"
+    fi
+
+    echo -e "${YELLOW}================================================================${RESET}"
+    echo -e "${YELLOW}  NEXT STEP: Collect Profile Data (${session})${RESET}"
+    echo -e "${YELLOW}================================================================${RESET}"
+    echo ""
+    echo -e "  ${BOLD}Instrumented binary:${RESET} ${binary}"
+    echo -e "  ${BOLD}Profile output dir :${RESET} ${profile_win}/"
+    echo ""
+    echo "  1. In PowerShell, set the profile destination and launch Citron:"
+    echo "       \$env:LLVM_PROFILE_FILE='${profile_win}/${profile_pattern}'"
+    echo "       & '${binary}'"
+    echo ""
+    echo "     (Setting LLVM_PROFILE_FILE is optional but recommended -- it"
+    echo "      lets you choose where files land. If you forget it, this"
+    echo "      build writes '${default_pattern}' next to citron.exe instead,"
+    echo "      with a unique %p-per-process name that won't collide with the"
+    echo "      other stage or with previous runs.)"
+    echo ""
+    echo "  2. Exercise games and menus for 15-30 minutes."
+    echo "     Exit cleanly via File > Exit or Ctrl+Q; do not kill the process."
+    echo ""
+    echo "  3. Confirm ${profile_pattern} files exist under:"
+    echo "       ${profile_win}/"
+    echo ""
+    echo "  4. ${next_title}:"
+    if [[ "${stage_name}" == "generate" && "${PGO_MODE}" == "ir" ]]; then
+        echo "       # Optional CS-IRPGO pass:"
+        echo "       ./build-clangtron-windows.sh csgenerate ${args}"
+        echo "       # Or build directly from stage1 profiles:"
+    fi
+    echo "       ./build-clangtron-windows.sh use ${args}"
+    echo ""
+    echo -e "${YELLOW}================================================================${RESET}"
+    echo ""
+}
+
+stage_clangcl() {
+    [[ "${_HOST_OS}" == "windows" ]] ||
+        error "clang-cl requires a native Windows host."
+    [[ "${STAGE}" == "generate" || "${STAGE}" == "csgenerate" || "${STAGE}" == "use" ]] ||
+        error "clang-cl supports generate, csgenerate, and use stages."
+    [[ "${STAGE}" != "csgenerate" || "${PGO_MODE}" == "ir" ]] ||
+        error "clang-cl csgenerate requires --pgo ir."
+
+    # ── Sentinel: record generate config; verify it matches on csgenerate/use ─
+    # Mirrors the llvm-mingw sentinel logic so LTO+PGO mismatches are caught
+    # before a long build wastes time. The write for STAGE=="generate" happens
+    # later, only after the build succeeds, so a failed/invalid generate run
+    # never leaves stale sentinel state for csgenerate/use to read.
+    #
+    # PGO_MODE=="none" is exempt entirely: a --pgo none build (use only --
+    # csgenerate always requires --pgo ir, enforced above) consumes no
+    # profraw/profdata from generate at all, so there is nothing that could
+    # actually be mismatched. It's an independent LTO-only build that should
+    # succeed regardless of what PGO mode (or LTO mode) a prior generate run
+    # used.
+    local _gen_cfg="${BUILD_ROOT}/.citron-clangcl-gen-config"
+    if [[ "${STAGE}" != "generate" && "${PGO_MODE}" != "none" && -f "${_gen_cfg}" ]]; then
+        local _gen_lto _gen_pgo
+        _gen_lto=$(awk -F= '/^LTO=/{print $2; exit}' "${_gen_cfg}" 2>/dev/null || true)
+        _gen_pgo=$(awk -F= '/^PGO=/{print $2; exit}' "${_gen_cfg}" 2>/dev/null || true)
+        if [[ -n "${_gen_lto}" && "${_gen_lto}" != "${LTO_MODE}" ]]; then
+            error "LTO mismatch: generate used LTO=${_gen_lto}, ${STAGE} has LTO=${LTO_MODE}.\n" \
+                  "       IR PGO profiles are tied to the IR produced at generate time.\n" \
+                  "       Re-run ${STAGE} with --lto ${_gen_lto}."
+        fi
+        if [[ -n "${_gen_pgo}" && "${_gen_pgo}" != "${PGO_MODE}" ]]; then
+            error "PGO mismatch: generate used PGO=${_gen_pgo}, ${STAGE} has PGO=${PGO_MODE}.\n" \
+                  "       Re-run ${STAGE} with --pgo ${_gen_pgo}."
+        fi
+    fi
+
+    local vswhere="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+    if [[ -z "${VS_INSTALL_PATH}" ]]; then
+        [[ -x "${vswhere}" ]] || error "vswhere.exe not found; install Visual Studio Installer or set VS_INSTALL_PATH."
+        VS_INSTALL_PATH="$("${vswhere}" -latest -products '*' \
+            -requires Microsoft.VisualStudio.Component.VC.Llvm.Clang \
+            -property installationPath | tr -d '\r')"
+    fi
+    [[ -n "${VS_INSTALL_PATH}" ]] || error "No Visual Studio installation with clang-cl found."
+
+    local vs_root vsdev clang_cl llvm_profdata native_perl native_python
+    vs_root="$(cygpath -au "${VS_INSTALL_PATH}")"
+    vsdev="${vs_root}/Common7/Tools/VsDevCmd.bat"
+    clang_cl="${vs_root}/VC/Tools/Llvm/x64/bin/clang-cl.exe"
+    llvm_profdata="${vs_root}/VC/Tools/Llvm/x64/bin/llvm-profdata.exe"
+    [[ -f "${vsdev}" ]] || error "VsDevCmd.bat missing under ${VS_INSTALL_PATH}."
+    [[ -f "${clang_cl}" ]] || error "clang-cl.exe missing under ${VS_INSTALL_PATH}."
+    [[ -f "${llvm_profdata}" ]] || error "llvm-profdata.exe missing beside clang-cl.exe."
+    local perl_candidate
+    native_perl=""
+    for perl_candidate in \
+        "${PERL_EXECUTABLE:-}" \
+        "/c/Strawberry/perl/bin/perl.exe" \
+        "/c/Perl64/bin/perl.exe"; do
+        [[ -n "${perl_candidate}" && -x "${perl_candidate}" ]] || continue
+        if "${perl_candidate}" -e 'exit(($^O eq "MSWin32") ? 0 : 1)'; then
+            native_perl="${perl_candidate}"
+            break
+        fi
+    done
+    [[ -n "${native_perl}" ]] ||
+        error "Native Win32 Perl required for clang-cl OpenSSL. Install Strawberry Perl or set PERL_EXECUTABLE. MSYS/Cygwin Perl is incompatible with VC-WIN64A."
+    local python_candidate
+    native_python=""
+    for python_candidate in \
+        "${PYTHON_EXECUTABLE:-}" \
+        /c/Python312/python.exe \
+        /c/hostedtoolcache/windows/Python/3.12.*/x64/python.exe \
+        /c/Users/*/AppData/Local/Programs/Python/Python312/python.exe; do
+        [[ -x "${python_candidate}" ]] || continue
+        if "${python_candidate}" -c 'import sys; raise SystemExit(sys.platform != "win32")'; then
+            native_python="${python_candidate}"
+            break
+        fi
+    done
+    [[ -n "${native_python}" ]] ||
+        error "Native Windows Python 3.12 required. Run setup --compiler clang-cl or set PYTHON_EXECUTABLE."
+
+    local sccache="/clang64/bin/sccache.exe"
+    local ninja="/clang64/bin/ninja.exe"
+    [[ -x "${ninja}" ]] ||
+        error "ninja.exe missing. Run setup --compiler clang-cl."
+    local sccache_cmake_args="  -DCMAKE_C_COMPILER_LAUNCHER= -DCMAKE_CXX_COMPILER_LAUNCHER= ^"
+    local sccache_start_cmd="rem sccache unavailable" sccache_stats_cmd="rem sccache unavailable"
+    if [[ -x "${sccache}" ]]; then
+        local sccache_win_tmp
+        sccache_win_tmp="$(cygpath -am "${sccache}")"
+        sccache_cmake_args="  -DCMAKE_C_COMPILER_LAUNCHER=\"${sccache_win_tmp}\" -DCMAKE_CXX_COMPILER_LAUNCHER=\"${sccache_win_tmp}\" ^"
+        sccache_start_cmd="set \"SCCACHE_IGNORE_SERVER_IO_ERROR=1\"
+\"${sccache_win_tmp}\" --start-server >NUL 2>&1"
+        sccache_stats_cmd="\"${sccache_win_tmp}\" --show-stats"
+    else
+        warn "sccache.exe missing; clang-cl build will run without compiler cache."
+    fi
+
+    local config="${BUILD_TYPE}" stage_name flags="" pgo_flags="" pgo_link_flags="" pgo_flags_dash="" config_compile_flags config_link_flags
+    case "${config}" in
+        Release)
+            config_compile_flags="/O2 /DNDEBUG"
+            config_link_flags="/OPT:REF /OPT:ICF"
+            ;;
+        RelWithDebInfo)
+            config_compile_flags="/O2 /Z7 /DNDEBUG"
+            config_link_flags="/DEBUG /OPT:REF /OPT:ICF"
+            ;;
+        Debug)
+            config_compile_flags="/Od /Z7"
+            config_link_flags="/DEBUG"
+            ;;
+        *) error "Unsupported clang-cl build type: ${config}" ;;
+    esac
+    stage_name="${STAGE}"
+    local package_dir="${BUILD_ROOT}/clang-cl/${stage_name}"
+    local build_dir="${BUILD_ROOT}/clang-cl/.work/${stage_name}"
+    mkdir -p "${build_dir}" "${PROFILE_DIR}" "${PROFILE_DIR}/cs"
+
+    # Default profraw filenames baked into the binary (relative path — writes next to citron.exe).
+    # %p = PID, so repeated runs and different stages never overwrite each other.
+    local default_profraw_name_generate="citron-generate-${PGO_MODE}-%p.profraw"
+    local default_profraw_name_csgenerate="citron-csgenerate-${PGO_MODE}-%p.profraw"
+
+    # Fold a content hash of the profdata into compile flags so sccache/ninja see
+    # a cache miss whenever the profile changes (path alone doesn't change on re-merge).
+    _pgo_profdata_hash() {
+        local pd="$1"
+        if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${pd}" | cut -c1-16
+        else
+            cksum "${pd}" | tr -d ' \r\n'
+        fi
+    }
+
+    # pgo_flags_dash: same as pgo_flags but in bare dash syntax for OpenSSL/FFmpeg
+    # configure scripts (they don't go through clang-cl's CL-style arg parser).
+    # /INCLUDE: linker flags are omitted — those only matter for the final citron.exe link.
+    case "${PGO_MODE}:${STAGE}" in
+        none:use) ;;
+        none:*) error "--pgo none supports only clang-cl use stage." ;;
+        fe:generate)
+            # /INCLUDE:__llvm_profile_runtime and /INCLUDE:__llvm_profile_write_file
+            # force-keep the LLVM profiling runtime's static initializer and
+            # flush routine at link time. Without them, /OPT:REF (dead-code
+            # elimination, enabled below for Release/RelWithDebInfo) can strip
+            # these symbols when the instrumented counter code that references
+            # them isn't directly reachable from main() -- the binary still
+            # links and runs, it just silently never writes any .profraw.
+            # See the identical -Wl,-u,__llvm_profile_write_file,-u,__llvm_profile_runtime
+            # workaround in stage_generate()/stage_csgenerate() for the
+            # llvm-mingw path; /INCLUDE: is the lld-link/link.exe (COFF)
+            # equivalent of that GNU-ld -u flag.
+            # =<pattern> bakes the default output filename into the binary
+            # itself, so it writes next to citron.exe with a unique name even
+            # when LLVM_PROFILE_FILE isn't set -- LLVM_PROFILE_FILE still
+            # overrides this at runtime if the user does set it.
+            # pgo_flags/pgo_link_flags (NOT flags): scoped to citron's own
+            # executables only via CITRON_CLANGCL_PGO_COMPILE_FLAGS/
+            # _LINK_FLAGS in the root CMakeLists.txt -- see the comment there
+            # for why this must not be applied through the global
+            # CMAKE_*_FLAGS_${config} variables.
+            #
+            # BUG FIX: pgo_flags (compile) and pgo_link_flags (link) are
+            # DELIBERATELY DIFFERENT, not the same string applied twice. For
+            # this MSVC-ABI toolchain, CMake's Ninja Multi-Config generator
+            # invokes lld-link.exe DIRECTLY for the final .exe link (via
+            # `cmake -E vs_link_exe`) -- it does NOT go through clang-cl.exe.
+            # /clang:-prefixed tokens are a clang-cl DRIVER escape hatch with
+            # no meaning to lld-link.exe itself; lld-link, like any COFF
+            # linker, treats an unrecognized token as an input file path and
+            # fails with "could not open '/clang:...'" when that "file"
+            # doesn't exist. /INCLUDE: IS genuine native lld-link/link.exe
+            # syntax, so it's the only thing that belongs in pgo_link_flags.
+            # -fprofile-instr-generate does not need to be repeated at link
+            # time -- the instrumentation is fully determined per-TU at
+            # compile time.
+            pgo_flags="/clang:-fprofile-instr-generate=${default_profraw_name_generate}"
+            pgo_link_flags="/INCLUDE:__llvm_profile_runtime /INCLUDE:__llvm_profile_write_file"
+            pgo_flags_dash="-fprofile-instr-generate=${default_profraw_name_generate}"
+            ;;
+        ir:generate)
+            # See fe:generate above for why pgo_flags and pgo_link_flags
+            # carry different content, why the /INCLUDE: force-keep flags
+            # only belong in pgo_link_flags, and why the baked-in =<pattern>
+            # output name is required.
+            pgo_flags="/clang:-fprofile-generate=${default_profraw_name_generate}"
+            pgo_link_flags="/INCLUDE:__llvm_profile_runtime /INCLUDE:__llvm_profile_write_file"
+            pgo_flags_dash="-fprofile-generate=${default_profraw_name_generate}"
+            ;;
+        fe:use|ir:use)
+            # Profile priority: merged.profdata (stage1+CS) → default.profdata (stage1) → profraw merge.
+            # If merged.profdata is stale (new CS profraw arrived), remove it so it gets rebuilt.
+            local merged_pd="${PROFILE_DIR}/clang-cl-merged.profdata"
+            local stage1_pd="${PROFILE_DIR}/clang-cl-ir.profdata"
+            local stage1_pd_default="${PROFILE_DIR}/default.profdata"
+            local profdata_use
+
+            # Fall back to default.profdata when clang-cl-ir.profdata is absent.
+            if [[ ! -f "${stage1_pd}" && -f "${stage1_pd_default}" ]]; then
+                stage1_pd="${stage1_pd_default}"
+            fi
+
+            if [[ -f "${merged_pd}" ]]; then
+                local _cs_dir_check="${PROFILE_DIR}/cs"
+                normalize_profraw_dirs "${_cs_dir_check}" 2>/dev/null || true
+                local _cs_pending
+                _cs_pending=$(find "${_cs_dir_check}" -maxdepth 1 -name "*.profraw" \
+                              2>/dev/null | wc -l)
+                if [[ "${_cs_pending}" -gt 0 ]]; then
+                    warn "clang-cl-merged.profdata exists but ${_cs_pending} unmerged CS" \
+                         "profraw file(s) found in ${_cs_dir_check}."
+                    warn "Removing stale merged profdata and re-merging with CS data..."
+                    rm -f "${merged_pd}"
+                fi
+            fi
+
+            if [[ -f "${merged_pd}" ]]; then
+                profdata_use="${merged_pd}"
+                info "Using CS-IRPGO merged profile: ${profdata_use}"
+            elif [[ -f "${stage1_pd}" ]]; then
+                # Check whether CS profraw exists and needs merging
+                local cs_dir="${PROFILE_DIR}/cs"
+                normalize_profraw_dirs "${cs_dir}" 2>/dev/null || true
+                local cs_count
+                cs_count=$(find "${cs_dir}" -maxdepth 1 -name "*.profraw" \
+                           2>/dev/null | wc -l)
+                if [[ "${cs_count}" -gt 0 ]]; then
+                    info "CS profraw detected (${cs_count} files) — merging with stage1..."
+                    local cs_tmp="${PROFILE_DIR}/clang-cl-cs-only.profdata"
+                    "${llvm_profdata}" merge -output="${cs_tmp}" "${cs_dir}"/*.profraw ||
+                        error "llvm-profdata CS merge failed."
+                    "${llvm_profdata}" merge -output="${merged_pd}" \
+                        "${stage1_pd}" "${cs_tmp}" ||
+                        error "llvm-profdata stage1+CS merge failed."
+                    rm -f "${cs_tmp}"
+                    profdata_use="${merged_pd}"
+                    info "CS-IRPGO merged profile written: ${profdata_use}"
+                else
+                    profdata_use="${stage1_pd}"
+                    info "Using stage1 profile (no CS data): ${profdata_use}"
+                fi
+            else
+                # On-the-fly merge from raw files
+                normalize_profraw_dirs "${PROFILE_DIR}" 2>/dev/null || true
+                local raw=("${PROFILE_DIR}"/*.profraw)
+                [[ -e "${raw[0]}" ]] || error \
+                    "No .profraw files in ${PROFILE_DIR}; run instrumented workload first.\n" \
+                    "       Collect default-<pid>.profraw from Windows, copy to ${PROFILE_DIR}/,\n" \
+                    "       then re-run: ./build-clangtron-windows.sh use --compiler clang-cl --pgo ir"
+                "${llvm_profdata}" merge -output="${stage1_pd}" "${raw[@]}" ||
+                    error "llvm-profdata merge failed."
+                profdata_use="${stage1_pd}"
+                info "Merged ${#raw[@]} profraw file(s) → ${stage1_pd}"
+            fi
+
+            # /DCITRON_PGO_PROFDATA_HASH: forces sccache/ninja cache miss when profdata content changes.
+            # pgo_link_flags empty — use stage activates no profiling runtime, nothing to force-keep.
+            # -Wno-error=backend-plugin: hash-mismatch profile warnings promoted to errors by -Werror.
+            local _pd_hash; _pd_hash="$(_pgo_profdata_hash "${profdata_use}")"
+            local _profdata_use_win; _profdata_use_win="$(cygpath -am "${profdata_use}")"
+            if [[ "${PGO_MODE}" == "fe" ]]; then
+                pgo_flags="/clang:-fprofile-instr-use=${_profdata_use_win} /DCITRON_PGO_PROFDATA_HASH=${_pd_hash} /clang:-Wno-error=backend-plugin"
+                pgo_flags_dash="-fprofile-instr-use=${_profdata_use_win} -DCITRON_PGO_PROFDATA_HASH=${_pd_hash} -Wno-error=backend-plugin"
+            else
+                pgo_flags="/clang:-fprofile-use=${_profdata_use_win} /DCITRON_PGO_PROFDATA_HASH=${_pd_hash} /clang:-Wno-error=backend-plugin"
+                pgo_flags_dash="-fprofile-use=${_profdata_use_win} -DCITRON_PGO_PROFDATA_HASH=${_pd_hash} -Wno-error=backend-plugin"
+            fi
+            ;;
+        ir:csgenerate)
+            local stage1="${PROFILE_DIR}/clang-cl-ir.profdata"
+            # CRITICAL: use ONLY the plain stage1 profdata (clang-cl-ir.profdata or
+            # default.profdata), never merged.profdata — see header CRITICAL INVARIANT.
+            # Priority: clang-cl-ir.profdata → default.profdata → raw profraw merge
+            #   2. default.profdata      (stage1 from llvm-mingw use/csgenerate path)
+            #   3. citron-generate-*.profraw  (canonical clang-cl generate output)
+            #   4. *.profraw             (fallback when LLVM_PROFILE_FILE was not set)
+            if [[ -f "${stage1}" ]]; then
+                info "Using existing stage-1 profdata: ${stage1}"
+            elif [[ -f "${PROFILE_DIR}/default.profdata" ]]; then
+                info "Using default.profdata as stage-1 profdata."
+                stage1="${PROFILE_DIR}/default.profdata"
+            else
+                # Explicit guard: merged.profdata without default.profdata means
+                # the stage1 raw files have been discarded after a CS cycle.
+                # Using merged.profdata here would violate the critical invariant.
+                local merged_check="${PROFILE_DIR}/clang-cl-merged.profdata"
+                if [[ ! -f "${merged_check}" ]]; then
+                    merged_check="${PROFILE_DIR}/merged.profdata"
+                fi
+                if [[ -f "${merged_check}" ]]; then
+                    error "default.profdata not found, but merged.profdata exists.\n" \
+                          "       merged.profdata contains CS records from a previous cycle and\n" \
+                          "       MUST NOT be used as the stage1 base for csgenerate.\n" \
+                          "       To rebuild default.profdata:\n" \
+                          "         1. Copy the original stage1 profraw files to ${PROFILE_DIR}/\n" \
+                          "         2. Re-run: ./build-clangtron-windows.sh use --compiler clang-cl --pgo ir\n" \
+                          "            (this produces clang-cl-ir.profdata from the stage1 profraw)"
+                fi
+                # Try to merge from raw files.
+                normalize_profraw_dirs "${PROFILE_DIR}" 2>/dev/null || true
+                local ir_raw=("${PROFILE_DIR}"/citron-generate-*.profraw)
+                if [[ ! -e "${ir_raw[0]}" ]]; then
+                    # Fallback: accept any *.profraw (e.g. default-<pid>.profraw
+                    # written when LLVM_PROFILE_FILE was not explicitly set).
+                    ir_raw=("${PROFILE_DIR}"/*.profraw)
+                    [[ -e "${ir_raw[0]}" ]] || error \
+                        "No stage-1 .profraw files in ${PROFILE_DIR}.\n" \
+                        "       Run generate, then profile citron.exe with:\n" \
+                        "         \$env:LLVM_PROFILE_FILE='${PROFILE_DIR}/citron-generate-%p.profraw'\n" \
+                        "       Copy the resulting .profraw to ${PROFILE_DIR}/ and re-run csgenerate."
+                fi
+                info "Merging ${#ir_raw[@]} stage-1 .profraw file(s) → ${stage1##*/}..."
+                "${llvm_profdata}" merge -output="${stage1}" "${ir_raw[@]}" ||
+                    error "llvm-profdata stage-1 merge failed."
+            fi
+            # BUG FIX: -fcs-profile-generate is a distinct driver flag from
+            # -fprofile-generate (it's only ever combined with -fprofile-use,
+            # /INCLUDE: force-keep: -fcs-profile-generate doesn't auto-inject the runtime reference
+            # that -fprofile-generate does. Without it, /OPT:REF strips the runtime silently.
+            # /DCITRON_PGO_PROFDATA_HASH: busts cache if stage1 content changes between runs.
+            local _pd_hash; _pd_hash="$(_pgo_profdata_hash "${stage1}")"
+            local _stage1_win; _stage1_win="$(cygpath -am "${stage1}")"
+            # pgo_link_flags is plain lld-link syntax (no /clang:) — lld-link is invoked directly.
+            # -Wno-error=backend-plugin: csgenerate also uses -fprofile-use and hits hash-mismatch
+            # warnings that citron's -Werror would otherwise promote to hard build failures.
+            pgo_flags="/clang:-fprofile-use=${_stage1_win} /DCITRON_PGO_PROFDATA_HASH=${_pd_hash} /clang:-fcs-profile-generate=${default_profraw_name_csgenerate} /clang:-Wno-error=backend-plugin"
+            pgo_link_flags="/INCLUDE:__llvm_profile_runtime /INCLUDE:__llvm_profile_write_file"
+            pgo_flags_dash="-fprofile-use=${_stage1_win} -DCITRON_PGO_PROFDATA_HASH=${_pd_hash} -fcs-profile-generate=${default_profraw_name_csgenerate} -Wno-error=backend-plugin"
+            ;;
+        *) error "Unsupported clang-cl PGO flow: ${PGO_MODE}:${STAGE}" ;;
+    esac
+    # LTO flags go in CMAKE_C/CXX_FLAGS (compile only), never CMAKE_EXE_LINKER_FLAGS.
+    # lld-link auto-detects bitcode .obj files; no flag needed at link time.
+    case "${LTO_MODE}" in
+        none) ;;
+        thin)
+            flags="${flags} /clang:-flto=thin"
+            pgo_flags_dash="${pgo_flags_dash} -flto=thin"
+            ;;
+        full)
+            flags="${flags} /clang:-flto=full"
+            pgo_flags_dash="${pgo_flags_dash} -flto=full"
+            ;;
+    esac
+
+    local source_win build_win package_win build_copy_win package_copy_win batch_win cpm_win vsdev_win perl_win python_win
+    local clang_cl_win clang_bin_win ninja_win clang64_bin_win
+    source_win="$(cygpath -am "${SOURCE_DIR}")"
+    build_win="$(cygpath -am "${build_dir}")"
+    package_win="$(cygpath -am "${package_dir}")"
+    build_copy_win="$(cygpath -aw "${build_dir}")"
+    package_copy_win="$(cygpath -aw "${package_dir}")"
+    batch_win="$(cygpath -aw "${build_dir}/build-clang-cl.cmd")"
+    cpm_win="$(cygpath -am "${CPM_SOURCE_CACHE}")"
+    vsdev_win="$(cygpath -am "${vsdev}")"
+    perl_win="$(cygpath -am "${native_perl}")"
+    python_win="$(cygpath -am "${native_python}")"
+    clang_cl_win="$(cygpath -am "${clang_cl}")"
+    clang_bin_win="$(cygpath -am "$(dirname "${clang_cl}")")"
+    ninja_win="$(cygpath -am "${ninja}")"
+    # Resolve the MSYS2 clang64/bin path dynamically (varies on CI runners).
+    clang64_bin_win="$(cygpath -am /clang64/bin)"
+    local msys2_usr_bin_win
+    msys2_usr_bin_win="$(cygpath -am /usr/bin)"
+    # Resolve native Python Scripts dir for aqt.exe.
+    local python_scripts_win=""
+    if [[ -n "${native_python}" && -d "$(dirname "${native_python}")/Scripts" ]]; then
+        python_scripts_win="$(cygpath -am "$(dirname "${native_python}")/Scripts")"
+    else
+        local _py_scripts_candidate
+        for _py_scripts_candidate in \
+                /c/hostedtoolcache/windows/Python/3.12.*/x64 \
+                /c/Python312; do
+            if [[ -x "${_py_scripts_candidate}/python.exe" ]]; then
+                python_scripts_win="$(cygpath -am "${_py_scripts_candidate}/Scripts")"
+                break
+            fi
+        done
+    fi
+
+    # Qt/OpenSSL/FFmpeg cached under CPM_SOURCE_CACHE — shared across all clang-cl stages.
+    local _qt_version="6.9.3"
+    local _openssl_version="3.4.1"
+    local _ffmpeg_tag="n8.0"
+
+    # Qt: qt_download.cmake already writes to CPM_SOURCE_CACHE/qt-bin/.
+    # Pre-check here and pass Qt6_DIR to cmake so the configure-time download
+    # is skipped when the cache is warm.
+    local _qt_cache_dir="${CPM_SOURCE_CACHE}/qt-bin/${_qt_version}/msvc2022_64"
+    local _qt6_dir="${_qt_cache_dir}/lib/cmake/Qt6"
+    local qt6_dir_win="" qt_target_path_win=""
+    if [[ -f "${_qt6_dir}/Qt6Config.cmake" ]]; then
+        info "Qt ${_qt_version} (msvc2022_64) found in CPM cache — skipping aqt download."
+        qt6_dir_win="$(cygpath -am "${_qt6_dir}")"
+        qt_target_path_win="$(cygpath -am "${_qt_cache_dir}")"
+    else
+        info "Qt ${_qt_version} (msvc2022_64) not in CPM cache — will download during cmake configure."
+        if [[ -n "${native_python}" ]]; then
+            "${native_python}" -m pip install aqtinstall --quiet 2>/dev/null || true
+        fi
+    fi
+
+    # Cache key folds LTO mode, PGO mode, stage, and profdata hash into the path.
+    # Each distinct (LTO, PGO, stage, profile) combination gets its own dir —
+    # prevents execute_process-based builds (OpenSSL, FFmpeg) from silently reusing
+    # a cache built with different flags.
+    local _pgo_lto_cache_key="lto-${LTO_MODE}_pgo-${PGO_MODE}_${STAGE}"
+    if [[ -n "${_pd_hash:-}" ]]; then
+        _pgo_lto_cache_key="${_pgo_lto_cache_key}_${_pd_hash}"
+    fi
+
+    local _openssl_cache_dir="${CPM_SOURCE_CACHE}/citron-openssl-clangcl/${_openssl_version}-VC-WIN64A-${_pgo_lto_cache_key}"
+    local openssl_cache_dir_win
+    openssl_cache_dir_win="$(cygpath -am "${_openssl_cache_dir}")"
+    mkdir -p "${_openssl_cache_dir}"
+
+    local _ffmpeg_cache_dir="${CPM_SOURCE_CACHE}/citron-ffmpeg-clangcl/${_ffmpeg_tag}-${_pgo_lto_cache_key}"
+    local ffmpeg_cache_dir_win
+    ffmpeg_cache_dir_win="$(cygpath -am "${_ffmpeg_cache_dir}")"
+    mkdir -p "${_ffmpeg_cache_dir}/build" "${_ffmpeg_cache_dir}/install"
+
+    # Qt cmake args — pass pre-resolved paths when cache is warm.
+    # Empty -DQt6_DIR= is a no-op when Qt is not yet cached.
+    local qt_cmake_line
+    if [[ -n "${qt6_dir_win}" ]]; then
+        qt_cmake_line="  -DQt6_DIR=\"${qt6_dir_win}\" -DQT_TARGET_PATH=\"${qt_target_path_win}\" ^"
+    else
+        qt_cmake_line="  -DQt6_DIR= ^"
+    fi
+
+    # BUG FIX: %p in profraw patterns (e.g. -fprofile-generate=..-%p.profraw) must be
+    # doubled to %%p in the .cmd heredoc. cmd.exe expands %...% pairs across the entire
+    # logical line (including ^ continuations), pairing stray percent signs and silently
+    # deleting everything between them. %%p collapses to literal %p after cmd.exe's
+    # one-pass expansion, so clang still sees the correct PID placeholder.
+    local flags_batch="${flags//%/%%}"
+    local pgo_flags_batch="${pgo_flags//%/%%}"
+    local pgo_link_flags_batch="${pgo_link_flags//%/%%}"
+    local pgo_flags_dash_batch="${pgo_flags_dash//%/%%}"
+
+    cat > "${build_dir}/build-clang-cl.cmd" <<CLANGCL_CMD_EOF
+@echo off
+setlocal
+for %%V in (CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH CFLAGS CXXFLAGS CPPFLAGS INCLUDE LIB LIBPATH PKG_CONFIG_PATH PKG_CONFIG_LIBDIR) do set "%%V="
+set "PATH=${clang_bin_win};C:\Program Files\CMake\bin;${clang64_bin_win};${msys2_usr_bin_win};%SystemRoot%\System32;%SystemRoot%;%SystemRoot%\System32\Wbem;C:\Program Files\Git\cmd;C:\Python312;${python_scripts_win}"
+call "${vsdev_win}" -arch=x64 -host_arch=x64
+if errorlevel 1 exit /b %errorlevel%
+if not defined CPM_SOURCE_CACHE set "CPM_SOURCE_CACHE=${cpm_win}"
+${sccache_start_cmd}
+cmake -S "${source_win}" -B "${build_win}" -G "Ninja Multi-Config" ^
+  -DCMAKE_MAKE_PROGRAM="${ninja_win}" ^
+  -DCMAKE_C_COMPILER="${clang_cl_win}" -DCMAKE_CXX_COMPILER="${clang_cl_win}" ^
+${sccache_cmake_args}
+  -DCMAKE_POLICY_DEFAULT_CMP0141=NEW -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT="$<$<CONFIG:Debug,RelWithDebInfo>:Embedded>" ^
+  -DCITRON_USE_CPM=ON -DCITRON_USE_BUNDLED_VCPKG=OFF -DCITRON_CHECK_SUBMODULES=OFF ^
+  -DCPM_SOURCE_CACHE="${cpm_win}" ^
+  -DCITRON_CLANGCL=ON -DCITRON_USE_BUNDLED_QT=ON -DCITRON_USE_BUNDLED_FFMPEG=ON ^
+  -DBUILD_TESTING=OFF -DCITRON_TESTS=OFF -DCITRON_SHADER_TOOL=OFF ^
+  -DCITRON_CRASH_DUMPS=OFF ^
+  -DENABLE_UNITY_BUILD=${UNITY_BUILD} ^
+  -DPython3_EXECUTABLE="${python_win}" ^
+  -DPERL_EXECUTABLE="${perl_win}" ^
+  -D_OPENSSL_NASM=${clang64_bin_win}/nasm.exe ^
+  -DGLSLANGVALIDATOR=${clang64_bin_win}/glslangValidator.exe ^
+  -DCLANGCL_OPENSSL_CACHE_DIR="${openssl_cache_dir_win}" ^
+  -DCLANGCL_FFMPEG_CACHE_DIR="${ffmpeg_cache_dir_win}" ^
+  -DCLANGCL_OPENSSL_EXTRA_CFLAGS="${pgo_flags_dash_batch}" ^
+  -DCLANGCL_FFMPEG_EXTRA_CFLAGS="${pgo_flags_dash_batch}" ^
+${qt_cmake_line}
+  -DCITRON_ENABLE_LTO=OFF ^
+  -DCITRON_ENABLE_PGO_GENERATE=OFF -DCITRON_ENABLE_PGO_USE=OFF ^
+  -DCMAKE_C_FLAGS_${config^^}="${config_compile_flags} ${flags_batch}" -DCMAKE_CXX_FLAGS_${config^^}="${config_compile_flags} ${flags_batch}" ^
+  -DCMAKE_EXE_LINKER_FLAGS_${config^^}="${config_link_flags}" ^
+  -DCITRON_CLANGCL_PGO_COMPILE_FLAGS="${pgo_flags_batch}" -DCITRON_CLANGCL_PGO_LINK_FLAGS="${pgo_link_flags_batch}" ^
+  -DCMAKE_RC_FLAGS="" -DCMAKE_RC_FLAGS_DEBUG="" -DCMAKE_RC_FLAGS_RELEASE="" -DCMAKE_RC_FLAGS_RELWITHDEBINFO=""
+if errorlevel 1 exit /b %errorlevel%
+cmake --build "${build_win}" --config ${config} --parallel ${JOBS} --target citron-runtime
+if not %errorlevel%==0 exit /b 1
+${sccache_stats_cmd}
+if not exist "${package_copy_win}" mkdir "${package_copy_win}"
+for %%F in ("${package_copy_win}\\*") do if exist "%%F" del /F /Q "%%F"
+for /D %%D in ("${package_copy_win}\\*") do if /I not "%%~nxD"=="user" if exist "%%D" rmdir /S /Q "%%D"
+if not exist "${package_copy_win}\\user" mkdir "${package_copy_win}\\user"
+copy /Y "${build_copy_win}\\bin\\${config}\\citron.exe" "${package_copy_win}\\citron.exe" >NUL
+if errorlevel 1 exit /b %errorlevel%
+copy /Y "${build_copy_win}\\bin\\${config}\\citron-cmd.exe" "${package_copy_win}\\citron-cmd.exe" >NUL
+if errorlevel 1 exit /b %errorlevel%
+copy /Y "${build_copy_win}\\bin\\${config}\\citron-room.exe" "${package_copy_win}\\citron-room.exe" >NUL
+if errorlevel 1 exit /b %errorlevel%
+if exist "${build_copy_win}\\bin\\${config}\\*.dll" (
+  copy /Y "${build_copy_win}\\bin\\${config}\\*.dll" "${package_copy_win}\\" >NUL
+  if errorlevel 1 exit /b 1
+)
+if /I "${config}"=="RelWithDebInfo" (
+  for %%P in (citron.pdb citron-cmd.pdb citron-room.pdb) do (
+    if not exist "${build_copy_win}\\bin\\${config}\\%%P" exit /b 1
+    copy /Y "${build_copy_win}\\bin\\${config}\\%%P" "${package_copy_win}\\%%P" >NUL
+  )
+)
+if exist "${build_copy_win}\\bin\\${config}\\qt.conf" (
+  copy /Y "${build_copy_win}\\bin\\${config}\\qt.conf" "${package_copy_win}\\qt.conf" >NUL
+  if errorlevel 1 exit /b %errorlevel%
+)
+for %%D in (iconengines imageformats platforms styles tls) do if exist "${build_copy_win}\\bin\\${config}\\%%D" (
+  xcopy /E /I /Y "${build_copy_win}\\bin\\${config}\\%%D" "${package_copy_win}\\%%D" >NUL
+  if errorlevel 1 exit /b %errorlevel%
+)
+exit /b 0
+CLANGCL_CMD_EOF
+    info "Visual Studio: ${VS_INSTALL_PATH}"
+    info "Compiler: $("${clang_cl}" --version | head -n1)"
+    MSYS2_ARG_CONV_EXCL='*' cmd.exe /D /C "${batch_win}" ||
+        error "clang-cl ${stage_name} build failed."
+    [[ -f "${package_dir}/citron.exe" ]] ||
+        error "clang-cl build returned success but citron.exe is missing."
+    if [[ "${STAGE}" == "generate" ]]; then
+        mkdir -p "${BUILD_ROOT}"
+        printf "LTO=%s\nPGO=%s\n" "${LTO_MODE}" "${PGO_MODE}" > "${_gen_cfg}"
+    fi
+    local binary_win
+    binary_win="$(cygpath -am "${package_dir}/citron.exe")"
+    success "clang-cl runtime package: ${package_dir}"
+    print_clangcl_stage_guidance "${stage_name}" "${binary_win}" "${config}"
+}
+
 # =============================================================================
 # Argument parsing
 # =============================================================================
@@ -4639,6 +4779,8 @@ while [[ $# -gt 0 ]]; do
                 ir|fe|none) PGO_MODE="$2"; shift 2 ;;
                 *) echo "[ERROR] --pgo-type requires: ir, fe, or none"; exit 1 ;;
             esac ;;
+        --release)
+            BUILD_TYPE="Release"; shift ;;
         --relwithdebinfo)
             BUILD_TYPE="RelWithDebInfo"; shift ;;
         --unity)
@@ -4655,6 +4797,11 @@ while [[ $# -gt 0 ]]; do
             shift 2 ;;
         --llvm-mingw-version)
             LLVM_MINGW_VERSION="$2"; shift 2 ;;
+        --compiler)
+            case "$2" in
+                llvm-mingw|clang-cl) COMPILER_MODE="$2"; shift 2 ;;
+                *) echo "[ERROR] --compiler requires: llvm-mingw or clang-cl"; exit 1 ;;
+            esac ;;
         --help|-h)
             sed -n '/^# USAGE/,/^# ====/p' "$0"
             exit 0 ;;
@@ -4664,6 +4811,15 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$STAGE" ]] || error "No stage specified. Run with --help for usage."
+
+if [[ "${COMPILER_MODE}" == "clang-cl" ]]; then
+    if [[ "${STAGE}" == "setup" ]]; then
+        stage_setup
+        exit 0
+    fi
+    stage_clangcl
+    exit 0
+fi
 
 case "$STAGE" in
     setup)       stage_setup ;;

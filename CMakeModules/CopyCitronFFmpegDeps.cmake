@@ -3,7 +3,7 @@
 
 function(copy_citron_FFmpeg_deps target_dir)
     # Static FFmpeg (Clangtron) — no DLLs to deploy
-    if (DEFINED CITRON_FFMPEG_STATIC_DIR)
+    if (DEFINED CITRON_FFMPEG_STATIC_DIR OR CITRON_CLANGCL)
         return()
     endif()
 

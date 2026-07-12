@@ -1021,9 +1021,18 @@ void MacroJITx64Impl::Compile_Read(Macro::Opcode opcode) {
         int3();
         L(pass_range_check);
     }
+#if defined(__clang__)
+    // Avoid null-pointer offsetof UB under LTO.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Winvalid-offsetof"
+    constexpr std::size_t regs_offset = __builtin_offsetof(Engines::Maxwell3D, regs);
+#pragma clang diagnostic pop
+#else
+    constexpr std::size_t regs_offset = offsetof(Engines::Maxwell3D, regs);
+#endif
     mov(rax, qword[STATE]);
     mov(RESULT,
-        dword[rax + offsetof(Engines::Maxwell3D, regs) +
+        dword[rax + regs_offset +
               offsetof(Engines::Maxwell3D::Regs, reg_array) + RESULT.cvt64() * sizeof(u32)]);
 
     Compile_ProcessResult(opcode.result_operation, opcode.dst);

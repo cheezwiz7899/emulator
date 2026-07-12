@@ -13,12 +13,16 @@ add_executable(tests
     common/ring_buffer.cpp
     common/scratch_buffer.cpp
     common/unique_function.cpp
+    common/uint128.cpp
     core/core_timing.cpp
     core/internal_network/network.cpp
     precompiled_headers.h
     video_core/memory_tracker.cpp
     input_common/calibration_configuration_job.cpp
 )
+
+# Test translation units are not unity-safe.
+set_property(TARGET tests PROPERTY UNITY_BUILD OFF)
 
 create_target_directory_groups(tests)
 

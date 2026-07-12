@@ -44,7 +44,7 @@ namespace Common {
 constexpr size_t PageAlignment = 0x1000;
 constexpr size_t HugePageSize = 0x200000;
 
-[[noreturn]] void CrashHostMemoryInvariant(const char* operation, const char* reason,
+[[noreturn]] static void CrashHostMemoryInvariant(const char* operation, const char* reason,
                                            size_t virtual_offset, size_t host_offset,
                                            size_t length, size_t virtual_size,
                                            size_t backing_size, MemoryPermission perms,

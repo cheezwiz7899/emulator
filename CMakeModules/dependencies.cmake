@@ -50,6 +50,15 @@ endif()
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ── Boost ─────────────────────────────────────────────────────────────────────
+if(CITRON_CLANGCL)
+    set(BOOST_CONTEXT_IMPLEMENTATION fcontext CACHE STRING "" FORCE)
+    # Use Boost's PE/MS-ABI GAS sources with clang's integrated assembler.
+    set(BOOST_CONTEXT_ASSEMBLER clang_gas CACHE STRING "" FORCE)
+    set(BOOST_CONTEXT_ASM_SUFFIX .S CACHE STRING "" FORCE)
+    set(BOOST_CONTEXT_BINARY_FORMAT pe CACHE STRING "" FORCE)
+    set(BOOST_CONTEXT_ABI ms CACHE STRING "" FORCE)
+endif()
+
 if (NOT TARGET Boost::headers)
     set(BOOST_INCLUDE_LIBRARIES "algorithm;asio;container;context;crc;heap;icl;intrusive;process;range;spirit;test;timer;variant" CACHE STRING "Boost components to build")
     set(BOOST_ENABLE_CMAKE ON CACHE BOOL "Enable Boost CMake")
@@ -124,6 +133,10 @@ if (NOT TARGET ZLIB::ZLIB)
         add_library(ZLIB::ZLIB ALIAS zlibstatic)
         set(ZLIB_FOUND TRUE CACHE BOOL "" FORCE)
         set(ZLIB_INCLUDE_DIRS "${ZLIB_SOURCE_DIR};${ZLIB_BINARY_DIR}" CACHE PATH "" FORCE)
+    endif()
+    if (CITRON_CLANGCL AND TARGET zlib)
+        # Only zlibstatic is used.
+        set_target_properties(zlib PROPERTIES EXCLUDE_FROM_ALL TRUE)
     endif()
 endif()
 
@@ -268,7 +281,7 @@ endif()
 
 # ── SPIRV-Headers ─────────────────────────────────────────────────────────────
 # Must be declared before sirit.
-if (NOT TARGET SPIRV-Headers)
+if (NOT CITRON_CLANGCL AND NOT TARGET SPIRV-Headers)
     CPMAddPackage(
         NAME SPIRV-Headers
         GITHUB_REPOSITORY KhronosGroup/SPIRV-Headers
@@ -295,6 +308,16 @@ endif()
 
 # ── opus ──────────────────────────────────────────────────────────────────────
 if (NOT TARGET Opus::opus)
+    set(_opus_cpm_patches "")
+    if (CITRON_CLANGCL)
+        # Opus only applies -msse4.1 under `if (NOT MSVC)`, but CMake's MSVC
+        # var is TRUE for clang-cl too, so that branch never fires — hence
+        # "requires target feature 'sse4.1'" errors. Can't fix this from here
+        # (set_source_files_properties is directory-scoped); must patch opus's
+        # own CMakeLists.txt to add an elseif for clang-cl detection.
+        list(APPEND _opus_cpm_patches "${CMAKE_SOURCE_DIR}/patches/opus-clangcl-sse4.patch")
+    endif()
+
     CPMAddPackage(
         NAME opus
         GITHUB_REPOSITORY xiph/opus
@@ -304,7 +327,10 @@ if (NOT TARGET Opus::opus)
             "OPUS_BUILD_PROGRAMS OFF"
             "OPUS_INSTALL_PKG_CONFIG_MODULE OFF"
             "OPUS_INSTALL_CMAKE_CONFIG_MODULE OFF"
+        PATCHES
+            ${_opus_cpm_patches}
     )
+    unset(_opus_cpm_patches)
 endif()
 
 # ── cubeb ─────────────────────────────────────────────────────────────────────
@@ -317,6 +343,7 @@ if (ENABLE_CUBEB AND NOT TARGET cubeb::cubeb)
             "BUILD_TESTS OFF"
             "BUILD_TOOLS OFF"
             "BUILD_RUST_LIBS OFF"
+            "BUNDLE_SPEEX ${CITRON_CLANGCL}"
     )
     if (TARGET cubeb AND NOT TARGET cubeb::cubeb)
         add_library(cubeb::cubeb ALIAS cubeb)
@@ -341,6 +368,7 @@ if (CITRON_USE_EXTERNAL_SDL2 AND NOT TARGET SDL2::SDL2)
             "SDL_SHARED OFF"
             "SDL_STATIC ON"
             "SDL_TEST OFF"
+            "SDL_FORCE_STATIC_VCRT OFF"
     )
 endif()
 
@@ -380,12 +408,29 @@ endif()
 # ── sirit (yuzu-mirror fork) ──────────────────────────────────────────────────
 # sirit needs SPIRV-Headers. CPM already populated it above.
 if (NOT TARGET sirit)
-    set(SIRIT_USE_SYSTEM_SPIRV_HEADERS ON)
+    if(CITRON_CLANGCL)
+        set(SIRIT_USE_SYSTEM_SPIRV_HEADERS OFF)
+    else()
+        set(SIRIT_USE_SYSTEM_SPIRV_HEADERS ON)
+    endif()
     CPMAddPackage(
         NAME sirit
         GITHUB_REPOSITORY yuzu-mirror/sirit
         GIT_TAG ab75463999f4f3291976b079d42d52ee91eebf3f
     )
+    if (CITRON_CLANGCL AND TARGET sirit)
+        get_target_property(_sirit_compile_options sirit COMPILE_OPTIONS)
+        if (_sirit_compile_options)
+            set(_sirit_filtered_compile_options "")
+            foreach(_sirit_option IN LISTS _sirit_compile_options)
+                string(TOLOWER "${_sirit_option}" _sirit_option_lower)
+                if (NOT _sirit_option_lower MATCHES "/zc:throwingnew")
+                    list(APPEND _sirit_filtered_compile_options "${_sirit_option}")
+                endif()
+            endforeach()
+            set_property(TARGET sirit PROPERTY COMPILE_OPTIONS "${_sirit_filtered_compile_options}")
+        endif()
+    endif()
 endif()
 
 # ── dynarmic (xinitrcn1 fork) ─────────────────────────────────────────────────
@@ -403,7 +448,6 @@ if ((ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64) AND NOT (MSVC AND ARCHITECTURE_a
         if (TARGET dynarmic AND NOT TARGET dynarmic::dynarmic)
             add_library(dynarmic::dynarmic ALIAS dynarmic)
         endif()
-
         if (CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND dynarmic_ADDED)
             execute_process(
                 COMMAND git apply --ignore-whitespace
@@ -493,6 +537,12 @@ endif()
 #
 # On Windows: the build script pre-builds static FFmpeg before cmake runs and
 # passes CITRON_FFMPEG_STATIC_DIR.  The CPM download is then informational only.
+
+# clang-cl builds MSVC ABI FFmpeg below.
+if(CITRON_CLANGCL)
+    unset(CITRON_FFMPEG_STATIC_DIR CACHE)
+    unset(CITRON_FFMPEG_STATIC_DIR)
+endif()
 
 if (DEFINED CITRON_FFMPEG_STATIC_DIR)
     # Pre-built static libs supplied externally (Windows build script path).

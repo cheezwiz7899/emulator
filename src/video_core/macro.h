@@ -166,7 +166,7 @@ struct MacroInterpreterImpl final {
     u32 GetRegister(u32 register_id) const;
     void SetRegister(u32 register_id, u32 value);
     /// Sets the method address to use for the next Send instruction.
-    [[nodiscard]] inline void SetMethodAddress(u32 address) noexcept {
+    inline void SetMethodAddress(u32 address) noexcept {
         method_address.raw = address;
     }
     void Send(Engines::Maxwell3D& maxwell3d, u32 value);

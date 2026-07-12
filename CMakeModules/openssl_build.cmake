@@ -17,7 +17,18 @@
 # execute_process during cmake configure.
 
 set(_OPENSSL_VERSION "3.4.1")
-set(_OPENSSL_INSTALL "${CMAKE_BINARY_DIR}/externals/openssl-install")
+
+# ── clang-cl global artifact cache ──────────────────────────────────────────
+# When CLANGCL_OPENSSL_CACHE_DIR is set (by build-clangtron-windows.sh), the
+# built OpenSSL install is stored there (under CPM_SOURCE_CACHE) rather than
+# in the per-stage cmake binary dir.  This lets generate/csgenerate/use stages
+# share a single OpenSSL build and survive binary-dir rebuilds.
+if (DEFINED CLANGCL_OPENSSL_CACHE_DIR AND NOT "${CLANGCL_OPENSSL_CACHE_DIR}" STREQUAL "")
+    set(_OPENSSL_INSTALL "${CLANGCL_OPENSSL_CACHE_DIR}")
+    message(STATUS "[OpenSSL] Using global clang-cl cache dir: ${_OPENSSL_INSTALL}")
+else()
+    set(_OPENSSL_INSTALL "${CMAKE_BINARY_DIR}/externals/openssl-install")
+endif()
 
 # OpenSSL's Perl Configure script cannot handle spaces in the working directory
 # or source path (same limitation as FFmpeg's configure).  When CMAKE_BINARY_DIR
@@ -61,7 +72,33 @@ set(_OPENSSL_AR     "${CMAKE_AR}")
 set(_OPENSSL_RANLIB "${CMAKE_RANLIB}")
 set(_OPENSSL_RC     "${CMAKE_RC_COMPILER}")
 
-if (CMAKE_CROSSCOMPILING AND CMAKE_C_COMPILER MATCHES "x86_64-w64-mingw32")
+set(_OPENSSL_BUILD_TOOL make)
+set(_OPENSSL_PARALLEL_ARGS "-j${_NPROC}")
+set(_OPENSSL_SSL_NAME "libssl.a")
+set(_OPENSSL_CRYPTO_NAME "libcrypto.a")
+
+set(_OPENSSL_EXTRA_CFLAGS "")
+
+if (WIN32 AND MSVC AND CMAKE_C_COMPILER_ID MATCHES "Clang")
+    set(_OPENSSL_TARGET "VC-WIN64A")
+    set(_OPENSSL_CC "clang-cl")
+    set(_OPENSSL_AR "llvm-lib")
+    set(_OPENSSL_RANLIB "")
+    set(_OPENSSL_RC "rc")
+    find_program(_OPENSSL_JOM jom)
+    if (_OPENSSL_JOM)
+        set(_OPENSSL_BUILD_TOOL "${_OPENSSL_JOM}")
+    else()
+        set(_OPENSSL_BUILD_TOOL nmake)
+    endif()
+    set(_OPENSSL_SSL_NAME "libssl.lib")
+    set(_OPENSSL_CRYPTO_NAME "libcrypto.lib")
+    # LTO/PGO flags from build-clangtron-windows.sh's clang-cl stage (pgo_flags_dash).
+    # Only read inside VC-WIN64A — llvm-mingw and Linux paths never reach this branch.
+    if (DEFINED CLANGCL_OPENSSL_EXTRA_CFLAGS AND NOT "${CLANGCL_OPENSSL_EXTRA_CFLAGS}" STREQUAL "")
+        set(_OPENSSL_EXTRA_CFLAGS "${CLANGCL_OPENSSL_EXTRA_CFLAGS}")
+    endif()
+elseif (CMAKE_CROSSCOMPILING AND CMAKE_C_COMPILER MATCHES "x86_64-w64-mingw32")
     # Case 2: Linux → Windows cross-compile with llvm-mingw.
     set(_OPENSSL_TARGET "mingw64")
     set(_OPENSSL_CROSS  "x86_64-w64-mingw32-")
@@ -89,7 +126,8 @@ endif()
 function(_citron_detect_openssl_libdir out_var)
     set(_detected "")
     foreach(_candidate_libdir lib64 lib)
-        if (EXISTS "${_OPENSSL_INSTALL}/${_candidate_libdir}/libssl.a")
+        if (EXISTS "${_OPENSSL_INSTALL}/${_candidate_libdir}/${_OPENSSL_SSL_NAME}" AND
+            EXISTS "${_OPENSSL_INSTALL}/${_candidate_libdir}/${_OPENSSL_CRYPTO_NAME}")
             set(_detected "${_candidate_libdir}")
             break()
         endif()
@@ -100,14 +138,14 @@ endfunction()
 function(_citron_publish_openssl_imports)
     _citron_detect_openssl_libdir(_OPENSSL_PUBLISH_LIBDIR)
     if (NOT _OPENSSL_PUBLISH_LIBDIR)
-        message(WARNING "[OpenSSL] Static libraries not found under ${_OPENSSL_INSTALL}/{lib64,lib}")
+        message(WARNING "[OpenSSL] Static libraries (${_OPENSSL_SSL_NAME} and/or ${_OPENSSL_CRYPTO_NAME}) not found under ${_OPENSSL_INSTALL}/{lib64,lib}")
         return()
     endif()
 
     set(OPENSSL_ROOT_DIR     "${_OPENSSL_INSTALL}" CACHE PATH     "" FORCE)
     set(OPENSSL_INCLUDE_DIR  "${_OPENSSL_INSTALL}/include" CACHE PATH "" FORCE)
-    set(OPENSSL_SSL_LIBRARY  "${_OPENSSL_INSTALL}/${_OPENSSL_PUBLISH_LIBDIR}/libssl.a"    CACHE FILEPATH "" FORCE)
-    set(OPENSSL_CRYPTO_LIBRARY "${_OPENSSL_INSTALL}/${_OPENSSL_PUBLISH_LIBDIR}/libcrypto.a" CACHE FILEPATH "" FORCE)
+    set(OPENSSL_SSL_LIBRARY  "${_OPENSSL_INSTALL}/${_OPENSSL_PUBLISH_LIBDIR}/${_OPENSSL_SSL_NAME}" CACHE FILEPATH "" FORCE)
+    set(OPENSSL_CRYPTO_LIBRARY "${_OPENSSL_INSTALL}/${_OPENSSL_PUBLISH_LIBDIR}/${_OPENSSL_CRYPTO_NAME}" CACHE FILEPATH "" FORCE)
     set(OPENSSL_FOUND TRUE CACHE BOOL "" FORCE)
 
     # Platform-specific link requirements:
@@ -171,6 +209,22 @@ if (_OPENSSL_LIBDIR AND _OPENSSL_IS_MINGW_CROSS)
     endif()
 endif()
 
+# Flag sentinel for VC-WIN64A: if cached flags don't match current, force rebuild.
+# The CLANGCL_OPENSSL_CACHE_DIR path key is the primary protection; this is a fallback.
+if (_OPENSSL_LIBDIR AND _OPENSSL_TARGET STREQUAL "VC-WIN64A")
+    set(_openssl_flags_sentinel "${_OPENSSL_INSTALL}/.citron-clangcl-extra-cflags")
+    set(_openssl_flags_sentinel_content "")
+    if (EXISTS "${_openssl_flags_sentinel}")
+        file(READ "${_openssl_flags_sentinel}" _openssl_flags_sentinel_content)
+        string(STRIP "${_openssl_flags_sentinel_content}" _openssl_flags_sentinel_content)
+    endif()
+    if (NOT _openssl_flags_sentinel_content STREQUAL "${_OPENSSL_EXTRA_CFLAGS}")
+        message(STATUS "[OpenSSL] Cached build's recorded flags don't match the current build's; rebuilding")
+        file(REMOVE_RECURSE "${_OPENSSL_BUILD_DIR}" "${_OPENSSL_INSTALL}")
+        set(_OPENSSL_LIBDIR "")
+    endif()
+endif()
+
 # Reuse a previously built cross OpenSSL only when the install tree is intact.
 if (_OPENSSL_LIBDIR)
     _citron_publish_openssl_imports()
@@ -191,7 +245,11 @@ if (NOT openssl_src_ADDED)
 endif()
 
 # ── Build from source ────────────────────────────────────────────────────────
-find_program(_PERL perl REQUIRED)
+if (PERL_EXECUTABLE)
+    set(_PERL "${PERL_EXECUTABLE}")
+else()
+    find_program(_PERL perl REQUIRED)
+endif()
 if (NOT _PERL)
     message(FATAL_ERROR "[OpenSSL] Perl is required to build OpenSSL from source")
 endif()
@@ -213,6 +271,10 @@ set(_openssl_env_path "$ENV{PATH}")
 if (_OPENSSL_CROSS)
     get_filename_component(_openssl_tool_dir "${CMAKE_C_COMPILER}" DIRECTORY)
     set(_openssl_env_path "${_openssl_tool_dir}:$ENV{PATH}")
+endif()
+if (WIN32 AND MSVC AND _OPENSSL_NASM)
+    get_filename_component(_openssl_nasm_dir "${_OPENSSL_NASM}" DIRECTORY)
+    set(_openssl_env_path "${_openssl_nasm_dir};${_openssl_env_path}")
 endif()
 
 # Determine what we are building for (for the status message).
@@ -267,11 +329,25 @@ set(_OPENSSL_CONFIGURE_ARGS
 if (_OPENSSL_CROSS)
     list(APPEND _OPENSSL_CONFIGURE_ARGS "--cross-compile-prefix=${_OPENSSL_CROSS}")
 endif()
-list(APPEND _OPENSSL_CONFIGURE_ARGS
-    "CC=${_OPENSSL_CC}"
-    "AR=${_OPENSSL_AR}"
-    "RANLIB=${_OPENSSL_RANLIB}"
-)
+if (_OPENSSL_TARGET STREQUAL "VC-WIN64A")
+    # The rest of the project is forced onto the dynamic CRT (/MD, /MDd) via
+    # CMAKE_MSVC_RUNTIME_LIBRARY in the top-level CMakeLists.txt. OpenSSL's
+    # VC-WIN64A Configure target does not automatically match that; passing
+    # -MD here pins OpenSSL's own build to the same CRT so its static libs
+    # don't get linked against a mismatched runtime (which otherwise shows up
+    # as CRT-mismatch link errors, e.g. LNK2038/LNK4098-style conflicts).
+    list(APPEND _OPENSSL_CONFIGURE_ARGS "-MD")
+    if (_OPENSSL_EXTRA_CFLAGS)
+        # Configure uses [-Dxxx] [-fxxx] bare token syntax — pass dash-prefixed flags,
+        # not /clang:-prefixed (which is clang-cl driver syntax, not plain token-splitting).
+        separate_arguments(_openssl_extra_cflags_list UNIX_COMMAND "${_OPENSSL_EXTRA_CFLAGS}")
+        list(APPEND _OPENSSL_CONFIGURE_ARGS ${_openssl_extra_cflags_list})
+    endif()
+endif()
+list(APPEND _OPENSSL_CONFIGURE_ARGS "CC=${_OPENSSL_CC}" "AR=${_OPENSSL_AR}")
+if (_OPENSSL_RANLIB)
+    list(APPEND _OPENSSL_CONFIGURE_ARGS "RANLIB=${_OPENSSL_RANLIB}")
+endif()
 if (_OPENSSL_RC)
     list(APPEND _OPENSSL_CONFIGURE_ARGS "RC=${_OPENSSL_RC}")
 endif()
@@ -296,10 +372,19 @@ ProcessorCount(_NPROC)
 if (_NPROC EQUAL 0)
     set(_NPROC 4)
 endif()
+if (_OPENSSL_BUILD_TOOL MATCHES "(^|[/\\\\])(make|jom)(\\.exe)?$")
+    set(_OPENSSL_PARALLEL_ARGS "-j${_NPROC}")
+else()
+    set(_OPENSSL_PARALLEL_ARGS "")
+endif()
+set(_OPENSSL_INSTALL_TOOL "${_OPENSSL_BUILD_TOOL}")
+if (_OPENSSL_BUILD_TOOL MATCHES "(^|[/\\\\])jom(\\.exe)?$")
+    set(_OPENSSL_INSTALL_TOOL nmake)
+endif()
 
 execute_process(
     COMMAND ${CMAKE_COMMAND} -E env "PATH=${_openssl_env_path}"
-        make -j${_NPROC} build_libs
+        ${_OPENSSL_BUILD_TOOL} ${_OPENSSL_PARALLEL_ARGS} build_libs
     WORKING_DIRECTORY "${_OPENSSL_BUILD_DIR}"
     RESULT_VARIABLE _ssl_build_result
     OUTPUT_QUIET
@@ -309,9 +394,15 @@ if (NOT _ssl_build_result EQUAL 0)
     message(FATAL_ERROR "[OpenSSL] Build failed (exit ${_ssl_build_result}).")
 endif()
 
+# VC install expects this file even when clang-cl does not emit it.
+if (_OPENSSL_INSTALL_TOOL STREQUAL "nmake" AND
+    NOT EXISTS "${_OPENSSL_BUILD_DIR}/ossl_static.pdb")
+    file(TOUCH "${_OPENSSL_BUILD_DIR}/ossl_static.pdb")
+endif()
+
 execute_process(
     COMMAND ${CMAKE_COMMAND} -E env "PATH=${_openssl_env_path}"
-        make install_sw
+        ${_OPENSSL_INSTALL_TOOL} install_sw
     WORKING_DIRECTORY "${_OPENSSL_BUILD_DIR}"
     RESULT_VARIABLE _ssl_install_result
     OUTPUT_QUIET
@@ -322,5 +413,10 @@ if (NOT _ssl_install_result EQUAL 0)
 endif()
 
 message(STATUS "[OpenSSL] Successfully built static OpenSSL ${_OPENSSL_VERSION}")
+
+# Write flag sentinel for future cache reuse validation.
+if (_OPENSSL_TARGET STREQUAL "VC-WIN64A")
+    file(WRITE "${_OPENSSL_INSTALL}/.citron-clangcl-extra-cflags" "${_OPENSSL_EXTRA_CFLAGS}")
+endif()
 
 _citron_publish_openssl_imports()

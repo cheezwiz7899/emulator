@@ -317,6 +317,9 @@ add_executable(citron
     citron.rc
 )
 
+# Qt AUTOGEN/RCC sources are not unity-safe.
+set_property(TARGET citron PROPERTY UNITY_BUILD OFF)
+
 set_source_files_properties(controller_overlay.cpp PROPERTIES SKIP_AUTOUIC ON)
 
 if (CITRON_CRASH_DUMPS)
@@ -661,9 +664,11 @@ if (ENABLE_SDL2)
 endif()
 
 if (MSVC)
-    include(CopyCitronSDLDeps)
+    if (CITRON_USE_BUNDLED_SDL2)
+        include(CopyCitronSDLDeps)
+        copy_citron_SDL_deps(citron)
+    endif()
     include(CopyCitronFFmpegDeps)
-    copy_citron_SDL_deps(citron)
     copy_citron_FFmpeg_deps(citron)
 elseif(MINGW)
     include(CopyMinGWDeps)
