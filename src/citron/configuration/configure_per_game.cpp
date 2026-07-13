@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -1192,9 +1193,10 @@ void ConfigurePerGame::OnTrimXCI() {
     }
 
     const std::filesystem::path filepath = file_name;
-    const std::string extension = filepath.extension().string();
-    if (extension != ".xci" && extension != ".XCI" && extension != ".dxci" &&
-        extension != ".DXCI") {
+    std::string extension = filepath.extension().string();
+    std::transform(extension.begin(), extension.end(), extension.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    if (extension != ".xci" && extension != ".dxci") {
         QMessageBox::warning(this, tr("Trim XCI File"),
                              tr("This feature only works with XCI files."));
         return;
