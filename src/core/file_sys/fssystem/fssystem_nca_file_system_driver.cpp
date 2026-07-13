@@ -905,6 +905,13 @@ Result NcaFileSystemDriver::CreateAesCtrExStorage(
     // Create bucket storages.
     auto data_storage =
         std::make_shared<OffsetVfsFile>(std::move(base_storage), data_size, data_offset);
+
+    // Pre-decrypted "DNCA" content needs no decryption here
+    if (m_reader->GetMagic() == NcaHeader::MagicDecrypted) {
+        *out = std::move(data_storage);
+        R_SUCCEED();
+    }
+
     auto node_storage = std::make_shared<OffsetVfsFile>(meta_storage, node_size, node_offset);
     auto entry_storage = std::make_shared<OffsetVfsFile>(meta_storage, entry_size, entry_offset);
 
