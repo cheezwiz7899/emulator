@@ -112,10 +112,6 @@ public:
 
     void NotifySegment(bool resume);
 
-    // Satisfies the Vulkan spec requirement that conditional rendering must end before
-    // vkCmdEndRenderPass, without closing ZPass or StreamingByteCount counters.
-    void PauseConditionalRenderingOnly();
-
     void BindToChannel(s32 id) override;
 
 protected:

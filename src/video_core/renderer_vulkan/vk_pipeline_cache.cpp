@@ -61,6 +61,7 @@ using VideoCommon::GraphicsEnvironment;
 using VideoCommon::SpirvKey;
 using VideoCommon::ComputeCbufKey;
 using VideoCommon::ComputeTextureKey;
+using VideoCommon::ComputeBindingKey;
 
 // PIPELINE_CACHE_VERSION is defined as inline constexpr in vk_pipeline_cache.h.
 // Use it here directly — single source of truth for the version number.
@@ -859,7 +860,37 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         const u64 texture_key = gen_env_stage
             ? ComputeTextureKey(gen_env_stage->CapturedTextureTypes(), gen_env_stage->CapturedTexturePixelFormats())
             : 0;
-        const u64 runtime_key = runtime_info.Hash();
+        u64 runtime_key = runtime_info.Hash();
+        if (stage_envs[index]->ShaderStage() == Shader::Stage::VertexB) {
+            // env.ReadViewportTransformState() is not stored in RuntimeInfo, but
+            // PositionPass() (ir_opt/position_pass.cpp) branches on it directly during
+            // TranslateProgram() above, before runtime_info even exists: when the real
+            // GPU's viewport_scale_offset_enabled is 0, the vertex shader must do a
+            // manual render-area-relative position remap; when it's 1, it must not.
+            // Without folding this bit into the key, a VertexB program compiled under
+            // one state (e.g. a speculative pre-cache guess, which always assumes 1)
+            // can be served to a draw using the other state, silently skipping/adding
+            // the remap and corrupting vertex output — most visible on screen-space
+            // overlay/UI-style geometry.
+            const u64 viewport_transform_state = stage_envs[index]->ReadViewportTransformState();
+            runtime_key ^= viewport_transform_state + 0x9e3779b97f4a7c15ULL +
+                            (runtime_key << 6) + (runtime_key >> 2);
+        }
+        // `binding` at this point holds the starting Bindings accumulator for THIS
+        // stage — the same state EmitSPIRV() below (or a prior cached compile) uses
+        // to bake absolute descriptor binding numbers into the SPIR-V. It is not
+        // otherwise part of the cache key. Two lookups can share unique_hash/cbuf_key/
+        // runtime_key/texture_key while genuinely needing different starting bindings
+        // — e.g. the same fragment shader paired with two different preceding vertex
+        // shaders that consume different descriptor counts, or (in practice, the more
+        // common case) a real draw with no captured cbuf values (cbuf_key == 0)
+        // colliding with a speculative pre-cache entry, which always assumes a
+        // starting state of all-zero. Folding this in turns that collision into a
+        // clean cache miss instead of silently serving SPIR-V with bindings baked in
+        // for the wrong starting offset — which is exactly what produces "descriptor
+        // used by shader but not declared in the pipeline layout" validation errors.
+        const u64 binding_key = ComputeBindingKey(binding);
+        runtime_key ^= binding_key + 0x9e3779b97f4a7c15ULL + (runtime_key << 6) + (runtime_key >> 2);
         const SpirvKey spirv_key{key.unique_hashes[index], cbuf_key, runtime_key, texture_key};
         std::vector<u32> code;
         const bool is_merged_vertex = uses_vertex_a && uses_vertex_b && index == 1;
@@ -1184,7 +1215,29 @@ void PipelineCache::SubmitSpeculativeShader(
             }
             auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, rt, program, binding);
             const u64 texture_key = ComputeTextureKey(env.CapturedTextureTypes(), env.CapturedTexturePixelFormats());
-            spirv_cache.InsertSpeculative(unique_hash, rt.Hash(), texture_key, std::move(spirv));
+            u64 runtime_key = rt.Hash();
+            if (stage == Shader::Stage::VertexB) {
+                // Must match the fold applied on the live path in CreateGraphicsPipeline().
+                // SpeculativeShaderEnvironment::ReadViewportTransformState() always
+                // guesses 1 (see speculative_shader_environment.h) since the real value
+                // is GPU register state, not something derivable from shader bytecode.
+                // Folding the guess into the key means a real draw whose GPU state is
+                // actually 0 will correctly MISS this cache entry and fall back to a
+                // live, correctly-specialised compile instead of silently reusing a
+                // program built with the wrong PositionPass() decision baked in.
+                const u64 viewport_transform_state = env.ReadViewportTransformState();
+                runtime_key ^= viewport_transform_state + 0x9e3779b97f4a7c15ULL +
+                                (runtime_key << 6) + (runtime_key >> 2);
+            }
+            // Must match the fold applied on the live path in CreateGraphicsPipeline().
+            // Speculative compiles always start from an all-zero Bindings accumulator
+            // (see `binding{}` above) — NOT the post-EmitSPIRV `binding`, which has
+            // since been advanced past this stage's slots. Using a fresh zero value
+            // here (rather than the mutated variable) is what actually matches what
+            // was baked into `spirv`.
+            const u64 binding_key = ComputeBindingKey(Shader::Backend::Bindings{});
+            runtime_key ^= binding_key + 0x9e3779b97f4a7c15ULL + (runtime_key << 6) + (runtime_key >> 2);
+            spirv_cache.InsertSpeculative(unique_hash, runtime_key, texture_key, std::move(spirv));
             if (!spirv_cache_filename.empty()) {
                 serialization_thread.QueueWork([this] {
                     spirv_cache.SaveThrottled(spirv_cache_filename);

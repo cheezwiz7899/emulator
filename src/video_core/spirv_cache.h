@@ -55,6 +55,23 @@ u64 ComputeTextureKey(const std::unordered_map<u32, Shader::TextureType>& textur
                       const std::unordered_map<u32, Shader::TexturePixelFormat>& texture_pixel_formats);
 
 // ---------------------------------------------------------------------------
+// ComputeBindingKey — hash of the *starting* descriptor binding state (the
+// Bindings accumulator as it stood immediately before EmitSPIRV ran for this
+// stage). EmitSPIRV bakes absolute descriptor binding numbers into the SPIR-V
+// relative to this starting point, but nothing about it was previously part
+// of SpirvKey. Two calls with identical unique_hash/cbuf_key/runtime_key/
+// texture_key can still legitimately have different starting bindings (e.g.
+// the same fragment shader reused after two different vertex shaders that
+// consume a different number of descriptor slots, or — critically — a real
+// draw colliding with a speculative pre-cache entry, which always assumes a
+// starting state of all-zero). Folding this in turns that collision into a
+// clean cache miss instead of silently serving structurally incompatible
+// SPIR-V.
+// ---------------------------------------------------------------------------
+u64 ComputeBindingKey(const Shader::Backend::Bindings& starting_binding);
+
+
+// ---------------------------------------------------------------------------
 // SpirvCache — thread-safe store of pre-translated SPIR-V programs.
 //
 // On-disk format (spirv_cache.bin):

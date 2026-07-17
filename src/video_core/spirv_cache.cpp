@@ -11,7 +11,7 @@
 
 namespace {
 constexpr std::array<char, 8> SPIRV_CACHE_MAGIC{'c', 'i', 't', 'r', 's', 'p', 'v', '\0'};
-constexpr u32 SPIRV_CACHE_VERSION = 2; // v2: adds Bindings end_binding per entry
+constexpr u32 SPIRV_CACHE_VERSION = 3; // v3: runtime_key now also folds in viewport_transform_state (VertexB) and the starting Bindings state (all stages)
 } // anonymous namespace
 
 namespace VideoCommon {
@@ -42,6 +42,21 @@ u64 ComputeTextureKey(const std::unordered_map<u32, Shader::TextureType>& textur
         hash ^= format_hash + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
     }
     return hash;
+}
+
+u64 ComputeBindingKey(const Shader::Backend::Bindings& starting_binding) {
+    // Deliberately not gated on "is this stage the first one" — a caller with an
+    // all-zero starting state (the true first stage, or a speculative pre-cache
+    // entry, which always assumes zero) still needs a stable, reproducible hash
+    // so that real non-leading-stage lookups/inserts with a genuinely non-zero
+    // starting state land on a *different* key rather than coincidentally 0.
+    const u32 fields[] = {
+        starting_binding.unified,       starting_binding.uniform_buffer,
+        starting_binding.storage_buffer, starting_binding.texture,
+        starting_binding.image,         starting_binding.texture_scaling_index,
+        starting_binding.image_scaling_index,
+    };
+    return Common::CityHash64(reinterpret_cast<const char*>(fields), sizeof(fields));
 }
 
 void SpirvCache::Load(const std::filesystem::path& path) {

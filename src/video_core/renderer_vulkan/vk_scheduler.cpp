@@ -294,13 +294,6 @@ void Scheduler::EndRenderPass() {
     if (!state.renderpass) {
         return;
     }
-    // The Vulkan spec forbids vkCmdEndRenderPass while conditional rendering is active.
-    // Pause only conditional rendering — ZPass and StreamingByteCount must NOT be closed
-    // here. These counters survive citron-internal render-pass splits invisibly; the game
-    // never sees the split and never re-enables them after it.
-    if (query_cache && Settings::IsGPULevelNormal()) {
-        query_cache->PauseConditionalRenderingOnly();
-    }
     Record([num_images = num_renderpass_images, images = renderpass_images,
             ranges = renderpass_image_ranges](vk::CommandBuffer cmdbuf) {
         std::array<VkImageMemoryBarrier, 9> barriers;
