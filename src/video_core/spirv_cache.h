@@ -12,6 +12,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include <ankerl/unordered_dense.h>
+
 #include "common/common_types.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/shader_info.h"
@@ -55,18 +57,22 @@ u64 ComputeTextureKey(const std::unordered_map<u32, Shader::TextureType>& textur
                       const std::unordered_map<u32, Shader::TexturePixelFormat>& texture_pixel_formats);
 
 // ---------------------------------------------------------------------------
-// ComputeBindingKey — hash of the *starting* descriptor binding state (the
-// Bindings accumulator as it stood immediately before EmitSPIRV ran for this
-// stage). EmitSPIRV bakes absolute descriptor binding numbers into the SPIR-V
-// relative to this starting point, but nothing about it was previously part
-// of SpirvKey. Two calls with identical unique_hash/cbuf_key/runtime_key/
-// texture_key can still legitimately have different starting bindings (e.g.
-// the same fragment shader reused after two different vertex shaders that
-// consume a different number of descriptor slots, or — critically — a real
-// draw colliding with a speculative pre-cache entry, which always assumes a
-// starting state of all-zero). Folding this in turns that collision into a
-// clean cache miss instead of silently serving structurally incompatible
-// SPIR-V.
+// ComputeBindingKey — returns 0 if the starting Bindings state (the
+// accumulator as it stood immediately before EmitSPIRV ran for this stage)
+// is all-zero — i.e. this is genuinely the leading stage of a pipeline, or a
+// speculative pre-cache entry (which always assumes it is) — and 1
+// otherwise. This is intentionally a single bit, not a full hash of the
+// state: it exists only to stop a real, non-leading-stage draw (non-zero
+// starting binding) from matching a speculative entry (always zero), which
+// is a genuine structural incompatibility — EmitSPIRV bakes absolute
+// descriptor binding numbers into the SPIR-V relative to the starting point,
+// so serving a zero-based speculative entry into a non-zero-based context
+// produces descriptors that don't match the pipeline layout. It deliberately
+// does NOT distinguish between two different non-zero starting states (e.g.
+// the same fragment shader reused after two different vertex shaders with
+// different descriptor counts) — that risk is unconfirmed, and fragmenting
+// the cache on it collapses the pre-cache's hit rate for most real
+// rendering, with no stutter-reduction benefit and higher overhead.
 // ---------------------------------------------------------------------------
 u64 ComputeBindingKey(const Shader::Backend::Bindings& starting_binding);
 
@@ -132,13 +138,20 @@ public:
     [[nodiscard]] size_t HitCount() const noexcept { return hit_count_.load(); }
     /// Total number of Lookup() calls (hit or miss) since construction.
     [[nodiscard]] size_t LookupCount() const noexcept { return lookup_count_.load(); }
+    /// Number of entries inserted via InsertSpeculative() since construction.
+    [[nodiscard]] size_t SpeculativeInsertCount() const noexcept { return speculative_insert_count_.load(); }
+    /// Number of entries inserted via the real (non-speculative) Insert() overloads since construction.
+    [[nodiscard]] size_t RealInsertCount() const noexcept { return real_insert_count_.load(); }
 
     [[nodiscard]] size_t Size() const;
 
     // Insert a real runtime-compiled entry (keyed with actual cbuf values and runtime info).
     // end_binding is the Bindings state immediately after EmitSPIRV returned for this stage.
+    // is_speculative is set internally by InsertSpeculative() — it exists purely so
+    // SpeculativeInsertCount()/RealInsertCount() can attribute correctly; it does not
+    // otherwise change behavior. Existing callers are unaffected by the default.
     void Insert(const SpirvKey& key, std::vector<u32> spirv,
-                const Shader::Backend::Bindings& end_binding);
+                const Shader::Backend::Bindings& end_binding, bool is_speculative = false);
     void Insert(u64 unique_hash, const std::unordered_map<u64, u32>& cbuf_values,
                 u64 runtime_key, u64 texture_key, std::vector<u32> spirv,
                 const Shader::Backend::Bindings& end_binding);
@@ -161,14 +174,39 @@ private:
         std::shared_ptr<const std::vector<u32>> spirv;
         Shader::Backend::Bindings end_binding; // binding state after EmitSPIRV for this stage
     };
-    std::unordered_map<SpirvKey, Entry, SpirvKeyHash> entries_;
+    ankerl::unordered_dense::map<SpirvKey, Entry, SpirvKeyHash> entries_;
+    // Secondary index: which unique_hashes have at least one entry in entries_.
+    // ContainsByUniqueHash() used to be an O(N) linear scan over entries_ —
+    // called on every shader the ROM pre-cache scanner considers, AND on every
+    // live shader translation via OnNewShaderSeen — which got slower over the
+    // course of a play session as entries_ grew, rather than staying flat.
+    // This set makes that check O(1). Kept in sync in the one place entries_
+    // is actually mutated (the SpirvKey overload of Insert()) and rebuilt
+    // during Load().
+    ankerl::unordered_dense::set<u64> unique_hashes_;
     mutable bool dirty_{false};
     mutable std::atomic<size_t> hit_count_{0};
     mutable std::atomic<size_t> lookup_count_{0};
+    // Speculative vs. real insert counts — split by which Insert() overload
+    // last touched a given entry is not tracked per-entry, but the totals
+    // are useful to know whether the pre-cache scanner is contributing
+    // anything at all, or whether every entry is coming from the live path.
+    mutable std::atomic<size_t> speculative_insert_count_{0};
+    mutable std::atomic<size_t> real_insert_count_{0};
 
     // Throttle state for SaveThrottled — updated under mutex_.
     mutable size_t saved_entry_count_{0};
     mutable std::chrono::steady_clock::time_point last_save_time_{};
+
+    // Baselines for the periodic windowed hit-rate log emitted by
+    // SaveThrottled(). A cumulative-since-boot hit rate blends the initial
+    // disk-cache warm-up (usually near 100%) with live-play behavior
+    // (which is what actually matters for judging stutter reduction), so it
+    // can look healthy even while live hit rate has collapsed. These track
+    // "since the last log line" instead.
+    mutable size_t hit_count_at_last_log_{0};
+    mutable size_t lookup_count_at_last_log_{0};
+
 };
 
 } // namespace VideoCommon

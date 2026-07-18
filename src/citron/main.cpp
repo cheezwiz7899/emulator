@@ -6915,6 +6915,8 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
     if (!Common::FS::CreateDirs(cache_dir)) return;
     const auto spirv_path = cache_dir / "spirv_cache.bin";
 
+    const int kMaxSamples = 8;
+
     struct ScanState {
         std::atomic<int>  files_total{0};
         std::atomic<int>  files_processed{0};
@@ -6923,6 +6925,20 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
         std::atomic<int>  shaders_failed{0};
         std::atomic<bool> cancelled{false};
         std::string       error_message;
+        // Breakdown of what each file's first bytes matched, to see empirically
+        // which container format (if any) the ROM's shader files actually use,
+        // rather than guessing blind. bnsh_matched/raw_matched count files whose
+        // magic/header shape was recognized at all (regardless of whether any
+        // shader inside them later passed the Maxwell SPH validation and
+        // produced a candidate); unrecognized is everything else.
+        std::atomic<int>  bnsh_matched{0};
+        std::atomic<int>  raw_matched{0};
+        std::atomic<int>  unrecognized{0};
+        // A handful of unrecognized files' first bytes, logged once so their
+        // actual format can be identified instead of guessed. Capped so a
+        // huge ROM doesn't spam the log.
+        std::mutex        sample_mutex;
+        int               samples_logged{0};
     };
     auto state = std::make_shared<ScanState>();
 
@@ -6982,10 +6998,15 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
         if (!romfs_raw) {
             state->error_message =
                 "Could not mount RomFS. Ensure prod.keys is installed.";
+            LOG_ERROR(Render_Vulkan, "PreCacheShaders: {}", state->error_message);
             return;
         }
         const auto romfs = FileSys::ExtractRomFS(romfs_raw);
-        if (!romfs) { state->error_message = "Failed to extract RomFS."; return; }
+        if (!romfs) {
+            state->error_message = "Failed to extract RomFS.";
+            LOG_ERROR(Render_Vulkan, "PreCacheShaders: {}", state->error_message);
+            return;
+        }
 
         std::vector<FileSys::VirtualFile> files;
         std::function<void(const FileSys::VirtualDir&)> walk =
@@ -6996,6 +7017,7 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
             };
         walk(romfs);
         state->files_total.store(static_cast<int>(files.size()));
+        LOG_INFO(Render_Vulkan, "PreCacheShaders: RomFS walk found {} files", files.size());
 
         VideoCommon::SpirvCache cache;
         cache.Load(spirv_path);
@@ -7141,9 +7163,24 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                     } catch(...) { ++state->shaders_failed; }
                 };
 
-                constexpr u32 BNSH_MAGIC = 0x68534E42u;
+                const auto log_unrecognized_sample = [&]() {
+                    std::lock_guard g{state->sample_mutex};
+                    if (state->samples_logged >= kMaxSamples) return;
+                    ++state->samples_logged;
+                    const size_t dump_len = std::min<size_t>(sz, 16);
+                    std::string hex;
+                    for (size_t i = 0; i < dump_len; ++i) {
+                        hex += fmt::format("{:02x} ", data[i]);
+                    }
+                    LOG_INFO(Render_Vulkan,
+                             "PreCacheShaders: unrecognized file '{}' ({} bytes), first {} bytes: {}",
+                             file->GetFullPath(), sz, dump_len, hex);
+                };
+
+                constexpr u32 BNSH_MAGIC = 0x48534E42u; // "BNSH" (was 0x68534E42 = "BNSh", a typo)
                 u32 magic4{}; std::memcpy(&magic4, data, 4);
                 if (magic4 == BNSH_MAGIC && sz >= 0x14) {
+                    ++state->bnsh_matched;
                     u32 nv{}; std::memcpy(&nv, data+0x0C, 4);
                     if (nv>0&&nv<=512) for (u32 v=0;v<nv;++v) {
                         size_t va=0x10+v*4; if(va+4>sz) break;
@@ -7175,13 +7212,30 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                     }
                 } else if (sz>=sizeof(Shader::ProgramHeader)) {
                     Shader::ProgramHeader sph{}; std::memcpy(&sph,data,sizeof(sph));
-                    if (sph.common0.shader_type.Value()>=1 && sph.common0.shader_type.Value()<=5)
+                    if (sph.common0.shader_type.Value()>=1 && sph.common0.shader_type.Value()<=5) {
+                        ++state->raw_matched;
                         process_blob(raw);
+                    } else {
+                        ++state->unrecognized;
+                        log_unrecognized_sample();
+                    }
+                } else {
+                    ++state->unrecognized;
+                    log_unrecognized_sample();
                 }
             });
         }
         workers.WaitForRequests();
         cache.Save(spirv_path);
+        LOG_INFO(Render_Vulkan,
+                 "PreCacheShaders: done. files={} processed={} bnsh_matched={} "
+                 "raw_matched={} unrecognized={} shaders_found={} translated={} failed={} "
+                 "cache_size={}",
+                 state->files_total.load(), state->files_processed.load(),
+                 state->bnsh_matched.load(), state->raw_matched.load(),
+                 state->unrecognized.load(), state->shaders_found.load(),
+                 state->shaders_translated.load(), state->shaders_failed.load(),
+                 cache.Size());
     };
 
     auto future = QtConcurrent::run(std::move(worker));

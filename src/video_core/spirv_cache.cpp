@@ -11,7 +11,18 @@
 
 namespace {
 constexpr std::array<char, 8> SPIRV_CACHE_MAGIC{'c', 'i', 't', 'r', 's', 'p', 'v', '\0'};
-constexpr u32 SPIRV_CACHE_VERSION = 3; // v3: runtime_key now also folds in viewport_transform_state (VertexB) and the starting Bindings state (all stages)
+constexpr u32 SPIRV_CACHE_VERSION = 5; // v5: ComputeBindingKey reverted to a full-state hash
+                                        // (see its doc comment for why the single-bit
+                                        // narrowing in v4 was wrong — real-vs-real
+                                        // collisions, not just real-vs-speculative, turned
+                                        // out to be the dominant case); entries_ moved to
+                                        // ankerl::unordered_dense::map and
+                                        // ContainsByUniqueHash() gained an O(1) secondary
+                                        // index instead of an O(N) linear scan
+                                        // (v4: single-bit ComputeBindingKey; v3: runtime_key
+                                        // folds in viewport_transform_state [VertexB] and
+                                        // starting Bindings state; v2: adds Bindings
+                                        // end_binding per entry)
 } // anonymous namespace
 
 namespace VideoCommon {
@@ -45,11 +56,21 @@ u64 ComputeTextureKey(const std::unordered_map<u32, Shader::TextureType>& textur
 }
 
 u64 ComputeBindingKey(const Shader::Backend::Bindings& starting_binding) {
-    // Deliberately not gated on "is this stage the first one" — a caller with an
-    // all-zero starting state (the true first stage, or a speculative pre-cache
-    // entry, which always assumes zero) still needs a stable, reproducible hash
-    // so that real non-leading-stage lookups/inserts with a genuinely non-zero
-    // starting state land on a *different* key rather than coincidentally 0.
+    // NOTE: this was briefly narrowed to a single leading/non-leading bit,
+    // on the theory that the only real risk was a real non-leading-stage
+    // draw colliding with a speculative entry (which always assumes an
+    // all-zero start). That turned out to be wrong in practice: the ROM
+    // pre-cache scanner was found to be inserting ~0 speculative entries
+    // (separate, still-open bug — see the scanner investigation), so almost
+    // everything in the cache during real play comes from the live path,
+    // not speculative entries. Two different *real* non-leading-stage
+    // shaders/pipelines can and do collide under the single-bit scheme
+    // (both map to bit=1 regardless of their actual offsets), and that
+    // reintroduced the exact "descriptor used by shader but not declared in
+    // the pipeline layout" / Ultrahand breakage this key exists to prevent.
+    // Back to hashing the full starting state until the scanner is fixed
+    // and there's real hit/miss data (Tracy) to make an informed tradeoff
+    // between correctness and pre-cache hit rate.
     const u32 fields[] = {
         starting_binding.unified,       starting_binding.uniform_buffer,
         starting_binding.storage_buffer, starting_binding.texture,
@@ -58,6 +79,7 @@ u64 ComputeBindingKey(const Shader::Backend::Bindings& starting_binding) {
     };
     return Common::CityHash64(reinterpret_cast<const char*>(fields), sizeof(fields));
 }
+
 
 void SpirvCache::Load(const std::filesystem::path& path) {
     std::unique_lock lock{mutex_};
@@ -78,6 +100,7 @@ void SpirvCache::Load(const std::filesystem::path& path) {
         u32 num_entries{};
         file.read(reinterpret_cast<char*>(&num_entries), sizeof(num_entries));
         entries_.reserve(num_entries);
+        unique_hashes_.reserve(num_entries);
 
         for (u32 i = 0; i < num_entries; ++i) {
             SpirvKey key{};
@@ -102,6 +125,7 @@ void SpirvCache::Load(const std::filesystem::path& path) {
             file.read(reinterpret_cast<char*>(&end_binding), sizeof(end_binding));
             entries_.emplace(key, Entry{std::make_shared<const std::vector<u32>>(std::move(spirv)),
                                         end_binding});
+            unique_hashes_.insert(key.unique_hash);
         }
         LOG_INFO(Render_Vulkan, "Loaded {} SPIR-V cache entries", entries_.size());
         saved_entry_count_ = entries_.size();
@@ -174,6 +198,8 @@ void SpirvCache::Save(const std::filesystem::path& path) const {
 void SpirvCache::SaveThrottled(const std::filesystem::path& path,
                                 size_t min_new_entries,
                                 std::chrono::seconds min_interval) const {
+    size_t hits_now{}, probes_now{}, hits_at_last{}, probes_at_last{}, entries_now{};
+    bool should_log = false;
     {
         // Exclusive lock: we read and conditionally write last_save_time_ / dirty_.
         std::unique_lock lock{mutex_};
@@ -185,8 +211,38 @@ void SpirvCache::SaveThrottled(const std::filesystem::path& path,
         // serialization_thread don't all pass the threshold check at once.
         // Save() will set saved_entry_count_ when the snapshot is taken.
         last_save_time_ = std::chrono::steady_clock::now();
+
+        // Snapshot windowed hit-rate counters under the same lock/cadence as the
+        // disk save, so this doesn't need its own timer. hit_count_/lookup_count_
+        // are atomics updated from Lookup() without holding mutex_, so reading them
+        // here only needs to be "recent enough," not perfectly synchronized.
+        hits_now      = hit_count_.load();
+        probes_now    = lookup_count_.load();
+        hits_at_last  = hit_count_at_last_log_;
+        probes_at_last = lookup_count_at_last_log_;
+        entries_now   = entries_.size();
+        hit_count_at_last_log_    = hits_now;
+        lookup_count_at_last_log_ = probes_now;
+        should_log = true;
     }
     Save(path);
+    if (should_log) {
+        const size_t window_hits   = hits_now   - hits_at_last;
+        const size_t window_probes = probes_now - probes_at_last;
+        if (window_probes > 0) {
+            const int window_pct = static_cast<int>(window_hits * 100 / window_probes);
+            LOG_INFO(Render_Vulkan,
+                     "SPIR-V cache: {} entries ({} speculative / {} real inserted so far) — "
+                     "recent window {}/{} stage hits ({}%).",
+                     entries_now, speculative_insert_count_.load(), real_insert_count_.load(),
+                     window_hits, window_probes, window_pct);
+        } else {
+            LOG_INFO(Render_Vulkan,
+                     "SPIR-V cache: {} entries ({} speculative / {} real inserted so far) — "
+                     "no lookups since last log.",
+                     entries_now, speculative_insert_count_.load(), real_insert_count_.load());
+        }
+    }
 }
 
 bool SpirvCache::Contains(const SpirvKey& key) const noexcept {
@@ -196,12 +252,7 @@ bool SpirvCache::Contains(const SpirvKey& key) const noexcept {
 
 bool SpirvCache::ContainsByUniqueHash(u64 unique_hash) const noexcept {
     std::shared_lock lock{mutex_};
-    for (const auto& [key, _] : entries_) {
-        if (key.unique_hash == unique_hash) {
-            return true;
-        }
-    }
-    return false;
+    return unique_hashes_.contains(unique_hash);
 }
 
 std::optional<SpirvCache::LookupResult> SpirvCache::Lookup(const SpirvKey& key) const {
@@ -214,11 +265,17 @@ std::optional<SpirvCache::LookupResult> SpirvCache::Lookup(const SpirvKey& key) 
 }
 
 void SpirvCache::Insert(const SpirvKey& key, std::vector<u32> spirv,
-                        const Shader::Backend::Bindings& end_binding) {
+                        const Shader::Backend::Bindings& end_binding, bool is_speculative) {
     std::unique_lock lock{mutex_};
     entries_.insert_or_assign(key, Entry{std::make_shared<const std::vector<u32>>(std::move(spirv)),
                                          end_binding});
+    unique_hashes_.insert(key.unique_hash);
     dirty_ = true;
+    if (is_speculative) {
+        ++speculative_insert_count_;
+    } else {
+        ++real_insert_count_;
+    }
 }
 
 size_t SpirvCache::Size() const {
@@ -237,7 +294,7 @@ void SpirvCache::InsertSpeculative(u64 unique_hash, u64 runtime_key, u64 texture
     if (unique_hash == 0 || spirv.empty()) [[unlikely]] return;
     // Speculative entries have no valid end_binding (they are consumed by the prewarmer,
     // not by the per-stage pipeline loop).  Store a zero binding delta.
-    Insert(SpirvKey{unique_hash, 0, runtime_key, texture_key}, std::move(spirv), {});
+    Insert(SpirvKey{unique_hash, 0, runtime_key, texture_key}, std::move(spirv), {}, /*is_speculative=*/true);
 }
 
 } // namespace VideoCommon

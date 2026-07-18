@@ -877,18 +877,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                             (runtime_key << 6) + (runtime_key >> 2);
         }
         // `binding` at this point holds the starting Bindings accumulator for THIS
-        // stage — the same state EmitSPIRV() below (or a prior cached compile) uses
-        // to bake absolute descriptor binding numbers into the SPIR-V. It is not
-        // otherwise part of the cache key. Two lookups can share unique_hash/cbuf_key/
-        // runtime_key/texture_key while genuinely needing different starting bindings
-        // — e.g. the same fragment shader paired with two different preceding vertex
-        // shaders that consume different descriptor counts, or (in practice, the more
-        // common case) a real draw with no captured cbuf values (cbuf_key == 0)
-        // colliding with a speculative pre-cache entry, which always assumes a
-        // starting state of all-zero. Folding this in turns that collision into a
-        // clean cache miss instead of silently serving SPIR-V with bindings baked in
-        // for the wrong starting offset — which is exactly what produces "descriptor
-        // used by shader but not declared in the pipeline layout" validation errors.
+        // stage. ComputeBindingKey() folds in a single bit — "is this state
+        // all-zero (genuinely the leading stage), or not" — solely to stop a
+        // real, non-leading-stage lookup from matching a speculative entry
+        // (which always assumes an all-zero start; see ComputeBindingKey's
+        // doc comment in spirv_cache.h for why it's deliberately not a full
+        // hash of the state).
         const u64 binding_key = ComputeBindingKey(binding);
         runtime_key ^= binding_key + 0x9e3779b97f4a7c15ULL + (runtime_key << 6) + (runtime_key >> 2);
         const SpirvKey spirv_key{key.unique_hashes[index], cbuf_key, runtime_key, texture_key};
@@ -1234,7 +1228,10 @@ void PipelineCache::SubmitSpeculativeShader(
             // (see `binding{}` above) — NOT the post-EmitSPIRV `binding`, which has
             // since been advanced past this stage's slots. Using a fresh zero value
             // here (rather than the mutated variable) is what actually matches what
-            // was baked into `spirv`.
+            // was baked into `spirv`. Under ComputeBindingKey()'s single-bit scheme
+            // this always evaluates to 0 (the "leading stage" case) — that's
+            // expected and correct; it's what lets a genuinely-leading-stage real
+            // draw still hit this entry.
             const u64 binding_key = ComputeBindingKey(Shader::Backend::Bindings{});
             runtime_key ^= binding_key + 0x9e3779b97f4a7c15ULL + (runtime_key << 6) + (runtime_key >> 2);
             spirv_cache.InsertSpeculative(unique_hash, runtime_key, texture_key, std::move(spirv));
