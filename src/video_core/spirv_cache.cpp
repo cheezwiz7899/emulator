@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 citron Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <shared_mutex>
@@ -126,6 +127,11 @@ void SpirvCache::Load(const std::filesystem::path& path) {
             entries_.emplace(key, Entry{std::make_shared<const std::vector<u32>>(std::move(spirv)),
                                         end_binding});
             unique_hashes_.insert(key.unique_hash);
+            constexpr size_t kMaxStoredKeysPerHashForDiagnosticsLoad = 8;
+            auto& stored_keys = keys_by_hash_[key.unique_hash];
+            if (stored_keys.size() < kMaxStoredKeysPerHashForDiagnosticsLoad) {
+                stored_keys.push_back(key);
+            }
         }
         LOG_INFO(Render_Vulkan, "Loaded {} SPIR-V cache entries", entries_.size());
         saved_entry_count_ = entries_.size();
@@ -199,6 +205,8 @@ void SpirvCache::SaveThrottled(const std::filesystem::path& path,
                                 size_t min_new_entries,
                                 std::chrono::seconds min_interval) const {
     size_t hits_now{}, probes_now{}, hits_at_last{}, probes_at_last{}, entries_now{};
+    size_t stale_misses_now{}, stale_misses_at_last{};
+    size_t no_ctx_now{}, no_ctx_at_last{}, with_ctx_now{}, with_ctx_at_last{};
     bool should_log = false;
     {
         // Exclusive lock: we read and conditionally write last_save_time_ / dirty_.
@@ -220,22 +228,37 @@ void SpirvCache::SaveThrottled(const std::filesystem::path& path,
         probes_now    = lookup_count_.load();
         hits_at_last  = hit_count_at_last_log_;
         probes_at_last = lookup_count_at_last_log_;
+        stale_misses_now     = miss_with_hash_present_count_.load();
+        stale_misses_at_last = miss_with_hash_present_at_last_log_;
+        no_ctx_now      = stale_miss_no_context_.load();
+        no_ctx_at_last  = stale_miss_no_context_at_last_log_;
+        with_ctx_now     = stale_miss_with_context_.load();
+        with_ctx_at_last = stale_miss_with_context_at_last_log_;
         entries_now   = entries_.size();
         hit_count_at_last_log_    = hits_now;
         lookup_count_at_last_log_ = probes_now;
+        miss_with_hash_present_at_last_log_ = stale_misses_now;
+        stale_miss_no_context_at_last_log_   = no_ctx_now;
+        stale_miss_with_context_at_last_log_ = with_ctx_now;
         should_log = true;
     }
     Save(path);
     if (should_log) {
         const size_t window_hits   = hits_now   - hits_at_last;
         const size_t window_probes = probes_now - probes_at_last;
+        const size_t window_stale_misses = stale_misses_now - stale_misses_at_last;
+        const size_t window_no_ctx = no_ctx_now - no_ctx_at_last;
+        const size_t window_with_ctx = with_ctx_now - with_ctx_at_last;
         if (window_probes > 0) {
             const int window_pct = static_cast<int>(window_hits * 100 / window_probes);
             LOG_INFO(Render_Vulkan,
                      "SPIR-V cache: {} entries ({} speculative / {} real inserted so far) — "
-                     "recent window {}/{} stage hits ({}%).",
+                     "recent window {}/{} stage hits ({}%), {} misses where the shader was "
+                     "already cached under a different key ({} had no real cbuf/texture "
+                     "context [FileEnvironment] / {} had real context that still mismatched).",
                      entries_now, speculative_insert_count_.load(), real_insert_count_.load(),
-                     window_hits, window_probes, window_pct);
+                     window_hits, window_probes, window_pct, window_stale_misses,
+                     window_no_ctx, window_with_ctx);
         } else {
             LOG_INFO(Render_Vulkan,
                      "SPIR-V cache: {} entries ({} speculative / {} real inserted so far) — "
@@ -255,11 +278,60 @@ bool SpirvCache::ContainsByUniqueHash(u64 unique_hash) const noexcept {
     return unique_hashes_.contains(unique_hash);
 }
 
-std::optional<SpirvCache::LookupResult> SpirvCache::Lookup(const SpirvKey& key) const {
+std::optional<SpirvCache::LookupResult> SpirvCache::Lookup(const SpirvKey& key,
+                                                             bool has_real_specialization_context) const {
     std::shared_lock lock{mutex_};
     ++lookup_count_;
     const auto it = entries_.find(key);
-    if (it == entries_.end()) return std::nullopt;
+    if (it == entries_.end()) {
+        // Full-key miss. Was this exact shader (by unique_hash alone) already
+        // translated and sitting in the cache under a DIFFERENT cbuf_key/
+        // runtime_key/texture_key? unique_hashes_ already tracks presence by
+        // unique_hash alone for ContainsByUniqueHash(), so this is a cheap,
+        // already-available check — no extra bookkeeping needed beyond the
+        // counter itself.
+        if (unique_hashes_.contains(key.unique_hash)) {
+            ++miss_with_hash_present_count_;
+            if (has_real_specialization_context) {
+                ++stale_miss_with_context_;
+            } else {
+                ++stale_miss_no_context_;
+            }
+
+            // Throttled: report exactly which field(s) differ from the
+            // requested key, using whatever's actually stored for this hash.
+            // A handful of samples is enough to tell whether cbuf_key,
+            // runtime_key, or texture_key (or some combination) is the
+            // dominant mismatch source, without flooding the log over a
+            // whole play session.
+            constexpr size_t kMaxFieldMismatchLogs = 30;
+            size_t expected = field_mismatch_logs_.load();
+            bool got_slot = false;
+            while (expected < kMaxFieldMismatchLogs &&
+                   !field_mismatch_logs_.compare_exchange_weak(expected, expected + 1)) {
+            }
+            got_slot = expected < kMaxFieldMismatchLogs;
+            if (got_slot) {
+                const auto hit_it = keys_by_hash_.find(key.unique_hash);
+                if (hit_it != keys_by_hash_.end() && !hit_it->second.empty()) {
+                    for (const SpirvKey& stored : hit_it->second) {
+                        LOG_INFO(Render_Vulkan,
+                                 "SPIR-V cache field mismatch [{}] (real_context={}): requested "
+                                 "cbuf={:016x} runtime={:016x} texture={:016x} vs "
+                                 "stored cbuf={:016x} runtime={:016x} texture={:016x} "
+                                 "(cbuf {}, runtime {}, texture {})",
+                                 expected, has_real_specialization_context,
+                                 key.cbuf_key, key.runtime_key, key.texture_key,
+                                 stored.cbuf_key, stored.runtime_key, stored.texture_key,
+                                 key.cbuf_key == stored.cbuf_key ? "matches" : "DIFFERS",
+                                 key.runtime_key == stored.runtime_key ? "matches" : "DIFFERS",
+                                 key.texture_key == stored.texture_key ? "matches" : "DIFFERS");
+                    }
+                }
+            }
+        }
+        return std::nullopt;
+    }
     ++hit_count_;
     return LookupResult{it->second.spirv, it->second.end_binding};
 }
@@ -270,6 +342,12 @@ void SpirvCache::Insert(const SpirvKey& key, std::vector<u32> spirv,
     entries_.insert_or_assign(key, Entry{std::make_shared<const std::vector<u32>>(std::move(spirv)),
                                          end_binding});
     unique_hashes_.insert(key.unique_hash);
+    constexpr size_t kMaxStoredKeysPerHashForDiagnostics = 8;
+    auto& stored_keys = keys_by_hash_[key.unique_hash];
+    if (std::find(stored_keys.begin(), stored_keys.end(), key) == stored_keys.end() &&
+        stored_keys.size() < kMaxStoredKeysPerHashForDiagnostics) {
+        stored_keys.push_back(key);
+    }
     dirty_ = true;
     if (is_speculative) {
         ++speculative_insert_count_;

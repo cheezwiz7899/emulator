@@ -133,4 +133,90 @@ std::vector<u8> DecompressDataZSTD(std::span<const u8> compressed) {
     return decompressed;
 }
 
+std::vector<u8> DecompressDataZSTDWithDictionary(std::span<const u8> compressed,
+                                                  std::span<const u8> dictionary,
+                                                  std::size_t max_decompressed_size) {
+    if (compressed.empty()) {
+        return {};
+    }
+
+    const unsigned long long decompressed_size =
+        ZSTD_getFrameContentSize(compressed.data(), compressed.size());
+
+    if (decompressed_size == ZSTD_CONTENTSIZE_ERROR) {
+        LOG_ERROR(Common, "ZSTD dictionary decompress: corrupted or invalid frame");
+        return {};
+    }
+    if (decompressed_size == ZSTD_CONTENTSIZE_UNKNOWN) {
+        LOG_ERROR(Common, "ZSTD dictionary decompress: frame content size unknown — "
+                           "streaming-with-dictionary isn't implemented here since every "
+                           "known caller (RomFS asset extraction) has a known-size frame");
+        return {};
+    }
+    if (decompressed_size > max_decompressed_size) {
+        LOG_ERROR(Common, "ZSTD dictionary decompress: frame claims {} bytes, exceeds cap of {}",
+                  decompressed_size, max_decompressed_size);
+        return {};
+    }
+
+    // Uses ZSTD_decompress_usingDict rather than a prebuilt ZSTD_DDict: simpler
+    // lifetime management (no dict object to cache/free across calls), at the
+    // cost of re-deriving internal dictionary structures on every call. Fine
+    // for a first correctness pass and for one-off extraction; if this becomes
+    // a hot path (e.g. scanning many thousands of same-dictionary files),
+    // switching to a cached ZSTD_DDict per dictionary is the natural follow-up.
+    ZSTD_DCtx* const dctx = ZSTD_createDCtx();
+    if (!dctx) {
+        LOG_ERROR(Common, "Failed to create ZSTD decompression context");
+        return {};
+    }
+
+    std::vector<u8> decompressed(decompressed_size);
+    const std::size_t result = ZSTD_decompress_usingDict(
+        dctx, decompressed.data(), decompressed.size(), compressed.data(), compressed.size(),
+        dictionary.data(), dictionary.size());
+    ZSTD_freeDCtx(dctx);
+
+    if (ZSTD_isError(result)) {
+        LOG_ERROR(Common, "ZSTD_decompress_usingDict failed: {}", ZSTD_getErrorName(result));
+        return {};
+    }
+    if (result != decompressed_size) {
+        LOG_ERROR(Common, "ZSTD dictionary decompress: size mismatch, expected {}, got {}",
+                  decompressed_size, result);
+        return {};
+    }
+
+    return decompressed;
+}
+
+std::optional<u32> GetZSTDFrameDictionaryID(std::span<const u8> compressed) {
+    // A zstd frame header is at most magic(4) + descriptor(1) + window(1) +
+    // dict_id(4) + content_size(8) = 18 bytes; well short of that can't be a
+    // complete/valid frame header. This avoids depending on
+    // ZSTD_FRAMEHEADERSIZE_MIN, which lives behind ZSTD_STATIC_LINKING_ONLY
+    // and isn't guaranteed to be defined wherever this compiles.
+    constexpr std::size_t kMinPossibleFrameHeaderSize = 18;
+    if (compressed.size() < kMinPossibleFrameHeaderSize) {
+        return std::nullopt;
+    }
+    // Deliberately not gated on ZSTD_isFrame() — that function isn't present in
+    // every zstd version this project might vendor. ZSTD_getDictID_fromFrame
+    // returns 0 both for "no dictionary referenced" and "couldn't read the
+    // header", so this can't distinguish those two cases the way a version
+    // with ZSTD_isFrame available could — but callers already treat a 0
+    // Dictionary_ID as "try plain decompression", and the decompress path
+    // itself will correctly fail (via ZSTD_getFrameContentSize returning
+    // ZSTD_CONTENTSIZE_ERROR) if the frame is actually invalid, so nothing is
+    // silently accepted as valid when it isn't.
+    return static_cast<u32>(ZSTD_getDictID_fromFrame(compressed.data(), compressed.size()));
+}
+
+u32 GetZSTDDictionaryID(std::span<const u8> dictionary) {
+    if (dictionary.empty()) {
+        return 0;
+    }
+    return static_cast<u32>(ZSTD_getDictID_fromDict(dictionary.data(), dictionary.size()));
+}
+
 } // namespace Common::Compression

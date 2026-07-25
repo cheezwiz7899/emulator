@@ -891,7 +891,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         // Since SpirvKey now includes the runtime_key, we can safely serve cached SPIR-V
         // to both the live path and the disk-load path.
         if (!is_merged_vertex) {
-            if (auto cached = spirv_cache.Lookup(spirv_key)) {
+            if (auto cached = spirv_cache.Lookup(spirv_key, gen_env_stage != nullptr)) {
                 code = *cached->spirv;
                 // Restore the binding counter to where EmitSPIRV left it when this
                 // SPIR-V was first compiled.  Without this, the next stage's
@@ -1023,7 +1023,7 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
     const u64 compute_unique_hash = gen_env ? gen_env->CalculateHash() : key.unique_hash;
     const SpirvKey spirv_key_c{compute_unique_hash, cbuf_key_c, 0, texture_key_c};
     std::vector<u32> code;
-    if (auto cached = spirv_cache.Lookup(spirv_key_c)) {
+    if (auto cached = spirv_cache.Lookup(spirv_key_c, gen_env != nullptr)) {
         code = *cached->spirv;
         // Compute pipelines are self-contained (no preceding stage to misalign),
         // so the stored end_binding is irrelevant here and intentionally ignored.

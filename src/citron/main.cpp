@@ -9,7 +9,10 @@
 #include <functional>
 #include <mutex>
 #include <random>
+#include <unordered_map>
 #include <unordered_set>
+
+#include <ankerl/unordered_dense.h>
 #include "citron/theme.h"
 #include <cmath>
 #include <cstdlib>
@@ -204,6 +207,8 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "video_core/shader_cache.h"
 #include "video_core/speculative_shader_environment.h"
+#include "common/zstd_compression.h"
+#include "core/file_sys/sarc_archive.h"
 #include "video_core/spirv_cache.h"
 #include "video_core/renderer_base.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
@@ -6916,6 +6921,7 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
     const auto spirv_path = cache_dir / "spirv_cache.bin";
 
     const int kMaxSamples = 8;
+    const int kMaxDiagBlobs = 3000;
 
     struct ScanState {
         std::atomic<int>  files_total{0};
@@ -6932,6 +6938,17 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
         // shader inside them later passed the Maxwell SPH validation and
         // produced a candidate); unrecognized is everything else.
         std::atomic<int>  bnsh_matched{0};
+        // zstd-compressed files (TotK-style shared-dictionary scheme): how many
+        // were successfully decompressed (with or without a dictionary) vs.
+        // failed (frame claims a Dictionary_ID we don't have loaded, or the
+        // frame itself is corrupt/unsupported).
+        std::atomic<int>  zstd_decompressed{0};
+        std::atomic<int>  zstd_failed{0};
+        // Temporary diagnostic: log the parsed SPH fields + outcome for the
+        // first several blobs that reach process_blob(), regardless of
+        // pass/fail, so a real run gives concrete evidence of what's actually
+        // happening to extracted candidates instead of more guessing.
+        std::atomic<int>  diag_blobs_logged{0};
         std::atomic<int>  raw_matched{0};
         std::atomic<int>  unrecognized{0};
         // A handful of unrecognized files' first bytes, logged once so their
@@ -7008,6 +7025,48 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
             return;
         }
 
+        // Some titles (e.g. Tears of the Kingdom) compress most RomFS assets
+        // against a shared dictionary rather than standalone. The dictionaries
+        // themselves live inside the SAME title's RomFS — grabbed fresh here
+        // per scan, not hardcoded — as a SARC archive at Pack/ZsDic.pack.zs,
+        // itself zstd-compressed but WITHOUT a dictionary (it's the bootstrap).
+        // Titles that don't use this scheme simply won't have this file; the
+        // map stays empty and any dictionary-compressed file found later is
+        // just counted as a decompression failure rather than crashing.
+        std::unordered_map<u32, std::vector<u8>> dictionaries_by_id;
+        // Keeps the decompressed ZsDic.pack SARC's owned buffer alive for the
+        // rest of the scan — dictionaries_by_id copies out of it once below,
+        // so this only needs to survive that copy, but keeping it named makes
+        // the lifetime obvious rather than relying on a temporary.
+        std::optional<FileSys::SarcArchive> zsdic_sarc;
+        if (const auto zsdic_file = romfs->GetFileRelative("Pack/ZsDic.pack.zs")) {
+            const auto zsdic_compressed = zsdic_file->ReadAllBytes();
+            auto zsdic_decompressed = Common::Compression::DecompressDataZSTD(zsdic_compressed);
+            if (zsdic_decompressed.empty()) {
+                LOG_ERROR(Render_Vulkan,
+                          "PreCacheShaders: found Pack/ZsDic.pack.zs but failed to "
+                          "decompress it (expected no dictionary — this file bootstraps "
+                          "every other dictionary, so it can't need one itself)");
+            } else {
+                zsdic_sarc = FileSys::SarcArchive::Parse(std::move(zsdic_decompressed));
+                if (!zsdic_sarc->Ok()) {
+                    LOG_ERROR(Render_Vulkan,
+                              "PreCacheShaders: Pack/ZsDic.pack.zs decompressed but isn't a "
+                              "valid SARC archive — dictionary format may have changed");
+                } else {
+                    for (const auto& entry : zsdic_sarc->Entries()) {
+                        const u32 dict_id = Common::Compression::GetZSTDDictionaryID(entry.data);
+                        if (dict_id == 0) continue; // Not a recognizable raw-content dictionary.
+                        dictionaries_by_id.emplace(
+                            dict_id, std::vector<u8>{entry.data.begin(), entry.data.end()});
+                        LOG_INFO(Render_Vulkan,
+                                 "PreCacheShaders: loaded dictionary '{}' (id={}, {} bytes)",
+                                 entry.name, dict_id, entry.data.size());
+                    }
+                }
+            }
+        }
+
         std::vector<FileSys::VirtualFile> files;
         std::function<void(const FileSys::VirtualDir&)> walk =
             [&](const FileSys::VirtualDir& dir) {
@@ -7016,6 +7075,28 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                 for (const auto& sub : dir->GetSubdirectories()) walk(sub);
             };
         walk(romfs);
+
+        // Temporary debug aid: set CITRON_PRECACHE_FILTER to a substring (e.g.
+        // "grass" or a specific file name) before launching citron to restrict
+        // the scan to only files whose full RomFS path contains it. Lets a
+        // known-good sample be iterated on in seconds instead of waiting
+        // several minutes for a full ~300k-file ROM scan on every rebuild.
+        // Unset (the default) scans everything, as before.
+        if (const char* filter = std::getenv("CITRON_PRECACHE_FILTER"); filter && *filter) {
+            const std::string needle(filter);
+            std::vector<FileSys::VirtualFile> filtered;
+            filtered.reserve(files.size());
+            for (auto& f : files) {
+                if (f->GetFullPath().find(needle) != std::string::npos) {
+                    filtered.push_back(f);
+                }
+            }
+            LOG_INFO(Render_Vulkan,
+                     "PreCacheShaders: CITRON_PRECACHE_FILTER='{}' active — {} of {} files matched",
+                     needle, filtered.size(), files.size());
+            files = std::move(filtered);
+        }
+
         state->files_total.store(static_cast<int>(files.size()));
         LOG_INFO(Render_Vulkan, "PreCacheShaders: RomFS walk found {} files", files.size());
 
@@ -7043,7 +7124,13 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
         host_info.support_conditional_barrier=false;
 
         std::mutex seen_mutex;
-        std::unordered_set<u64> seen_hashes;
+        // Checked/inserted while holding seen_mutex, on every shader blob
+        // candidate found across the scan (potentially many thousands between
+        // BNSH sub-blocks and raw-matched files) — unordered_dense's better
+        // cache locality reduces time spent inside the lock, which matters
+        // more here than usual since it's contended across every worker
+        // thread, not just a single-thread hot path.
+        ankerl::unordered_dense::set<u64> seen_hashes;
 
         const size_t nthreads = std::max(1u, std::thread::hardware_concurrency()-1u);
         Common::ThreadWorker workers{nthreads, "PreCacheShader"};
@@ -7056,52 +7143,147 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                 const auto raw = file->ReadAllBytes();
                 if (raw.size() < 4) return;
 
+                // zstd frames start with a fixed 4-byte magic (0x28 0xB5 0x2F 0xFD).
+                // TotK-style titles wrap most RomFS assets this way, frequently
+                // against a shared dictionary (see dictionaries_by_id above) rather
+                // than standalone. Decompress here, before anything else looks at
+                // the bytes, so every check below transparently operates on the
+                // real (uncompressed) shader-archive contents regardless of
+                // whether the file on disk happened to be compressed.
+                std::vector<u8> decompressed_storage;
                 const u8* data = raw.data();
-                const size_t sz = raw.size();
+                size_t sz = raw.size();
+                static constexpr u8 kZstdMagic[4] = {0x28, 0xB5, 0x2F, 0xFD};
+                if (sz >= 4 && std::memcmp(raw.data(), kZstdMagic, 4) == 0) {
+                    const auto dict_id = Common::Compression::GetZSTDFrameDictionaryID(raw);
+                    if (!dict_id.has_value()) {
+                        // Magic matched but the rest of the header doesn't parse as a
+                        // real frame — corrupt or truncated. Nothing more to do.
+                        ++state->zstd_failed;
+                        return;
+                    }
+                    if (*dict_id == 0) {
+                        decompressed_storage =
+                            Common::Compression::DecompressDataZSTD(raw);
+                    } else if (const auto it = dictionaries_by_id.find(*dict_id);
+                               it != dictionaries_by_id.end()) {
+                        decompressed_storage = Common::Compression::DecompressDataZSTDWithDictionary(
+                            raw, it->second, /*max_decompressed_size=*/256ULL * 1024 * 1024);
+                    } else {
+                        // References a dictionary we don't have loaded — either this
+                        // title has more dictionary-compressed resource types than the
+                        // 3 known Pack/ZsDic.pack.zs entries cover, or ZsDic.pack.zs
+                        // itself wasn't found/failed to parse earlier. Either way we
+                        // can't decompress this file; skip it rather than guess.
+                        ++state->zstd_failed;
+                        return;
+                    }
+                    if (decompressed_storage.empty()) {
+                        ++state->zstd_failed;
+                        return;
+                    }
+                    ++state->zstd_decompressed;
+                    data = decompressed_storage.data();
+                    sz = decompressed_storage.size();
+                }
+                if (sz < 4) return;
 
-                const auto process_blob = [&](const std::vector<u8>& blob) {
-                    if (blob.size() < sizeof(Shader::ProgramHeader)) return;
+                const auto process_blob = [&](const std::vector<u8>& blob, bool is_bnsh_derived) -> bool {
+                    // Claim one of a limited number of diagnostic-logging slots
+                    // (thread-safe across the worker pool). diag_slot >= 0 means
+                    // this call should log; this is temporary instrumentation to
+                    // see exactly where real candidates succeed or fail, since
+                    // shaders_found has stayed at 0 despite the extraction logic
+                    // checking out correctly against a hand-verified real sample.
+                    //
+                    // Restricted to is_bnsh_derived candidates only: the previous
+                    // run showed every one of the 20 slots consumed by raw_matched
+                    // noise (identical common0_raw across every entry despite
+                    // different sizes — a dead giveaway of unrelated small files
+                    // that happen to share a leading byte coincidentally passing
+                    // the loose per-file heuristic) before a single real
+                    // BNSH-extracted candidate got a chance to log at all.
+                    int diag_slot = -1;
+                    if (is_bnsh_derived) {
+                        int expected = state->diag_blobs_logged.load();
+                        while (expected < kMaxDiagBlobs &&
+                               !state->diag_blobs_logged.compare_exchange_weak(expected, expected + 1)) {
+                        }
+                        if (expected < kMaxDiagBlobs) diag_slot = expected;
+                    }
+
+                    if (blob.size() < sizeof(Shader::ProgramHeader)) {
+                        if (diag_slot >= 0) {
+                            LOG_INFO(Render_Vulkan,
+                                     "PreCacheShaders diag[{}]: blob too small ({} bytes, need {})",
+                                     diag_slot, blob.size(), sizeof(Shader::ProgramHeader));
+                        }
+                        return false;
+                    }
                     Shader::ProgramHeader bsph{};
                     std::memcpy(&bsph, blob.data(), sizeof(bsph));
 
                     // Validate SPH header fields before attempting to decode.
                     // Real NVIDIA shader program headers have:
-                    //   sph_type     (bits  0-4)  == 1
                     //   version      (bits  5-9)  != 0  (typically 0x02)
                     //   shader_type  (bits 10-13) in [1,5]
                     //   sass_version (bits 17-20) != 0
-                    // Files whose bytes happen to pass only the shader_type check
-                    // (asset data, textures, etc.) are rejected here to avoid
-                    // flooding the Maxwell decoder with garbage and spamming
-                    // "Invalid insn" assertions.
+                    // sph_type (bits 0-4) is NOT a flat constant — the header
+                    // itself is a union of two different shapes depending on
+                    // it: sph_type==1 selects the "vtg" layout (used by
+                    // vertex/tess-control/tess-eval/geometry — shader_type
+                    // 1-4), while sph_type==2 selects the "ps" (pixel/
+                    // fragment) layout, used only by shader_type==5. Treating
+                    // sph_type==1 as universally required was silently
+                    // rejecting every real fragment shader in the ROM.
+                    // Files whose bytes happen to pass only the shader_type
+                    // check (asset data, textures, etc.) are rejected here to
+                    // avoid flooding the Maxwell decoder with garbage and
+                    // spamming "Invalid insn" assertions.
                     u32 common0_raw{};
                     std::memcpy(&common0_raw, blob.data(), sizeof(common0_raw));
                     const u32 sph_type    = (common0_raw >>  0) & 0x1Fu;
                     const u32 version     = (common0_raw >>  5) & 0x1Fu;
                     const u32 shader_type = (common0_raw >> 10) & 0x0Fu;
                     const u32 sass_ver    = (common0_raw >> 17) & 0x0Fu;
-                    if (sph_type != 1u)             return;
-                    if (version == 0u)              return;
-                    if (shader_type < 1u || shader_type > 5u) return;
-                    if (sass_ver == 0u)             return;
+                    if (diag_slot >= 0) {
+                        LOG_INFO(Render_Vulkan,
+                                 "PreCacheShaders diag[{}]: blob_size={} common0_raw={:08x} "
+                                 "sph_type={} version={} shader_type={} sass_ver={}",
+                                 diag_slot, blob.size(), common0_raw, sph_type, version,
+                                 shader_type, sass_ver);
+                    }
+                    if (version == 0u)              { if (diag_slot >= 0) LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: rejected — version == 0", diag_slot); return false; }
+                    if (shader_type < 1u || shader_type > 5u) { if (diag_slot >= 0) LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: rejected — shader_type out of range", diag_slot); return false; }
+                    const u32 expected_sph_type = (shader_type == 5u) ? 2u : 1u;
+                    if (sph_type != expected_sph_type) { if (diag_slot >= 0) LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: rejected — sph_type={} (expected {} for shader_type={})", diag_slot, sph_type, expected_sph_type, shader_type); return false; }
+                    if (sass_ver == 0u)             { if (diag_slot >= 0) LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: rejected — sass_ver == 0", diag_slot); return false; }
 
                     // Require at least one instruction beyond the header,
                     // aligned to 8 bytes (Maxwell instruction size).
                     const size_t payload = blob.size() - sizeof(Shader::ProgramHeader);
-                    if (payload < 8 || payload % 8 != 0) return;
-
-                    // Quick decode check: the first instruction must be recognisable.
-                    // This rejects blobs that have a plausible-looking header but
-                    // non-Maxwell instruction bytes immediately after it.
-                    {
-                        u64 first_insn{};
-                        std::memcpy(&first_insn,
-                                    blob.data() + sizeof(Shader::ProgramHeader), 8);
-                        try {
-                            (void)Shader::Maxwell::Decode(first_insn);
-                        } catch (...) {
-                            return; // Not a valid Maxwell instruction stream
+                    if (payload < 8 || payload % 8 != 0) {
+                        if (diag_slot >= 0) {
+                            LOG_INFO(Render_Vulkan,
+                                     "PreCacheShaders diag[{}]: rejected — payload={} not 8-aligned "
+                                     "or empty", diag_slot, payload);
                         }
+                        return false;
+                    }
+
+                    // NOTE: a standalone "decode the first instruction in isolation"
+                    // pre-check used to live here. It was removed after tracing the
+                    // real cause of decode failures to CFG's start address, which the
+                    // live pipeline computes as env.StartAddress() + sizeof(SPH) —
+                    // StartAddress() being live GPU-register-supplied context that a
+                    // static file scan cannot know. See process_stage_offset's
+                    // ControlCode-fallback comment for how this is being worked
+                    // around instead.
+                    if (diag_slot >= 0) {
+                        u64 first_insn{};
+                        std::memcpy(&first_insn, blob.data() + sizeof(Shader::ProgramHeader), 8);
+                        LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: first_insn={:016x}, proceeding to CFG/translate",
+                                 diag_slot, first_insn);
                     }
 
                     const u32 t = shader_type;
@@ -7113,7 +7295,7 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                     const u64 blob_fingerprint = Common::CityHash64(
                         reinterpret_cast<const char*>(blob.data()), blob.size());
                     { std::lock_guard g{seen_mutex};
-                      if (!seen_hashes.insert(blob_fingerprint).second) return; }
+                      if (!seen_hashes.insert(blob_fingerprint).second) return true; }
 
                     const Shader::Stage stage = [t]()->Shader::Stage {
                         switch(t){case 1:return Shader::Stage::VertexB;
@@ -7126,41 +7308,164 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                     std::memcpy(code.data(), blob.data() + sizeof(Shader::ProgramHeader), payload);
                     const u32 lm = static_cast<u32>(bsph.LocalMemorySize()) +
                                    static_cast<u32>(bsph.common3.shader_local_memory_crs_size);
-                    try {
-                        VideoCommon::SpeculativeShaderEnvironment env{std::move(code), stage, lm, bsph};
-                        Shader::ObjectPool<Shader::Maxwell::Flow::Block> fp(16);
-                        Shader::ObjectPool<Shader::IR::Inst> ip(8192);
-                        Shader::ObjectPool<Shader::IR::Block> bp(32);
-                        Shader::Maxwell::Flow::CFG cfg(env, fp,
-                            static_cast<u32>(sizeof(Shader::ProgramHeader)), false);
+                    if (diag_slot >= 0) {
+                        LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: entering CFG/translate, stage={}",
+                                 diag_slot, static_cast<int>(stage));
+                    }
 
-                        // Compute the authoritative hash AFTER CFG determines shader bounds.
-                        // This must match GenericEnvironment::CalculateHash() used by the live path.
-                        const u64 unique_hash = env.CalculateHash();
-                        if (cache.ContainsByUniqueHash(unique_hash)) return;
-                        ++state->shaders_found;
+                    // Attempts a full translate — CFG, TranslateProgram, and SPIR-V
+                    // emission — starting from a given byte offset WITHIN the
+                    // payload (0 = the naive/default assumption: real code starts
+                    // immediately after the SPH). This is a much stronger success
+                    // signal than just checking whether a few instructions decode
+                    // without throwing: CFG construction validates branch targets
+                    // resolve to in-bounds instruction boundaries, block structure
+                    // is self-consistent, etc. — a wrong alignment is very unlikely
+                    // to satisfy all of that by chance. code is passed by value
+                    // (copied, not moved) so it can be reused across multiple
+                    // attempts at different offsets.
+                    const auto try_translate_at = [&](u32 entry_offset_in_payload) -> bool {
+                        try {
+                            VideoCommon::SpeculativeShaderEnvironment env{code, stage, lm, bsph};
+                            Shader::ObjectPool<Shader::Maxwell::Flow::Block> fp(16);
+                            Shader::ObjectPool<Shader::IR::Inst> ip(8192);
+                            Shader::ObjectPool<Shader::IR::Block> bp(32);
+                            const u32 start_address =
+                                static_cast<u32>(sizeof(Shader::ProgramHeader)) + entry_offset_in_payload;
+                            Shader::Maxwell::Flow::CFG cfg(env, fp, start_address, false);
+                            if (diag_slot >= 0) {
+                                LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: CFG construction OK at entry +{}",
+                                         diag_slot, entry_offset_in_payload);
+                            }
 
-                        auto prog = Shader::Maxwell::TranslateProgram(ip,bp,env,cfg,host_info);
-                        Shader::Backend::Bindings binding{};
-                        Shader::RuntimeInfo rt{};
-                        // Without a live pipeline key we have no previous-stage stores
-                        // information, so conservatively set all bits — the same thing
-                        // MakeRuntimeInfo does when there is no previous program.
-                        rt.previous_stage_stores.mask.set();
-                        // Triangles are the overwhelmingly common input topology.
-                        // Geometry and tessellation shaders that need a different
-                        // topology will be recompiled correctly during live play.
-                        rt.input_topology = Shader::InputTopology::Triangles;
-                        if (stage == Shader::Stage::Fragment) {
-                            // Accept all frag color output types conservatively.
-                            rt.frag_color_types.fill(Shader::FragmentOutputType::Float);
+                            // Compute the authoritative hash AFTER CFG determines shader bounds.
+                            // This must match GenericEnvironment::CalculateHash() used by the live path.
+                            const u64 unique_hash = env.CalculateHash();
+                            if (diag_slot >= 0) {
+                                LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: unique_hash={:016x} already_cached={}",
+                                         diag_slot, unique_hash, cache.ContainsByUniqueHash(unique_hash));
+                            }
+                            if (cache.ContainsByUniqueHash(unique_hash)) return true;
+                            ++state->shaders_found;
+
+                            auto prog = Shader::Maxwell::TranslateProgram(ip,bp,env,cfg,host_info);
+                            if (diag_slot >= 0) {
+                                LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: TranslateProgram OK at entry +{}",
+                                         diag_slot, entry_offset_in_payload);
+                            }
+                            Shader::Backend::Bindings binding{};
+                            Shader::RuntimeInfo rt{};
+                            // Without a live pipeline key we have no previous-stage stores
+                            // information, so conservatively set all bits — the same thing
+                            // MakeRuntimeInfo does when there is no previous program.
+                            rt.previous_stage_stores.mask.set();
+                            // Triangles are the overwhelmingly common input topology.
+                            // Geometry and tessellation shaders that need a different
+                            // topology will be recompiled correctly during live play.
+                            rt.input_topology = Shader::InputTopology::Triangles;
+                            if (stage == Shader::Stage::Fragment) {
+                                // Accept all frag color output types conservatively.
+                                rt.frag_color_types.fill(Shader::FragmentOutputType::Float);
+                            }
+                            Shader::Maxwell::ConvertLegacyToGeneric(prog, rt);
+                            auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile,rt,prog,binding);
+                            const u64 texture_key = VideoCommon::ComputeTextureKey(env.CapturedTextureTypes(), env.CapturedTexturePixelFormats());
+                            cache.InsertSpeculative(unique_hash, rt.Hash(), texture_key, std::move(spirv));
+                            ++state->shaders_translated;
+                            if (diag_slot >= 0) {
+                                LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: fully translated OK at entry +{}",
+                                         diag_slot, entry_offset_in_payload);
+                            }
+                            return true;
+                        } catch (const std::exception& e) {
+                            if (diag_slot >= 0) {
+                                LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: entry +{} threw std::exception: {}",
+                                         diag_slot, entry_offset_in_payload, e.what());
+                            }
+                            return false;
+                        } catch (...) {
+                            if (diag_slot >= 0) {
+                                LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: entry +{} threw unknown exception",
+                                         diag_slot, entry_offset_in_payload);
+                            }
+                            return false;
                         }
-                        Shader::Maxwell::ConvertLegacyToGeneric(prog, rt);
-                        auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile,rt,prog,binding);
-                        const u64 texture_key = VideoCommon::ComputeTextureKey(env.CapturedTextureTypes(), env.CapturedTexturePixelFormats());
-                        cache.InsertSpeculative(unique_hash, rt.Hash(), texture_key, std::move(spirv));
-                        ++state->shaders_translated;
-                    } catch(...) { ++state->shaders_failed; }
+                    };
+
+                    if (try_translate_at(0)) {
+                        return true;
+                    }
+
+                    // Opt-in: search for a working entry point at other offsets
+                    // within the payload, using the FULL pipeline above (not a
+                    // cheap decode check) as the success signal. Off by default —
+                    // this is expensive (each candidate re-runs the whole
+                    // translate pipeline) and, applied to an entire ROM scan,
+                    // could turn a several-minute scan into a much longer one.
+                    // Best combined with CITRON_PRECACHE_FILTER to restrict to a
+                    // small, known set of files while evaluating whether this
+                    // finds anything real. Window and step are in bytes.
+                    static const bool bruteforce_entry = [] {
+                        const char* v = std::getenv("CITRON_PRECACHE_BRUTEFORCE_ENTRY");
+                        return v && *v && std::string(v) != "0";
+                    }();
+                    if (bruteforce_entry) {
+                        u32 window_bytes = 512;
+                        if (const char* w = std::getenv("CITRON_PRECACHE_BRUTEFORCE_WINDOW")) {
+                            const int parsed = std::atoi(w);
+                            if (parsed > 0) window_bytes = static_cast<u32>(parsed);
+                        }
+                        const u32 limit = std::min<u32>(window_bytes, static_cast<u32>(payload));
+
+                        // Fast pass: across two independent stages (vertex and
+                        // fragment) and 55 real successes found scanning every
+                        // 8-byte position, every single one landed at
+                        // payload_offset % 32 == 8, with zero exceptions. That's
+                        // not coincidence at that sample size — it's a real
+                        // structural fact (almost certainly the entry point
+                        // sitting right after a variable-length, 32-byte-granular
+                        // embedded-constants region — consistent with e.g. 4x4
+                        // matrices or similar GPU-aligned data preceding the real
+                        // code). Try this residue class first: same recall so
+                        // far, 4x fewer candidates.
+                        for (u32 off = 8; off < limit; off += 32) {
+                            if (try_translate_at(off)) {
+                                if (diag_slot >= 0) {
+                                    LOG_INFO(Render_Vulkan,
+                                             "PreCacheShaders diag[{}]: BRUTEFORCE (fast pass, %32==8) found "
+                                             "working entry at payload offset +{} (naive offset was +0)",
+                                             diag_slot, off);
+                                }
+                                return true;
+                            }
+                        }
+                        // Fallback: exhaustive search of the remaining phases, in
+                        // case some shader's true entry doesn't fit the pattern
+                        // above. Only reached when the fast pass above found
+                        // nothing, so this doesn't cost anything extra for the
+                        // (so far) common case.
+                        for (u32 off = 0; off < limit; off += 8) {
+                            if (off % 32 == 8) continue; // already tried above
+                            if (try_translate_at(off)) {
+                                if (diag_slot >= 0) {
+                                    LOG_INFO(Render_Vulkan,
+                                             "PreCacheShaders diag[{}]: BRUTEFORCE (fallback pass) found "
+                                             "working entry at payload offset +{} (naive offset was +0, "
+                                             "did NOT fit the %32==8 pattern)",
+                                             diag_slot, off);
+                                }
+                                return true;
+                            }
+                        }
+                        if (diag_slot >= 0) {
+                            LOG_INFO(Render_Vulkan,
+                                     "PreCacheShaders diag[{}]: BRUTEFORCE found no working entry within "
+                                     "+{} bytes", diag_slot, limit);
+                        }
+                    }
+
+                    ++state->shaders_failed;
+                    return false;
                 };
 
                 const auto log_unrecognized_sample = [&]() {
@@ -7177,44 +7482,173 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                              file->GetFullPath(), sz, dump_len, hex);
                 };
 
-                constexpr u32 BNSH_MAGIC = 0x48534E42u; // "BNSH" (was 0x68534E42 = "BNSh", a typo)
-                u32 magic4{}; std::memcpy(&magic4, data, 4);
-                if (magic4 == BNSH_MAGIC && sz >= 0x14) {
-                    ++state->bnsh_matched;
-                    u32 nv{}; std::memcpy(&nv, data+0x0C, 4);
-                    if (nv>0&&nv<=512) for (u32 v=0;v<nv;++v) {
-                        size_t va=0x10+v*4; if(va+4>sz) break;
-                        u32 voff{}; std::memcpy(&voff,data+va,4);
-                        if((size_t)voff+8>sz) continue;
-                        u32 ns{}; std::memcpy(&ns,data+voff+4,4);
-                        if(!ns||ns>64) continue;
-                        for(u32 s=0;s<ns;++s) {
-                            size_t sa=voff+8+s*4; if(sa+4>sz) break;
-                            u32 sr{}; std::memcpy(&sr,data+sa,4);
-                            size_t sabs=(size_t)voff+sr; if(sabs+0x10>sz) continue;
-                            u32 ds{},st{}; std::memcpy(&ds,data+sabs+4,4); std::memcpy(&st,data+sabs+8,4);
-                            if(st>5||sabs+0x10+ds>sz) continue;
-                            Shader::ProgramHeader syn{};
-                            // Set all SPH fields validated by process_blob.
-                            // sph_type=1  : rendering shader (not compute)
-                            // version=2   : Maxwell SPH format version
-                            // shader_type : from BNSH stage index
-                            // sass_version=5 : Maxwell2/GM20B (Switch GPU, SM52/53)
-                            syn.common0.sph_type.Assign(1u);
-                            syn.common0.version.Assign(2u);
-                            syn.common0.shader_type.Assign(st < 5u ? st + 1u : 1u);
-                            syn.common0.sass_version.Assign(5u);
-                            std::vector<u8> blob(sizeof(syn)+ds);
-                            std::memcpy(blob.data(),&syn,sizeof(syn));
-                            std::memcpy(blob.data()+sizeof(syn),data+sabs+0x10,ds);
-                            process_blob(blob);
+                constexpr u32 BNSH_MAGIC = 0x48534E42u; // "BNSH"
+
+                // Extracts and translates every shader from a BNSH blob starting
+                // at byte offset `base` within data/sz. This is the real BNSH
+                // (BFRES-family) container format, verified field-by-field
+                // against an actual decompressed TotK BFSHA sample rather than
+                // reconstructed from a generic guess:
+                //
+                //   base + 0x00  BinaryHeader (32 bytes; shared with other
+                //                 BFRES-family formats). Field of interest:
+                //                 BlockOffset (u16 @ 0x16) — where the
+                //                 format-specific header starts (conventionally
+                //                 96, but read rather than assumed).
+                //   base + BlockOffset
+                //                GRSC header (56 bytes). Fields of interest:
+                //                 magic (u32 @ 0x00, == "grsc", lowercase —
+                //                 despite the reference implementation's own
+                //                 comment calling it "GRSC"), NumVariation
+                //                 (u32 @ 0x1C), VariationStartOffset (u64 @ 0x20).
+                //   base + VariationStartOffset + i*64
+                //                One VariationHeader per variation (64 bytes
+                //                each). Field of interest: BinaryOffset
+                //                (u64 @ 0x10).
+                //   base + BinaryOffset
+                //                BnshShaderProgramHeader (176 bytes). Six u64
+                //                per-stage offsets at fixed positions: Vertex
+                //                @0x08, TessControl @0x10, TessEval @0x18,
+                //                Geometry @0x20, Fragment @0x28, Compute @0x30.
+                //                Zero means that stage isn't present.
+                //   base + <stage offset>
+                //                ShaderCode header (64 bytes): 8 bytes unused,
+                //                then ControlCodeOffset (u64 @0x08), ByteCodeOffset
+                //                (u64 @0x10), ByteCodeSize (u32 @0x18),
+                //                ControlCodeSize (u32 @0x1C), 32 bytes reserved.
+                //   base + ByteCodeOffset
+                //                The actual per-stage data. The first 48 bytes
+                //                here are some other preamble/marker (starts
+                //                with a 0x12345678 sentinel, otherwise mostly
+                //                zero) — NOT part of the shader. The real,
+                //                complete 80-byte hardware SPH (matching
+                //                sizeof(Shader::ProgramHeader) exactly) starts
+                //                at +48, immediately followed by the actual
+                //                Maxwell instructions — i.e. process_blob() can
+                //                be handed this slice directly with no
+                //                synthesized header at all.
+                //
+                // All offsets above are absolute from `base` (byte 0 of the
+                // BNSH blob, i.e. its own magic) — confirmed via the reference
+                // loader's SeekBegin()/TemporarySeek() semantics, which always
+                // seek from the start of whatever stream/blob is being read,
+                // not relative to any intermediate structure.
+                constexpr size_t kByteCodePreambleSize = 48;
+
+                const auto read_u16 = [&](size_t off, u16& out) {
+                    if (off + 2 > sz) return false;
+                    std::memcpy(&out, data + off, 2); return true;
+                };
+                const auto read_u32 = [&](size_t off, u32& out) {
+                    if (off + 4 > sz) return false;
+                    std::memcpy(&out, data + off, 4); return true;
+                };
+                const auto read_u64 = [&](size_t off, u64& out) {
+                    if (off + 8 > sz) return false;
+                    std::memcpy(&out, data + off, 8); return true;
+                };
+
+                const auto process_stage_offset = [&](size_t base, u64 stage_offset) {
+                    if (stage_offset == 0) return;
+                    const size_t code_hdr = base + static_cast<size_t>(stage_offset);
+                    u64 control_code_offset{};
+                    u64 byte_code_offset{};
+                    u32 byte_code_size{};
+                    u32 control_code_size{};
+                    if (!read_u64(code_hdr + 0x08, control_code_offset)) return;
+                    if (!read_u64(code_hdr + 0x10, byte_code_offset)) return;
+                    if (!read_u32(code_hdr + 0x18, byte_code_size)) return;
+                    if (!read_u32(code_hdr + 0x1C, control_code_size)) return;
+
+                    bool succeeded = false;
+                    if (byte_code_offset != 0 && byte_code_size > kByteCodePreambleSize) {
+                        const size_t blob_start = base + static_cast<size_t>(byte_code_offset) + kByteCodePreambleSize;
+                        const size_t blob_size = byte_code_size - kByteCodePreambleSize;
+                        if (blob_start + blob_size <= sz) {
+                            succeeded = process_blob(std::vector<u8>(data + blob_start, data + blob_start + blob_size),
+                                                      /*is_bnsh_derived=*/true);
                         }
                     }
+                    if (succeeded) return;
+
+                    // Fallback: try ControlCode instead of ByteCode. This mirrors a
+                    // workaround documented by the Switch-modding community for
+                    // exactly this situation (see e.g. the GBATemp "Dump Vertex and
+                    // Fragment Shader code" tutorial, and Switch-Toolbox's own BNSH
+                    // exporter, which offers both "Shader0" [ControlCode] and
+                    // "Shader1" [ByteCode] as export options because either one can
+                    // turn out to be the section that actually contains valid,
+                    // decodable code for a given shader — "if [Shader1] gives an
+                    // error, try [Shader0]"). Root cause: the real live pipeline's
+                    // CFG starts reading at env.StartAddress() + sizeof(SPH), where
+                    // StartAddress() is live GPU-register-supplied context this
+                    // static scan has no access to — so for some shaders, what we'd
+                    // naively pick (ByteCode, offset 0) isn't the section the real
+                    // pipeline actually executes from. Trying ControlCode next is a
+                    // cheap, community-precedented second guess, not a blind one.
+                    if (control_code_offset != 0 && control_code_size > kByteCodePreambleSize) {
+                        const size_t blob_start = base + static_cast<size_t>(control_code_offset) + kByteCodePreambleSize;
+                        const size_t blob_size = control_code_size - kByteCodePreambleSize;
+                        if (blob_start + blob_size <= sz) {
+                            process_blob(std::vector<u8>(data + blob_start, data + blob_start + blob_size),
+                                         /*is_bnsh_derived=*/true);
+                        }
+                    }
+                };
+
+                const auto process_bnsh_at = [&](size_t base) {
+                    u16 block_offset{};
+                    if (!read_u16(base + 0x16, block_offset)) return;
+                    const size_t grsc = base + block_offset;
+                    u32 grsc_magic{};
+                    if (!read_u32(grsc, grsc_magic)) return;
+                    if (grsc_magic != 0x63737267u) return; // "grsc"
+                    u32 num_variations{};
+                    u64 variation_start{};
+                    if (!read_u32(grsc + 0x1C, num_variations)) return;
+                    if (!read_u64(grsc + 0x20, variation_start)) return;
+                    if (num_variations == 0 || num_variations > 4096) return; // sanity bound
+
+                    for (u32 v = 0; v < num_variations; ++v) {
+                        const size_t var_hdr = base + static_cast<size_t>(variation_start) + v * 64;
+                        u64 binary_offset{};
+                        if (!read_u64(var_hdr + 0x10, binary_offset)) continue;
+                        if (binary_offset == 0) continue;
+
+                        const size_t prog_hdr = base + static_cast<size_t>(binary_offset);
+                        static constexpr size_t kStageOffsetFields[6] = {0x08, 0x10, 0x18, 0x20, 0x28, 0x30};
+                        for (const size_t field : kStageOffsetFields) {
+                            u64 stage_offset{};
+                            if (!read_u64(prog_hdr + field, stage_offset)) continue;
+                            process_stage_offset(base, stage_offset);
+                        }
+                    }
+                };
+
+
+                // Full-buffer scan, 4-byte-aligned (the format is never sub-word
+                // aligned in practice). This runs once per file, on the
+                // decompressed buffer where applicable — if profiling later shows
+                // this dominates scan time on very large archives, the memcpy+
+                // compare per position here is the first thing to optimize (e.g.
+                // via std::search / an SSE-friendly scan), but it hasn't been
+                // measured yet so this stays simple until there's a reason not to.
+                bool any_bnsh = false;
+                for (size_t base = 0; base + 4 <= sz; base += 4) {
+                    u32 magic4{}; std::memcpy(&magic4, data+base, 4);
+                    if (magic4 == BNSH_MAGIC) {
+                        any_bnsh = true;
+                        process_bnsh_at(base);
+                    }
+                }
+
+                if (any_bnsh) {
+                    ++state->bnsh_matched;
                 } else if (sz>=sizeof(Shader::ProgramHeader)) {
                     Shader::ProgramHeader sph{}; std::memcpy(&sph,data,sizeof(sph));
                     if (sph.common0.shader_type.Value()>=1 && sph.common0.shader_type.Value()<=5) {
                         ++state->raw_matched;
-                        process_blob(raw);
+                        process_blob(std::vector<u8>(data, data+sz), /*is_bnsh_derived=*/false);
                     } else {
                         ++state->unrecognized;
                         log_unrecognized_sample();
@@ -7228,10 +7662,11 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
         workers.WaitForRequests();
         cache.Save(spirv_path);
         LOG_INFO(Render_Vulkan,
-                 "PreCacheShaders: done. files={} processed={} bnsh_matched={} "
-                 "raw_matched={} unrecognized={} shaders_found={} translated={} failed={} "
-                 "cache_size={}",
+                 "PreCacheShaders: done. files={} processed={} zstd_decompressed={} "
+                 "zstd_failed={} bnsh_matched={} raw_matched={} unrecognized={} "
+                 "shaders_found={} translated={} failed={} cache_size={}",
                  state->files_total.load(), state->files_processed.load(),
+                 state->zstd_decompressed.load(), state->zstd_failed.load(),
                  state->bnsh_matched.load(), state->raw_matched.load(),
                  state->unrecognized.load(), state->shaders_found.load(),
                  state->shaders_translated.load(), state->shaders_failed.load(),

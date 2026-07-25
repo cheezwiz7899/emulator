@@ -123,7 +123,16 @@ public:
 
     // Look up a pre-translated SPIR-V program.
     // Returns nullopt on miss.
-    [[nodiscard]] std::optional<LookupResult> Lookup(const SpirvKey& key) const;
+    // has_real_specialization_context: true if the caller's cbuf_key/texture_key
+    // were computed from real captured data (gen_env_stage/gen_env != nullptr),
+    // false if they were forced to 0 because the environment was FileEnvironment
+    // (citron's older disk-cache-load path, which doesn't carry cbuf/texture
+    // capture data). Used only to split the stale-miss diagnostic counters
+    // precisely instead of guessing from cbuf_key==0/texture_key==0 alone, since
+    // those can ALSO be the legitimate value for a shader with no specialization
+    // or no textures — ambiguous without this explicit flag from the caller.
+    [[nodiscard]] std::optional<LookupResult> Lookup(const SpirvKey& key,
+                                                       bool has_real_specialization_context) const;
 
     // Returns true if the cache already contains an entry for @p key.
     // Faster than Lookup() when the SPIR-V itself is not needed — avoids the vector copy.
@@ -138,6 +147,11 @@ public:
     [[nodiscard]] size_t HitCount() const noexcept { return hit_count_.load(); }
     /// Total number of Lookup() calls (hit or miss) since construction.
     [[nodiscard]] size_t LookupCount() const noexcept { return lookup_count_.load(); }
+    /// Number of misses where the shader's unique_hash existed under a different key.
+    [[nodiscard]] size_t MissWithHashPresentCount() const noexcept { return miss_with_hash_present_count_.load(); }
+    /// Of those, how many had no real cbuf/texture context (FileEnvironment) vs. real context that still mismatched.
+    [[nodiscard]] size_t StaleMissNoContextCount() const noexcept { return stale_miss_no_context_.load(); }
+    [[nodiscard]] size_t StaleMissWithContextCount() const noexcept { return stale_miss_with_context_.load(); }
     /// Number of entries inserted via InsertSpeculative() since construction.
     [[nodiscard]] size_t SpeculativeInsertCount() const noexcept { return speculative_insert_count_.load(); }
     /// Number of entries inserted via the real (non-speculative) Insert() overloads since construction.
@@ -184,9 +198,48 @@ private:
     // is actually mutated (the SpirvKey overload of Insert()) and rebuilt
     // during Load().
     ankerl::unordered_dense::set<u64> unique_hashes_;
+    // Maps unique_hash -> every full SpirvKey currently stored for it. Lets a
+    // stale miss (see miss_with_hash_present_count_) efficiently find what
+    // the stored key(s) actually look like and report which specific
+    // field(s) — cbuf_key, runtime_key, or texture_key — differ from what
+    // the real draw asked for, instead of just knowing that something does.
+    // Capped per-hash (kMaxStoredKeysPerHashForDiagnostics) purely so a
+    // pathological hash can't grow this unboundedly; diagnostic-only, never
+    // consulted for correctness.
+    ankerl::unordered_dense::map<u64, std::vector<SpirvKey>> keys_by_hash_;
     mutable bool dirty_{false};
     mutable std::atomic<size_t> hit_count_{0};
     mutable std::atomic<size_t> lookup_count_{0};
+    // Incremented when a Lookup() misses on the full SpirvKey (unique_hash +
+    // cbuf_key + runtime_key + texture_key) but unique_hashes_ shows this
+    // exact shader (unique_hash alone) IS present in the cache under some
+    // OTHER combination of the remaining three fields. A high rate here
+    // means speculative entries the pre-cache scanner inserted (keyed with
+    // guessed cbuf/texture state, since it has no real draw context) are
+    // sitting in the cache unused — the shader itself was correctly
+    // translated, but real draws can't find it because their actual
+    // cbuf_key/texture_key don't match what was guessed. Distinguishes that
+    // from the more boring "the scan just didn't cover what was played"
+    // explanation, which wouldn't show up here at all.
+    mutable std::atomic<size_t> miss_with_hash_present_count_{0};
+    // Splits miss_with_hash_present_count_ by has_real_specialization_context.
+    // stale_miss_no_context_: the caller's cbuf_key/texture_key were forced to
+    // 0 because gen_env_stage/gen_env was null (FileEnvironment — citron's
+    // older disk-cache-load path, no capture data available at all).
+    // stale_miss_with_context_: the caller had REAL captured cbuf/texture data
+    // and it still didn't match what's stored. These two need different
+    // fixes: the first can only be resolved by skipping the lookup (nothing
+    // to guess correctly from) or extending FileEnvironment's serialization
+    // format; the second means our speculative guessing itself (fixed
+    // Color2D/A8B8G8R8_UNORM texture type, cbuf_key=0) is wrong often enough
+    // in practice to be worth improving.
+    mutable std::atomic<size_t> stale_miss_no_context_{0};
+    mutable std::atomic<size_t> stale_miss_with_context_{0};
+    // Throttle for the field-level mismatch log lines emitted from Lookup()
+    // (see kMaxFieldMismatchLogs in the .cpp). Capped so a long play session
+    // doesn't flood the log — this is meant to establish which field(s)
+    // differ, which a handful of samples is enough to answer.
+    mutable std::atomic<size_t> field_mismatch_logs_{0};
     // Speculative vs. real insert counts — split by which Insert() overload
     // last touched a given entry is not tracked per-entry, but the totals
     // are useful to know whether the pre-cache scanner is contributing
@@ -206,6 +259,9 @@ private:
     // "since the last log line" instead.
     mutable size_t hit_count_at_last_log_{0};
     mutable size_t lookup_count_at_last_log_{0};
+    mutable size_t miss_with_hash_present_at_last_log_{0};
+    mutable size_t stale_miss_no_context_at_last_log_{0};
+    mutable size_t stale_miss_with_context_at_last_log_{0};
 
 };
 
