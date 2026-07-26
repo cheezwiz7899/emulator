@@ -7370,11 +7370,57 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                             Shader::Maxwell::ConvertLegacyToGeneric(prog, rt);
                             auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile,rt,prog,binding);
                             const u64 texture_key = VideoCommon::ComputeTextureKey(env.CapturedTextureTypes(), env.CapturedTexturePixelFormats());
-                            cache.InsertSpeculative(unique_hash, rt.Hash(), texture_key, std::move(spirv));
+                            // Every real Lookup()/Insert() call folds viewport_transform_state
+                            // (VertexB only) and binding_key into runtime_key before touching
+                            // the cache (see FoldViewportTransformState/FoldBindingKey's doc
+                            // comment in spirv_cache.h) — passing rt.Hash() straight through
+                            // here, unfolded, put every entry this scanner ever inserted in a
+                            // format that could never match a real one, regardless of how
+                            // accurate any other part of the guess was.
+                            u64 runtime_key = rt.Hash();
+                            if (stage == Shader::Stage::VertexB) {
+                                runtime_key = VideoCommon::FoldViewportTransformState(
+                                    runtime_key, env.ReadViewportTransformState());
+                            }
+                            runtime_key = VideoCommon::FoldBindingKey(
+                                runtime_key, VideoCommon::ComputeBindingKey(Shader::Backend::Bindings{}));
+                            cache.InsertSpeculative(unique_hash, runtime_key, texture_key, std::move(spirv));
                             ++state->shaders_translated;
                             if (diag_slot >= 0) {
                                 LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: fully translated OK at entry +{}",
                                          diag_slot, entry_offset_in_payload);
+                            }
+                            // VertexB: PositionPass() bakes viewport_transform_state into the
+                            // emitted code itself (see the matching comment in
+                            // PipelineCache::SubmitSpeculativeShader), and it's a genuine 2-way
+                            // fork with nothing else possible — worth a second full translate
+                            // for the other guess. Best-effort: any failure here must not affect
+                            // this offset's success/failure verdict for the search above, since
+                            // the primary translate (the thing that verdict is actually about)
+                            // already succeeded by this point.
+                            if (stage == Shader::Stage::VertexB) {
+                                try {
+                                    VideoCommon::SpeculativeShaderEnvironment env0{code, stage, lm, bsph};
+                                    env0.SetViewportTransformState(0u);
+                                    Shader::ObjectPool<Shader::Maxwell::Flow::Block> fp0(16);
+                                    Shader::ObjectPool<Shader::IR::Inst> ip0(8192);
+                                    Shader::ObjectPool<Shader::IR::Block> bp0(32);
+                                    Shader::Maxwell::Flow::CFG cfg0(env0, fp0, start_address, false);
+                                    auto prog0 = Shader::Maxwell::TranslateProgram(ip0, bp0, env0, cfg0, host_info);
+                                    Shader::Backend::Bindings binding0{};
+                                    Shader::RuntimeInfo rt0{};
+                                    rt0.previous_stage_stores.mask.set();
+                                    rt0.input_topology = Shader::InputTopology::Triangles;
+                                    Shader::Maxwell::ConvertLegacyToGeneric(prog0, rt0);
+                                    auto spirv0 = Shader::Backend::SPIRV::EmitSPIRV(profile, rt0, prog0, binding0);
+                                    const u64 texture_key0 = VideoCommon::ComputeTextureKey(
+                                        env0.CapturedTextureTypes(), env0.CapturedTexturePixelFormats());
+                                    u64 runtime_key0 = VideoCommon::FoldViewportTransformState(
+                                        rt0.Hash(), env0.ReadViewportTransformState());
+                                    runtime_key0 = VideoCommon::FoldBindingKey(
+                                        runtime_key0, VideoCommon::ComputeBindingKey(Shader::Backend::Bindings{}));
+                                    cache.InsertSpeculative(unique_hash, runtime_key0, texture_key0, std::move(spirv0));
+                                } catch (...) {}
                             }
                             return true;
                         } catch (const std::exception& e) {

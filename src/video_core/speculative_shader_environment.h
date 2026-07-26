@@ -81,7 +81,15 @@ public:
         return Shader::TexturePixelFormat::A8B8G8R8_UNORM;
     }
     bool IsTexturePixelFormatInteger(u32) override { return false; }
-    u32 ReadViewportTransformState() override { return 1u; }
+    u32 ReadViewportTransformState() override { return viewport_transform_state_; }
+    // The real value is GPU register state a speculative (no live draw) translation
+    // has no way to observe. Unlike cbuf content or non-leading binding state, this
+    // is a genuine 2-way fork (see PositionPass() in ir_opt/position_pass.cpp) with
+    // no other possible values, so callers can cheaply try both by translating twice
+    // with this set differently each time, instead of betting on a single guess.
+    // Defaults to 1 (the prior hardcoded behavior) so existing call sites that never
+    // call this are unaffected.
+    void SetViewportTransformState(u32 value) noexcept { viewport_transform_state_ = value; }
     u32 TextureBoundBuffer() const override { return texture_bound; }
     u32 LocalMemorySize() const override { return local_memory_size; }
     u32 SharedMemorySize() const override { return shared_memory_size; }
@@ -131,6 +139,7 @@ private:
     u32 code_lowest;
     u32 read_lowest = ~0u;
     u32 read_highest = 0;
+    u32 viewport_transform_state_ = 1u;
 };
 
 } // namespace VideoCommon

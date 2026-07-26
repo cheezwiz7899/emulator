@@ -16,6 +16,7 @@ namespace Shader {
 // Defined in video_core/shader_environment.h.
 } // namespace Shader
 namespace VideoCommon { class GenericEnvironment; }
+namespace VideoCommon { class FileEnvironment; }
 namespace Shader {
 
 class Environment {
@@ -30,6 +31,19 @@ public:
     }
     [[nodiscard]] virtual const VideoCommon::GenericEnvironment*
         AsGenericEnvironment() const noexcept {
+        return nullptr;
+    }
+
+    /// Returns a FileEnvironment* if this object IS a FileEnvironment, nullptr
+    /// otherwise. Same no-RTTI downcast pattern as AsGenericEnvironment() above,
+    /// for the one class that deliberately does NOT derive from GenericEnvironment
+    /// but still deserializes real (not guessed) cbuf/texture capture data from
+    /// disk — see FileEnvironment::CapturedCbufValues() and friends.
+    [[nodiscard]] virtual VideoCommon::FileEnvironment* AsFileEnvironment() noexcept {
+        return nullptr;
+    }
+    [[nodiscard]] virtual const VideoCommon::FileEnvironment*
+        AsFileEnvironment() const noexcept {
         return nullptr;
     }
 

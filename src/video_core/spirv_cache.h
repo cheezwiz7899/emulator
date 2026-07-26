@@ -57,24 +57,35 @@ u64 ComputeTextureKey(const std::unordered_map<u32, Shader::TextureType>& textur
                       const std::unordered_map<u32, Shader::TexturePixelFormat>& texture_pixel_formats);
 
 // ---------------------------------------------------------------------------
-// ComputeBindingKey — returns 0 if the starting Bindings state (the
-// accumulator as it stood immediately before EmitSPIRV ran for this stage)
-// is all-zero — i.e. this is genuinely the leading stage of a pipeline, or a
-// speculative pre-cache entry (which always assumes it is) — and 1
-// otherwise. This is intentionally a single bit, not a full hash of the
-// state: it exists only to stop a real, non-leading-stage draw (non-zero
-// starting binding) from matching a speculative entry (always zero), which
-// is a genuine structural incompatibility — EmitSPIRV bakes absolute
-// descriptor binding numbers into the SPIR-V relative to the starting point,
-// so serving a zero-based speculative entry into a non-zero-based context
-// produces descriptors that don't match the pipeline layout. It deliberately
-// does NOT distinguish between two different non-zero starting states (e.g.
-// the same fragment shader reused after two different vertex shaders with
-// different descriptor counts) — that risk is unconfirmed, and fragmenting
-// the cache on it collapses the pre-cache's hit rate for most real
-// rendering, with no stutter-reduction benefit and higher overhead.
+// ComputeBindingKey — hashes the full starting Bindings state (the
+// accumulator as it stood immediately before EmitSPIRV ran for this stage).
+// v4 briefly narrowed this to a single leading/non-leading bit, on the
+// theory that the only real risk was a real non-leading-stage draw
+// colliding with a speculative entry (which always assumes an all-zero
+// start). That was wrong: two different *real* non-leading-stage
+// shaders/pipelines can and do collide under a single-bit scheme (both map
+// to bit=1 regardless of their actual descriptor offsets), which reintroduced
+// the "descriptor used by shader but not declared in the pipeline layout" /
+// Ultrahand-style breakage this key exists to prevent. v5 reverted to a full
+// hash of the state — see SPIRV_CACHE_VERSION's comment in the .cpp.
 // ---------------------------------------------------------------------------
 u64 ComputeBindingKey(const Shader::Backend::Bindings& starting_binding);
+
+// ---------------------------------------------------------------------------
+// FoldViewportTransformState / FoldBindingKey — the exact boost::hash_combine
+// -style XOR fold CreateGraphicsPipeline()/CreateComputePipeline() apply to
+// runtime_key before ever calling Lookup()/Insert(). Speculative insertion
+// (InsertSpeculative(), called from both PipelineCache::SubmitSpeculativeShader
+// and the ROM pre-cache scanner in citron/main.cpp) MUST apply the identical
+// fold to the values it's guessing, or its runtime_key is in a different,
+// incompatible format from every real entry's and can never match one no
+// matter how accurate the guess is otherwise — this is what one of the two
+// InsertSpeculative() call sites was silently skipping. Centralized here
+// instead of duplicated inline at each call site specifically because that
+// duplication is exactly how it drifted out of sync in the first place.
+// ---------------------------------------------------------------------------
+u64 FoldViewportTransformState(u64 runtime_key, u64 viewport_transform_state);
+u64 FoldBindingKey(u64 runtime_key, u64 binding_key);
 
 
 // ---------------------------------------------------------------------------
@@ -238,8 +249,15 @@ private:
     // Throttle for the field-level mismatch log lines emitted from Lookup()
     // (see kMaxFieldMismatchLogs in the .cpp). Capped so a long play session
     // doesn't flood the log — this is meant to establish which field(s)
-    // differ, which a handful of samples is enough to answer.
-    mutable std::atomic<size_t> field_mismatch_logs_{0};
+    // differ, which a handful of samples is enough to answer. Split by
+    // has_real_specialization_context (no_context_ / with_context_) rather
+    // than sharing one counter: the disk-cache replay at boot can throw
+    // dozens of no-context misses within milliseconds on the worker pool,
+    // which was silently consuming the *entire* shared budget before a
+    // single real-context sample — the case that actually matters for
+    // live-play stutter — ever got a slot.
+    mutable std::atomic<size_t> field_mismatch_logs_no_context_{0};
+    mutable std::atomic<size_t> field_mismatch_logs_with_context_{0};
     // Speculative vs. real insert counts — split by which Insert() overload
     // last touched a given entry is not tracked per-entry, but the totals
     // are useful to know whether the pre-cache scanner is contributing

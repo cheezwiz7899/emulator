@@ -199,6 +199,31 @@ public:
 
     void Deserialize(std::ifstream& file);
 
+    /// No-RTTI downcast: FileEnvironment is always a FileEnvironment.
+    VideoCommon::FileEnvironment* AsFileEnvironment() noexcept override { return this; }
+    const VideoCommon::FileEnvironment* AsFileEnvironment() const noexcept override {
+        return this;
+    }
+
+    /// Real (not guessed) cbuf/texture specialization data deserialized from
+    /// disk — the exact values GenericEnvironment::Serialize() wrote out when
+    /// this pipeline was originally compiled live. Mirrors GenericEnvironment's
+    /// accessors of the same name so SpirvCache key computation can use real
+    /// specialization for the disk-replay path instead of forcing cbuf_key/
+    /// texture_key to 0 for lack of anywhere to read it from — the data was
+    /// deserialized into cbuf_values/texture_types/texture_pixel_formats below
+    /// all along, just not previously exposed.
+    const std::unordered_map<u64, u32>& CapturedCbufValues() const noexcept {
+        return cbuf_values;
+    }
+    const std::unordered_map<u32, Shader::TextureType>& CapturedTextureTypes() const noexcept {
+        return texture_types;
+    }
+    const std::unordered_map<u32, Shader::TexturePixelFormat>&
+        CapturedTexturePixelFormats() const noexcept {
+        return texture_pixel_formats;
+    }
+
     [[nodiscard]] u64 ReadInstruction(u32 address) override;
 
     [[nodiscard]] u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) override;

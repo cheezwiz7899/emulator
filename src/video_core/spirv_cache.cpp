@@ -81,6 +81,16 @@ u64 ComputeBindingKey(const Shader::Backend::Bindings& starting_binding) {
     return Common::CityHash64(reinterpret_cast<const char*>(fields), sizeof(fields));
 }
 
+u64 FoldViewportTransformState(u64 runtime_key, u64 viewport_transform_state) {
+    return runtime_key ^ (viewport_transform_state + 0x9e3779b97f4a7c15ULL +
+                          (runtime_key << 6) + (runtime_key >> 2));
+}
+
+u64 FoldBindingKey(u64 runtime_key, u64 binding_key) {
+    return runtime_key ^ (binding_key + 0x9e3779b97f4a7c15ULL +
+                          (runtime_key << 6) + (runtime_key >> 2));
+}
+
 
 void SpirvCache::Load(const std::filesystem::path& path) {
     std::unique_lock lock{mutex_};
@@ -305,10 +315,13 @@ std::optional<SpirvCache::LookupResult> SpirvCache::Lookup(const SpirvKey& key,
             // dominant mismatch source, without flooding the log over a
             // whole play session.
             constexpr size_t kMaxFieldMismatchLogs = 30;
-            size_t expected = field_mismatch_logs_.load();
+            std::atomic<size_t>& field_mismatch_logs =
+                has_real_specialization_context ? field_mismatch_logs_with_context_
+                                                 : field_mismatch_logs_no_context_;
+            size_t expected = field_mismatch_logs.load();
             bool got_slot = false;
             while (expected < kMaxFieldMismatchLogs &&
-                   !field_mismatch_logs_.compare_exchange_weak(expected, expected + 1)) {
+                   !field_mismatch_logs.compare_exchange_weak(expected, expected + 1)) {
             }
             got_slot = expected < kMaxFieldMismatchLogs;
             if (got_slot) {
