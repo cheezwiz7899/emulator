@@ -106,25 +106,32 @@ public:
         return texture_pixel_formats;
     }
 
+    // Must match GenericEnvironment::Analyze() EXACTLY, or unique_hash never agrees
+    // with what a live lookup computes for the same shader — see the doc comment
+    // on this class'''s declaration in main.cpp'''s caller for the full story. Two
+    // things Analyze() does that this now mirrors:
+    //  1. Hashes from the real entry point onward — read_lowest here, since that'''s
+    //     the first address ReadInstruction() actually saw, i.e. wherever THIS
+    //     translation attempt really started. A prior version of this function
+    //     scanned code[] from index 0, which is a fixed position (code_lowest)
+    //     with no relationship to where any given shader'''s real entry is.
+    //  2. Stops BEFORE the self-branch terminator, not after it. Analyze() hashes
+    //     `size` bytes where `size` is the self-branch'''s byte offset from
+    //     start_address — i.e. the self-branch itself is excluded. read_highest,
+    //     once CFG/TranslateProgram has run, IS the self-branch'''s address (it has
+    //     to be read to be recognized as one), so the upper index below is
+    //     exclusive rather than +1.
     u64 CalculateHash() const {
-        static constexpr u64 SELF_BRANCH_A = 0xE2400FFFFF87000FULL;
-        static constexpr u64 SELF_BRANCH_B = 0xE2400FFFFF07000FULL;
-
-        // Try to find self-branch to match GenericEnvironment::Analyze() behavior
-        for (size_t i = 0; i < code.size(); ++i) {
-            if (code[i] == SELF_BRANCH_A || code[i] == SELF_BRANCH_B) {
-                return Common::CityHash64(reinterpret_cast<const char*>(code.data()), (i + 1) * sizeof(u64));
-            }
-        }
-
-        // Fallback to hashing read instructions
         if (read_highest >= read_lowest && read_highest >= code_lowest) {
-            u32 start_i = (read_lowest - code_lowest) / 8;
-            u32 end_i = (read_highest - code_lowest) / 8;
-            size_t size = (end_i - start_i + 1) * sizeof(u64);
-            return Common::CityHash64(reinterpret_cast<const char*>(&code[start_i]), size);
+            const u32 start_i = (read_lowest - code_lowest) / 8;
+            const u32 end_i = (read_highest - code_lowest) / 8; // self-branch'''s index — excluded
+            const size_t size = (end_i - start_i) * sizeof(u64);
+            return Common::CityHash64(reinterpret_cast<const char*>(code.data() + start_i), size);
         }
-
+        // No usable read range (e.g. translation never actually ran for this
+        // instance) — this can'''t match a live Analyze() hash regardless of how
+        // it'''s computed, so it only needs to be internally consistent for this
+        // scan'''s own unique_hashes_/dedup bookkeeping.
         return Common::CityHash64(reinterpret_cast<const char*>(code.data()), code.size() * sizeof(u64));
     }
 

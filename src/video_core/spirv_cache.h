@@ -93,13 +93,24 @@ u64 FoldBindingKey(u64 runtime_key, u64 binding_key);
 //
 // On-disk format (spirv_cache.bin):
 //   8 bytes   magic "citrspv\0"
-//   u32       version (currently 1)
+//   u32       version (currently 5 — see SPIRV_CACHE_VERSION in the .cpp; a
+//             mismatch discards the whole file rather than trying to
+//             interpret entries in a layout they weren't written in)
 //   u32       num_entries
 //   per entry:
 //     u64     unique_hash
 //     u64     cbuf_key
+//     u64     runtime_key
+//     u64     texture_key
 //     u32     word_count
 //     u32[]   spirv words (word_count × 4 bytes)
+//     <raw>   end_binding — Shader::Backend::Bindings written as a raw
+//             struct (sizeof(end_binding) bytes; see Save()/Load()), not
+//             field-by-field, so its exact size follows that struct's
+//             layout rather than being spelled out here
+// Entry::is_speculative is NOT part of this format — every entry loaded
+// from disk comes back with is_speculative=false regardless of how it was
+// originally inserted (see Entry::is_speculative's own doc comment).
 // ---------------------------------------------------------------------------
 class SpirvCache {
 public:
@@ -130,6 +141,8 @@ public:
     struct LookupResult {
         std::shared_ptr<const std::vector<u32>> spirv;
         Shader::Backend::Bindings end_binding;
+        // See Entry::is_speculative — carried through so the caller can log/act on it.
+        bool is_speculative = false;
     };
 
     // Look up a pre-translated SPIR-V program.
@@ -198,6 +211,12 @@ private:
         // increasingly long stretches as the cache fills up over a session.
         std::shared_ptr<const std::vector<u32>> spirv;
         Shader::Backend::Bindings end_binding; // binding state after EmitSPIRV for this stage
+        // True if this entry came from InsertSpeculative() (live OnNewShaderSeen guess or
+        // the ROM pre-cache scanner) rather than a real, GenericEnvironment/FileEnvironment
+        // -backed compile. Surfaced through LookupResult so a caller can tell, at the exact
+        // point a hit is about to be used, whether it's serving a real capture or a guess —
+        // load-bearing for diagnosing whether a specific bad hit came from the scanner.
+        bool is_speculative = false;
     };
     ankerl::unordered_dense::map<SpirvKey, Entry, SpirvKeyHash> entries_;
     // Secondary index: which unique_hashes have at least one entry in entries_.

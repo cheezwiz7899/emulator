@@ -7390,38 +7390,18 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                                 LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: fully translated OK at entry +{}",
                                          diag_slot, entry_offset_in_payload);
                             }
-                            // VertexB: PositionPass() bakes viewport_transform_state into the
-                            // emitted code itself (see the matching comment in
-                            // PipelineCache::SubmitSpeculativeShader), and it's a genuine 2-way
-                            // fork with nothing else possible — worth a second full translate
-                            // for the other guess. Best-effort: any failure here must not affect
-                            // this offset's success/failure verdict for the search above, since
-                            // the primary translate (the thing that verdict is actually about)
-                            // already succeeded by this point.
-                            if (stage == Shader::Stage::VertexB) {
-                                try {
-                                    VideoCommon::SpeculativeShaderEnvironment env0{code, stage, lm, bsph};
-                                    env0.SetViewportTransformState(0u);
-                                    Shader::ObjectPool<Shader::Maxwell::Flow::Block> fp0(16);
-                                    Shader::ObjectPool<Shader::IR::Inst> ip0(8192);
-                                    Shader::ObjectPool<Shader::IR::Block> bp0(32);
-                                    Shader::Maxwell::Flow::CFG cfg0(env0, fp0, start_address, false);
-                                    auto prog0 = Shader::Maxwell::TranslateProgram(ip0, bp0, env0, cfg0, host_info);
-                                    Shader::Backend::Bindings binding0{};
-                                    Shader::RuntimeInfo rt0{};
-                                    rt0.previous_stage_stores.mask.set();
-                                    rt0.input_topology = Shader::InputTopology::Triangles;
-                                    Shader::Maxwell::ConvertLegacyToGeneric(prog0, rt0);
-                                    auto spirv0 = Shader::Backend::SPIRV::EmitSPIRV(profile, rt0, prog0, binding0);
-                                    const u64 texture_key0 = VideoCommon::ComputeTextureKey(
-                                        env0.CapturedTextureTypes(), env0.CapturedTexturePixelFormats());
-                                    u64 runtime_key0 = VideoCommon::FoldViewportTransformState(
-                                        rt0.Hash(), env0.ReadViewportTransformState());
-                                    runtime_key0 = VideoCommon::FoldBindingKey(
-                                        runtime_key0, VideoCommon::ComputeBindingKey(Shader::Backend::Bindings{}));
-                                    cache.InsertSpeculative(unique_hash, runtime_key0, texture_key0, std::move(spirv0));
-                                } catch (...) {}
-                            }
+                            // A second VertexB translate guessing viewport_transform_state=0
+                            // used to run here (mirroring PipelineCache::SubmitSpeculativeShader).
+                            // Measured across three full TotK sessions with 2000+ speculative
+                            // entries sitting in the cache: zero hits against any of them,
+                            // scanner or live-path alike. cbuf_key — hardcoded to 0 for every
+                            // speculative entry, never guessed — is what actually gates a hit
+                            // (see FoldViewportTransformState's doc comment in spirv_cache.h),
+                            // and it's off the table for real shaders that specialize on cbuf
+                            // content, which is most of them. Guessing harder on
+                            // viewport_transform_state doesn't move that ceiling, so removed
+                            // rather than doubling down on it — see PipelineCache::
+                            // SubmitSpeculativeShader for the matching removal on the live path.
                             return true;
                         } catch (const std::exception& e) {
                             if (diag_slot >= 0) {
@@ -7442,21 +7422,34 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                         return true;
                     }
 
-                    // Opt-in: search for a working entry point at other offsets
-                    // within the payload, using the FULL pipeline above (not a
-                    // cheap decode check) as the success signal. Off by default —
-                    // this is expensive (each candidate re-runs the whole
-                    // translate pipeline) and, applied to an entire ROM scan,
-                    // could turn a several-minute scan into a much longer one.
-                    // Best combined with CITRON_PRECACHE_FILTER to restrict to a
-                    // small, known set of files while evaluating whether this
-                    // finds anything real. Window and step are in bytes.
+                    // On by default as of this build — was opt-in behind
+                    // CITRON_PRECACHE_BRUTEFORCE_ENTRY=1 while this was still being
+                    // validated. It's still expensive (each candidate re-runs the
+                    // whole translate pipeline, not a cheap decode check), so a full
+                    // ROM scan takes meaningfully longer than the naive-offset-only
+                    // pass, but that's the intended default now rather than
+                    // something to remember to opt into per session.
+                    // Set CITRON_PRECACHE_BRUTEFORCE_ENTRY=0 to disable it (e.g. to
+                    // fall back to the old, faster, naive-offset-only behavior).
+                    // Window and step are in bytes; CITRON_PRECACHE_FILTER remains
+                    // useful for restricting a scan to a small, known set of files.
                     static const bool bruteforce_entry = [] {
                         const char* v = std::getenv("CITRON_PRECACHE_BRUTEFORCE_ENTRY");
-                        return v && *v && std::string(v) != "0";
+                        return !(v && *v && std::string(v) == "0");
                     }();
                     if (bruteforce_entry) {
-                        u32 window_bytes = 512;
+                        // Default window bumped from 512 to 8192 bytes: a scan with
+                        // the old 4096-byte default logged failed=9389, of which 507
+                        // were specifically "no working entry within +4096 bytes" —
+                        // i.e. window-limited, not a translation failure. 8192 gives
+                        // that tail more room without needing CITRON_PRECACHE_
+                        // BRUTEFORCE_WINDOW set by hand. Don'''t expect this to move
+                        // `failed` by much on its own, though — the other ~8900
+                        // failures in that run were for unrelated reasons (unsupported
+                        // instructions, genuine translation errors, etc.) a bigger
+                        // window can'''t fix. Still overridable via the env var, larger
+                        // or smaller, same as before.
+                        u32 window_bytes = 8192;
                         if (const char* w = std::getenv("CITRON_PRECACHE_BRUTEFORCE_WINDOW")) {
                             const int parsed = std::atoi(w);
                             if (parsed > 0) window_bytes = static_cast<u32>(parsed);

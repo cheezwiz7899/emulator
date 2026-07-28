@@ -346,14 +346,14 @@ std::optional<SpirvCache::LookupResult> SpirvCache::Lookup(const SpirvKey& key,
         return std::nullopt;
     }
     ++hit_count_;
-    return LookupResult{it->second.spirv, it->second.end_binding};
+    return LookupResult{it->second.spirv, it->second.end_binding, it->second.is_speculative};
 }
 
 void SpirvCache::Insert(const SpirvKey& key, std::vector<u32> spirv,
                         const Shader::Backend::Bindings& end_binding, bool is_speculative) {
     std::unique_lock lock{mutex_};
     entries_.insert_or_assign(key, Entry{std::make_shared<const std::vector<u32>>(std::move(spirv)),
-                                         end_binding});
+                                         end_binding, is_speculative});
     unique_hashes_.insert(key.unique_hash);
     constexpr size_t kMaxStoredKeysPerHashForDiagnostics = 8;
     auto& stored_keys = keys_by_hash_[key.unique_hash];
