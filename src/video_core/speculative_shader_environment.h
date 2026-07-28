@@ -30,9 +30,20 @@ public:
         is_proprietary_driver = false;
     }
 
-    // Constructor used by pre-cache scanner
+    // Constructor used by pre-cache scanner. code_offset_in_program_ is 0, not
+    // sizeof(ProgramHeader): the caller is expected to include the SPH as a
+    // prefix of code_ (see the call site in main.cpp), matching how a live
+    // GraphicsEnvironment's code[] always starts at the SPH's own address
+    // (start_address IS the SPH address there — see its constructor, which
+    // reads the SPH from program_base + start_address). Passing
+    // sizeof(ProgramHeader) here used to silently exclude the SPH from
+    // code_lowest regardless of what code_ actually contained, which is what
+    // made CalculateHash() below disagree with GenericEnvironment::Analyze()
+    // (the common-case live hash, which does include the SPH) even after the
+    // read_lowest/read_highest fix — it was matching the rare fallback path
+    // instead, since that one also excludes the SPH on the live side.
     explicit SpeculativeShaderEnvironment(std::vector<u64> code_, Shader::Stage stage_, u32 local_memory_size_, Shader::ProgramHeader sph_)
-        : SpeculativeShaderEnvironment(std::move(code_), 0, stage_, local_memory_size_, 0, {1u, 1u, 1u}, 1u, sph_, static_cast<u32>(sizeof(Shader::ProgramHeader))) {
+        : SpeculativeShaderEnvironment(std::move(code_), 0, stage_, local_memory_size_, 0, {1u, 1u, 1u}, 1u, sph_, 0u) {
     }
 
     u64 ReadInstruction(u32 address) override {

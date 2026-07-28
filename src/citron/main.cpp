@@ -7304,8 +7304,18 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                                   case 4:return Shader::Stage::Geometry;
                                   default:return Shader::Stage::Fragment;}
                     }();
-                    std::vector<u64> code(payload / 8);
-                    std::memcpy(code.data(), blob.data() + sizeof(Shader::ProgramHeader), payload);
+                    // code[] now includes the SPH as its first sizeof(ProgramHeader)/8
+                    // words, followed by the payload — matching what a live
+                    // GraphicsEnvironment's code[] always contains (it's read starting
+                    // at start_address, which IS the SPH's own address there). This is
+                    // what code_lowest=0 in the scanner's SpeculativeShaderEnvironment
+                    // constructor now assumes; see that constructor's doc comment for
+                    // why this alignment is what makes CalculateHash() actually agree
+                    // with GenericEnvironment::Analyze() on the same shader.
+                    std::vector<u64> code(sizeof(Shader::ProgramHeader) / 8 + payload / 8);
+                    std::memcpy(code.data(), blob.data(), sizeof(Shader::ProgramHeader));
+                    std::memcpy(code.data() + sizeof(Shader::ProgramHeader) / 8,
+                                blob.data() + sizeof(Shader::ProgramHeader), payload);
                     const u32 lm = static_cast<u32>(bsph.LocalMemorySize()) +
                                    static_cast<u32>(bsph.common3.shader_local_memory_crs_size);
                     if (diag_slot >= 0) {

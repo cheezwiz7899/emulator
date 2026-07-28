@@ -259,21 +259,29 @@ void SpirvCache::SaveThrottled(const std::filesystem::path& path,
         const size_t window_stale_misses = stale_misses_now - stale_misses_at_last;
         const size_t window_no_ctx = no_ctx_now - no_ctx_at_last;
         const size_t window_with_ctx = with_ctx_now - with_ctx_at_last;
+        const size_t cbuf_zero = real_cbuf_zero_count_.load();
+        const size_t cbuf_nonzero = real_cbuf_nonzero_count_.load();
+        const size_t cbuf_total = cbuf_zero + cbuf_nonzero;
+        const int cbuf_zero_pct =
+            cbuf_total > 0 ? static_cast<int>(cbuf_zero * 100 / cbuf_total) : 0;
         if (window_probes > 0) {
             const int window_pct = static_cast<int>(window_hits * 100 / window_probes);
             LOG_INFO(Render_Vulkan,
                      "SPIR-V cache: {} entries ({} speculative / {} real inserted so far) — "
                      "recent window {}/{} stage hits ({}%), {} misses where the shader was "
                      "already cached under a different key ({} had no real cbuf/texture "
-                     "context [FileEnvironment] / {} had real context that still mismatched).",
+                     "context [FileEnvironment] / {} had real context that still mismatched). "
+                     "Real-draw cbuf_key==0 so far: {}/{} ({}%) — the ceiling on how many real "
+                     "draws a speculative entry could ever match, regardless of key correctness.",
                      entries_now, speculative_insert_count_.load(), real_insert_count_.load(),
                      window_hits, window_probes, window_pct, window_stale_misses,
-                     window_no_ctx, window_with_ctx);
+                     window_no_ctx, window_with_ctx, cbuf_zero, cbuf_total, cbuf_zero_pct);
         } else {
             LOG_INFO(Render_Vulkan,
                      "SPIR-V cache: {} entries ({} speculative / {} real inserted so far) — "
-                     "no lookups since last log.",
-                     entries_now, speculative_insert_count_.load(), real_insert_count_.load());
+                     "no lookups since last log. Real-draw cbuf_key==0 so far: {}/{} ({}%).",
+                     entries_now, speculative_insert_count_.load(), real_insert_count_.load(),
+                     cbuf_zero, cbuf_total, cbuf_zero_pct);
         }
     }
 }
@@ -292,6 +300,13 @@ std::optional<SpirvCache::LookupResult> SpirvCache::Lookup(const SpirvKey& key,
                                                              bool has_real_specialization_context) const {
     std::shared_lock lock{mutex_};
     ++lookup_count_;
+    if (has_real_specialization_context) {
+        if (key.cbuf_key == 0) {
+            ++real_cbuf_zero_count_;
+        } else {
+            ++real_cbuf_nonzero_count_;
+        }
+    }
     const auto it = entries_.find(key);
     if (it == entries_.end()) {
         // Full-key miss. Was this exact shader (by unique_hash alone) already

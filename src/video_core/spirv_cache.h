@@ -284,6 +284,20 @@ private:
     mutable std::atomic<size_t> speculative_insert_count_{0};
     mutable std::atomic<size_t> real_insert_count_{0};
 
+    // Frequency of key.cbuf_key == 0 among REAL (has_real_specialization_context
+    // == true) Lookup() calls only — i.e. actual gameplay draws, never
+    // speculative/scanner lookups themselves. This is the number that settles
+    // whether the speculative-entry approach has a structural ceiling: every
+    // speculative entry is inserted with cbuf_key hardcoded to 0 (nothing
+    // captures real cbuf content without a live draw), so it can only ever be
+    // hit by a real draw whose OWN cbuf_key also happens to be 0. If this
+    // stays low across real play, that's the ceiling, independent of how
+    // correct the rest of the key is — see SubmitSpeculativeShader's
+    // ReadCbufValue() doc comment for why cbuf can't be guessed the way
+    // viewport_transform_state could.
+    mutable std::atomic<size_t> real_cbuf_zero_count_{0};
+    mutable std::atomic<size_t> real_cbuf_nonzero_count_{0};
+
     // Throttle state for SaveThrottled — updated under mutex_.
     mutable size_t saved_entry_count_{0};
     mutable std::chrono::steady_clock::time_point last_save_time_{};
