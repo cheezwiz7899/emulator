@@ -11,8 +11,10 @@
 #include <ranges>
 #include <string_view>
 
+#include <fmt/format.h>
 #include "common/assert.h"
 #include "common/common_types.h"
+#include "common/logging.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/maxwell/decode.h"
 #include "shader_recompiler/frontend/maxwell/opcodes.h"
@@ -61,8 +63,7 @@ Opcode Decode(u64 insn) {
         });
         return Opcode::NOP;
     }
-    ASSERT_MSG(false, "Invalid insn 0x{:016x}", insn);
-    return Opcode::NOP;
+    throw Shader::Exception(fmt::format("Invalid insn 0x{:016x}", insn));
 }
 
 } // namespace Shader::Maxwell

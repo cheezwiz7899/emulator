@@ -564,6 +564,8 @@ struct Values {
 #endif
                                                   "use_reactive_flushing",
                                                   Category::RendererAdvanced};
+    SwitchableSetting<bool> use_gpl_speculative_shaders{
+        linkage, true, "use_gpl_speculative_shaders", Category::RendererAdvanced};
     SwitchableSetting<bool> use_asynchronous_shaders{linkage, false, "use_asynchronous_shaders",
                                                      Category::RendererAdvanced};
     SwitchableSetting<bool> use_fast_gpu_time{

@@ -302,6 +302,7 @@ private slots:
     void OnGameListAddDirectory();
     void OnGameListShowList(bool show);
     void OnGameListOpenPerGameProperties(const std::string& file, u64 program_id = 0);
+    void OnGameListPreCacheShaders(u64 program_id, const std::string& game_path);
     void OnMenuLoadFile();
     void OnMenuLoadFolder();
     void OnMenuInstallToNAND();
@@ -377,6 +378,7 @@ private:
     void RemoveUpdateContent(u64 program_id, InstalledEntryType type);
     void RemoveAddOnContent(u64 program_id, InstalledEntryType type);
     void RemoveTransferableShaderCache(u64 program_id);
+    void RemoveSpirvCache(u64 program_id);
     void RemoveVulkanDriverPipelineCache(u64 program_id);
     void RemoveAllTransferableShaderCaches(u64 program_id);
     void RemoveCustomConfiguration(u64 program_id, const std::string& game_path);

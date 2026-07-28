@@ -62,6 +62,32 @@ public:
 
     void Serialize(std::ofstream& file) const;
 
+    /// GPL: copy the cached Maxwell code words into @p out.
+    void CopyCode(std::vector<u64>& out) const { out = code; }
+
+    /// GPL: read-only view of cbuf values captured during translation.
+    const std::unordered_map<u64, u32>& CapturedCbufValues() const noexcept {
+        return cbuf_values;
+    }
+
+    /// GPL: read-only view of texture types captured during translation.
+    const std::unordered_map<u32, Shader::TextureType>& CapturedTextureTypes() const noexcept {
+        return texture_types;
+    }
+
+    /// GPL: read-only view of texture pixel formats captured during translation.
+    const std::unordered_map<u32, Shader::TexturePixelFormat>& CapturedTexturePixelFormats() const noexcept {
+        return texture_pixel_formats;
+    }
+
+    /// No-RTTI downcast: GenericEnvironment is always a GenericEnvironment.
+    VideoCommon::GenericEnvironment* AsGenericEnvironment() noexcept override {
+        return this;
+    }
+    const VideoCommon::GenericEnvironment* AsGenericEnvironment() const noexcept override {
+        return this;
+    }
+
     bool HasHLEMacroState() const override {
         return has_hle_engine_state;
     }
@@ -172,6 +198,31 @@ public:
     FileEnvironment(const FileEnvironment&) = delete;
 
     void Deserialize(std::ifstream& file);
+
+    /// No-RTTI downcast: FileEnvironment is always a FileEnvironment.
+    VideoCommon::FileEnvironment* AsFileEnvironment() noexcept override { return this; }
+    const VideoCommon::FileEnvironment* AsFileEnvironment() const noexcept override {
+        return this;
+    }
+
+    /// Real (not guessed) cbuf/texture specialization data deserialized from
+    /// disk — the exact values GenericEnvironment::Serialize() wrote out when
+    /// this pipeline was originally compiled live. Mirrors GenericEnvironment's
+    /// accessors of the same name so SpirvCache key computation can use real
+    /// specialization for the disk-replay path instead of forcing cbuf_key/
+    /// texture_key to 0 for lack of anywhere to read it from — the data was
+    /// deserialized into cbuf_values/texture_types/texture_pixel_formats below
+    /// all along, just not previously exposed.
+    const std::unordered_map<u64, u32>& CapturedCbufValues() const noexcept {
+        return cbuf_values;
+    }
+    const std::unordered_map<u32, Shader::TextureType>& CapturedTextureTypes() const noexcept {
+        return texture_types;
+    }
+    const std::unordered_map<u32, Shader::TexturePixelFormat>&
+        CapturedTexturePixelFormats() const noexcept {
+        return texture_pixel_formats;
+    }
 
     [[nodiscard]] u64 ReadInstruction(u32 address) override;
 

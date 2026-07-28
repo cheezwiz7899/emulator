@@ -12,9 +12,40 @@
 
 namespace Shader {
 
+// Forward declaration so Environment can expose a no-RTTI downcast helper.
+// Defined in video_core/shader_environment.h.
+} // namespace Shader
+namespace VideoCommon { class GenericEnvironment; }
+namespace VideoCommon { class FileEnvironment; }
+namespace Shader {
+
 class Environment {
 public:
     virtual ~Environment() = default;
+
+    /// Returns a GenericEnvironment* if this object derives from GenericEnvironment,
+    /// nullptr otherwise (e.g. FileEnvironment). Used in place of dynamic_cast
+    /// when the build disables RTTI (-fno-rtti).
+    [[nodiscard]] virtual VideoCommon::GenericEnvironment* AsGenericEnvironment() noexcept {
+        return nullptr;
+    }
+    [[nodiscard]] virtual const VideoCommon::GenericEnvironment*
+        AsGenericEnvironment() const noexcept {
+        return nullptr;
+    }
+
+    /// Returns a FileEnvironment* if this object IS a FileEnvironment, nullptr
+    /// otherwise. Same no-RTTI downcast pattern as AsGenericEnvironment() above,
+    /// for the one class that deliberately does NOT derive from GenericEnvironment
+    /// but still deserializes real (not guessed) cbuf/texture capture data from
+    /// disk — see FileEnvironment::CapturedCbufValues() and friends.
+    [[nodiscard]] virtual VideoCommon::FileEnvironment* AsFileEnvironment() noexcept {
+        return nullptr;
+    }
+    [[nodiscard]] virtual const VideoCommon::FileEnvironment*
+        AsFileEnvironment() const noexcept {
+        return nullptr;
+    }
 
     [[nodiscard]] virtual u64 ReadInstruction(u32 address) = 0;
 

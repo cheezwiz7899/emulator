@@ -28,6 +28,7 @@
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/shader_cache.h"
+#include "video_core/spirv_cache.h"
 
 namespace Core {
 class System;
@@ -113,6 +114,12 @@ public:
                            const VideoCore::DiskResourceLoadCallback& callback);
 
 private:
+    void SubmitSpeculativeShader(u64 unique_hash, std::vector<u64> maxwell_code,
+                               Shader::Stage stage, u32 local_memory_size,
+                               u32 shared_memory_size, std::array<u32, 3> workgroup_size,
+                               u32 start_address, u32 texture_bound,
+                               Shader::ProgramHeader sph);
+    void OnNewShaderSeen(VideoCommon::GenericEnvironment& env, u64 unique_hash) override;
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath();
 
     [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) const noexcept;
@@ -156,6 +163,19 @@ public:
     BufferCache& buffer_cache;
     TextureCache& texture_cache;
     VideoCore::ShaderNotify& shader_notify;
+
+    VideoCommon::SpirvCache spirv_cache;
+    std::filesystem::path spirv_cache_filename;
+    Common::ThreadWorker speculative_worker;
+    Common::ThreadWorker serialization_thread;
+
+    // Shader recompiler pools reused across speculative translations on the
+    // speculative_worker thread.  Reusing rather than reallocating per shader
+    // eliminates repeated large VirtualAlloc/VirtualFree calls that fragment the
+    // address space and push Dynarmic JIT allocations outside the ±2 GB range
+    // required for 32-bit RIP-relative addressing.
+    // IMPORTANT: must only ever be accessed from speculative_worker's thread.
+    ShaderPools spec_pools;
     bool use_asynchronous_shaders{};
     bool use_vulkan_pipeline_cache{};
 
@@ -182,7 +202,6 @@ public:
     vk::PipelineCache vulkan_pipeline_cache;
 
     Common::ThreadWorker workers;
-    Common::ThreadWorker serialization_thread;
     DynamicFeatures dynamic_features;
 
 };

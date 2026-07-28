@@ -5,10 +5,14 @@
 #pragma once
 
 #include <array>
+#include <bitset>
+#include <cstring>
+#include <functional>
 #include <map>
 #include <optional>
 #include <vector>
 
+#include "common/cityhash.h"
 #include "common/common_types.h"
 #include "shader_recompiler/varying_state.h"
 
@@ -111,6 +115,46 @@ struct RuntimeInfo {
     /// Transform feedback state for each varying
     std::array<TransformFeedbackVarying, 256> xfb_varyings{};
     u32 xfb_count{0};
+
+    [[nodiscard]] u64 Hash() const noexcept {
+        u64 hash = 0;
+        auto hash_combine = [&hash](u64 val) {
+            hash ^= val + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
+        };
+
+        hash_combine(Common::CityHash64(reinterpret_cast<const char*>(generic_input_types.data()), generic_input_types.size() * sizeof(AttributeType)));
+        hash_combine(std::hash<std::bitset<512>>{}(previous_stage_stores.mask));
+        for (const auto& [key, value] : previous_stage_legacy_stores_mapping) {
+            hash_combine((static_cast<u64>(key) << 32) | static_cast<u64>(value));
+        }
+        hash_combine(convert_depth_mode);
+        hash_combine(force_early_z);
+        hash_combine(static_cast<u64>(tess_primitive));
+        hash_combine(static_cast<u64>(tess_spacing));
+        hash_combine(tess_clockwise);
+        hash_combine(static_cast<u64>(input_topology));
+        if (fixed_state_point_size) {
+            u32 val;
+            std::memcpy(&val, &*fixed_state_point_size, sizeof(val));
+            hash_combine(val);
+        }
+        if (alpha_test_func) {
+            hash_combine(static_cast<u64>(*alpha_test_func) + 1);
+        }
+        u32 alpha_ref;
+        std::memcpy(&alpha_ref, &alpha_test_reference, sizeof(alpha_ref));
+        hash_combine(alpha_ref);
+        hash_combine(alpha_to_coverage_enabled);
+        hash_combine(Common::CityHash64(reinterpret_cast<const char*>(frag_color_types.data()), frag_color_types.size() * sizeof(FragmentOutputType)));
+        hash_combine(y_negate);
+        hash_combine(glasm_use_storage_buffers);
+        hash_combine(xfb_count);
+        if (xfb_count > 0) {
+            hash_combine(Common::CityHash64(reinterpret_cast<const char*>(xfb_varyings.data()), xfb_count * sizeof(TransformFeedbackVarying)));
+        }
+
+        return hash;
+    }
 };
 
 } // namespace Shader

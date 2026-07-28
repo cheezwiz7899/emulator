@@ -3212,8 +3212,11 @@ void GameList::AddGamePopup(QMenu& context_menu, const QModelIndex& index, u64 p
     QAction* open_current_game_sdmc =
         open_sdmc_mod_menu->addAction(tr("Open Current Game Location"));
     QAction* open_full_sdmc = open_sdmc_mod_menu->addAction(tr("Open Full Location"));
+    QMenu* shader_cache_menu = context_menu.addMenu(tr("Shader Cache"));
     QAction* open_transferable_shader_cache =
-        context_menu.addAction(tr("Open Transferable Pipeline Cache"));
+        shader_cache_menu->addAction(tr("Open Transferable Pipeline Cache"));
+    QAction* precache_shaders =
+        shader_cache_menu->addAction(tr("Pre-cache Shaders from ROM"));
     context_menu.addSeparator();
     QMenu* remove_menu = context_menu.addMenu(tr("Remove"));
     QAction* remove_update = remove_menu->addAction(tr("Remove Installed Update"));
@@ -3222,6 +3225,7 @@ void GameList::AddGamePopup(QMenu& context_menu, const QModelIndex& index, u64 p
     QAction* remove_play_time_data = remove_menu->addAction(tr("Remove Play Time Data"));
     QAction* remove_cache_storage = remove_menu->addAction(tr("Remove Cache Storage"));
     QAction* remove_vk_shader_cache = remove_menu->addAction(tr("Remove Vulkan Pipeline Cache"));
+    QAction* remove_spirv_cache = remove_menu->addAction(tr("Remove SPIR-V Shader Cache"));
     remove_menu->addSeparator();
     QAction* remove_shader_cache = remove_menu->addAction(tr("Remove All Pipeline Caches"));
     QAction* remove_all_content = remove_menu->addAction(tr("Remove All Installed Contents"));
@@ -3322,9 +3326,12 @@ void GameList::AddGamePopup(QMenu& context_menu, const QModelIndex& index, u64 p
     open_mod_location->setVisible(program_id != 0);
     open_sdmc_mod_menu->menuAction()->setVisible(program_id != 0);
     open_transferable_shader_cache->setVisible(program_id != 0);
+    precache_shaders->setVisible(program_id != 0);
+    shader_cache_menu->menuAction()->setVisible(program_id != 0);
     remove_update->setVisible(program_id != 0);
     remove_dlc->setVisible(program_id != 0);
     remove_vk_shader_cache->setVisible(program_id != 0);
+    remove_spirv_cache->setVisible(program_id != 0);
     remove_shader_cache->setVisible(program_id != 0);
     remove_all_content->setVisible(program_id != 0);
 
@@ -3507,6 +3514,8 @@ void GameList::AddGamePopup(QMenu& context_menu, const QModelIndex& index, u64 p
     });
     connect(open_transferable_shader_cache, &QAction::triggered,
             [this, program_id]() { emit OpenTransferableShaderCacheRequested(program_id); });
+    connect(precache_shaders, &QAction::triggered,
+            [this, program_id, path_str]() { emit PreCacheShadersRequested(program_id, path_str); });
     connect(remove_all_content, &QAction::triggered, [this, program_id]() {
         emit RemoveInstalledEntryRequested(program_id, InstalledEntryType::Game);
     });
@@ -3518,6 +3527,9 @@ void GameList::AddGamePopup(QMenu& context_menu, const QModelIndex& index, u64 p
     });
     connect(remove_vk_shader_cache, &QAction::triggered, [this, program_id, path_str]() {
         emit RemoveFileRequested(program_id, GameListRemoveTarget::VkShaderCache, path_str);
+    });
+    connect(remove_spirv_cache, &QAction::triggered, [this, program_id, path_str]() {
+        emit RemoveFileRequested(program_id, GameListRemoveTarget::SpirvCache, path_str);
     });
     connect(remove_shader_cache, &QAction::triggered, [this, program_id, path_str]() {
         emit RemoveFileRequested(program_id, GameListRemoveTarget::AllShaderCache, path_str);

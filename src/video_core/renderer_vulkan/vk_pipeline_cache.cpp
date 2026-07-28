@@ -9,12 +9,15 @@
 #include <thread>
 #include <vector>
 
+#include <fmt/format.h>
+
 #include "common/bit_cast.h"
 #include "common/cityhash.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/profiling.h"
 #include "common/settings.h"
+#include "common/thread.h"
 #include "common/thread_worker.h"
 #include "core/core.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -36,7 +39,9 @@
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/shader_cache.h"
+#include "video_core/spirv_cache.h"
 #include "video_core/shader_environment.h"
+#include "video_core/speculative_shader_environment.h"
 #include "video_core/shader_notify.h"
 #include "video_core/surface.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -54,6 +59,12 @@ using VideoCommon::ComputeEnvironment;
 using VideoCommon::FileEnvironment;
 using VideoCommon::GenericEnvironment;
 using VideoCommon::GraphicsEnvironment;
+using VideoCommon::SpirvKey;
+using VideoCommon::ComputeCbufKey;
+using VideoCommon::ComputeTextureKey;
+using VideoCommon::ComputeBindingKey;
+using VideoCommon::FoldViewportTransformState;
+using VideoCommon::FoldBindingKey;
 
 constexpr u32 TRANSFERABLE_CACHE_VERSION = 15;
 constexpr u32 VULKAN_PIPELINE_CACHE_VERSION = 14;
@@ -335,11 +346,12 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
       descriptor_pool{descriptor_pool_}, guest_descriptor_queue{guest_descriptor_queue_},
       render_pass_cache{render_pass_cache_}, buffer_cache{buffer_cache_},
       texture_cache{texture_cache_}, shader_notify{shader_notify_},
+      speculative_worker(1, "VkSpeculativeShader"),
+      serialization_thread(1, "VkPipelineSerialization"),
       use_asynchronous_shaders{Settings::values.use_asynchronous_shaders.GetValue()},
       use_vulkan_pipeline_cache{Settings::values.use_vulkan_driver_pipeline_cache.GetValue()},
       workers(device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers(),
-              "VkPipelineBuilder"),
-      serialization_thread(1, "VkPipelineSerialization") {
+              "VkPipelineBuilder") {
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
     // OPTIMIZED FOR LOW GPU ACCURACY - enable mediump in fragment shaders for better perf
@@ -424,6 +436,12 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .support_geometry_shader_passthrough = device.IsNvGeometryShaderPassthroughSupported(),
         .support_conditional_barrier = device.SupportsConditionalBarriers(),
     };
+    speculative_worker.QueueWork([] {
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+    });
+    serialization_thread.QueueWork([] {
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+    });
 
     if (device.GetMaxVertexInputAttributes() <
         Tegra::Engines::Maxwell3D::Regs::NumVertexAttributes) {
@@ -458,9 +476,11 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
 }
 
 PipelineCache::~PipelineCache() {
-    // Drain all pending SerializePipeline tasks before the serialization_thread
-    // member is destroyed.
+    speculative_worker.WaitForRequests();
     serialization_thread.WaitForRequests();
+    if (!spirv_cache_filename.empty()) {
+        spirv_cache.Save(spirv_cache_filename);
+    }
 
     if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
@@ -585,6 +605,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         return;
     }
     pipeline_cache_filename = base_dir / "vulkan.bin";
+
+    // Load SPIR-V cache — feeds the GPL speculative path and AOT scanner results.
+    spirv_cache_filename = base_dir / "spirv_cache.bin";
+    spirv_cache.Load(spirv_cache_filename);
+
 
     if (use_vulkan_pipeline_cache) {
         vulkan_pipeline_cache_filename = base_dir / "vulkan_pipelines.bin";
@@ -722,6 +747,27 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
 
     workers.WaitForRequests(stop_loading);
 
+    // Log SPIR-V cache effectiveness.
+    const size_t hits   = spirv_cache.HitCount();
+    const size_t probes = spirv_cache.LookupCount();
+    if (probes == 0) {
+        const size_t loaded = spirv_cache.Size();
+        if (loaded == 0) {
+            LOG_INFO(Render_Vulkan, "SPIR-V cache: empty — first boot or cache not yet populated.");
+        } else {
+            LOG_INFO(Render_Vulkan,
+                     "SPIR-V cache: {} entries loaded but no probes during disk build "
+                     "(all pipelines may have been rebuilt from disk cache).",
+                     loaded);
+        }
+    } else {
+        const int pct = static_cast<int>(hits * 100 / probes);
+        LOG_INFO(Render_Vulkan,
+                 "SPIR-V cache: {}/{} stage hits ({}% -- {} EmitSPIRV calls avoided).",
+                 hits, probes, pct, hits);
+    }
+
+
     if (use_vulkan_pipeline_cache) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
                                      VULKAN_PIPELINE_CACHE_VERSION);
@@ -774,6 +820,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     LOG_INFO(Render_Vulkan, "0x{:016x}", hash);
     size_t env_index{0};
     std::array<Shader::IR::Program, Tegra::Engines::Maxwell3D::Regs::MaxShaderProgram> programs;
+    // Track env pointer per shader index so the emit loop can compute cbuf keys.
+    std::array<Shader::Environment*, Tegra::Engines::Maxwell3D::Regs::MaxShaderProgram> stage_envs{};
     const bool uses_vertex_a{key.unique_hashes[0] != 0};
     const bool uses_vertex_b{key.unique_hashes[1] != 0};
 
@@ -795,6 +843,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         Shader::Environment& env{*envs[env_index]};
         ++env_index;
+        stage_envs[index] = &env;
 
         const u32 cfg_offset{static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
         Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
@@ -837,9 +886,96 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
 
         const auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage)};
         ConvertLegacyToGeneric(program, runtime_info);
-        std::vector<u32> code = EmitSPIRV(profile, runtime_info, program, binding);
-        // Reserve space to reduce allocations during shader compilation
-        code.reserve(std::max<size_t>(code.size(), 16 * 1024 / sizeof(u32)));
+        // SPIR-V cache check
+        // AsGenericEnvironment() returns nullptr for FileEnvironment (disk-load path)
+        // and this* for GraphicsEnvironment (live path). Avoids dynamic_cast/-frtti.
+        // FileEnvironment doesn't derive from GenericEnvironment, but it deserializes
+        // the same real cbuf/texture capture data from disk (whatever the pipeline
+        // was actually specialized with when it was originally compiled live and
+        // serialized — see GenericEnvironment::Serialize / FileEnvironment::Deserialize).
+        // AsFileEnvironment() reaches it the same no-RTTI way, so the disk-replay path
+        // only falls back to the 0/"no specialization" guess when there's genuinely
+        // nowhere to read real data from.
+        const auto* gen_env_stage = stage_envs[index]->AsGenericEnvironment();
+        const auto* file_env_stage = stage_envs[index]->AsFileEnvironment();
+        const bool has_real_specialization_context =
+            gen_env_stage != nullptr || file_env_stage != nullptr;
+        const u64 cbuf_key = gen_env_stage    ? ComputeCbufKey(gen_env_stage->CapturedCbufValues())
+                             : file_env_stage ? ComputeCbufKey(file_env_stage->CapturedCbufValues())
+                                              : 0;
+        const u64 texture_key =
+            gen_env_stage    ? ComputeTextureKey(gen_env_stage->CapturedTextureTypes(),
+                                                 gen_env_stage->CapturedTexturePixelFormats())
+            : file_env_stage ? ComputeTextureKey(file_env_stage->CapturedTextureTypes(),
+                                                 file_env_stage->CapturedTexturePixelFormats())
+                             : 0;
+        u64 runtime_key = runtime_info.Hash();
+        if (stage_envs[index]->ShaderStage() == Shader::Stage::VertexB) {
+            // env.ReadViewportTransformState() is not stored in RuntimeInfo, but
+            // PositionPass() (ir_opt/position_pass.cpp) branches on it directly during
+            // TranslateProgram() above, before runtime_info even exists: when the real
+            // GPU's viewport_scale_offset_enabled is 0, the vertex shader must do a
+            // manual render-area-relative position remap; when it's 1, it must not.
+            // Without folding this bit into the key, a VertexB program compiled under
+            // one state (e.g. a speculative pre-cache guess, which always assumes 1)
+            // can be served to a draw using the other state, silently skipping/adding
+            // the remap and corrupting vertex output — most visible on screen-space
+            // overlay/UI-style geometry.
+            const u64 viewport_transform_state = stage_envs[index]->ReadViewportTransformState();
+            runtime_key = FoldViewportTransformState(runtime_key, viewport_transform_state);
+        }
+        // `binding` at this point holds the starting Bindings accumulator for THIS
+        // stage. ComputeBindingKey() hashes the full state (see its doc comment in
+        // spirv_cache.h) — this fold, and FoldViewportTransformState() above, are
+        // exactly what a speculative InsertSpeculative() call must also apply to
+        // its guessed values, or its runtime_key ends up in a different format
+        // from every real entry's and can never match one.
+        const u64 binding_key = ComputeBindingKey(binding);
+        runtime_key = FoldBindingKey(runtime_key, binding_key);
+        const SpirvKey spirv_key{key.unique_hashes[index], cbuf_key, runtime_key, texture_key};
+        std::vector<u32> code;
+        const bool is_merged_vertex = uses_vertex_a && uses_vertex_b && index == 1;
+        // Since SpirvKey now includes the runtime_key, we can safely serve cached SPIR-V
+        // to both the live path and the disk-load path.
+        if (!is_merged_vertex) {
+            if (auto cached = spirv_cache.Lookup(spirv_key, has_real_specialization_context)) {
+                code = *cached->spirv;
+                if (cached->is_speculative) {
+                    // Capped like the field-mismatch diagnostic in spirv_cache.cpp — this
+                    // logs unconditionally otherwise, and if speculative hits start
+                    // happening at real volume during a busy scene, an uncapped LOG_INFO
+                    // per hit is exactly the kind of per-frame synchronous logging cost
+                    // worth avoiding once the diagnostic has said what it needs to.
+                    static std::atomic<size_t> speculative_hit_logs{0};
+                    if (size_t expected = speculative_hit_logs.load(); expected < 50 &&
+                        speculative_hit_logs.compare_exchange_strong(expected, expected + 1)) {
+                        LOG_INFO(Render_Vulkan, "0x{:016x} stage[{}] served from SPECULATIVE entry (unique_hash=0x{:016x})",
+                                 hash, index, key.unique_hashes[index]);
+                    }
+                }
+                // Restore the binding counter to where EmitSPIRV left it when this
+                // SPIR-V was first compiled.  Without this, the next stage's
+                // EmitSPIRV (or cache miss) would start at the wrong descriptor
+                // slot, producing binding collisions and graphical corruption.
+                binding = cached->end_binding;
+            }
+        }
+        if (code.empty()) {
+            code = EmitSPIRV(profile, runtime_info, program, binding);
+            // binding has now been advanced past this stage's slots.
+            // has_real_specialization_context (not just gen_env_stage != nullptr) so a
+            // disk-replay translation gets cached too, now that it's keyed with real
+            // cbuf/texture data instead of a forced 0 — previously this branch's
+            // EmitSPIRV work was simply thrown away every time, guaranteeing this
+            // exact stage would miss and re-translate again on every future load.
+            if (!is_merged_vertex && has_real_specialization_context) {
+                spirv_cache.Insert(spirv_key, code, binding);
+                if (!spirv_cache_filename.empty()) {
+                    serialization_thread.QueueWork([this] { spirv_cache.SaveThrottled(spirv_cache_filename); });
+                }
+            }
+            code.reserve(std::max<size_t>(code.size(), 16 * 1024 / sizeof(u32)));
+        }
         device.SaveShader(code);
         modules[stage_index] = BuildShader(device, code);
         if (device.HasDebuggingToolAttached()) {
@@ -944,8 +1080,61 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
     }
 
     auto program{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
-    std::vector<u32> code = EmitSPIRV(profile, program);
-    // Reserve space to reduce allocations during shader compilation
+    // SPIR-V cache check for compute
+    // AsGenericEnvironment() returns nullptr for FileEnvironment (disk-load path).
+    // AsFileEnvironment() covers that case with FileEnvironment's own real,
+    // disk-deserialized cbuf/texture data — see the matching comment in
+    // CreateGraphicsPipeline() above for why this is real captured data, not a
+    // guess. This also closes a gap specific to this function: unlike the
+    // graphics path, the Insert() below was never gated on having real context,
+    // so a FileEnvironment compute miss was inserting under a forced cbuf_key=0/
+    // texture_key=0 key — the same collision risk flagged for the graphics path,
+    // except actually happening here rather than just possible. Real keys make
+    // that insert correct instead of needing to gate it off.
+    auto* gen_env = env.AsGenericEnvironment();
+    auto* file_env = env.AsFileEnvironment();
+    const bool has_real_specialization_context = gen_env != nullptr || file_env != nullptr;
+    const u64 cbuf_key_c = gen_env    ? ComputeCbufKey(gen_env->CapturedCbufValues())
+                          : file_env ? ComputeCbufKey(file_env->CapturedCbufValues())
+                                     : 0;
+    const u64 texture_key_c =
+        gen_env    ? ComputeTextureKey(gen_env->CapturedTextureTypes(),
+                                       gen_env->CapturedTexturePixelFormats())
+        : file_env ? ComputeTextureKey(file_env->CapturedTextureTypes(),
+                                       file_env->CapturedTexturePixelFormats())
+                   : 0;
+    // Use gen_env->CalculateHash() — CalculateHash() is defined on GenericEnvironment,
+    // not on the base Shader::Environment. Fall back to key.unique_hash if not available.
+    const u64 compute_unique_hash = gen_env ? gen_env->CalculateHash() : key.unique_hash;
+    const SpirvKey spirv_key_c{compute_unique_hash, cbuf_key_c, 0, texture_key_c};
+    std::vector<u32> code;
+    if (auto cached = spirv_cache.Lookup(spirv_key_c, has_real_specialization_context)) {
+        code = *cached->spirv;
+        if (cached->is_speculative) {
+            // See the matching throttle comment in CreateGraphicsPipeline() above.
+            static std::atomic<size_t> speculative_hit_logs_compute{0};
+            if (size_t expected = speculative_hit_logs_compute.load(); expected < 50 &&
+                speculative_hit_logs_compute.compare_exchange_strong(expected, expected + 1)) {
+                LOG_INFO(Render_Vulkan, "0x{:016x} served from SPECULATIVE entry (unique_hash=0x{:016x})",
+                         hash, compute_unique_hash);
+            }
+        }
+        // Compute pipelines are self-contained (no preceding stage to misalign),
+        // so the stored end_binding is irrelevant here and intentionally ignored.
+    } else {
+        code = EmitSPIRV(profile, program);
+        // Compute's EmitSPIRV overload takes no Bindings parameter (it always
+        // starts descriptor allocation at zero), so store a default end_binding.
+        spirv_cache.Insert(spirv_key_c, code, {});
+        // Reserve extra capacity on the local upload copy only — the stored
+        // cache entry was inserted before the reserve so it stays compact.
+        code.reserve(std::max<size_t>(code.size(), 16 * 1024 / sizeof(u32)));
+        if (!spirv_cache_filename.empty()) {
+            serialization_thread.QueueWork([this] {
+                spirv_cache.SaveThrottled(spirv_cache_filename); });
+        }
+    }
+    // Ensure the upload copy has enough capacity on the cache-hit path too.
     code.reserve(std::max<size_t>(code.size(), 16 * 1024 / sizeof(u32)));
     device.SaveShader(code);
     vk::ShaderModule spv_module{BuildShader(device, code)};
@@ -1051,7 +1240,8 @@ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::
         file.read(cache_data.data(), cache_size);
 
         LOG_INFO(Render_Vulkan,
-                 "Loaded Vulkan driver pipeline cache: ", Common::FS::PathToUTF8String(filename));
+                 "Loaded Vulkan driver pipeline cache: {}",
+                 Common::FS::PathToUTF8String(filename));
 
         return create_pipeline_cache(cache_size, cache_data.data());
 
@@ -1064,6 +1254,125 @@ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::
 
         return create_pipeline_cache(0, nullptr);
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// GPL: speculative Maxwell->SPIR-V translation
+// ---------------------------------------------------------------------------
+
+
+
+void PipelineCache::SubmitSpeculativeShader(
+        u64 unique_hash, std::vector<u64> maxwell_code,
+        Shader::Stage stage, u32 local_memory_size,
+        u32 shared_memory_size, std::array<u32, 3> workgroup_size,
+        u32 start_address, u32 texture_bound,
+        Shader::ProgramHeader sph) {
+    if (spirv_cache.ContainsByUniqueHash(unique_hash)) return;
+
+    speculative_worker.QueueWork(
+        [this, unique_hash, code = std::move(maxwell_code),
+         stage, local_memory_size, shared_memory_size,
+         workgroup_size, start_address, texture_bound, sph]() mutable {
+        // Reuse persistent pools to avoid per-translation VirtualAlloc churn.
+        spec_pools.ReleaseContents();
+
+        const u32 cfg_start = start_address +
+            ((stage == Shader::Stage::Compute)
+                 ? 0u : static_cast<u32>(sizeof(Shader::ProgramHeader)));
+
+        // SpeculativeShaderEnvironment::ReadViewportTransformState() always guesses 1
+        // (see speculative_shader_environment.h) since the real value is GPU register
+        // state, not something derivable from shader bytecode. This was briefly widened
+        // to translate VertexB twice (guessing both 0 and 1) on the theory that it's a
+        // genuinely enumerable 2-way fork worth paying for — measured across three full
+        // TotK sessions with 2000+ speculative entries sitting in the cache, it added
+        // 2x translate cost for VertexB and zero additional hits: cbuf_key is what's
+        // actually gating speculative hits (a speculative entry only matches a real draw
+        // with zero captured cbuf specialization, which most real shaders don't have —
+        // see ComputeCbufKey's doc comment), and no amount of guessing on this other axis
+        // moves that ceiling. Reverted to a single guess to stop paying for the second
+        // translation. If cbuf specialization coverage improves later, this is the first
+        // place to reconsider re-widening.
+        try {
+            VideoCommon::SpeculativeShaderEnvironment env{
+                std::move(code), start_address, stage, local_memory_size,
+                shared_memory_size, workgroup_size, texture_bound, sph,
+                /*code_offset_in_program=*/0u};
+
+            Shader::Maxwell::Flow::CFG cfg(env, spec_pools.flow_block, cfg_start, false);
+            auto program = Shader::Maxwell::TranslateProgram(
+                spec_pools.inst, spec_pools.block, env, cfg, host_info);
+
+            Shader::Backend::Bindings binding{};
+            Shader::RuntimeInfo rt{};
+            if (stage == Shader::Stage::Fragment) {
+                rt.previous_stage_stores.mask.set();
+                rt.input_topology = Shader::InputTopology::Triangles;
+            }
+            if (stage != Shader::Stage::Compute) {
+                Shader::Maxwell::ConvertLegacyToGeneric(program, rt);
+            }
+            auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, rt, program, binding);
+            const u64 texture_key = ComputeTextureKey(env.CapturedTextureTypes(), env.CapturedTexturePixelFormats());
+            u64 runtime_key = rt.Hash();
+            if (stage == Shader::Stage::VertexB) {
+                // Must match the fold CreateGraphicsPipeline() applies on the real
+                // path — otherwise this entry's runtime_key is in a different
+                // format from every real one and can never match, regardless of
+                // how accurate the guess is (see FoldViewportTransformState's
+                // doc comment in spirv_cache.h).
+                runtime_key = FoldViewportTransformState(runtime_key, env.ReadViewportTransformState());
+            }
+            // Must match the fold applied on the live path in CreateGraphicsPipeline().
+            // Speculative compiles always start from an all-zero Bindings
+            // accumulator (see `binding{}` above) — NOT the post-EmitSPIRV
+            // `binding`, which has since been advanced past this stage's slots.
+            // Using a fresh zero value here is what actually matches what was
+            // baked into `spirv`, and what lets a genuinely-leading-stage real
+            // draw hit this entry.
+            const u64 binding_key = ComputeBindingKey(Shader::Backend::Bindings{});
+            runtime_key = FoldBindingKey(runtime_key, binding_key);
+            spirv_cache.InsertSpeculative(unique_hash, runtime_key, texture_key, std::move(spirv));
+            if (!spirv_cache_filename.empty()) {
+                serialization_thread.QueueWork([this] {
+                    spirv_cache.SaveThrottled(spirv_cache_filename);
+                });
+            }
+        } catch (...) {}
+    });
+}
+
+void PipelineCache::OnNewShaderSeen(VideoCommon::GenericEnvironment& env,
+                                    u64 unique_hash) {
+    if (!Settings::values.use_gpl_speculative_shaders.GetValue()) return;
+    if (env.ShaderStage() == Shader::Stage::VertexA) return;
+    if (spirv_cache.ContainsByUniqueHash(unique_hash)) return;
+
+    // Use CopyCode() rather than CachedSizeBytes() to obtain the shader binary.
+    // When GenericEnvironment::Analyze() fails (TryFindSize returns nullopt), the
+    // slow CFG path is taken and cached_lowest/cached_highest are left at their
+    // sentinel defaults (UINT32_MAX / 0). Calling CachedSizeBytes() then produces
+    // a wildly large value that causes std::bad_alloc when used as a vector size.
+    // CopyCode() copies the `code` field directly — it is empty when Analyze() did
+    // not run (fast path never set it), or populated with up to 1MB of instructions
+    // when TryFindSize scanned without finding a self-branch. Either way, if the
+    // code vector is empty we have nothing useful to speculatively translate.
+    std::vector<u64> maxwell_code;
+    env.CopyCode(maxwell_code);
+    if (maxwell_code.empty()) return;
+
+    // Sanity-check: reject unreasonably large blobs (> 256 KB of Maxwell instructions).
+    // A legitimate shader is rarely over 64 KB; 256 KB gives ample headroom.
+    constexpr size_t MAX_SPECULATIVE_WORDS = 256 * 1024 / sizeof(u64);
+    if (maxwell_code.size() > MAX_SPECULATIVE_WORDS) return;
+
+    SubmitSpeculativeShader(unique_hash, std::move(maxwell_code),
+                            env.ShaderStage(), env.LocalMemorySize(),
+                            env.SharedMemorySize(), env.WorkgroupSize(),
+                            env.StartAddress(), env.TextureBoundBuffer(),
+                            env.SPH());
 }
 
 } // namespace Vulkan
