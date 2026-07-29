@@ -166,6 +166,14 @@ _set_derived_paths() {
     BUILD_BOLT="${BUILD_ROOT}/bolt"
     PROFILE_DIR="${BUILD_ROOT}/pgo-profiles"
     BOLT_PROFILE_DIR="${BUILD_ROOT}/bolt-profiles"
+    # Build-scoped home for tools this script installs for its own use (BOLT
+    # binaries, currently) instead of a shared system location. Never write
+    # to /usr or /usr/local here: this must stay safe to run locally without
+    # sudo and without clobbering anything already on the system outside the
+    # build tree.
+    BUILD_TOOLS_BIN="${BUILD_ROOT}/tools/bin"
+    BUILD_TOOLS_LIB="${BUILD_ROOT}/tools/lib"
+    PATH="${BUILD_TOOLS_BIN}:${PATH}"
 }
 _set_derived_paths
 
@@ -384,7 +392,8 @@ _setup_apt() {
         lsb-release software-properties-common gnupg \
         libelf-dev libzstd-dev libudev-dev zstd \
         libgl-dev libopengl-dev \
-        libxkbcommon-dev libwayland-dev
+        libxkbcommon-dev libwayland-dev \
+        libfontconfig1-dev libfreetype-dev
     # linux-tools-common/generic are best-effort: the versioned
     # linux-tools-$(uname -r) package frequently doesn't exist on the runner's
     # kernel and is intentionally optional.  Keeping them in a separate call
@@ -444,6 +453,7 @@ _setup_apt() {
         libva-dev libva-drm2 libva-x11-2 \
         libdrm-dev \
         libx11-dev libxext-dev \
+        libxrandr-dev \
         || error "VAAPI+X11 group install failed — a partial install would leave libva found but libdrm/X11 missing, which FFmpeg's cmake treats as a hard requirement once libva is found, causing a much less clear failure later"
 
     # ── VDPAU (NVIDIA legacy — independent of VAAPI) ─────────────────────────
@@ -482,7 +492,6 @@ _setup_apt() {
     # extension headers.  All are optional — their cmake checks produce soft
     # warnings, not hard errors.  --ignore-missing lets a single unavailable
     # package name (which can vary across distro versions) skip cleanly.
-    info "Installing optional X11/XCB extension packages..."
     sudo apt-get install -y --ignore-missing \
         libxi-dev \
         libxkbcommon-x11-dev libxss-dev \
@@ -496,8 +505,12 @@ _setup_apt() {
 }
 
 _setup_pacman() {
+    local SUDO="sudo"
+    if [ "$(id -u)" -eq 0 ]; then
+        SUDO=""
+    fi
     info "Installing build tools via pacman..."
-    sudo pacman -Syu --needed --noconfirm \
+    $SUDO pacman -Syu --needed --noconfirm \
         base-devel cmake ninja git pkgconf \
         python python-pip curl wget \
         nasm yasm perl gperf \
@@ -505,33 +518,35 @@ _setup_pacman() {
         shaderc clang lld llvm zstd \
         patchelf \
         elfutils systemd-libs \
-        libglvnd libxkbcommon wayland
+        libglvnd libxkbcommon wayland \
+        fontconfig freetype2
     # perf is optional and kept out of the required transaction above so a
     # missing/unavailable perf package can never mask a failure in the
     # required compiler/build toolchain (matches the apt path).
-    sudo pacman -S --needed --noconfirm perf 2>/dev/null || true
+    $SUDO pacman -S --needed --noconfirm perf 2>/dev/null || true
 
     # ── VAAPI + X11 core (all-or-nothing) ───────────────────────────────────
     info "Installing VAAPI + X11 core packages (required together)..."
-    sudo pacman -S --needed --noconfirm \
+    $SUDO pacman -S --needed --noconfirm \
         libva libva-utils \
         libdrm \
         libx11 libxext \
+        libxrandr \
         || error "VAAPI+X11 group install failed — a partial install would leave libva found but libdrm/X11 missing, which FFmpeg's cmake treats as a hard requirement once libva is found, causing a much less clear failure later"
 
     # ── VDPAU (NVIDIA legacy — independent of VAAPI) ─────────────────────────
     info "Installing VDPAU hw-accel packages..."
-    sudo pacman -S --needed --noconfirm libvdpau \
+    $SUDO pacman -S --needed --noconfirm libvdpau \
         || warn "libvdpau unavailable — FFmpeg will build with --disable-vdpau"
 
     # ── Linux audio output (ALSA + PulseAudio) — REQUIRED, not optional ─────
     info "Installing ALSA + PulseAudio dev packages (required for audio output)..."
-    sudo pacman -S --needed --noconfirm alsa-lib libpulse \
+    $SUDO pacman -S --needed --noconfirm alsa-lib libpulse \
         || error "ALSA/PulseAudio packages failed to install — Linux builds would have no audio output"
 
     # ── X11 / XCB optional extras (SDL2 Xi/XSS/XCB, Qt XCB platform plugin) ─
     info "Installing optional X11/XCB extension packages..."
-    sudo pacman -S --needed --noconfirm \
+    $SUDO pacman -S --needed --noconfirm \
         libxi \
         libxkbcommon-x11 libxss \
         libxcb xcb-util-cursor xcb-util-image \
@@ -539,13 +554,13 @@ _setup_pacman() {
         2>/dev/null || warn "Some optional X11/XCB extension packages unavailable — optional display features may be limited"
 
     # Optional: bundled into the AppImage by package-citron-linux.sh if present.
-    sudo pacman -S --needed --noconfirm gamemode 2>/dev/null || true
+    $SUDO pacman -S --needed --noconfirm gamemode 2>/dev/null || true
 
     # Arch ships unversioned tools — symlink to versioned names
     for tool in clang clang++ lld llvm-profdata llvm-bolt merge-fdata; do
         local versioned="/usr/local/bin/${tool}-${CLANG_VERSION}"
         if command -v "${tool}" &>/dev/null && [[ ! -e "${versioned}" ]]; then
-            sudo ln -sf "$(command -v "${tool}")" "${versioned}" 2>/dev/null || true
+            $SUDO ln -sf "$(command -v "${tool}")" "${versioned}" 2>/dev/null || true
         fi
     done
     success "Pacman packages installed."
@@ -560,7 +575,8 @@ _setup_dnf() {
         autoconf automake libtool make \
         glslc clang lld patchelf \
         elfutils-libelf-devel libudev-devel zstd \
-        libglvnd-devel mesa-libGL-devel libxkbcommon-devel wayland-devel
+        libglvnd-devel mesa-libGL-devel libxkbcommon-devel wayland-devel \
+        fontconfig-devel freetype-devel
     # perf is optional and kept out of the required transaction above so a
     # missing/unavailable perf package can never mask a failure in the
     # required compiler/build toolchain (matches the apt path).
@@ -574,6 +590,7 @@ _setup_dnf() {
         libva-devel \
         libdrm-devel \
         libX11-devel libXext-devel \
+        libXrandr-devel \
         || error "VAAPI+X11 group install failed — a partial install would leave libva found but libdrm/X11 missing, which FFmpeg's cmake treats as a hard requirement once libva is found, causing a much less clear failure later"
 
     # ── VDPAU (NVIDIA legacy — independent of VAAPI) ─────────────────────────
@@ -609,7 +626,8 @@ _setup_yum() {
         autoconf automake libtool make \
         glslc clang lld patchelf \
         elfutils-libelf-devel libudev-devel zstd \
-        libglvnd-devel mesa-libGL-devel libxkbcommon-devel wayland-devel
+        libglvnd-devel mesa-libGL-devel libxkbcommon-devel wayland-devel \
+        fontconfig-devel freetype-devel
     # perf is optional and kept out of the required transaction above so a
     # missing/unavailable perf package can never mask a failure in the
     # required compiler/build toolchain (matches the apt path).
@@ -622,6 +640,7 @@ _setup_yum() {
         libva-devel \
         libdrm-devel \
         libX11-devel libXext-devel \
+        libXrandr-devel \
         || error "VAAPI+X11 group install failed — a partial install would leave libva found but libdrm/X11 missing, which FFmpeg's cmake treats as a hard requirement once libva is found, causing a much less clear failure later"
 
     # ── VDPAU (NVIDIA legacy — independent of VAAPI) ─────────────────────────
@@ -657,7 +676,8 @@ _setup_zypper() {
         autoconf automake libtool make \
         shaderc clang lld llvm patchelf \
         libelf-devel libudev-devel zstd \
-        Mesa-libGL-devel libglvnd-devel libxkbcommon-devel libwayland-client0
+        Mesa-libGL-devel libglvnd-devel libxkbcommon-devel libwayland-client0 \
+        fontconfig-devel freetype2-devel
     # perf is optional and kept out of the required transaction above so a
     # missing/unavailable perf package can never mask a failure in the
     # required compiler/build toolchain (matches the apt path).
@@ -669,6 +689,7 @@ _setup_zypper() {
         libva-devel \
         libdrm-devel \
         libX11-devel libXext-devel \
+        libXrandr-devel \
         || error "VAAPI+X11 group install failed — a partial install would leave libva found but libdrm/X11 missing, which FFmpeg's cmake treats as a hard requirement once libva is found, causing a much less clear failure later"
 
     # ── VDPAU (NVIDIA legacy — independent of VAAPI) ─────────────────────────
@@ -706,7 +727,8 @@ _setup_emerge() {
         media-libs/shaderc \
         dev-util/gperf dev-util/patchelf \
         dev-libs/elfutils virtual/libudev app-arch/zstd \
-        media-libs/libglvnd x11-libs/libxkbcommon dev-libs/wayland\
+        media-libs/libglvnd x11-libs/libxkbcommon dev-libs/wayland \
+        media-libs/fontconfig media-libs/freetype \
         sys-apps/util-linux 2>/dev/null || true
 
     # ── VAAPI + X11 core (all-or-nothing) ───────────────────────────────────
@@ -715,6 +737,7 @@ _setup_emerge() {
         media-libs/libva \
         x11-libs/libdrm \
         x11-libs/libX11 x11-libs/libXext \
+        x11-libs/libXrandr \
         || error "VAAPI+X11 group install failed — a partial install would leave libva found but libdrm/X11 missing, which FFmpeg's cmake treats as a hard requirement once libva is found, causing a much less clear failure later"
 
     # ── VDPAU (NVIDIA legacy — independent of VAAPI) ─────────────────────────
@@ -784,8 +807,9 @@ _check_bolt() {
         return 0
     fi
     if command -v llvm-bolt &>/dev/null; then
-        sudo ln -sf "$(command -v llvm-bolt)"   "/usr/local/bin/${LLVM_BOLT}" 2>/dev/null || true
-        sudo ln -sf "$(command -v merge-fdata)" "/usr/local/bin/${MERGE_FDATA}" 2>/dev/null || true
+        mkdir -p "${BUILD_TOOLS_BIN}"
+        ln -sf "$(command -v llvm-bolt)"   "${BUILD_TOOLS_BIN}/${LLVM_BOLT}"
+        ln -sf "$(command -v merge-fdata)" "${BUILD_TOOLS_BIN}/${MERGE_FDATA}"
         return 0
     fi
     warn "${LLVM_BOLT} not found. The bolt stage will build it from source (~15-20 min)."
@@ -1140,22 +1164,15 @@ _patch_binary_rpaths() {
 
     # Extract paths from the generated config.sh
     local qt_path;  qt_path="$(grep -oP '(?<=export CITRON_QT_PATH=")[^"]+' "${config_file}" || true)"
-    local icu_path; icu_path="$(grep -oP '(?<=export CITRON_ICU_PATH=")[^"]+' "${config_file}" || true)"
     local xcb_path; xcb_path="$(grep -oP '(?<=export CITRON_XCB_PATH=")[^"]+' "${config_file}" || true)"
     
-    # Construct RPATH (Qt lib, ICU lib, XCB lib).
+    # Construct RPATH (Qt lib, XCB lib).
     #
     # Variable semantics from config.sh (set by CMake configure_file):
     #   CITRON_QT_PATH  = QT_TARGET_PATH  = Qt6 prefix          (append /lib)
-    #   CITRON_ICU_PATH = ICU_BINARY_DIR  = ICU lib dir itself   (do NOT append /lib)
     #   CITRON_XCB_PATH = XCB_BUILD_ROOT  = XCB prefix           (append /lib)
-    #
-    # ICU_BINARY_DIR is set as "${ICU_BUILD_DIR}/lib" in icu_build.cmake, so
-    # it already ends in /lib. Appending /lib again produces a wrong path like
-    # "icu-build/lib/lib" which does not exist on disk.
     local rpath=""
     [[ -n "${qt_path}" ]]  && rpath="${qt_path}/lib"
-    [[ -n "${icu_path}" ]] && rpath="${rpath}${rpath:+:}${icu_path}"
     [[ -n "${xcb_path}" ]] && rpath="${rpath}${rpath:+:}${xcb_path}/lib"
     
     if [[ -z "${rpath}" ]]; then
@@ -1330,18 +1347,19 @@ build_appimage_stage() {
     fi
     local arch_suffix="${ARCH_SUFFIX:-"-${stage_name}"}"
 
-    # Extract CITRON_QT_PATH from config.sh so package-citron-linux.sh can
-    # derive QT_LOCATION and point quick-sharun at CPM's Qt plugins rather
-    # than the system Qt's plugins (system plugins depend on the system
-    # libQt6Core.so.6 which may be older than the CPM-built Qt 6.9.3 citron
-    # was compiled against, causing "libQt6Core.so.6: version 'Qt_6.9' not
-    # found" at AppImage runtime).
+    # Bring in CITRON_QT_PATH, CITRON_ICU_PATH and CITRON_XCB_PATH — all
+    # written by CMake's configure_file(AppImageBuilder/config.sh.in), one
+    # per CPM SDK (Qt, ICU, XCB) that quick-sharun's dependency scan needs to
+    # prefer over any same-named system package. Source the whole file
+    # rather than grep a single var out of it: grepping only CITRON_QT_PATH
+    # here left CITRON_ICU_PATH and CITRON_XCB_PATH computed by CMake but
+    # never actually reaching package-citron-linux.sh.
     local config_file="${build_dir}/AppImageBuilder/config.sh"
-    local qt_path=""
     if [[ -f "${config_file}" ]]; then
-        qt_path="$(grep -oP '(?<=export CITRON_QT_PATH=")[^"]+' "${config_file}" || true)"
+        # shellcheck disable=SC1090
+        source "${config_file}"
     fi
-    if [[ -z "${qt_path}" ]]; then
+    if [[ -z "${CITRON_QT_PATH:-}" ]]; then
         error "CITRON_QT_PATH not found in ${config_file} — cannot package AppImage with correct Qt plugins. Ensure the build completed successfully and config.sh was written."
     fi
 
@@ -1350,7 +1368,9 @@ build_appimage_stage() {
     DEVEL="${DEVEL:-false}" \
     OUTPATH="${pkg_work}" \
     DESTDIR="${install_root}" \
-    CITRON_QT_PATH="${qt_path}" \
+    CITRON_QT_PATH="${CITRON_QT_PATH}" \
+    CITRON_XCB_PATH="${CITRON_XCB_PATH:-}" \
+    CITRON_VULKAN_LOADER_PATH="${CITRON_VULKAN_LOADER_PATH:-}" \
         bash "${SCRIPT_DIR}/AppImageBuilder/package-citron-linux.sh" \
         || error "package-citron-linux.sh failed for ${stage_name}"
 
@@ -1623,9 +1643,10 @@ _ensure_bolt() {
     if command -v "${LLVM_BOLT}" &>/dev/null && command -v "${MERGE_FDATA}" &>/dev/null; then
         success "${LLVM_BOLT} available"; return 0
     fi
+    mkdir -p "${BUILD_TOOLS_BIN}"
     if command -v llvm-bolt &>/dev/null; then
-        sudo ln -sf "$(command -v llvm-bolt)"   "/usr/local/bin/${LLVM_BOLT}" 2>/dev/null || true
-        sudo ln -sf "$(command -v merge-fdata)" "/usr/local/bin/${MERGE_FDATA}" 2>/dev/null || true
+        ln -sf "$(command -v llvm-bolt)"   "${BUILD_TOOLS_BIN}/${LLVM_BOLT}"
+        ln -sf "$(command -v merge-fdata)" "${BUILD_TOOLS_BIN}/${MERGE_FDATA}"
         return 0
     fi
 
@@ -1662,12 +1683,13 @@ _ensure_bolt() {
 
     cmake --build "${bolt_build}" --target llvm-bolt merge-fdata bolt_rt -j "${JOBS}"
 
-    sudo cp "${bolt_build}/bin/llvm-bolt"   "/usr/local/bin/${LLVM_BOLT}"
-    sudo cp "${bolt_build}/bin/merge-fdata" "/usr/local/bin/${MERGE_FDATA}"
-    sudo chmod +x "/usr/local/bin/${LLVM_BOLT}" "/usr/local/bin/${MERGE_FDATA}"
-    sudo cp "${bolt_build}/lib/libbolt_rt_instr.a"  /usr/local/lib/ 2>/dev/null || true
-    sudo cp "${bolt_build}/lib/libbolt_rt_hugify.a" /usr/local/lib/ 2>/dev/null || true
-    success "${LLVM_BOLT} installed"
+    mkdir -p "${BUILD_TOOLS_LIB}"
+    cp "${bolt_build}/bin/llvm-bolt"   "${BUILD_TOOLS_BIN}/${LLVM_BOLT}"
+    cp "${bolt_build}/bin/merge-fdata" "${BUILD_TOOLS_BIN}/${MERGE_FDATA}"
+    chmod +x "${BUILD_TOOLS_BIN}/${LLVM_BOLT}" "${BUILD_TOOLS_BIN}/${MERGE_FDATA}"
+    cp "${bolt_build}/lib/libbolt_rt_instr.a"  "${BUILD_TOOLS_LIB}/" 2>/dev/null || true
+    cp "${bolt_build}/lib/libbolt_rt_hugify.a" "${BUILD_TOOLS_LIB}/" 2>/dev/null || true
+    success "${LLVM_BOLT} installed to ${BUILD_TOOLS_BIN}"
 }
 
 # =============================================================================
@@ -1739,7 +1761,7 @@ stage_bolt() {
     local config_file="${relocs_dir}/AppImageBuilder/config.sh"
     if [[ -f "${config_file}" ]]; then
         # Use a subshell to avoid polluting our current environment
-        lp_env="$( (source "${config_file}"; echo "LD_LIBRARY_PATH=\"${CITRON_QT_PATH}/lib:${CITRON_ICU_PATH}:${CITRON_XCB_PATH}/lib\" ") )"
+        lp_env="$( (source "${config_file}"; echo "LD_LIBRARY_PATH=\"${CITRON_QT_PATH}/lib:${CITRON_XCB_PATH}/lib\" ") )"
     fi
 
     echo ""

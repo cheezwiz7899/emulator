@@ -548,11 +548,8 @@ elseif (CITRON_USE_BUNDLED_FFMPEG)
     endif()
 endif()
 
-# ── Dependency Versions (Qt, ICU, XCB) ─────────────────────────────────────────
+# ── Dependency Versions (Qt, XCB) ─────────────────────────────────────────
 set(CITRON_QT_VERSION "6.9.3" CACHE STRING "Qt version to download via aqt")
-
-set(CITRON_ICU_REPO "unicode-org/icu" CACHE STRING "ICU GitHub repository")
-set(CITRON_ICU_TAG "release-73-2" CACHE STRING "ICU git tag/version")
 
 set(CITRON_XCB_MACROS_VER "1.20.2" CACHE STRING "XCB util-macros version")
 set(CITRON_XCB_PROTO_VER "1.17.0" CACHE STRING "XCB proto version")
@@ -566,6 +563,8 @@ set(CITRON_XCB_KEYSYMS_VER "0.4.1" CACHE STRING "XCB keysyms version")
 set(CITRON_XCB_RENDERUTIL_VER "0.3.10" CACHE STRING "XCB renderutil version")
 set(CITRON_XCB_WM_VER "0.4.2" CACHE STRING "XCB wm version")
 
+set(CITRON_VULKAN_LOADER_TAG "vulkan-sdk-1.4.350.0" CACHE STRING "Vulkan-Loader/Vulkan-Headers git tag (packaging use only, not a compile-time dependency)")
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Qt
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -575,9 +574,18 @@ set(CITRON_XCB_WM_VER "0.4.2" CACHE STRING "XCB wm version")
 if (ENABLE_QT AND NOT USE_SYSTEM_QT)
     include(${CMAKE_SOURCE_DIR}/CMakeModules/qt_download.cmake)
     if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        include(${CMAKE_SOURCE_DIR}/CMakeModules/icu_build.cmake)
         include(${CMAKE_SOURCE_DIR}/CMakeModules/xcb_build.cmake)
     endif()
+endif()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Vulkan loader (packaging only — not a link-time dependency of anything)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Deliberately not nested under the Qt block above: citron-cmd (SDL2, no Qt)
+# needs Vulkan too, and neither actually links the loader at compile time —
+# see vulkan_loader_build.cmake's own header comment for why this exists.
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    include(${CMAKE_SOURCE_DIR}/CMakeModules/vulkan_loader_build.cmake)
 endif()
 
 message(STATUS "[CPM] All dependency packages configured")
