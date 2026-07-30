@@ -53,10 +53,6 @@ constexpr std::array<char, 8> MAGIC_NUMBER{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h
 
 constexpr size_t INST_SIZE = sizeof(u64);
 
-static u64 MakeCbufKey(u32 index, u32 offset) {
-    return VideoCommon::MakeCbufKey(index, offset);
-}
-
 static Shader::TextureType ConvertTextureType(const Tegra::Texture::TICEntry& entry) {
     switch (entry.texture_type) {
     case Tegra::Texture::TextureType::Texture1D:
