@@ -106,6 +106,25 @@ public:
         return value;
     }
 
+    // See RecordResolvedTextureType()/RecordResolvedTexturePixelFormat()'s doc comment in
+    // environment.h. GenericEnvironment is the one override point, same as
+    // ReadCbufValueForTextureHandle above — UNVERIFIED, see the doc comment on these two
+    // functions' definitions in shader_environment.cpp.
+    void RecordResolvedTextureType(u32 cbuf_index, u32 cbuf_offset,
+                                   Shader::TextureType type) override final;
+    void RecordResolvedTexturePixelFormat(u32 cbuf_index, u32 cbuf_offset,
+                                          Shader::TexturePixelFormat format) override final;
+
+    // Prints (LOG_INFO, Render_Vulkan) a distinct-value-count histogram across every
+    // (shader, cbuf slot) pair observed so far this session, answering
+    // handoff_04_specialization_constants_investigation.md item 2. Self-throttled — cheap
+    // to call from anywhere convenient during play (e.g. next to the existing
+    // spirv_cache.SaveThrottled(...) call sites); most calls are a no-op. Static because the
+    // data it reports is accumulated across ALL GenericEnvironment instances over the
+    // session, not any one instance — see the accumulator's own doc comment in
+    // shader_environment.cpp for why. UNVERIFIED, same caveat as the two functions above.
+    static void LogTextureSlotVarianceReportThrottled();
+
     /// GPL: read-only view of texture types captured during translation.
     const std::unordered_map<u32, Shader::TextureType>& CapturedTextureTypes() const noexcept {
         return texture_types;
@@ -143,6 +162,14 @@ protected:
     std::unordered_map<u64, u32> cbuf_values;
     // See ReadCbufValueForTextureHandle() and CapturedTextureHandleCbufKeys() above.
     std::unordered_set<u64> texture_handle_cbuf_keys;
+    // Memoized CalculateHash() for RecordResolvedTextureType()/RecordResolvedTexturePixelFormat()
+    // (shader_environment.cpp) — those can fire once per texture instruction in a shader, and
+    // CalculateHash() does a fresh GPU-memory read + CityHash64 over the whole shader every
+    // call, so this caches it per-instance instead of recomputing per texture instruction.
+    // Safe to cache: the underlying shader bytes are immutable for this instance's lifetime.
+    // Computed lazily — stays unset (and free) for any translation that never touches a
+    // bindless texture handle. mutable: read-only diagnostic memoization, not real state.
+    mutable std::optional<u64> texture_slot_diag_hash_cache;
     std::unordered_map<u64, Shader::ReplaceConstant> cbuf_replacements;
     // Cbuf sizes captured on the main thread at construction time while GPU state is live.
     std::unordered_map<u32, u32> cbuf_sizes;

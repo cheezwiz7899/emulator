@@ -1024,6 +1024,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 if (!spirv_cache_filename.empty()) {
                     serialization_thread.QueueWork([this] { spirv_cache.SaveThrottled(spirv_cache_filename); });
                 }
+                // Phase 4 feasibility instrumentation — see LogTextureSlotVarianceReportThrottled's
+                // doc comment in shader_environment.h. Unconditional (not gated on
+                // spirv_cache_filename): unrelated to whether disk persistence is configured.
+                VideoCommon::GenericEnvironment::LogTextureSlotVarianceReportThrottled();
             }
             code.reserve(std::max<size_t>(code.size(), 16 * 1024 / sizeof(u32)));
         }
@@ -1204,6 +1208,9 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
             serialization_thread.QueueWork([this] {
                 spirv_cache.SaveThrottled(spirv_cache_filename); });
         }
+        // Phase 4 feasibility instrumentation — see the matching comment at the
+        // CreateGraphicsPipeline call site above.
+        VideoCommon::GenericEnvironment::LogTextureSlotVarianceReportThrottled();
     }
     // Ensure the upload copy has enough capacity on the cache-hit path too.
     code.reserve(std::max<size_t>(code.size(), 16 * 1024 / sizeof(u32)));
@@ -1423,6 +1430,9 @@ void PipelineCache::SubmitSpeculativeShader(
                     spirv_cache.SaveThrottled(spirv_cache_filename);
                 });
             }
+            // Phase 4 feasibility instrumentation — see the matching comment at the
+            // CreateGraphicsPipeline call site above.
+            VideoCommon::GenericEnvironment::LogTextureSlotVarianceReportThrottled();
         } catch (...) {}
     });
 }

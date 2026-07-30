@@ -398,11 +398,19 @@ u32 GetTextureHandle(Environment& env, const ConstBufferAddr& cbuf) {
 }
 
 TextureType ReadTextureType(Environment& env, const ConstBufferAddr& cbuf) {
-    return env.ReadTextureType(GetTextureHandle(env, cbuf));
+    const TextureType type{env.ReadTextureType(GetTextureHandle(env, cbuf))};
+    // See RecordResolvedTextureType's doc comment in environment.h — Phase 4 feasibility
+    // instrumentation, no-op for every Environment except GenericEnvironment.
+    env.RecordResolvedTextureType(cbuf.index, cbuf.offset, type);
+    return type;
 }
 
 TexturePixelFormat ReadTexturePixelFormat(Environment& env, const ConstBufferAddr& cbuf) {
-    return env.ReadTexturePixelFormat(GetTextureHandle(env, cbuf));
+    const TexturePixelFormat format{env.ReadTexturePixelFormat(GetTextureHandle(env, cbuf))};
+    // See RecordResolvedTexturePixelFormat's doc comment in environment.h — same Phase 4
+    // instrumentation as ReadTextureType above.
+    env.RecordResolvedTexturePixelFormat(cbuf.index, cbuf.offset, format);
+    return format;
 }
 
 bool IsTexturePixelFormatInteger(Environment& env, const ConstBufferAddr& cbuf) {
