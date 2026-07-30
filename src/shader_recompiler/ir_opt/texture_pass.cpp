@@ -385,8 +385,14 @@ TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst) {
 u32 GetTextureHandle(Environment& env, const ConstBufferAddr& cbuf) {
     const u32 secondary_index{cbuf.has_secondary ? cbuf.secondary_index : cbuf.index};
     const u32 secondary_offset{cbuf.has_secondary ? cbuf.secondary_offset : cbuf.offset};
-    const u32 lhs_raw{env.ReadCbufValue(cbuf.index, cbuf.offset) << cbuf.shift_left};
-    const u32 rhs_raw{env.ReadCbufValue(secondary_index, secondary_offset)
+    // ReadCbufValueForTextureHandle, not ReadCbufValue: this is the ONE place in the
+    // whole codebase that resolves a bindless texture handle from a cbuf read (see its
+    // doc comment in environment.h) — tagging it here, at the only call site that
+    // actually knows that's what it's doing, is what lets a later diagnostic ask "how
+    // much of cbuf_key's entropy is actually just re-deriving what texture_key already
+    // captures on its own?" without guessing at intent after the fact.
+    const u32 lhs_raw{env.ReadCbufValueForTextureHandle(cbuf.index, cbuf.offset) << cbuf.shift_left};
+    const u32 rhs_raw{env.ReadCbufValueForTextureHandle(secondary_index, secondary_offset)
                       << cbuf.secondary_shift_left};
     return lhs_raw | rhs_raw;
 }

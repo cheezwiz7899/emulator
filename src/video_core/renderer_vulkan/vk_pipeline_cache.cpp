@@ -61,8 +61,10 @@ using VideoCommon::GenericEnvironment;
 using VideoCommon::GraphicsEnvironment;
 using VideoCommon::SpirvKey;
 using VideoCommon::ComputeCbufKey;
+using VideoCommon::ComputeCbufKeyExcludingTextureHandles;
 using VideoCommon::ComputeTextureKey;
 using VideoCommon::ComputeBindingKey;
+using VideoCommon::ComputeWorkgroupKey;
 using VideoCommon::FoldViewportTransformState;
 using VideoCommon::FoldBindingKey;
 
@@ -747,6 +749,13 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
 
     workers.WaitForRequests(stop_loading);
 
+    // Boot-time disk-cache replay above can throw dozens of no-context field-mismatch
+    // samples at spirv_cache's diagnostic throttle within milliseconds on the worker
+    // pool — resetting here gives live play (the case that actually matters for
+    // judging stutter) its own fresh budget instead of starting already exhausted.
+    // See ResetFieldMismatchLogBudget()'s doc comment in spirv_cache.h.
+    spirv_cache.ResetFieldMismatchLogBudget();
+
     // Log SPIR-V cache effectiveness.
     const size_t hits   = spirv_cache.HitCount();
     const size_t probes = spirv_cache.LookupCount();
@@ -909,8 +918,41 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             : file_env_stage ? ComputeTextureKey(file_env_stage->CapturedTextureTypes(),
                                                  file_env_stage->CapturedTexturePixelFormats())
                              : 0;
-        u64 runtime_key = runtime_info.Hash();
-        if (stage_envs[index]->ShaderStage() == Shader::Stage::VertexB) {
+        // Diagnostic-only (see ComputeCbufKeyExcludingTextureHandles's doc comment in
+        // spirv_cache.cpp) — only gen_env_stage can supply real tagging data today
+        // (GenericEnvironment::CapturedTextureHandleCbufKeys(); FileEnvironment doesn't
+        // derive from GenericEnvironment, so boot-replay stages fall back to the "no
+        // data available" convention of equaling their own real cbuf_key — see
+        // Entry::diag_cbuf_key_excl_texture_handles's doc comment in spirv_cache.h).
+        // Extending real tagging data to FileEnvironment/serialization so boot-replay
+        // entries can participate too is exactly Phase 1's prerequisite, not something
+        // to sneak in here — this stays diagnostic-only and gen_env-only for now.
+        const u64 diag_cbuf_key_excl_texture_handles =
+            gen_env_stage ? ComputeCbufKeyExcludingTextureHandles(
+                                gen_env_stage->CapturedCbufValues(),
+                                gen_env_stage->CapturedTextureHandleCbufKeys())
+                          : cbuf_key;
+        // diag_base_runtime_hash captures runtime_info.SpirvRelevantHash(stage) BEFORE
+        // any folding — for VertexB this also includes the viewport-transform-state
+        // fold below, since that fold (unlike the binding fold) genuinely reflects
+        // fixed-function GPU state at PositionPass()-translation time, not a
+        // per-pipeline-position offset.
+        // Passed through to Lookup()/Insert() purely so the field-mismatch diagnostic
+        // in spirv_cache.cpp can tell whether a runtime_key mismatch traces to this
+        // core RuntimeInfo state or to the binding-offset fold below — see
+        // spirv_cache.h's Insert()/Lookup() doc comments.
+        //
+        // SpirvRelevantHash(stage), not Hash(): folds only the RuntimeInfo fields
+        // THIS stage's SPIR-V emission actually reads (see its doc comment in
+        // runtime_info.h for the full per-field justification) instead of hashing
+        // the whole struct regardless of stage. Confirmed measurably over-broad for
+        // the common case — Fragment shaders were picking up entropy from
+        // input_topology and force_early_z despite neither ever being read for
+        // Fragment codegen, over-invalidating cache entries for reasons that could
+        // never have produced different SPIR-V bytes in the first place.
+        const Shader::Stage current_stage = stage_envs[index]->ShaderStage();
+        u64 runtime_key = runtime_info.SpirvRelevantHash(current_stage);
+        if (current_stage == Shader::Stage::VertexB) {
             // env.ReadViewportTransformState() is not stored in RuntimeInfo, but
             // PositionPass() (ir_opt/position_pass.cpp) branches on it directly during
             // TranslateProgram() above, before runtime_info even exists: when the real
@@ -924,6 +966,11 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             const u64 viewport_transform_state = stage_envs[index]->ReadViewportTransformState();
             runtime_key = FoldViewportTransformState(runtime_key, viewport_transform_state);
         }
+        // Snapshot the diagnostic "core" component here — everything folded into
+        // runtime_key so far except the binding-offset fold below. See the comment
+        // above the runtime_key declaration for why viewport_transform_state belongs
+        // on this side of the split rather than being treated like binding_key.
+        const u64 diag_base_runtime_hash = runtime_key;
         // `binding` at this point holds the starting Bindings accumulator for THIS
         // stage. ComputeBindingKey() hashes the full state (see its doc comment in
         // spirv_cache.h) — this fold, and FoldViewportTransformState() above, are
@@ -938,7 +985,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         // Since SpirvKey now includes the runtime_key, we can safely serve cached SPIR-V
         // to both the live path and the disk-load path.
         if (!is_merged_vertex) {
-            if (auto cached = spirv_cache.Lookup(spirv_key, has_real_specialization_context)) {
+            if (auto cached = spirv_cache.Lookup(spirv_key, has_real_specialization_context,
+                                                 diag_base_runtime_hash, binding_key,
+                                                 diag_cbuf_key_excl_texture_handles)) {
                 code = *cached->spirv;
                 if (cached->is_speculative) {
                     // Capped like the field-mismatch diagnostic in spirv_cache.cpp — this
@@ -969,7 +1018,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             // EmitSPIRV work was simply thrown away every time, guaranteeing this
             // exact stage would miss and re-translate again on every future load.
             if (!is_merged_vertex && has_real_specialization_context) {
-                spirv_cache.Insert(spirv_key, code, binding);
+                spirv_cache.Insert(spirv_key, code, binding, /*is_speculative=*/false,
+                                  diag_base_runtime_hash, binding_key,
+                                  diag_cbuf_key_excl_texture_handles);
                 if (!spirv_cache_filename.empty()) {
                     serialization_thread.QueueWork([this] { spirv_cache.SaveThrottled(spirv_cache_filename); });
                 }
@@ -1103,12 +1154,31 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
         : file_env ? ComputeTextureKey(file_env->CapturedTextureTypes(),
                                        file_env->CapturedTexturePixelFormats())
                    : 0;
+    // Diagnostic-only — see the matching comment in CreateGraphicsPipeline() above.
+    // Compute shaders CAN sample textures (image-processing/compute-particle style
+    // kernels), so they go through the exact same GetTextureHandle() tagging path;
+    // this isn't graphics-only. Same gen_env-only-for-now caveat applies.
+    const u64 diag_cbuf_key_excl_texture_handles_c =
+        gen_env ? ComputeCbufKeyExcludingTextureHandles(
+                      gen_env->CapturedCbufValues(), gen_env->CapturedTextureHandleCbufKeys())
+                : cbuf_key_c;
     // Use gen_env->CalculateHash() — CalculateHash() is defined on GenericEnvironment,
     // not on the base Shader::Environment. Fall back to key.unique_hash if not available.
     const u64 compute_unique_hash = gen_env ? gen_env->CalculateHash() : key.unique_hash;
-    const SpirvKey spirv_key_c{compute_unique_hash, cbuf_key_c, 0, texture_key_c};
+    // Was hardcoded 0 — see ComputeWorkgroupKey's doc comment in spirv_cache.h for why
+    // that was a real correctness bug (not just a cache-efficiency one): workgroup_size
+    // and shared_memory_size get baked into the SPIR-V as literals, and neither was
+    // previously part of this key at all, so two dispatches of the same compute program
+    // at different launch dimensions could silently swap SPIR-V if cbuf_key/texture_key
+    // happened to coincide. diag_base_runtime_hash is set to this same value (instead of
+    // the usual 0 default) so the field-mismatch diagnostic can now show real data for
+    // compute misses too, instead of a 0/0 default that could spuriously read as
+    // "matches" against an unrelated real-zero-state graphics entry.
+    const u64 workgroup_key = ComputeWorkgroupKey(key.shared_memory_size, key.workgroup_size);
+    const SpirvKey spirv_key_c{compute_unique_hash, cbuf_key_c, workgroup_key, texture_key_c};
     std::vector<u32> code;
-    if (auto cached = spirv_cache.Lookup(spirv_key_c, has_real_specialization_context)) {
+    if (auto cached = spirv_cache.Lookup(spirv_key_c, has_real_specialization_context,
+                                         workgroup_key, 0, diag_cbuf_key_excl_texture_handles_c)) {
         code = *cached->spirv;
         if (cached->is_speculative) {
             // See the matching throttle comment in CreateGraphicsPipeline() above.
@@ -1125,7 +1195,8 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
         code = EmitSPIRV(profile, program);
         // Compute's EmitSPIRV overload takes no Bindings parameter (it always
         // starts descriptor allocation at zero), so store a default end_binding.
-        spirv_cache.Insert(spirv_key_c, code, {});
+        spirv_cache.Insert(spirv_key_c, code, {}, /*is_speculative=*/false, workgroup_key, 0,
+                          diag_cbuf_key_excl_texture_handles_c);
         // Reserve extra capacity on the local upload copy only — the stored
         // cache entry was inserted before the reserve so it stays compact.
         code.reserve(std::max<size_t>(code.size(), 16 * 1024 / sizeof(u32)));
@@ -1316,7 +1387,13 @@ void PipelineCache::SubmitSpeculativeShader(
             }
             auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, rt, program, binding);
             const u64 texture_key = ComputeTextureKey(env.CapturedTextureTypes(), env.CapturedTexturePixelFormats());
-            u64 runtime_key = rt.Hash();
+            // SpirvRelevantHash(stage), not Hash() — see the same swap and its
+            // rationale in CreateGraphicsPipeline() above. Matters doubly here:
+            // this is the SAME function that produces the actual translated SPIR-V
+            // (rt is used for both), so restricting to stage-relevant fields also
+            // means a wider set of real pipeline states can validly reuse this exact
+            // guess, not just a wider match against the folded key.
+            u64 runtime_key = rt.SpirvRelevantHash(stage);
             if (stage == Shader::Stage::VertexB) {
                 // Must match the fold CreateGraphicsPipeline() applies on the real
                 // path — otherwise this entry's runtime_key is in a different
@@ -1325,6 +1402,11 @@ void PipelineCache::SubmitSpeculativeShader(
                 // doc comment in spirv_cache.h).
                 runtime_key = FoldViewportTransformState(runtime_key, env.ReadViewportTransformState());
             }
+            // See the matching diag_base_runtime_hash comment in CreateGraphicsPipeline() —
+            // everything folded into runtime_key up to (not including) the binding fold
+            // below, purely so a later stale miss against this entry can be attributed to
+            // "core RuntimeInfo state never matched" vs "binding offset never matched".
+            const u64 diag_base_runtime_hash = runtime_key;
             // Must match the fold applied on the live path in CreateGraphicsPipeline().
             // Speculative compiles always start from an all-zero Bindings
             // accumulator (see `binding{}` above) — NOT the post-EmitSPIRV
@@ -1334,7 +1416,8 @@ void PipelineCache::SubmitSpeculativeShader(
             // draw hit this entry.
             const u64 binding_key = ComputeBindingKey(Shader::Backend::Bindings{});
             runtime_key = FoldBindingKey(runtime_key, binding_key);
-            spirv_cache.InsertSpeculative(unique_hash, runtime_key, texture_key, std::move(spirv));
+            spirv_cache.InsertSpeculative(unique_hash, runtime_key, texture_key, std::move(spirv),
+                                          diag_base_runtime_hash, binding_key);
             if (!spirv_cache_filename.empty()) {
                 serialization_thread.QueueWork([this] {
                     spirv_cache.SaveThrottled(spirv_cache_filename);

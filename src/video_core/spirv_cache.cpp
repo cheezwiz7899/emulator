@@ -12,7 +12,24 @@
 
 namespace {
 constexpr std::array<char, 8> SPIRV_CACHE_MAGIC{'c', 'i', 't', 'r', 's', 'p', 'v', '\0'};
-constexpr u32 SPIRV_CACHE_VERSION = 5; // v5: ComputeBindingKey reverted to a full-state hash
+constexpr u32 SPIRV_CACHE_VERSION = 6; // v6: persists Entry::is_speculative per entry
+                                        // instead of dropping it (every reloaded entry
+                                        // used to silently become "real" after one
+                                        // restart, which would have quietly corrupted
+                                        // any future feature — e.g. scan-time guess
+                                        // derivation — built on "is this entry backed by
+                                        // an actual observed draw". Separately (no format
+                                        // impact, but invalidates old entries just the
+                                        // same, so bundled into this bump rather than
+                                        // wasted on its own): graphics runtime_key now
+                                        // folds RuntimeInfo::SpirvRelevantHash(stage)
+                                        // instead of the whole-struct Hash(), and compute
+                                        // runtime_key is ComputeWorkgroupKey(...) instead
+                                        // of a hardcoded 0 — see both functions' doc
+                                        // comments. Old entries aren't wrong under the
+                                        // new scheme, just computed differently, so they
+                                        // will not match, which is fine for a cache;
+                                        // (v5: ComputeBindingKey reverted to a full-state hash
                                         // (see its doc comment for why the single-bit
                                         // narrowing in v4 was wrong — real-vs-real
                                         // collisions, not just real-vs-speculative, turned
@@ -31,6 +48,62 @@ namespace VideoCommon {
 u64 ComputeCbufKey(const std::unordered_map<u64, u32>& cbuf_values) {
     if (cbuf_values.empty()) return 0;
     std::vector<std::pair<u64,u32>> sorted(cbuf_values.begin(), cbuf_values.end());
+    std::sort(sorted.begin(), sorted.end());
+    return Common::CityHash64(reinterpret_cast<const char*>(sorted.data()),
+                              sorted.size() * sizeof(sorted[0]));
+}
+
+// ---------------------------------------------------------------------------
+// DIAGNOSTIC ONLY — not used by any real cache key today, not called from
+// CreateGraphicsPipeline()/CreateComputePipeline()/InsertSpeculative() at all.
+// This exists purely to test, against real gameplay, a specific hypothesis
+// about cbuf_key before anyone commits to actually narrowing it: most of what
+// gets captured in cbuf_values (GenericEnvironment::ReadCbufValue) is read
+// only to resolve a bindless texture handle (GetTextureHandle(), texture_
+// pass.cpp) — whose downstream effect on codegen is ALREADY captured
+// separately by texture_key (ComputeTextureKey, from ReadTextureType()/
+// ReadTexturePixelFormat()'s own results). If that's true, two shaders that
+// differ only in WHICH raw handle they read — but resolve to the SAME
+// texture type/format, which is a real and plausible case, not an edge case
+// — currently get DIFFERENT cbuf_key despite producing byte-identical
+// SPIR-V, which is the same shape of over-invalidation
+// RuntimeInfo::SpirvRelevantHash() already fixed on the runtime_key side.
+//
+// Computes what cbuf_key WOULD be if every entry tagged via
+// ReadCbufValueForTextureHandle() (see its doc comment in environment.h for
+// exactly what "tagged" means and why it's a structural guarantee, not an
+// inference) were excluded from the hash. texture_handle_keys is expected to
+// be GenericEnvironment::CapturedTextureHandleCbufKeys() — empty for a
+// FileEnvironment or the scanner's SpeculativeShaderEnvironment today (see
+// the plumbing note in Lookup()'s caller), which just means the
+// counterfactual degrades to ComputeCbufKey() unchanged for those cases —
+// never wrong, just uninformative for the ones that can't supply the tag yet.
+//
+// NOT a candidate to become the real cbuf_key as-is: FoldDriverConstBuffer's
+// bank-1 constant-folding and control_flow.cpp's indirect-branch-table walk
+// both call plain ReadCbufValue(), so this exclusion set structurally can
+// never include either of those — but that's exactly the property that
+// makes it SAFE to test empirically, not a claim that it's already
+// production-ready. See handoff notes for the full safety reasoning.
+// ---------------------------------------------------------------------------
+u64 ComputeCbufKeyExcludingTextureHandles(const std::unordered_map<u64, u32>& cbuf_values,
+                                          const std::unordered_set<u64>& texture_handle_keys) {
+    if (cbuf_values.empty() || texture_handle_keys.empty()) {
+        return ComputeCbufKey(cbuf_values);
+    }
+    std::vector<std::pair<u64, u32>> sorted;
+    sorted.reserve(cbuf_values.size());
+    for (const auto& [key, value] : cbuf_values) {
+        if (!texture_handle_keys.contains(key)) {
+            sorted.emplace_back(key, value);
+        }
+    }
+    if (sorted.empty()) {
+        // Every captured read was texture-handle-purposed — the counterfactual key is
+        // "no non-texture-handle cbuf dependency at all", same as an empty cbuf_values
+        // map would hash to.
+        return 0;
+    }
     std::sort(sorted.begin(), sorted.end());
     return Common::CityHash64(reinterpret_cast<const char*>(sorted.data()),
                               sorted.size() * sizeof(sorted[0]));
@@ -78,6 +151,12 @@ u64 ComputeBindingKey(const Shader::Backend::Bindings& starting_binding) {
         starting_binding.image,         starting_binding.texture_scaling_index,
         starting_binding.image_scaling_index,
     };
+    return Common::CityHash64(reinterpret_cast<const char*>(fields), sizeof(fields));
+}
+
+u64 ComputeWorkgroupKey(u32 shared_memory_size, const std::array<u32, 3>& workgroup_size) {
+    const u32 fields[] = {shared_memory_size, workgroup_size[0], workgroup_size[1],
+                          workgroup_size[2]};
     return Common::CityHash64(reinterpret_cast<const char*>(fields), sizeof(fields));
 }
 
@@ -134,8 +213,20 @@ void SpirvCache::Load(const std::filesystem::path& path) {
             file.read(reinterpret_cast<char*>(spirv.data()), word_count * sizeof(u32));
             Shader::Backend::Bindings end_binding{};
             file.read(reinterpret_cast<char*>(&end_binding), sizeof(end_binding));
+            u8 is_speculative_byte{};
+            file.read(reinterpret_cast<char*>(&is_speculative_byte), sizeof(is_speculative_byte));
+            // Trailing three diag_* fields: diag_base_runtime_hash/diag_binding_key stay
+            // at their documented 0/0 "no data" default (unaffected by this load). The
+            // third, diag_cbuf_key_excl_texture_handles, deliberately defaults to
+            // key.cbuf_key (this entry's own real value) rather than a bare 0 — see its
+            // doc comment on Entry: "diag_cbuf_key_excl_texture_handles ==
+            // <this entry's key.cbuf_key>" is the documented signal for "no narrowing
+            // data available", and a reloaded entry never has any (the tagging that
+            // would produce a real value is session-scoped, not persisted). Defaulting
+            // to a bare 0 here would have been silently wrong for the common case of a
+            // reloaded entry with a genuinely nonzero cbuf_key.
             entries_.emplace(key, Entry{std::make_shared<const std::vector<u32>>(std::move(spirv)),
-                                        end_binding});
+                                        end_binding, is_speculative_byte != 0, 0, 0, key.cbuf_key});
             unique_hashes_.insert(key.unique_hash);
             constexpr size_t kMaxStoredKeysPerHashForDiagnosticsLoad = 8;
             auto& stored_keys = keys_by_hash_[key.unique_hash];
@@ -187,6 +278,8 @@ void SpirvCache::Save(const std::filesystem::path& path) const {
             file.write(reinterpret_cast<const char*>(&word_count),      sizeof(word_count));
             file.write(reinterpret_cast<const char*>(entry.spirv->data()), word_count * sizeof(u32));
             file.write(reinterpret_cast<const char*>(&entry.end_binding), sizeof(entry.end_binding));
+            const u8 is_speculative_byte = entry.is_speculative ? 1 : 0;
+            file.write(reinterpret_cast<const char*>(&is_speculative_byte), sizeof(is_speculative_byte));
         }
     } catch (const std::exception& e) {
         LOG_ERROR(Render_Vulkan, "Failed to write SPIR-V cache: {}", e.what());
@@ -264,6 +357,28 @@ void SpirvCache::SaveThrottled(const std::filesystem::path& path,
         const size_t cbuf_total = cbuf_zero + cbuf_nonzero;
         const int cbuf_zero_pct =
             cbuf_total > 0 ? static_cast<int>(cbuf_zero * 100 / cbuf_total) : 0;
+        // See RuntimeBindingComponentNeverMatchedCount() / RuntimeCoreComponentNeverMatchedCount()'s
+        // doc comments in spirv_cache.h — these split the folded runtime_key mismatch
+        // (stale_miss_with_context_) into its two pre-fold components so it's clear
+        // whether the binding-offset fold or the core RuntimeInfo state is the
+        // dominant blocker, instead of only ever seeing "runtime differs" with no way
+        // to tell which. Cumulative since boot (not windowed), since a small sample can
+        // be misleading here and the whole-session total is what actually settles the
+        // question.
+        const size_t binding_never_matched = runtime_binding_component_never_matched_with_context_.load();
+        const size_t core_never_matched = runtime_core_component_never_matched_with_context_.load();
+        const size_t with_ctx_total = with_ctx_now; // cumulative stale_miss_with_context_ since boot
+        // See CbufTextureHandleNarrowingEligibleCount() / ...WouldHaveMatchedCount()'s doc
+        // comments in spirv_cache.h. Cumulative since boot, same reasoning as the two
+        // counters above — this is Phase 0 of the cbuf/texture_key redundancy
+        // investigation: pure measurement, no behavior change, answering "would
+        // narrowing cbuf_key to exclude texture-handle-only reads actually help" with
+        // real gameplay data before anyone commits to actually cutting anything.
+        const size_t cbuf_narrow_eligible = cbuf_texture_handle_narrowing_eligible_.load();
+        const size_t cbuf_narrow_matched = cbuf_texture_handle_narrowing_would_have_matched_.load();
+        const int cbuf_narrow_pct = cbuf_narrow_eligible > 0
+                                        ? static_cast<int>(cbuf_narrow_matched * 100 / cbuf_narrow_eligible)
+                                        : 0;
         if (window_probes > 0) {
             const int window_pct = static_cast<int>(window_hits * 100 / window_probes);
             LOG_INFO(Render_Vulkan,
@@ -272,16 +387,30 @@ void SpirvCache::SaveThrottled(const std::filesystem::path& path,
                      "already cached under a different key ({} had no real cbuf/texture "
                      "context [FileEnvironment] / {} had real context that still mismatched). "
                      "Real-draw cbuf_key==0 so far: {}/{} ({}%) — the ceiling on how many real "
-                     "draws a speculative entry could ever match, regardless of key correctness.",
+                     "draws a speculative entry could ever match, regardless of key correctness. "
+                     "Of {} real-context stale misses so far, {} could not have matched on the "
+                     "binding-offset component alone (vs any stored variant) / {} could not have "
+                     "matched on the core RuntimeInfo component alone — whichever is closer to "
+                     "{} is the dominant runtime_key blocker. Of {} cbuf_key-caused misses with "
+                     "real narrowing data available, {} ({}%) would have matched a stored variant "
+                     "if texture-handle-only cbuf reads were excluded from cbuf_key.",
                      entries_now, speculative_insert_count_.load(), real_insert_count_.load(),
                      window_hits, window_probes, window_pct, window_stale_misses,
-                     window_no_ctx, window_with_ctx, cbuf_zero, cbuf_total, cbuf_zero_pct);
+                     window_no_ctx, window_with_ctx, cbuf_zero, cbuf_total, cbuf_zero_pct,
+                     with_ctx_total, binding_never_matched, core_never_matched, with_ctx_total,
+                     cbuf_narrow_eligible, cbuf_narrow_matched, cbuf_narrow_pct);
         } else {
             LOG_INFO(Render_Vulkan,
                      "SPIR-V cache: {} entries ({} speculative / {} real inserted so far) — "
-                     "no lookups since last log. Real-draw cbuf_key==0 so far: {}/{} ({}%).",
+                     "no lookups since last log. Real-draw cbuf_key==0 so far: {}/{} ({}%). "
+                     "Of {} real-context stale misses so far, {} binding-component-never-matched / "
+                     "{} core-component-never-matched. Of {} cbuf_key-caused misses with real "
+                     "narrowing data available, {} ({}%) would have matched if texture-handle-only "
+                     "cbuf reads were excluded.",
                      entries_now, speculative_insert_count_.load(), real_insert_count_.load(),
-                     cbuf_zero, cbuf_total, cbuf_zero_pct);
+                     cbuf_zero, cbuf_total, cbuf_zero_pct,
+                     with_ctx_total, binding_never_matched, core_never_matched,
+                     cbuf_narrow_eligible, cbuf_narrow_matched, cbuf_narrow_pct);
         }
     }
 }
@@ -297,7 +426,10 @@ bool SpirvCache::ContainsByUniqueHash(u64 unique_hash) const noexcept {
 }
 
 std::optional<SpirvCache::LookupResult> SpirvCache::Lookup(const SpirvKey& key,
-                                                             bool has_real_specialization_context) const {
+                                                             bool has_real_specialization_context,
+                                                             u64 diag_base_runtime_hash,
+                                                             u64 diag_binding_key,
+                                                             u64 diag_cbuf_key_excl_texture_handles) const {
     std::shared_lock lock{mutex_};
     ++lookup_count_;
     if (has_real_specialization_context) {
@@ -323,13 +455,87 @@ std::optional<SpirvCache::LookupResult> SpirvCache::Lookup(const SpirvKey& key,
                 ++stale_miss_no_context_;
             }
 
+            // Look up every stored key for this unique_hash once — used below both
+            // for the (uncapped) binding-vs-core component counters and for the
+            // (throttled) per-field LOG_INFO samples.
+            const auto hit_it = keys_by_hash_.find(key.unique_hash);
+            const bool have_stored_keys = hit_it != keys_by_hash_.end() && !hit_it->second.empty();
+
+            // Uncapped: for every real (has_real_specialization_context) stale miss,
+            // check whether the REQUESTED side's pre-fold runtime_key components
+            // (diag_base_runtime_hash / diag_binding_key) match ANY stored variant's
+            // components — not just the one variant that happened to be logged. If a
+            // component differs from every single stored variant, that component
+            // could not possibly have produced a hit here no matter what the other
+            // fields were, which is exactly the "is it the binding fold or the core
+            // RuntimeInfo state" question handoff_02 asks. This runs for the whole
+            // session (not throttled like the LOG_INFO samples below) since it's just
+            // a couple of atomic increments — cheap enough to never need a cap, and
+            // this is the number that actually matters for the aggregate answer,
+            // rather than relying on however many per-field log samples fit in a
+            // throttle budget.
+            if (has_real_specialization_context && have_stored_keys) {
+                bool binding_matched_any = false;
+                bool core_matched_any = false;
+                bool cbuf_matched_any = false;           // real cbuf_key vs real cbuf_key
+                bool cbuf_narrowed_matched_any = false;   // counterfactual vs counterfactual
+                for (const SpirvKey& stored : hit_it->second) {
+                    if (stored.cbuf_key == key.cbuf_key) {
+                        cbuf_matched_any = true;
+                    }
+                    const auto stored_it = entries_.find(stored);
+                    if (stored_it == entries_.end()) {
+                        continue; // shouldn't happen (keys_by_hash_ mirrors entries_), but be safe
+                    }
+                    if (stored_it->second.diag_binding_key == diag_binding_key) {
+                        binding_matched_any = true;
+                    }
+                    if (stored_it->second.diag_base_runtime_hash == diag_base_runtime_hash) {
+                        core_matched_any = true;
+                    }
+                    if (stored_it->second.diag_cbuf_key_excl_texture_handles ==
+                        diag_cbuf_key_excl_texture_handles) {
+                        cbuf_narrowed_matched_any = true;
+                    }
+                }
+                if (!binding_matched_any) {
+                    ++runtime_binding_component_never_matched_with_context_;
+                }
+                if (!core_matched_any) {
+                    ++runtime_core_component_never_matched_with_context_;
+                }
+                // See CbufTextureHandleNarrowingEligibleCount() / ...WouldHaveMatchedCount()'s
+                // doc comments in spirv_cache.h for the full reasoning. Two gates, both
+                // needed for this to be a meaningful data point rather than noise:
+                //   1. cbuf_key is DEMONSTRABLY why this specific miss happened — it
+                //      differs from every stored variant's real cbuf_key. If it already
+                //      matched one, cbuf wasn't the blocker here; counting it would
+                //      credit narrowing for something narrowing had nothing to do with.
+                //   2. The requester actually had real tagging data to narrow with —
+                //      its counterfactual differs from its own real cbuf_key (see
+                //      Entry::diag_cbuf_key_excl_texture_handles's doc comment for why
+                //      that specific comparison is the correct "do we have real data"
+                //      test, not just diag_cbuf_key_excl_texture_handles != 0).
+                if (!cbuf_matched_any && diag_cbuf_key_excl_texture_handles != key.cbuf_key) {
+                    ++cbuf_texture_handle_narrowing_eligible_;
+                    if (cbuf_narrowed_matched_any) {
+                        ++cbuf_texture_handle_narrowing_would_have_matched_;
+                    }
+                }
+            }
+
             // Throttled: report exactly which field(s) differ from the
             // requested key, using whatever's actually stored for this hash.
             // A handful of samples is enough to tell whether cbuf_key,
             // runtime_key, or texture_key (or some combination) is the
             // dominant mismatch source, without flooding the log over a
-            // whole play session.
-            constexpr size_t kMaxFieldMismatchLogs = 30;
+            // whole play session. Bumped 30 -> 500 (was exhausting itself
+            // within the first ~60s of a session, almost entirely on
+            // boot-time disk-cache replay, before any live-play sample ever
+            // got a slot) — see also ResetFieldMismatchLogBudget(), which
+            // callers should invoke once boot-time replay finishes so
+            // live-play gets its own fresh budget on top of this.
+            constexpr size_t kMaxFieldMismatchLogs = 500;
             std::atomic<size_t>& field_mismatch_logs =
                 has_real_specialization_context ? field_mismatch_logs_with_context_
                                                  : field_mismatch_logs_no_context_;
@@ -339,22 +545,29 @@ std::optional<SpirvCache::LookupResult> SpirvCache::Lookup(const SpirvKey& key,
                    !field_mismatch_logs.compare_exchange_weak(expected, expected + 1)) {
             }
             got_slot = expected < kMaxFieldMismatchLogs;
-            if (got_slot) {
-                const auto hit_it = keys_by_hash_.find(key.unique_hash);
-                if (hit_it != keys_by_hash_.end() && !hit_it->second.empty()) {
-                    for (const SpirvKey& stored : hit_it->second) {
-                        LOG_INFO(Render_Vulkan,
-                                 "SPIR-V cache field mismatch [{}] (real_context={}): requested "
-                                 "cbuf={:016x} runtime={:016x} texture={:016x} vs "
-                                 "stored cbuf={:016x} runtime={:016x} texture={:016x} "
-                                 "(cbuf {}, runtime {}, texture {})",
-                                 expected, has_real_specialization_context,
-                                 key.cbuf_key, key.runtime_key, key.texture_key,
-                                 stored.cbuf_key, stored.runtime_key, stored.texture_key,
-                                 key.cbuf_key == stored.cbuf_key ? "matches" : "DIFFERS",
-                                 key.runtime_key == stored.runtime_key ? "matches" : "DIFFERS",
-                                 key.texture_key == stored.texture_key ? "matches" : "DIFFERS");
-                    }
+            if (got_slot && have_stored_keys) {
+                for (const SpirvKey& stored : hit_it->second) {
+                    const auto stored_it = entries_.find(stored);
+                    const u64 stored_base_rt =
+                        stored_it != entries_.end() ? stored_it->second.diag_base_runtime_hash : 0;
+                    const u64 stored_binding_key =
+                        stored_it != entries_.end() ? stored_it->second.diag_binding_key : 0;
+                    LOG_INFO(Render_Vulkan,
+                             "SPIR-V cache field mismatch [{}] (real_context={}): requested "
+                             "cbuf={:016x} runtime={:016x} (base_runtime={:016x} binding_key={:016x}) "
+                             "texture={:016x} vs stored cbuf={:016x} runtime={:016x} "
+                             "(base_runtime={:016x} binding_key={:016x}) texture={:016x} "
+                             "(cbuf {}, runtime {} [base_runtime {}, binding_key {}], texture {})",
+                             expected, has_real_specialization_context,
+                             key.cbuf_key, key.runtime_key, diag_base_runtime_hash, diag_binding_key,
+                             key.texture_key,
+                             stored.cbuf_key, stored.runtime_key, stored_base_rt, stored_binding_key,
+                             stored.texture_key,
+                             key.cbuf_key == stored.cbuf_key ? "matches" : "DIFFERS",
+                             key.runtime_key == stored.runtime_key ? "matches" : "DIFFERS",
+                             diag_base_runtime_hash == stored_base_rt ? "matches" : "DIFFERS",
+                             diag_binding_key == stored_binding_key ? "matches" : "DIFFERS",
+                             key.texture_key == stored.texture_key ? "matches" : "DIFFERS");
                 }
             }
         }
@@ -365,10 +578,14 @@ std::optional<SpirvCache::LookupResult> SpirvCache::Lookup(const SpirvKey& key,
 }
 
 void SpirvCache::Insert(const SpirvKey& key, std::vector<u32> spirv,
-                        const Shader::Backend::Bindings& end_binding, bool is_speculative) {
+                        const Shader::Backend::Bindings& end_binding, bool is_speculative,
+                        u64 diag_base_runtime_hash, u64 diag_binding_key,
+                        u64 diag_cbuf_key_excl_texture_handles) {
     std::unique_lock lock{mutex_};
     entries_.insert_or_assign(key, Entry{std::make_shared<const std::vector<u32>>(std::move(spirv)),
-                                         end_binding, is_speculative});
+                                         end_binding, is_speculative,
+                                         diag_base_runtime_hash, diag_binding_key,
+                                         diag_cbuf_key_excl_texture_handles});
     unique_hashes_.insert(key.unique_hash);
     constexpr size_t kMaxStoredKeysPerHashForDiagnostics = 8;
     auto& stored_keys = keys_by_hash_[key.unique_hash];
@@ -391,16 +608,27 @@ size_t SpirvCache::Size() const {
 
 void SpirvCache::Insert(u64 unique_hash, const std::unordered_map<u64, u32>& cbuf_values,
                         u64 runtime_key, u64 texture_key, std::vector<u32> spirv,
-                        const Shader::Backend::Bindings& end_binding) {
+                        const Shader::Backend::Bindings& end_binding,
+                        u64 diag_base_runtime_hash, u64 diag_binding_key,
+                        u64 diag_cbuf_key_excl_texture_handles) {
     Insert(SpirvKey{unique_hash, ComputeCbufKey(cbuf_values), runtime_key, texture_key},
-           std::move(spirv), end_binding);
+           std::move(spirv), end_binding, /*is_speculative=*/false,
+           diag_base_runtime_hash, diag_binding_key, diag_cbuf_key_excl_texture_handles);
 }
 
-void SpirvCache::InsertSpeculative(u64 unique_hash, u64 runtime_key, u64 texture_key, std::vector<u32> spirv) {
+void SpirvCache::InsertSpeculative(u64 unique_hash, u64 runtime_key, u64 texture_key,
+                                   std::vector<u32> spirv, u64 diag_base_runtime_hash,
+                                   u64 diag_binding_key) {
     if (unique_hash == 0 || spirv.empty()) [[unlikely]] return;
     // Speculative entries have no valid end_binding (they are consumed by the prewarmer,
     // not by the per-stage pipeline loop).  Store a zero binding delta.
-    Insert(SpirvKey{unique_hash, 0, runtime_key, texture_key}, std::move(spirv), {}, /*is_speculative=*/true);
+    // diag_cbuf_key_excl_texture_handles intentionally left at its default (0): every
+    // speculative entry already uses cbuf_key=0 (empty cbuf_values — see the SpirvKey
+    // built below), so 0 already correctly equals "this entry's own key.cbuf_key",
+    // which is exactly the "no narrowing data / nothing to narrow" convention documented
+    // on Entry::diag_cbuf_key_excl_texture_handles. No special-casing needed here.
+    Insert(SpirvKey{unique_hash, 0, runtime_key, texture_key}, std::move(spirv), {},
+           /*is_speculative=*/true, diag_base_runtime_hash, diag_binding_key);
 }
 
 } // namespace VideoCommon

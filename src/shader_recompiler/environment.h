@@ -51,6 +51,25 @@ public:
 
     [[nodiscard]] virtual u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) = 0;
 
+    // Same read as ReadCbufValue, called ONLY from GetTextureHandle() (texture_pass.cpp)
+    // for the two reads that resolve a bindless texture handle — never from anywhere
+    // else (constant-propagation's FoldDriverConstBuffer and the indirect-branch-table
+    // walk in control_flow.cpp both call plain ReadCbufValue(), deliberately not this).
+    // That makes this call site itself the signal: whichever (index, offset) pairs
+    // arrive here are — as far as every Environment::ReadCbufValue caller in the
+    // codebase is concerned — used for NOTHING except resolving a handle that
+    // ReadTextureType()/ReadTexturePixelFormat() then resolve independently and that
+    // spirv_cache's texture_key already captures on its own. Default implementation
+    // just forwards to ReadCbufValue() (identical behavior to before this existed) —
+    // GenericEnvironment is the only override, and it ALSO records the (index, offset)
+    // pair for VideoCommon::GraphicsPipelineCacheKey-adjacent diagnostics (see
+    // CapturedTextureHandleCbufKeys() in shader_environment.h). Every other Environment
+    // (FileEnvironment, the scanner's SpeculativeShaderEnvironment) gets the safe
+    // default: no tagging, same as if this method didn't exist.
+    [[nodiscard]] virtual u32 ReadCbufValueForTextureHandle(u32 cbuf_index, u32 cbuf_offset) {
+        return ReadCbufValue(cbuf_index, cbuf_offset);
+    }
+
     /// Returns the byte size of the const buffer at cbuf_index, or 0 if not bound /
     /// not knowable from this environment. Callers treat 0 as "unknown" and fall
     /// back to the original conservative default (e.g. disk-cache replay path).

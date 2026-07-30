@@ -7449,14 +7449,33 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                             // here, unfolded, put every entry this scanner ever inserted in a
                             // format that could never match a real one, regardless of how
                             // accurate any other part of the guess was.
-                            u64 runtime_key = rt.Hash();
+                            //
+                            // SpirvRelevantHash(stage), not Hash(): folds only the fields this
+                            // stage's SPIR-V emission actually reads (runtime_info.h) instead
+                            // of the whole struct. Directly relevant to the two guesses just
+                            // above — rt.input_topology=Triangles only ever mattered for
+                            // Geometry anyway (never read for Fragment/VertexB codegen), so
+                            // real Fragment/VertexB draws using Lines/Points no longer need to
+                            // coincidentally match a guess that was never going to affect their
+                            // actual SPIR-V in the first place.
+                            u64 runtime_key = rt.SpirvRelevantHash(stage);
                             if (stage == Shader::Stage::VertexB) {
                                 runtime_key = VideoCommon::FoldViewportTransformState(
                                     runtime_key, env.ReadViewportTransformState());
                             }
-                            runtime_key = VideoCommon::FoldBindingKey(
-                                runtime_key, VideoCommon::ComputeBindingKey(Shader::Backend::Bindings{}));
-                            cache.InsertSpeculative(unique_hash, runtime_key, texture_key, std::move(spirv));
+                            // Same diagnostic split as the live speculative path in
+                            // vk_pipeline_cache.cpp: capture the pre-binding-fold "core"
+                            // component so a later stale miss against this scanner-inserted
+                            // entry can be attributed to the core RuntimeInfo state vs. the
+                            // binding-offset guess specifically, instead of only ever seeing
+                            // an opaque "runtime differs" on the folded key. See
+                            // spirv_cache.h's Insert()/InsertSpeculative() doc comments.
+                            const u64 diag_base_runtime_hash = runtime_key;
+                            const u64 diag_binding_key =
+                                VideoCommon::ComputeBindingKey(Shader::Backend::Bindings{});
+                            runtime_key = VideoCommon::FoldBindingKey(runtime_key, diag_binding_key);
+                            cache.InsertSpeculative(unique_hash, runtime_key, texture_key, std::move(spirv),
+                                                    diag_base_runtime_hash, diag_binding_key);
                             ++state->shaders_translated;
                             if (diag_slot >= 0) {
                                 LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: fully translated OK at entry +{}",

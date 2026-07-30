@@ -12,6 +12,7 @@
 #include <span>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "common/common_types.h"
@@ -25,6 +26,15 @@ class Memorymanager;
 }
 
 namespace VideoCommon {
+
+// Canonical (cbuf_index, cbuf_offset) -> u64 packing shared by every cbuf-key consumer:
+// GenericEnvironment's own cbuf_values/cbuf_replacements capture (shader_environment.cpp),
+// the texture-handle tagging below, and anything reading CapturedCbufValues() /
+// CapturedTextureHandleCbufKeys() from outside this class. One definition, so the two
+// sides of that comparison can never silently drift out of sync with each other.
+[[nodiscard]] constexpr u64 MakeCbufKey(u32 index, u32 offset) noexcept {
+    return (static_cast<u64>(index) << 32) | offset;
+}
 
 class GenericEnvironment : public Shader::Environment {
 public:
@@ -70,6 +80,32 @@ public:
         return cbuf_values;
     }
 
+    /// Subset of CapturedCbufValues()'s keys (same MakeCbufKey(index, offset) packing)
+    /// that were read ONLY to resolve a bindless texture handle — see
+    /// ReadCbufValueForTextureHandle's doc comment in environment.h for exactly what
+    /// "only" means here and why it's safe to rely on structurally rather than by
+    /// inference. Diagnostic scaffolding for validating (with real per-session gameplay
+    /// data, not guesswork) whether cbuf_key can be narrowed to exclude entries whose
+    /// downstream effect on codegen is already fully captured by texture_key — see
+    /// VideoCommon::ComputeCbufKeyExcludingTextureHandles in spirv_cache.h. Empty for
+    /// any shader that doesn't sample a bindless texture at all, which is common and
+    /// fine — an empty exclusion set just means the counterfactual equals cbuf_key.
+    const std::unordered_set<u64>& CapturedTextureHandleCbufKeys() const noexcept {
+        return texture_handle_cbuf_keys;
+    }
+
+    /// See ReadCbufValueForTextureHandle's doc comment in environment.h. GenericEnvironment
+    /// is the one override point for ALL its subclasses (GraphicsEnvironment,
+    /// ComputeEnvironment) — `final` stops the chain here since the tagging logic
+    /// itself doesn't differ between them; it just needs to reach whichever
+    /// ReadCbufValue() override is active, which happens automatically via the
+    /// (still-virtual, separately overridden per subclass) call below.
+    u32 ReadCbufValueForTextureHandle(u32 cbuf_index, u32 cbuf_offset) override final {
+        const u32 value = ReadCbufValue(cbuf_index, cbuf_offset);
+        texture_handle_cbuf_keys.insert(MakeCbufKey(cbuf_index, cbuf_offset));
+        return value;
+    }
+
     /// GPL: read-only view of texture types captured during translation.
     const std::unordered_map<u32, Shader::TextureType>& CapturedTextureTypes() const noexcept {
         return texture_types;
@@ -105,6 +141,8 @@ protected:
     std::unordered_map<u32, Shader::TextureType> texture_types;
     std::unordered_map<u32, Shader::TexturePixelFormat> texture_pixel_formats;
     std::unordered_map<u64, u32> cbuf_values;
+    // See ReadCbufValueForTextureHandle() and CapturedTextureHandleCbufKeys() above.
+    std::unordered_set<u64> texture_handle_cbuf_keys;
     std::unordered_map<u64, Shader::ReplaceConstant> cbuf_replacements;
     // Cbuf sizes captured on the main thread at construction time while GPU state is live.
     std::unordered_map<u32, u32> cbuf_sizes;
