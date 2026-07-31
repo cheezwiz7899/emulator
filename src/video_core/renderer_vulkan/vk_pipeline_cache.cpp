@@ -920,9 +920,29 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         const auto* file_env_stage = stage_envs[index]->AsFileEnvironment();
         const bool has_real_specialization_context =
             gen_env_stage != nullptr || file_env_stage != nullptr;
-        const u64 cbuf_key = gen_env_stage    ? ComputeCbufKey(gen_env_stage->CapturedCbufValues())
-                             : file_env_stage ? ComputeCbufKey(file_env_stage->CapturedCbufValues())
-                                              : 0;
+        // PHASE 1 — narrowing enabled. Validated across two independent full play
+        // sessions (see the diagnostic below): texture-handle-only cbuf reads account
+        // for ~24-28% of cbuf_key-caused stale misses where real narrowing data was
+        // available — consistent between a fresh-wipe session (1126 eligible samples,
+        // 28.2% would-match) and a post-precache session with far more boot-replay
+        // traffic (2278 eligible samples, 21.9% would-match) once the FileEnvironment
+        // gap below was closed. Not a majority fix, but real, safe (see
+        // ReadCbufValueForTextureHandle's doc comment in environment.h for exactly
+        // why the exclusion set can only ever contain genuinely-redundant reads), and
+        // worth taking. The diagnostic further down (diag_cbuf_key_excl_texture_handles)
+        // is now redundant with this — it will report eligible=0 forever going
+        // forward, since it's computed with the identical formula key.cbuf_key now
+        // uses. That's expected, not a bug; left in place rather than removed in the
+        // same change that flips production matching behavior, so this diff stays as
+        // small and reviewable as possible. Safe to clean up separately later.
+        const u64 cbuf_key =
+            gen_env_stage    ? ComputeCbufKeyExcludingTextureHandles(
+                                   gen_env_stage->CapturedCbufValues(),
+                                   gen_env_stage->CapturedTextureHandleCbufKeys())
+            : file_env_stage ? ComputeCbufKeyExcludingTextureHandles(
+                                   file_env_stage->CapturedCbufValues(),
+                                   file_env_stage->CapturedTextureHandleCbufKeys())
+                             : 0;
         const u64 texture_key =
             gen_env_stage    ? ComputeTextureKey(gen_env_stage->CapturedTextureTypes(),
                                                  gen_env_stage->CapturedTexturePixelFormats())
@@ -1163,9 +1183,14 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
     auto* gen_env = env.AsGenericEnvironment();
     auto* file_env = env.AsFileEnvironment();
     const bool has_real_specialization_context = gen_env != nullptr || file_env != nullptr;
-    const u64 cbuf_key_c = gen_env    ? ComputeCbufKey(gen_env->CapturedCbufValues())
-                          : file_env ? ComputeCbufKey(file_env->CapturedCbufValues())
-                                     : 0;
+    // PHASE 1 — narrowing enabled, same validated switch as CreateGraphicsPipeline()
+    // above. See that comment for the two-session data behind it; not repeated here.
+    const u64 cbuf_key_c =
+        gen_env    ? ComputeCbufKeyExcludingTextureHandles(gen_env->CapturedCbufValues(),
+                                                           gen_env->CapturedTextureHandleCbufKeys())
+        : file_env ? ComputeCbufKeyExcludingTextureHandles(file_env->CapturedCbufValues(),
+                                                           file_env->CapturedTextureHandleCbufKeys())
+                   : 0;
     const u64 texture_key_c =
         gen_env    ? ComputeTextureKey(gen_env->CapturedTextureTypes(),
                                        gen_env->CapturedTexturePixelFormats())

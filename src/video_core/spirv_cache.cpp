@@ -12,7 +12,25 @@
 
 namespace {
 constexpr std::array<char, 8> SPIRV_CACHE_MAGIC{'c', 'i', 't', 'r', 's', 'p', 'v', '\0'};
-constexpr u32 SPIRV_CACHE_VERSION = 6; // v6: persists Entry::is_speculative per entry
+constexpr u32 SPIRV_CACHE_VERSION = 7; // v7: cbuf_key now excludes texture-handle-only
+                                        // reads (ComputeCbufKeyExcludingTextureHandles,
+                                        // vk_pipeline_cache.cpp's CreateGraphicsPipeline/
+                                        // CreateComputePipeline — see the "PHASE 1 —
+                                        // narrowing enabled" comments there for the
+                                        // validation data). No on-disk byte format
+                                        // change, but the VALUE stored under cbuf_key
+                                        // now means something different than it did
+                                        // under v6 and earlier — an old entry's cbuf_key
+                                        // was computed over strictly more reads than a
+                                        // v7 entry's would be for the identical shader,
+                                        // so mixing them wouldn't be wrong (a stale
+                                        // cross-version entry just fails to match,
+                                        // same as any other cache miss) but would make
+                                        // any future cbuf_key==0-rate diagnostics
+                                        // ambiguous about which scheme produced a given
+                                        // number. Bumping forces a clean full rebuild
+                                        // instead, same reasoning as v6's bundled bump;
+                                        // (v6: persists Entry::is_speculative per entry
                                         // instead of dropping it (every reloaded entry
                                         // used to silently become "real" after one
                                         // restart, which would have quietly corrupted
