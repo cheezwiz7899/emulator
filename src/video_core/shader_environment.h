@@ -261,6 +261,16 @@ public:
         CapturedTexturePixelFormats() const noexcept {
         return texture_pixel_formats;
     }
+    /// Mirrors GenericEnvironment::CapturedTextureHandleCbufKeys() — see its doc
+    /// comment there. Populated from disk (see Deserialize()) starting with
+    /// TRANSFERABLE_CACHE_VERSION 16; caches written by older versions never had
+    /// this data captured at all, so this is simply empty for anything serialized
+    /// before the bump, which is the correct, safe "no narrowing data" behavior
+    /// (see Entry::diag_cbuf_key_excl_texture_handles's convention in spirv_cache.h)
+    /// rather than something that needs special-casing here.
+    const std::unordered_set<u64>& CapturedTextureHandleCbufKeys() const noexcept {
+        return texture_handle_cbuf_keys;
+    }
 
     [[nodiscard]] u64 ReadInstruction(u32 address) override;
 
@@ -300,6 +310,8 @@ private:
     std::unordered_map<u32, Shader::TextureType> texture_types;
     std::unordered_map<u32, Shader::TexturePixelFormat> texture_pixel_formats;
     std::unordered_map<u64, u32> cbuf_values;
+    // See CapturedTextureHandleCbufKeys() above.
+    std::unordered_set<u64> texture_handle_cbuf_keys;
     std::unordered_map<u64, Shader::ReplaceConstant> cbuf_replacements;
     std::unordered_map<u32, u32> cbuf_sizes;
     std::array<u32, 3> workgroup_size{};

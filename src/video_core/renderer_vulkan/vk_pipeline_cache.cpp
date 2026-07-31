@@ -68,7 +68,18 @@ using VideoCommon::ComputeWorkgroupKey;
 using VideoCommon::FoldViewportTransformState;
 using VideoCommon::FoldBindingKey;
 
-constexpr u32 TRANSFERABLE_CACHE_VERSION = 15;
+// v16: GenericEnvironment::Serialize()/FileEnvironment::Deserialize() gained
+// texture_handle_cbuf_keys (see CapturedTextureHandleCbufKeys() in
+// shader_environment.h) so boot-time disk-replay entries can supply real
+// cbuf/texture-handle narrowing data to the same diagnostic that live play
+// already could — Phase 0 testing showed this gap wasn't cosmetic: sessions
+// with a lot of preloaded content had an eligible-sample rate roughly 9x
+// lower than a fresh-wipe session, since every stale miss sourced from a
+// FileEnvironment was structurally excluded from the "would narrowing help"
+// measurement. Old caches have no data for this field at all (not a partial-
+// data situation — the bytes genuinely aren't there), hence the version bump
+// rather than trying to read old files as if they had it.
+constexpr u32 TRANSFERABLE_CACHE_VERSION = 16;
 constexpr u32 VULKAN_PIPELINE_CACHE_VERSION = 14;
 constexpr std::array<char, 8> VULKAN_CACHE_MAGIC_NUMBER{'y', 'u', 'z', 'u', 'v', 'k', 'c', 'h'};
 
@@ -919,19 +930,26 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                                                  file_env_stage->CapturedTexturePixelFormats())
                              : 0;
         // Diagnostic-only (see ComputeCbufKeyExcludingTextureHandles's doc comment in
-        // spirv_cache.cpp) — only gen_env_stage can supply real tagging data today
-        // (GenericEnvironment::CapturedTextureHandleCbufKeys(); FileEnvironment doesn't
-        // derive from GenericEnvironment, so boot-replay stages fall back to the "no
-        // data available" convention of equaling their own real cbuf_key — see
-        // Entry::diag_cbuf_key_excl_texture_handles's doc comment in spirv_cache.h).
-        // Extending real tagging data to FileEnvironment/serialization so boot-replay
-        // entries can participate too is exactly Phase 1's prerequisite, not something
-        // to sneak in here — this stays diagnostic-only and gen_env-only for now.
+        // spirv_cache.cpp). Both gen_env_stage (live play) and file_env_stage
+        // (boot-time disk replay, TRANSFERABLE_CACHE_VERSION 16+) can supply real
+        // tagging data now — see CapturedTextureHandleCbufKeys() on both
+        // GenericEnvironment and FileEnvironment. This matters far more than it might
+        // look: Phase 0 testing showed sessions with a lot of preloaded content had an
+        // eligible-sample rate roughly 9x lower than a fresh-wipe session, because
+        // every stale miss sourced from a FileEnvironment was structurally excluded
+        // from the "would narrowing help" measurement before this. A cache written
+        // before v16 still degrades safely to the "no data available" convention
+        // (equaling its own real cbuf_key) — file_env_stage->CapturedTextureHandleCbufKeys()
+        // is simply empty for anything deserialized from an old-format file, same as if
+        // this whole feature didn't exist yet for that specific entry.
         const u64 diag_cbuf_key_excl_texture_handles =
-            gen_env_stage ? ComputeCbufKeyExcludingTextureHandles(
-                                gen_env_stage->CapturedCbufValues(),
-                                gen_env_stage->CapturedTextureHandleCbufKeys())
-                          : cbuf_key;
+            gen_env_stage    ? ComputeCbufKeyExcludingTextureHandles(
+                                   gen_env_stage->CapturedCbufValues(),
+                                   gen_env_stage->CapturedTextureHandleCbufKeys())
+            : file_env_stage ? ComputeCbufKeyExcludingTextureHandles(
+                                   file_env_stage->CapturedCbufValues(),
+                                   file_env_stage->CapturedTextureHandleCbufKeys())
+                             : cbuf_key;
         // diag_base_runtime_hash captures runtime_info.SpirvRelevantHash(stage) BEFORE
         // any folding — for VertexB this also includes the viewport-transform-state
         // fold below, since that fold (unlike the binding fold) genuinely reflects
@@ -1157,11 +1175,16 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
     // Diagnostic-only — see the matching comment in CreateGraphicsPipeline() above.
     // Compute shaders CAN sample textures (image-processing/compute-particle style
     // kernels), so they go through the exact same GetTextureHandle() tagging path;
-    // this isn't graphics-only. Same gen_env-only-for-now caveat applies.
+    // this isn't graphics-only. Both gen_env and file_env can supply real tagging
+    // data as of TRANSFERABLE_CACHE_VERSION 16 — see the CreateGraphicsPipeline()
+    // comment for why closing the file_env gap mattered more than it looked like it
+    // would.
     const u64 diag_cbuf_key_excl_texture_handles_c =
-        gen_env ? ComputeCbufKeyExcludingTextureHandles(
-                      gen_env->CapturedCbufValues(), gen_env->CapturedTextureHandleCbufKeys())
-                : cbuf_key_c;
+        gen_env    ? ComputeCbufKeyExcludingTextureHandles(gen_env->CapturedCbufValues(),
+                                                           gen_env->CapturedTextureHandleCbufKeys())
+        : file_env ? ComputeCbufKeyExcludingTextureHandles(file_env->CapturedCbufValues(),
+                                                           file_env->CapturedTextureHandleCbufKeys())
+                   : cbuf_key_c;
     // Use gen_env->CalculateHash() — CalculateHash() is defined on GenericEnvironment,
     // not on the base Shader::Environment. Fall back to key.unique_hash if not available.
     const u64 compute_unique_hash = gen_env ? gen_env->CalculateHash() : key.unique_hash;

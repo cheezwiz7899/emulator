@@ -218,6 +218,7 @@ void GenericEnvironment::Serialize(std::ofstream& file) const {
     const u64 num_texture_types{static_cast<u64>(texture_types.size())};
     const u64 num_texture_pixel_formats{static_cast<u64>(texture_pixel_formats.size())};
     const u64 num_cbuf_values{static_cast<u64>(cbuf_values.size())};
+    const u64 num_texture_handle_cbuf_keys{static_cast<u64>(texture_handle_cbuf_keys.size())};
     const u64 num_cbuf_replacement_values{static_cast<u64>(cbuf_replacements.size())};
     const u64 num_cbuf_sizes{static_cast<u64>(cbuf_sizes.size())};
 
@@ -226,6 +227,8 @@ void GenericEnvironment::Serialize(std::ofstream& file) const {
         .write(reinterpret_cast<const char*>(&num_texture_pixel_formats),
                sizeof(num_texture_pixel_formats))
         .write(reinterpret_cast<const char*>(&num_cbuf_values), sizeof(num_cbuf_values))
+        .write(reinterpret_cast<const char*>(&num_texture_handle_cbuf_keys),
+               sizeof(num_texture_handle_cbuf_keys))
         .write(reinterpret_cast<const char*>(&num_cbuf_replacement_values),
                sizeof(num_cbuf_replacement_values))
         .write(reinterpret_cast<const char*>(&num_cbuf_sizes), sizeof(num_cbuf_sizes))
@@ -249,6 +252,14 @@ void GenericEnvironment::Serialize(std::ofstream& file) const {
     for (const auto& [key, type] : cbuf_values) {
         file.write(reinterpret_cast<const char*>(&key), sizeof(key))
             .write(reinterpret_cast<const char*>(&type), sizeof(type));
+    }
+    // Just the keys — no associated value, since this is a set (see
+    // ReadCbufValueForTextureHandle's doc comment in environment.h). Written as its
+    // own count + loop rather than piggybacking on cbuf_values above so a reader can
+    // tell which of cbuf_values' entries are texture-handle reads without needing to
+    // cross-reference anything beyond this one extra list.
+    for (const u64 key : texture_handle_cbuf_keys) {
+        file.write(reinterpret_cast<const char*>(&key), sizeof(key));
     }
     for (const auto& [key, type] : cbuf_replacements) {
         file.write(reinterpret_cast<const char*>(&key), sizeof(key))
@@ -546,6 +557,7 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
     u64 num_texture_types{};
     u64 num_texture_pixel_formats{};
     u64 num_cbuf_values{};
+    u64 num_texture_handle_cbuf_keys{};
     u64 num_cbuf_replacement_values{};
     u64 num_cbuf_sizes{};
     file.read(reinterpret_cast<char*>(&code_size), sizeof(code_size))
@@ -553,6 +565,8 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
         .read(reinterpret_cast<char*>(&num_texture_pixel_formats),
               sizeof(num_texture_pixel_formats))
         .read(reinterpret_cast<char*>(&num_cbuf_values), sizeof(num_cbuf_values))
+        .read(reinterpret_cast<char*>(&num_texture_handle_cbuf_keys),
+              sizeof(num_texture_handle_cbuf_keys))
         .read(reinterpret_cast<char*>(&num_cbuf_replacement_values),
               sizeof(num_cbuf_replacement_values))
         .read(reinterpret_cast<char*>(&num_cbuf_sizes), sizeof(num_cbuf_sizes))
@@ -585,6 +599,14 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
         file.read(reinterpret_cast<char*>(&key), sizeof(key))
             .read(reinterpret_cast<char*>(&value), sizeof(value));
         cbuf_values.emplace(key, value);
+    }
+    // Same set-of-keys-only format Serialize() wrote — see its doc comment. Read after
+    // cbuf_values, matching write order exactly, since this format has no per-field
+    // framing beyond the counts read up front.
+    for (size_t i = 0; i < num_texture_handle_cbuf_keys; ++i) {
+        u64 key;
+        file.read(reinterpret_cast<char*>(&key), sizeof(key));
+        texture_handle_cbuf_keys.insert(key);
     }
     for (size_t i = 0; i < num_cbuf_replacement_values; ++i) {
         u64 key;
