@@ -11,6 +11,7 @@
 #include <mutex>
 #include <optional>
 #include <ranges>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -259,8 +260,33 @@ void GenericEnvironment::RecordResolvedTextureType(u32 cbuf_index, u32 cbuf_offs
         texture_slot_diag_hash_cache = CalculateHash();
     }
     std::scoped_lock lock{g_texture_slot_variance_mutex};
-    g_texture_types_seen[*texture_slot_diag_hash_cache][MakeCbufKey(cbuf_index, cbuf_offset)]
-        .insert(type);
+    auto& slot_set = g_texture_types_seen[*texture_slot_diag_hash_cache]
+                                          [MakeCbufKey(cbuf_index, cbuf_offset)];
+    const bool newly_distinct = slot_set.insert(type).second;
+    // Fired only on a genuinely NEW distinct value for a slot that already had at least one —
+    // i.e. exactly the "variance" events the aggregate histogram in
+    // LogTextureSlotVarianceReportThrottled() counts, logged individually and immediately
+    // (not throttled: real session data so far shows these are rare — order of 10, not
+    // thousands — so there's no log-spam risk the way there would be for the per-instruction
+    // recording this function does on every call). TextureType values are logged as their
+    // raw underlying u32 rather than a name — see shader_info.h's `enum class TextureType`
+    // for the mapping (0=Color1D, 1=ColorArray1D, 2=Color2D, 3=ColorArray2D, 4=Color3D,
+    // 5=ColorCube, 6=ColorArrayCube, 7=Buffer, 8=Color2DRect) — no existing fmt::formatter
+    // for this enum was found to reuse, and guessing at one risked a compile error this
+    // session has no way to catch.
+    if (newly_distinct && slot_set.size() > 1) {
+        std::string values;
+        for (const Shader::TextureType seen : slot_set) {
+            values += fmt::format("{}{}", values.empty() ? "" : ",",
+                                   static_cast<u32>(seen));
+        }
+        LOG_INFO(Render_Vulkan,
+                 "Texture slot variance (TextureType) NEW distinct value: shader unique_hash="
+                 "{:016x} cbuf_index={} cbuf_offset={} newly observed type={} — slot's full "
+                 "distinct set so far: [{}]",
+                 *texture_slot_diag_hash_cache, cbuf_index, cbuf_offset,
+                 static_cast<u32>(type), values);
+    }
 }
 
 void GenericEnvironment::RecordResolvedTexturePixelFormat(u32 cbuf_index, u32 cbuf_offset,
