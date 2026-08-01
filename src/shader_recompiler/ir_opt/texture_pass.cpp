@@ -561,6 +561,16 @@ void PatchTexelFetch(IR::Block& block, IR::Inst& inst, TexturePixelFormat pixel_
                               ir.FPMul(ir.ConvertSToF(32, 32, ir.BitCast<IR::U32>(w)), max_value));
     inst.ReplaceUsesWith(converted);
 }
+// Phase 4 narrow prototype (specialization-constant texture-type resolution) -- hardcoded to
+// the one real (cbuf_index, cbuf_offset) pattern handoff_04's investigation identified. Used
+// by both the ImageQueryDimensions case (to canonicalize flags.type) and the TextureDescriptor
+// construction site (to set phase4_prototype_polymorphic) further down in TexturePass, so both
+// checks stay in sync from one definition instead of two independently-maintained literals.
+bool IsPhase4PrototypeSlot(const ConstBufferAddr& cbuf) {
+    constexpr u32 kPrototypeCbufIndex = 2;
+    constexpr u32 kPrototypeCbufOffset = 192;
+    return cbuf.index == kPrototypeCbufIndex && cbuf.offset == kPrototypeCbufOffset;
+}
 } // Anonymous namespace
 
 void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo& host_info) {
@@ -595,10 +605,31 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
         auto flags{inst->Flags<IR::TextureInstInfo>()};
         bool is_multisample{false};
         switch (inst->GetOpcode()) {
-        case IR::Opcode::ImageQueryDimensions:
-            flags.type.Assign(ReadTextureType(env, cbuf));
+        case IR::Opcode::ImageQueryDimensions: {
+            const TextureType resolved{ReadTextureType(env, cbuf)};
+            // Phase 4 narrow prototype: this exact (cbuf_index, cbuf_offset) is the one real
+            // pattern handoff_04's investigation identified (12 real TotK shaders, Color2D vs
+            // ColorArray2D, see handoff_04_specialization_constants_investigation.md and the
+            // accompanying findings report). Hardcoded on purpose -- see TextureDescriptor's
+            // phase4_prototype_polymorphic field doc comment for what a general version of
+            // this would need. For this one slot: keep calling ReadTextureType() above (so
+            // the existing distinct-value-tracking instrumentation still sees what this draw
+            // actually resolved to -- that data stays useful even once this prototype is
+            // active), but DON'T bake the real per-draw resolution into flags.type the normal
+            // way. Every translation of this slot -- whichever type this particular draw
+            // resolved to -- assigns the SAME canonical value instead, so every translation
+            // produces an identical TextureDescriptor (same .type, same everything), which is
+            // what makes them dedupe to the one shared, polymorphic SPIR-V module instead of
+            // fragmenting into two cache entries the way an un-prototyped slot would.
+            constexpr TextureType kPrototypeCanonicalType = TextureType::Color2D;
+            if (IsPhase4PrototypeSlot(cbuf)) {
+                flags.type.Assign(kPrototypeCanonicalType);
+            } else {
+                flags.type.Assign(resolved);
+            }
             inst->SetFlags(flags);
             break;
+        }
         case IR::Opcode::ImageSampleImplicitLod:
             if (flags.type != TextureType::Color2D) {
                 break;
@@ -702,6 +733,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                     .secondary_shift_left = cbuf.secondary_shift_left,
                     .count = cbuf.count,
                     .size_shift = DESCRIPTOR_SIZE_SHIFT,
+                    .phase4_prototype_polymorphic = IsPhase4PrototypeSlot(cbuf),
                 });
             }
             break;
