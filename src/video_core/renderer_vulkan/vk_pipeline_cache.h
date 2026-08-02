@@ -179,6 +179,15 @@ public:
     bool use_asynchronous_shaders{};
     bool use_vulkan_pipeline_cache{};
 
+    // Phase 4 narrow prototype's graphics_cache lookup-timing fix. Called from
+    // CurrentGraphicsPipeline(), after RefreshStages()/state.Refresh() but before the
+    // graphics_cache/Next() lookups that graphics_key feeds -- see this method's definition in
+    // vk_pipeline_cache.cpp for the full reasoning and its real, flagged limitations (assumes
+    // no secondary cbuf combine for this one hardcoded slot; runs unconditionally for every
+    // draw with an active fragment stage rather than only shaders that actually have the
+    // marked descriptor, since Shader::Info isn't available yet at this point either).
+    bool ResolvePhase4PrototypeSpecValue() const;
+
     GraphicsPipelineCacheKey graphics_key{};
     GraphicsPipeline* current_pipeline{};
 

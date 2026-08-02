@@ -497,6 +497,51 @@ Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, 
     return entry;
 }
 
+// Phase 4 narrow prototype's graphics_cache lookup-timing fix (see
+// PipelineCache::ResolvePhase4PrototypeSpecValue, vk_pipeline_cache.cpp, for why this is
+// needed: that function runs BEFORE any Environment exists, so it can't call
+// GenericEnvironment::ReadTextureInfo/GraphicsEnvironment::ReadTextureType directly -- both
+// need a live instance). Duplicates GenericEnvironment::ReadTextureInfo's body exactly, just
+// taking gpu_memory as an explicit parameter instead of implicit instance state (its only
+// dependency on `this` in the original) -- copied character for character from the function
+// immediately above, not reimplemented from scratch, specifically to avoid the two silently
+// drifting apart. Calls ConvertTextureType (this file's anonymous namespace, line ~61)
+// directly by unqualified lookup -- legal and safe: anonymous-namespace members are visible to
+// the rest of this translation unit's enclosing namespace from their point of declaration
+// onward, and this function is defined later in the same file, same as every other place in
+// this file that already calls ConvertTextureType unqualified.
+//
+// UNVERIFIED, same standing as everything else in this session's citron-side work: reasoned
+// through and copied from real existing code, not guessed, but not compiled (no toolchain
+// available here).
+Shader::TextureType ResolveTextureTypeFromRawHandle(Tegra::MemoryManager& gpu_memory,
+                                                     GPUVAddr tic_addr, u32 tic_limit,
+                                                     bool via_header_index, u32 raw) {
+    const auto handle{Tegra::Texture::TexturePair(raw, via_header_index)};
+    Tegra::Texture::TICEntry entry;
+    if (handle.first > tic_limit) {
+        // Mirrors ReadTextureInfo's out-of-range fallback exactly -- same safe default
+        // (A8B8G8R8_UNORM, Texture2D), deliberately without the sentinel-detection logging
+        // ReadTextureInfo has: that logging exists to catch translation-time anomalies in a
+        // shader's actual handle-resolution reads, not to log every draw's speculative,
+        // possibly-irrelevant read of a hardcoded cbuf coordinate that may not even mean
+        // anything for whichever shader happens to be bound (see the caller's doc comment for
+        // why this gets called unconditionally rather than only for known-relevant shaders).
+        entry = Tegra::Texture::TICEntry{};
+        entry.format.Assign(Tegra::Texture::TextureFormat::A8B8G8R8);
+        entry.r_type.Assign(Tegra::Texture::ComponentType::UNORM);
+        entry.g_type.Assign(Tegra::Texture::ComponentType::UNORM);
+        entry.b_type.Assign(Tegra::Texture::ComponentType::UNORM);
+        entry.a_type.Assign(Tegra::Texture::ComponentType::UNORM);
+        entry.texture_type.Assign(Tegra::Texture::TextureType::Texture2D);
+    } else {
+        const GPUVAddr descriptor_addr{tic_addr +
+                                       handle.first * sizeof(Tegra::Texture::TICEntry)};
+        gpu_memory.ReadBlock(descriptor_addr, &entry, sizeof(entry));
+    }
+    return ConvertTextureType(entry);
+}
+
 GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
                                          Tegra::MemoryManager& gpu_memory_,
                                          Tegra::Engines::Maxwell3D::Regs::ShaderType program, GPUVAddr program_base_,

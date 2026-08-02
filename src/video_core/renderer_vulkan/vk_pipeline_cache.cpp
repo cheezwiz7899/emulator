@@ -544,12 +544,71 @@ void PipelineCache::EvictOldPipelines() {
     }
 }
 
+// Phase 4 narrow prototype's graphics_cache lookup-timing fix. The problem this solves:
+// graphics_key (unique_hashes + fixed-function state) gets looked up in graphics_cache/
+// current_pipeline->Next() BEFORE any Shader::Environment exists -- CurrentGraphicsPipeline()
+// only reaches CreateGraphicsPipeline() (where env access and this slot's real resolution
+// already happen, see the texture_key fix above) on a cache MISS. Without this,
+// phase4_prototype_needs_array_variant only ever gets a real value after the lookup its whole
+// purpose depends on has already happened.
+//
+// Reads the (cbuf_index=2, cbuf_offset=192) raw handle directly from GPU state and resolves
+// its TextureType, mirroring GraphicsEnvironment::ReadCbufValue/ReadTextureType's actual GPU
+// access exactly (confirmed by reading both, not assumed) but without needing a live
+// GraphicsEnvironment instance -- ResolveTextureTypeFromRawHandle (shader_environment.h/.cpp)
+// is the shared piece both this and the real environment path use.
+//
+// Two real, deliberate simplifications, not oversights:
+// - Assumes no secondary cbuf combine for this one slot (GetTextureHandle, texture_pass.cpp,
+//   can OR together two separate cbuf reads via has_secondary/secondary_cbuf_index/
+//   secondary_cbuf_offset when a descriptor needs it). Not confirmed either way for the real
+//   slot this prototype targets -- this session has no way to inspect that shader's actual
+//   descriptor fields directly. If it turns out this slot does use a secondary combine, this
+//   function silently resolves the wrong handle. Flagging plainly rather than guessing further.
+// - Runs unconditionally for every draw with an active fragment stage, not just draws using
+//   one of the 12 real shaders this prototype targets -- Shader::Info (which would say "this
+//   shader actually has the marked descriptor") isn't available at this point any more than
+//   the environment is. Reading garbage cbuf content for unrelated fragment shaders is safe
+//   (see below), but see this function's use in CurrentGraphicsPipeline for why it could still
+//   theoretically add spurious graphics_key entropy for shaders that don't actually care.
+//
+// Returns false (the same default the SPIR-V's spec constant itself defaults to) whenever cbuf
+// 2 isn't enabled or offset 192 is out of range for the currently-bound fragment shader --
+// exactly the same safe-fallback shape ReadCbufValue/ReadTextureInfo already use for their own
+// out-of-range cases, so an unrelated shader reading garbage here is, at worst, exactly as safe
+// as any other out-of-range cbuf read already is elsewhere in this codebase.
+bool PipelineCache::ResolvePhase4PrototypeSpecValue() const {
+    constexpr size_t kFragmentStageIndex = 4; // Shader::Stage::Fragment via StageFromIndex(4),
+                                              // confirmed against GraphicsEnvironment's own
+                                              // ShaderType::Pixel -> stage_index=4 mapping.
+    constexpr u32 kPrototypeCbufIndex = 2;
+    constexpr u32 kPrototypeCbufOffset = 192;
+    if (graphics_key.unique_hashes[kFragmentStageIndex] == 0) {
+        return false; // No fragment shader bound at all.
+    }
+    const auto& cbuf{
+        maxwell3d->state.shader_stages[kFragmentStageIndex].const_buffers[kPrototypeCbufIndex]};
+    if (!cbuf.enabled || kPrototypeCbufOffset >= cbuf.size) {
+        return false;
+    }
+    const u32 handle{gpu_memory->Read<u32>(cbuf.address + kPrototypeCbufOffset)};
+    const auto& regs{maxwell3d->regs};
+    const bool via_header_index{regs.sampler_binding == Tegra::Engines::Maxwell3D::Regs::SamplerBinding::ViaHeaderBinding};
+    const Shader::TextureType resolved{VideoCommon::ResolveTextureTypeFromRawHandle(
+        *gpu_memory, regs.tex_header.Address(), regs.tex_header.limit, via_header_index, handle)};
+    return resolved == Shader::TextureType::ColorArray2D;
+}
+
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     if (!RefreshStages(graphics_key.unique_hashes)) {
         current_pipeline = nullptr;
         return nullptr;
     }
     graphics_key.state.Refresh(*maxwell3d, dynamic_features);
+    // Phase 4 narrow prototype's graphics_cache lookup-timing fix -- must happen here, after
+    // unique_hashes/state are current but before current_pipeline->Next()/graphics_cache are
+    // consulted below, since graphics_key IS the lookup key both of those use.
+    graphics_key.phase4_prototype_needs_array_variant = ResolvePhase4PrototypeSpecValue();
 
     if (current_pipeline) {
         GraphicsPipeline* const next{current_pipeline->Next(graphics_key)};

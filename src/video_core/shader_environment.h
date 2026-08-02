@@ -36,6 +36,14 @@ namespace VideoCommon {
     return (static_cast<u64>(index) << 32) | offset;
 }
 
+// See this function's doc comment at its definition in shader_environment.cpp (right after
+// GenericEnvironment::ReadTextureInfo, which it mirrors). Phase 4 narrow prototype's
+// graphics_cache lookup-timing fix -- lets PipelineCache resolve a texture type directly from
+// GPU state without needing a live Environment instance.
+[[nodiscard]] Shader::TextureType ResolveTextureTypeFromRawHandle(Tegra::MemoryManager& gpu_memory,
+                                                                  GPUVAddr tic_addr, u32 tic_limit,
+                                                                  bool via_header_index, u32 raw);
+
 class GenericEnvironment : public Shader::Environment {
 public:
     explicit GenericEnvironment() = default;
