@@ -10,6 +10,8 @@
 #include "common/scm_rev.h"
 #include "common/swap.h"
 #include "core/core.h"
+#include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/k_thread.h"
 #include "core/hle/service/fatal/fatal.h"
 #include "core/hle/service/fatal/fatal_p.h"
 #include "core/hle/service/fatal/fatal_u.h"
@@ -138,8 +140,8 @@ static void GenerateErrorReport(Core::System& system, Result error_code, const F
         info.backtrace_size, info.ArchAsString(), info.unk10);
 }
 
-static void ThrowFatalError(Core::System& system, Result error_code, FatalType fatal_type,
-                            const FatalInfo& info) {
+static void ThrowFatalError(Core::System& system, HLERequestContext& ctx, Result error_code,
+                            FatalType fatal_type, const FatalInfo& info) {
     const auto module = static_cast<u32>(error_code.GetModule());
     LOG_ERROR(Service_Fatal, "Threw fatal error type {} with error code 0x{:X}", fatal_type,
               error_code.raw);
@@ -162,8 +164,22 @@ static void ThrowFatalError(Core::System& system, Result error_code, FatalType f
                         "connection attempts. Continuing execution instead of crashing.");
             break;
         }
-        // Since we have no fatal:u error screen. We should just kill execution instead
-        ASSERT(false);
+        // We have no fatal:u error screen. On real hardware this call never returns --
+        // the OS shows the error screen and the title does not resume. Terminate the
+        // calling process instead of letting its IPC call return normally into
+        // execution it was never designed to still be running.
+        //
+        // Exit(), not Terminate(): Terminate()'s StartTermination() calls
+        // TerminateChildren() which explicitly excludes the current thread (see its
+        // GetCurrentThreadPointer() argument) -- it's built for killing a process from
+        // outside itself. This call runs on the calling thread's own stack, so
+        // Terminate() would tear down every other thread and leave this one running;
+        // it's exactly the thread that keeps issuing real IPC calls afterward. Exit()
+        // does the same child-thread teardown and then explicitly exits the current
+        // thread too (KThread::Exit() asserts it's only ever called on itself).
+        LOG_CRITICAL(Service_Fatal,
+                    "No fatal:u error screen implemented; exiting the calling process");
+        ctx.GetThread().GetOwnerProcess()->Exit();
         break;
         // Should not throw a fatal screen but should generate an error report
     case FatalType::ErrorReport:
@@ -177,7 +193,7 @@ void Module::Interface::ThrowFatal(HLERequestContext& ctx) {
     IPC::RequestParser rp{ctx};
     const auto error_code = rp.Pop<Result>();
 
-    ThrowFatalError(system, error_code, FatalType::ErrorScreen, {});
+    ThrowFatalError(system, ctx, error_code, FatalType::ErrorScreen, {});
     IPC::ResponseBuilder rb{ctx, 2};
     rb.Push(ResultSuccess);
 }
@@ -188,7 +204,7 @@ void Module::Interface::ThrowFatalWithPolicy(HLERequestContext& ctx) {
     const auto error_code = rp.Pop<Result>();
     const auto fatal_type = rp.PopEnum<FatalType>();
 
-    ThrowFatalError(system, error_code, fatal_type,
+    ThrowFatalError(system, ctx, error_code, fatal_type,
                     {}); // No info is passed with ThrowFatalWithPolicy
     IPC::ResponseBuilder rb{ctx, 2};
     rb.Push(ResultSuccess);
@@ -205,7 +221,7 @@ void Module::Interface::ThrowFatalWithCpuContext(HLERequestContext& ctx) {
     ASSERT(fatal_info.size() == sizeof(FatalInfo) && "Invalid fatal info buffer size!");
     std::memcpy(&info, fatal_info.data(), sizeof(FatalInfo));
 
-    ThrowFatalError(system, error_code, fatal_type, info);
+    ThrowFatalError(system, ctx, error_code, fatal_type, info);
     IPC::ResponseBuilder rb{ctx, 2};
     rb.Push(ResultSuccess);
 }
