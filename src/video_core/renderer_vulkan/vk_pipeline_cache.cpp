@@ -949,27 +949,22 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             : file_env_stage ? ComputeTextureKey(file_env_stage->CapturedTextureTypes(),
                                                  file_env_stage->CapturedTexturePixelFormats())
                              : 0;
-        // Diagnostic-only (see ComputeCbufKeyExcludingTextureHandles's doc comment in
-        // spirv_cache.cpp). Both gen_env_stage (live play) and file_env_stage
-        // (boot-time disk replay, TRANSFERABLE_CACHE_VERSION 16+) can supply real
-        // tagging data now — see CapturedTextureHandleCbufKeys() on both
-        // GenericEnvironment and FileEnvironment. This matters far more than it might
-        // look: Phase 0 testing showed sessions with a lot of preloaded content had an
-        // eligible-sample rate roughly 9x lower than a fresh-wipe session, because
-        // every stale miss sourced from a FileEnvironment was structurally excluded
-        // from the "would narrowing help" measurement before this. A cache written
-        // before v16 still degrades safely to the "no data available" convention
-        // (equaling its own real cbuf_key) — file_env_stage->CapturedTextureHandleCbufKeys()
-        // is simply empty for anything deserialized from an old-format file, same as if
-        // this whole feature didn't exist yet for that specific entry.
-        const u64 diag_cbuf_key_excl_texture_handles =
-            gen_env_stage    ? ComputeCbufKeyExcludingTextureHandles(
-                                   gen_env_stage->CapturedCbufValues(),
-                                   gen_env_stage->CapturedTextureHandleCbufKeys())
-            : file_env_stage ? ComputeCbufKeyExcludingTextureHandles(
-                                   file_env_stage->CapturedCbufValues(),
-                                   file_env_stage->CapturedTextureHandleCbufKeys())
-                             : cbuf_key;
+        // Was a second independent ComputeCbufKeyExcludingTextureHandles(...) call here,
+        // duplicating the work cbuf_key above already did — kept as a genuinely separate
+        // computation while validating whether narrowing was worth shipping at all, so
+        // Lookup()'s diagnostic could tell real narrowing data apart from "no data,
+        // defaulted." That question's answered now (cbuf_key above already reflects the
+        // narrowed value in production) and the duplicate computation turned out to be
+        // a real, measurable cost on this hot path once eligible/matched activity got
+        // heavy enough — reusing cbuf_key directly instead. This also makes it
+        // impossible for the two to read differently, which they were doing in
+        // practice for a reason that was still open when this was cut over; see the
+        // handoff notes for that thread if it's worth resuming later — it wasn't a
+        // multi-threading issue (confirmed: every captured sample came from the same
+        // thread id), so whatever it was, it's a separate question from whether
+        // narrowing itself is safe to ship, which two full play sessions already
+        // answered before this diagnostic started costing more than it was worth.
+        const u64 diag_cbuf_key_excl_texture_handles = cbuf_key;
         // diag_base_runtime_hash captures runtime_info.SpirvRelevantHash(stage) BEFORE
         // any folding — for VertexB this also includes the viewport-transform-state
         // fold below, since that fold (unlike the binding fold) genuinely reflects
@@ -1197,19 +1192,9 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
         : file_env ? ComputeTextureKey(file_env->CapturedTextureTypes(),
                                        file_env->CapturedTexturePixelFormats())
                    : 0;
-    // Diagnostic-only — see the matching comment in CreateGraphicsPipeline() above.
-    // Compute shaders CAN sample textures (image-processing/compute-particle style
-    // kernels), so they go through the exact same GetTextureHandle() tagging path;
-    // this isn't graphics-only. Both gen_env and file_env can supply real tagging
-    // data as of TRANSFERABLE_CACHE_VERSION 16 — see the CreateGraphicsPipeline()
-    // comment for why closing the file_env gap mattered more than it looked like it
-    // would.
-    const u64 diag_cbuf_key_excl_texture_handles_c =
-        gen_env    ? ComputeCbufKeyExcludingTextureHandles(gen_env->CapturedCbufValues(),
-                                                           gen_env->CapturedTextureHandleCbufKeys())
-        : file_env ? ComputeCbufKeyExcludingTextureHandles(file_env->CapturedCbufValues(),
-                                                           file_env->CapturedTextureHandleCbufKeys())
-                   : cbuf_key_c;
+    // Was a second independent ComputeCbufKeyExcludingTextureHandles(...) call here —
+    // see the matching comment in CreateGraphicsPipeline() above for why it's gone.
+    const u64 diag_cbuf_key_excl_texture_handles_c = cbuf_key_c;
     // Use gen_env->CalculateHash() — CalculateHash() is defined on GenericEnvironment,
     // not on the base Shader::Environment. Fall back to key.unique_hash if not available.
     const u64 compute_unique_hash = gen_env ? gen_env->CalculateHash() : key.unique_hash;

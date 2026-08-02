@@ -5,6 +5,7 @@
 #include <chrono>
 #include <fstream>
 #include <shared_mutex>
+#include <thread>
 
 #include "common/cityhash.h"
 #include "common/logging.h"
@@ -72,14 +73,21 @@ u64 ComputeCbufKey(const std::unordered_map<u64, u32>& cbuf_values) {
 }
 
 // ---------------------------------------------------------------------------
-// DIAGNOSTIC ONLY — not used by any real cache key today, not called from
-// CreateGraphicsPipeline()/CreateComputePipeline()/InsertSpeculative() at all.
-// This exists purely to test, against real gameplay, a specific hypothesis
-// about cbuf_key before anyone commits to actually narrowing it: most of what
-// gets captured in cbuf_values (GenericEnvironment::ReadCbufValue) is read
-// only to resolve a bindless texture handle (GetTextureHandle(), texture_
-// pass.cpp) — whose downstream effect on codegen is ALREADY captured
-// separately by texture_key (ComputeTextureKey, from ReadTextureType()/
+// UPDATE (v7 / Phase 1): this IS now used by the real cache key —
+// CreateGraphicsPipeline()/CreateComputePipeline() (vk_pipeline_cache.cpp) compute
+// the real cbuf_key with this function directly, not ComputeCbufKey() above. The
+// paragraph below describes why this function exists and was originally added as
+// diagnostic-only; that history is still accurate, the "not used by any real cache
+// key today" line specifically is not anymore and is left uncorrected inline below
+// only so the reasoning that follows still reads coherently — treat this update
+// note as the current status.
+//
+// Originally added purely to test, against real gameplay, a specific hypothesis
+// about cbuf_key before anyone committed to narrowing it: most of what gets
+// captured in cbuf_values (GenericEnvironment::ReadCbufValue) is read only to
+// resolve a bindless texture handle (GetTextureHandle(), texture_pass.cpp) —
+// whose downstream effect on codegen is ALREADY captured separately by
+// texture_key (ComputeTextureKey, from ReadTextureType()/
 // ReadTexturePixelFormat()'s own results). If that's true, two shaders that
 // differ only in WHICH raw handle they read — but resolve to the SAME
 // texture type/format, which is a real and plausible case, not an edge case
@@ -97,12 +105,10 @@ u64 ComputeCbufKey(const std::unordered_map<u64, u32>& cbuf_values) {
 // counterfactual degrades to ComputeCbufKey() unchanged for those cases —
 // never wrong, just uninformative for the ones that can't supply the tag yet.
 //
-// NOT a candidate to become the real cbuf_key as-is: FoldDriverConstBuffer's
-// bank-1 constant-folding and control_flow.cpp's indirect-branch-table walk
-// both call plain ReadCbufValue(), so this exclusion set structurally can
-// never include either of those — but that's exactly the property that
-// makes it SAFE to test empirically, not a claim that it's already
-// production-ready. See handoff notes for the full safety reasoning.
+// Also still used diagnostically: passed alongside the real cbuf_key it now
+// computes so Lookup() can flag (currently unexplained — see the divergence
+// log in Lookup()) any case where the two disagree, which per the call sites
+// shouldn't be structurally possible anymore.
 // ---------------------------------------------------------------------------
 u64 ComputeCbufKeyExcludingTextureHandles(const std::unordered_map<u64, u32>& cbuf_values,
                                           const std::unordered_set<u64>& texture_handle_keys) {
@@ -386,17 +392,11 @@ void SpirvCache::SaveThrottled(const std::filesystem::path& path,
         const size_t binding_never_matched = runtime_binding_component_never_matched_with_context_.load();
         const size_t core_never_matched = runtime_core_component_never_matched_with_context_.load();
         const size_t with_ctx_total = with_ctx_now; // cumulative stale_miss_with_context_ since boot
-        // See CbufTextureHandleNarrowingEligibleCount() / ...WouldHaveMatchedCount()'s doc
-        // comments in spirv_cache.h. Cumulative since boot, same reasoning as the two
-        // counters above — this is Phase 0 of the cbuf/texture_key redundancy
-        // investigation: pure measurement, no behavior change, answering "would
-        // narrowing cbuf_key to exclude texture-handle-only reads actually help" with
-        // real gameplay data before anyone commits to actually cutting anything.
-        const size_t cbuf_narrow_eligible = cbuf_texture_handle_narrowing_eligible_.load();
-        const size_t cbuf_narrow_matched = cbuf_texture_handle_narrowing_would_have_matched_.load();
-        const int cbuf_narrow_pct = cbuf_narrow_eligible > 0
-                                        ? static_cast<int>(cbuf_narrow_matched * 100 / cbuf_narrow_eligible)
-                                        : 0;
+        // The cbuf-narrowing eligible/would-have-matched line that used to print here is
+        // gone along with the counters it read (see Lookup()'s comment where that logic
+        // used to live) — narrowing shipped in production (v7) after two full sessions
+        // validated it at ~24-28%, and the follow-up measurement had turned into a real
+        // per-Lookup() cost without answering anything that was still blocking work.
         if (window_probes > 0) {
             const int window_pct = static_cast<int>(window_hits * 100 / window_probes);
             LOG_INFO(Render_Vulkan,
@@ -409,26 +409,20 @@ void SpirvCache::SaveThrottled(const std::filesystem::path& path,
                      "Of {} real-context stale misses so far, {} could not have matched on the "
                      "binding-offset component alone (vs any stored variant) / {} could not have "
                      "matched on the core RuntimeInfo component alone — whichever is closer to "
-                     "{} is the dominant runtime_key blocker. Of {} cbuf_key-caused misses with "
-                     "real narrowing data available, {} ({}%) would have matched a stored variant "
-                     "if texture-handle-only cbuf reads were excluded from cbuf_key.",
+                     "{} is the dominant runtime_key blocker.",
                      entries_now, speculative_insert_count_.load(), real_insert_count_.load(),
                      window_hits, window_probes, window_pct, window_stale_misses,
                      window_no_ctx, window_with_ctx, cbuf_zero, cbuf_total, cbuf_zero_pct,
-                     with_ctx_total, binding_never_matched, core_never_matched, with_ctx_total,
-                     cbuf_narrow_eligible, cbuf_narrow_matched, cbuf_narrow_pct);
+                     with_ctx_total, binding_never_matched, core_never_matched, with_ctx_total);
         } else {
             LOG_INFO(Render_Vulkan,
                      "SPIR-V cache: {} entries ({} speculative / {} real inserted so far) — "
                      "no lookups since last log. Real-draw cbuf_key==0 so far: {}/{} ({}%). "
                      "Of {} real-context stale misses so far, {} binding-component-never-matched / "
-                     "{} core-component-never-matched. Of {} cbuf_key-caused misses with real "
-                     "narrowing data available, {} ({}%) would have matched if texture-handle-only "
-                     "cbuf reads were excluded.",
+                     "{} core-component-never-matched.",
                      entries_now, speculative_insert_count_.load(), real_insert_count_.load(),
                      cbuf_zero, cbuf_total, cbuf_zero_pct,
-                     with_ctx_total, binding_never_matched, core_never_matched,
-                     cbuf_narrow_eligible, cbuf_narrow_matched, cbuf_narrow_pct);
+                     with_ctx_total, binding_never_matched, core_never_matched);
         }
     }
 }
@@ -495,12 +489,7 @@ std::optional<SpirvCache::LookupResult> SpirvCache::Lookup(const SpirvKey& key,
             if (has_real_specialization_context && have_stored_keys) {
                 bool binding_matched_any = false;
                 bool core_matched_any = false;
-                bool cbuf_matched_any = false;           // real cbuf_key vs real cbuf_key
-                bool cbuf_narrowed_matched_any = false;   // counterfactual vs counterfactual
                 for (const SpirvKey& stored : hit_it->second) {
-                    if (stored.cbuf_key == key.cbuf_key) {
-                        cbuf_matched_any = true;
-                    }
                     const auto stored_it = entries_.find(stored);
                     if (stored_it == entries_.end()) {
                         continue; // shouldn't happen (keys_by_hash_ mirrors entries_), but be safe
@@ -511,10 +500,6 @@ std::optional<SpirvCache::LookupResult> SpirvCache::Lookup(const SpirvKey& key,
                     if (stored_it->second.diag_base_runtime_hash == diag_base_runtime_hash) {
                         core_matched_any = true;
                     }
-                    if (stored_it->second.diag_cbuf_key_excl_texture_handles ==
-                        diag_cbuf_key_excl_texture_handles) {
-                        cbuf_narrowed_matched_any = true;
-                    }
                 }
                 if (!binding_matched_any) {
                     ++runtime_binding_component_never_matched_with_context_;
@@ -522,24 +507,17 @@ std::optional<SpirvCache::LookupResult> SpirvCache::Lookup(const SpirvKey& key,
                 if (!core_matched_any) {
                     ++runtime_core_component_never_matched_with_context_;
                 }
-                // See CbufTextureHandleNarrowingEligibleCount() / ...WouldHaveMatchedCount()'s
-                // doc comments in spirv_cache.h for the full reasoning. Two gates, both
-                // needed for this to be a meaningful data point rather than noise:
-                //   1. cbuf_key is DEMONSTRABLY why this specific miss happened — it
-                //      differs from every stored variant's real cbuf_key. If it already
-                //      matched one, cbuf wasn't the blocker here; counting it would
-                //      credit narrowing for something narrowing had nothing to do with.
-                //   2. The requester actually had real tagging data to narrow with —
-                //      its counterfactual differs from its own real cbuf_key (see
-                //      Entry::diag_cbuf_key_excl_texture_handles's doc comment for why
-                //      that specific comparison is the correct "do we have real data"
-                //      test, not just diag_cbuf_key_excl_texture_handles != 0).
-                if (!cbuf_matched_any && diag_cbuf_key_excl_texture_handles != key.cbuf_key) {
-                    ++cbuf_texture_handle_narrowing_eligible_;
-                    if (cbuf_narrowed_matched_any) {
-                        ++cbuf_texture_handle_narrowing_would_have_matched_;
-                    }
-                }
+                // The cbuf-narrowing eligible/would-have-matched comparison that used to
+                // live here (plus a throttled divergence-value log) is gone — it answered
+                // the question it existed for (whether narrowing cbuf_key was worth
+                // shipping; two full play sessions said yes, ~24-28%) and had turned into
+                // a real, measurable per-Lookup() cost for a follow-up question that
+                // wasn't blocking anything else. diag_cbuf_key_excl_texture_handles is
+                // now just an alias for the real cbuf_key at every call site (see
+                // CreateGraphicsPipeline()/CreateComputePipeline() in
+                // vk_pipeline_cache.cpp) — still threaded through Insert()/Lookup() so
+                // those signatures don't need touching again, but no longer worth
+                // comparing against anything here.
             }
 
             // Throttled: report exactly which field(s) differ from the
