@@ -19,6 +19,10 @@ public:
                                     std::shared_ptr<Applet> applet);
     ~ILibraryAppletAccessor();
 
+    std::shared_ptr<Applet> GetApplet() const {
+        return m_applet;
+    }
+
 private:
     Result GetAppletStateChangedEvent(OutCopyHandle<Kernel::KReadableEvent> out_event);
     Result IsCompleted(Out<bool> out_is_completed);
