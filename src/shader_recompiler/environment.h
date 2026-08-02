@@ -109,6 +109,7 @@ public:
     // compile and a real play session before anyone trusts its output.
     virtual void RecordResolvedTextureType([[maybe_unused]] u32 cbuf_index,
                                            [[maybe_unused]] u32 cbuf_offset,
+                                           [[maybe_unused]] u32 handle,
                                            [[maybe_unused]] TextureType type) {}
     virtual void RecordResolvedTexturePixelFormat([[maybe_unused]] u32 cbuf_index,
                                                   [[maybe_unused]] u32 cbuf_offset,
@@ -160,5 +161,18 @@ protected:
     u32 start_address{};
     bool is_proprietary_driver{};
 };
+
+// Phase 4 narrow prototype (specialization-constant texture-type resolution). The one
+// hardcoded (cbuf_index, cbuf_offset) pattern handoff_04's investigation identified (12 real
+// TotK shaders, Color2D vs ColorArray2D). Shared between texture_pass.cpp (which uses it to
+// canonicalize flags.type and mark TextureDescriptor::phase4_prototype_polymorphic) and
+// shader_environment.cpp (which uses it to know which resolved handles to exclude from
+// texture_key, so the two real variants of this slot hash to the same key instead of
+// fragmenting the cache) -- one definition so the two can't independently drift out of sync.
+[[nodiscard]] constexpr bool IsPhase4PrototypeSlot(u32 cbuf_index, u32 cbuf_offset) noexcept {
+    constexpr u32 kPrototypeCbufIndex = 2;
+    constexpr u32 kPrototypeCbufOffset = 192;
+    return cbuf_index == kPrototypeCbufIndex && cbuf_offset == kPrototypeCbufOffset;
+}
 
 } // namespace Shader

@@ -1061,10 +1061,40 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .requiredSubgroupSize = GuestWarpSize,
     };
     boost::container::static_vector<VkPipelineShaderStageCreateInfo, 5> shader_stages;
+
+    // Phase 4 narrow prototype (specialization-constant texture-type resolution). Built once,
+    // referenced by whichever stage(s) actually declared the spec constant -- passing
+    // pSpecializationInfo to a stage that has no SpecId 0 declared at all is harmless (the
+    // driver just has nothing to match the map entry against), so no per-stage value
+    // computation is needed beyond knowing WHICH stages to attach it to.
+    //
+    // key.phase4_prototype_needs_array_variant was resolved once, at translation time in
+    // CreateGraphicsPipeline (vk_pipeline_cache.cpp, where env access exists), and carried
+    // here via the pipeline key specifically so a real draw needing the array variant and one
+    // needing the canonical variant become two different VkPipeline objects (see the key
+    // field's doc comment, vk_graphics_pipeline.h) instead of one draw silently reusing a
+    // pipeline specialized for the other's value.
+    const VkBool32 phase4_spec_value{key.phase4_prototype_needs_array_variant ? VK_TRUE
+                                                                              : VK_FALSE};
+    static constexpr VkSpecializationMapEntry phase4_spec_map_entry{
+        .constantID = 0, // matches the hardcoded SpecId in EmitContext::DefineTextures
+        .offset = 0,
+        .size = sizeof(VkBool32),
+    };
+    const VkSpecializationInfo phase4_spec_info{
+        .mapEntryCount = 1,
+        .pMapEntries = &phase4_spec_map_entry,
+        .dataSize = sizeof(phase4_spec_value),
+        .pData = &phase4_spec_value,
+    };
+
     for (size_t stage = 0; stage < Tegra::Engines::Maxwell3D::Regs::MaxShaderStage; ++stage) {
         if (!spv_modules[stage]) {
             continue;
         }
+        const bool stage_has_phase4_slot{std::ranges::any_of(
+            stage_infos[stage].texture_descriptors,
+            [](const Shader::TextureDescriptor& desc) { return desc.phase4_prototype_polymorphic; })};
         [[maybe_unused]] auto& stage_ci =
             shader_stages.emplace_back(VkPipelineShaderStageCreateInfo{
                 .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -1073,7 +1103,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
                 .stage = MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage)),
                 .module = *spv_modules[stage],
                 .pName = "main",
-                .pSpecializationInfo = nullptr,
+                .pSpecializationInfo = stage_has_phase4_slot ? &phase4_spec_info : nullptr,
             });
         /*
         if (program[stage]->entries.uses_warps && device.IsGuestWarpSizeSupported(stage_ci.stage)) {

@@ -398,10 +398,13 @@ u32 GetTextureHandle(Environment& env, const ConstBufferAddr& cbuf) {
 }
 
 TextureType ReadTextureType(Environment& env, const ConstBufferAddr& cbuf) {
-    const TextureType type{env.ReadTextureType(GetTextureHandle(env, cbuf))};
+    const u32 handle{GetTextureHandle(env, cbuf)};
+    const TextureType type{env.ReadTextureType(handle)};
     // See RecordResolvedTextureType's doc comment in environment.h — Phase 4 feasibility
-    // instrumentation, no-op for every Environment except GenericEnvironment.
-    env.RecordResolvedTextureType(cbuf.index, cbuf.offset, type);
+    // instrumentation, no-op for every Environment except GenericEnvironment. Passing handle
+    // too now (not just cbuf coordinates) — needed by the texture_key exclusion fix, see
+    // CapturedPhase4PrototypeHandles's doc comment in shader_environment.h.
+    env.RecordResolvedTextureType(cbuf.index, cbuf.offset, handle, type);
     return type;
 }
 
@@ -561,15 +564,14 @@ void PatchTexelFetch(IR::Block& block, IR::Inst& inst, TexturePixelFormat pixel_
                               ir.FPMul(ir.ConvertSToF(32, 32, ir.BitCast<IR::U32>(w)), max_value));
     inst.ReplaceUsesWith(converted);
 }
-// Phase 4 narrow prototype (specialization-constant texture-type resolution) -- hardcoded to
-// the one real (cbuf_index, cbuf_offset) pattern handoff_04's investigation identified. Used
-// by both the ImageQueryDimensions case (to canonicalize flags.type) and the TextureDescriptor
-// construction site (to set phase4_prototype_polymorphic) further down in TexturePass, so both
-// checks stay in sync from one definition instead of two independently-maintained literals.
+// Phase 4 narrow prototype (specialization-constant texture-type resolution) -- thin
+// ConstBufferAddr-taking wrapper around Shader::IsPhase4PrototypeSlot (environment.h), which
+// is the single shared definition (also used by shader_environment.cpp's texture_key
+// exclusion tracking). Used by both the ImageQueryDimensions case (to canonicalize
+// flags.type) and the TextureDescriptor construction site (to set
+// phase4_prototype_polymorphic) further down in TexturePass.
 bool IsPhase4PrototypeSlot(const ConstBufferAddr& cbuf) {
-    constexpr u32 kPrototypeCbufIndex = 2;
-    constexpr u32 kPrototypeCbufOffset = 192;
-    return cbuf.index == kPrototypeCbufIndex && cbuf.offset == kPrototypeCbufOffset;
+    return Shader::IsPhase4PrototypeSlot(cbuf.index, cbuf.offset);
 }
 } // Anonymous namespace
 

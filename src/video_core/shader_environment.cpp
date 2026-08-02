@@ -254,7 +254,7 @@ constexpr size_t kLogEveryNCalls = 200;
 std::atomic<size_t> g_report_call_count{0};
 } // namespace
 
-void GenericEnvironment::RecordResolvedTextureType(u32 cbuf_index, u32 cbuf_offset,
+void GenericEnvironment::RecordResolvedTextureType(u32 cbuf_index, u32 cbuf_offset, u32 handle,
                                                     Shader::TextureType type) {
     if (!texture_slot_diag_hash_cache) {
         texture_slot_diag_hash_cache = CalculateHash();
@@ -263,6 +263,15 @@ void GenericEnvironment::RecordResolvedTextureType(u32 cbuf_index, u32 cbuf_offs
     auto& slot_set = g_texture_types_seen[*texture_slot_diag_hash_cache]
                                           [MakeCbufKey(cbuf_index, cbuf_offset)];
     const bool newly_distinct = slot_set.insert(type).second;
+
+    // Phase 4 narrow prototype's texture_key fix — see CapturedPhase4PrototypeHandles's doc
+    // comment in shader_environment.h. Independent of the newly_distinct/diagnostic logging
+    // below: needs every resolved handle for this slot recorded, not just the ones that
+    // introduce a new distinct value.
+    if (Shader::IsPhase4PrototypeSlot(cbuf_index, cbuf_offset)) {
+        phase4_prototype_handles.insert(handle);
+    }
+
     // Fired only on a genuinely NEW distinct value for a slot that already had at least one —
     // i.e. exactly the "variance" events the aggregate histogram in
     // LogTextureSlotVarianceReportThrottled() counts, logged individually and immediately

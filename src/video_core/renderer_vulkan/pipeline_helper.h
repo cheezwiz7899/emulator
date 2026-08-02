@@ -297,6 +297,36 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
                                                             : sampler.Handle()};
             guest_descriptor_queue.AddSampledImage(vk_image_view, vk_sampler);
             rescaling.PushTexture(texture_cache.IsRescaling(image_view));
+
+            if (desc.phase4_prototype_polymorphic) {
+                // Phase 4 narrow prototype: DefineTextures (spirv_emit_context.cpp) declares
+                // an EXTRA binding for this one marked descriptor (the ColorArray2D variant),
+                // but this loop -- unmodified until now -- only ever pushed one real resource
+                // per descriptor, from `views`/`samplers`, which only have one entry for this
+                // logical slot to begin with (desc.count is still 1). Left alone, that extra
+                // binding would go unbound/undefined -- likely the more direct cause of the
+                // corruption these screenshots showed than the spec-constant default alone.
+                //
+                // Fix: push a SECOND descriptor entry for the SAME underlying image_view/
+                // sampler pair (not a second real resource -- there isn't one; `views` only
+                // advanced once, deliberately not advanced again here), requesting it viewed
+                // as ColorArray2D instead of desc.type. Whether image_view.Handle(ColorArray2D)
+                // returns something meaningful for content that's genuinely never used as an
+                // array, vs. falling back to the same null/placeholder path just above, isn't
+                // confirmed -- not verified against a real driver. Either way this binding now
+                // gets something valid rather than nothing, which is the part confirmed broken.
+                VkImageView vk_alt_image_view{image_view.Handle(Shader::TextureType::ColorArray2D)};
+                if (vk_alt_image_view == VK_NULL_HANDLE) {
+                    const VkImageView null_alt_image_view{
+                        texture_cache.GetImageView(VideoCommon::NULL_IMAGE_VIEW_ID)
+                            .Handle(Shader::TextureType::ColorArray2D)};
+                    if (null_alt_image_view != VK_NULL_HANDLE) {
+                        vk_alt_image_view = null_alt_image_view;
+                    }
+                }
+                guest_descriptor_queue.AddSampledImage(vk_alt_image_view, vk_sampler);
+                rescaling.PushTexture(texture_cache.IsRescaling(image_view));
+            }
         }
     }
     for (const auto& desc : info.image_descriptors) {

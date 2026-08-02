@@ -129,6 +129,25 @@ u64 ComputeTextureKey(const std::unordered_map<u32, Shader::TextureType>& textur
     return hash;
 }
 
+u64 ComputeTextureKeyExcludingHandles(
+   const std::unordered_map<u32, Shader::TextureType>& texture_types,
+   const std::unordered_map<u32, Shader::TexturePixelFormat>& texture_pixel_formats,
+   const std::unordered_set<u32>& excluded_handles) {
+    if (texture_types.empty() || excluded_handles.empty()) {
+        return ComputeTextureKey(texture_types, texture_pixel_formats);
+    }
+    std::unordered_map<u32, Shader::TextureType> filtered_types;
+    filtered_types.reserve(texture_types.size());
+    for (const auto& [handle, type] : texture_types) {
+        if (!excluded_handles.contains(handle)) {
+            filtered_types.emplace(handle, type);
+        }
+    }
+    // texture_pixel_formats passed through unfiltered -- see this function's doc comment in
+    // spirv_cache.h for why (this prototype never touches pixel-format resolution).
+    return ComputeTextureKey(filtered_types, texture_pixel_formats);
+}
+
 u64 ComputeBindingKey(const Shader::Backend::Bindings& starting_binding) {
     // NOTE: this was briefly narrowed to a single leading/non-leading bit,
     // on the theory that the only real risk was a real non-leading-stage

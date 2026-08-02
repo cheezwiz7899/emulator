@@ -110,10 +110,22 @@ public:
     // environment.h. GenericEnvironment is the one override point, same as
     // ReadCbufValueForTextureHandle above — UNVERIFIED, see the doc comment on these two
     // functions' definitions in shader_environment.cpp.
-    void RecordResolvedTextureType(u32 cbuf_index, u32 cbuf_offset,
+    void RecordResolvedTextureType(u32 cbuf_index, u32 cbuf_offset, u32 handle,
                                    Shader::TextureType type) override final;
     void RecordResolvedTexturePixelFormat(u32 cbuf_index, u32 cbuf_offset,
                                           Shader::TexturePixelFormat format) override final;
+
+    // Phase 4 narrow prototype's texture_key fix. Populated inside RecordResolvedTextureType
+    // (shader_environment.cpp) whenever a resolved handle belongs to the one hardcoded
+    // (cbuf_index, cbuf_offset) slot (Shader::IsPhase4PrototypeSlot, environment.h). Passed to
+    // ComputeTextureKeyExcludingHandles (spirv_cache.h) at the CreateGraphicsPipeline/
+    // CreateComputePipeline call sites so the two real variants of this one slot hash to the
+    // same texture_key instead of fragmenting the cache — mirrors
+    // CapturedTextureHandleCbufKeys/ComputeCbufKeyExcludingTextureHandles above exactly, same
+    // reasoning, different key.
+    const std::unordered_set<u32>& CapturedPhase4PrototypeHandles() const noexcept {
+        return phase4_prototype_handles;
+    }
 
     // Prints (LOG_INFO, Render_Vulkan) a distinct-value-count histogram across every
     // (shader, cbuf slot) pair observed so far this session, answering
@@ -162,6 +174,8 @@ protected:
     std::unordered_map<u64, u32> cbuf_values;
     // See ReadCbufValueForTextureHandle() and CapturedTextureHandleCbufKeys() above.
     std::unordered_set<u64> texture_handle_cbuf_keys;
+    // See CapturedPhase4PrototypeHandles() above.
+    std::unordered_set<u32> phase4_prototype_handles;
     // Memoized CalculateHash() for RecordResolvedTextureType()/RecordResolvedTexturePixelFormat()
     // (shader_environment.cpp) — those can fire once per texture instruction in a shader, and
     // CalculateHash() does a fresh GPU-memory read + CityHash64 over the whole shader every

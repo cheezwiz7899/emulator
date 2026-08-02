@@ -28,6 +28,22 @@ namespace Vulkan {
 struct GraphicsPipelineCacheKey {
     std::array<u64, 6> unique_hashes;
     FixedPipelineState state;
+    // Phase 4 narrow prototype (specialization-constant texture-type resolution). Resolved
+    // once per real draw in CreateGraphicsPipeline (vk_pipeline_cache.cpp, where env access
+    // exists) and carried here so MakePipeline (vk_graphics_pipeline.cpp, which only has this
+    // key + the cached Shader::Info, not the original env) knows what to supply as this
+    // shader's VkSpecializationInfo value. false (the default, matching the hardcoded
+    // SpecConstantFalse in spirv_emit_context.cpp) for every shader that doesn't have the
+    // marked slot at all -- only meaningful when at least one stage's Shader::Info has a
+    // texture_descriptors entry with phase4_prototype_polymorphic set.
+    //
+    // Deliberately part of this key (not stored/tracked separately): this struct IS the
+    // pipeline-identity key two draws get compared by (see the has_unique_object_
+    // representations_v/trivially-copyable static_asserts below, and Hash()/operator==) --
+    // adding it here is what makes two real draws needing different values for this one slot
+    // correctly become two different VkPipeline objects instead of silently reusing whichever
+    // was created first.
+    bool phase4_prototype_needs_array_variant = false;
 
     size_t Hash() const noexcept;
 
@@ -38,7 +54,7 @@ struct GraphicsPipelineCacheKey {
     }
 
     size_t Size() const noexcept {
-        return sizeof(unique_hashes) + state.Size();
+        return sizeof(unique_hashes) + state.Size() + sizeof(phase4_prototype_needs_array_variant);
     }
 };
 static_assert(std::has_unique_object_representations_v<GraphicsPipelineCacheKey>);

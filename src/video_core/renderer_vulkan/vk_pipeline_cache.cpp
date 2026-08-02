@@ -913,8 +913,16 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                              : file_env_stage ? ComputeCbufKey(file_env_stage->CapturedCbufValues())
                                               : 0;
         const u64 texture_key =
-            gen_env_stage    ? ComputeTextureKey(gen_env_stage->CapturedTextureTypes(),
-                                                 gen_env_stage->CapturedTexturePixelFormats())
+            // Phase 4 narrow prototype's texture_key fix: exclude handles resolved for the
+            // one hardcoded polymorphic slot, so its two real variants hash the same instead
+            // of fragmenting the cache. FileEnvironment falls back to plain ComputeTextureKey
+            // -- it doesn't derive from GenericEnvironment, so it has no
+            // CapturedPhase4PrototypeHandles() to exclude with, same reasoning as the cbuf_key
+            // narrowing diagnostic just below already applies to that path.
+            gen_env_stage    ? ComputeTextureKeyExcludingHandles(
+                                   gen_env_stage->CapturedTextureTypes(),
+                                   gen_env_stage->CapturedTexturePixelFormats(),
+                                   gen_env_stage->CapturedPhase4PrototypeHandles())
             : file_env_stage ? ComputeTextureKey(file_env_stage->CapturedTextureTypes(),
                                                  file_env_stage->CapturedTexturePixelFormats())
                              : 0;
@@ -1153,8 +1161,14 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
                           : file_env ? ComputeCbufKey(file_env->CapturedCbufValues())
                                      : 0;
     const u64 texture_key_c =
-        gen_env    ? ComputeTextureKey(gen_env->CapturedTextureTypes(),
-                                       gen_env->CapturedTexturePixelFormats())
+        // Phase 4 narrow prototype's texture_key fix — see the matching comment in
+        // CreateGraphicsPipeline() above. This hardcoded slot is graphics-content-shaped
+        // (a portal/particle effect), so this branch firing in practice is unlikely, but the
+        // fix is applied here too for correctness rather than assuming compute never touches
+        // it.
+        gen_env    ? ComputeTextureKeyExcludingHandles(gen_env->CapturedTextureTypes(),
+                                                       gen_env->CapturedTexturePixelFormats(),
+                                                       gen_env->CapturedPhase4PrototypeHandles())
         : file_env ? ComputeTextureKey(file_env->CapturedTextureTypes(),
                                        file_env->CapturedTexturePixelFormats())
                    : 0;
@@ -1393,7 +1407,9 @@ void PipelineCache::SubmitSpeculativeShader(
                 Shader::Maxwell::ConvertLegacyToGeneric(program, rt);
             }
             auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, rt, program, binding);
-            const u64 texture_key = ComputeTextureKey(env.CapturedTextureTypes(), env.CapturedTexturePixelFormats());
+            const u64 texture_key = ComputeTextureKeyExcludingHandles(
+                env.CapturedTextureTypes(), env.CapturedTexturePixelFormats(),
+                env.CapturedPhase4PrototypeHandles());
             // SpirvRelevantHash(stage), not Hash() — see the same swap and its
             // rationale in CreateGraphicsPipeline() above. Matters doubly here:
             // this is the SAME function that produces the actual translated SPIR-V

@@ -64,6 +64,20 @@ u64 ComputeCbufKeyExcludingTextureHandles(const std::unordered_map<u64, u32>& cb
 u64 ComputeTextureKey(const std::unordered_map<u32, Shader::TextureType>& texture_types,
                       const std::unordered_map<u32, Shader::TexturePixelFormat>& texture_pixel_formats);
 
+// Phase 4 narrow prototype's texture_key fix. Same shape as
+// ComputeCbufKeyExcludingTextureHandles above: excludes entries whose key (the raw resolved
+// texture handle, per GraphicsEnvironment::ReadTextureType's texture_types.emplace(handle,
+// result) — NOT the (cbuf_index, cbuf_offset) coordinates, which this map doesn't carry) is in
+// excluded_handles, before hashing. Only filters texture_types, not texture_pixel_formats —
+// this prototype's canonicalization (texture_pass.cpp) only ever touches
+// ImageQueryDimensions's resolved TYPE, never pixel format, so there's nothing to exclude
+// there. Falls back to plain ComputeTextureKey when excluded_handles is empty, same as the
+// cbuf_key version does.
+u64 ComputeTextureKeyExcludingHandles(
+   const std::unordered_map<u32, Shader::TextureType>& texture_types,
+   const std::unordered_map<u32, Shader::TexturePixelFormat>& texture_pixel_formats,
+   const std::unordered_set<u32>& excluded_handles);
+
 // ---------------------------------------------------------------------------
 // ComputeBindingKey — hashes the full starting Bindings state (the
 // accumulator as it stood immediately before EmitSPIRV ran for this stage).
