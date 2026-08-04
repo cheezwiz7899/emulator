@@ -6,6 +6,7 @@
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
+#include "common/settings.h"
 #include "common/string_util.h"
 #include "core/core.h"
 #include "core/file_sys/content_archive.h"
@@ -307,6 +308,17 @@ void WebBrowser::ExecuteInteractive() {
 }
 
 void WebBrowser::Execute() {
+    // Raw input breaks with the web applet; fall back the same way whether the user opted
+    // out via disable_web_applet or has raw input enabled (which conflicts unconditionally).
+    if (Settings::values.disable_web_applet || Settings::values.enable_raw_input) {
+        LOG_WARNING(Service_AM,
+                    "Web Browser Applet unavailable (disabled={}, raw_input={}), shim_kind={}",
+                    Settings::values.disable_web_applet.GetValue(),
+                    Settings::values.enable_raw_input.GetValue(), web_arg_header.shim_kind);
+        WebBrowserExit(WebExitReason::EndButtonPressed);
+        return;
+    }
+
     switch (web_arg_header.shim_kind) {
     case ShimKind::Shop:
         ExecuteShop();

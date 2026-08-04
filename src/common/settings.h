@@ -719,6 +719,13 @@ struct Values {
     Setting<bool> enable_all_controllers{linkage, false, "enable_all_controllers",
                                          Category::Debugging};
     Setting<bool> perform_vulkan_check{linkage, true, "perform_vulkan_check", Category::Debugging};
+    // Was UISettings::values (Qt-only) with a default of true; moved here so every frontend
+    // (not just Qt) gets consistent behavior, and defaulted to false since forcing every web
+    // applet request to fail closed -- rather than opt-in for the one title it was meant for --
+    // breaks any game that depends on a real response, e.g. Super Smash Bros. Ultimate's offline
+    // help page. Still available for the raw-input conflict (Super Mario 3D All-Stars) it was
+    // added for; just no longer on for everyone by default.
+    Setting<bool> disable_web_applet{linkage, false, "disable_web_applet", Category::Debugging};
 
     // Miscellaneous
     Setting<std::string> log_filter{linkage, "*:Warning", "log_filter", Category::Debugging};

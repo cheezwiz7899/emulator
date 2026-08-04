@@ -892,13 +892,6 @@ void GMainWindow::WebBrowserOpenWebPage(const std::string& main_url,
                                         const std::string& additional_args, bool is_local) {
 #ifdef CITRON_USE_QT_WEB_ENGINE
 
-    // Raw input breaks with the web applet, Disable web applets if enabled
-    if (UISettings::values.disable_web_applet || Settings::values.enable_raw_input) {
-        emit WebBrowserClosed(Service::AM::Frontend::WebExitReason::WindowClosed,
-                              "http://localhost/");
-        return;
-    }
-
     web_applet = new QtNXWebEngineView(this, *system, input_subsystem.get());
 
     ui->action_Pause->setEnabled(false);
@@ -963,7 +956,7 @@ void GMainWindow::WebBrowserOpenWebPage(const std::string& main_url,
                "applet?\n(This can be re-enabled in the Debug settings.)"),
             QMessageBox::Yes | QMessageBox::No);
         if (result == QMessageBox::Yes) {
-            UISettings::values.disable_web_applet = true;
+            Settings::values.disable_web_applet = true;
             web_applet->SetFinished(true);
         }
     });
