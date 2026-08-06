@@ -63,6 +63,7 @@ using VideoCommon::SpirvKey;
 using VideoCommon::ComputeCbufKey;
 using VideoCommon::ComputeCbufKeyExcludingTextureHandles;
 using VideoCommon::ComputeTextureKey;
+using VideoCommon::ComputeTextureKeyExcludingHandles;
 using VideoCommon::ComputeBindingKey;
 using VideoCommon::ComputeWorkgroupKey;
 using VideoCommon::FoldViewportTransformState;
@@ -1466,9 +1467,15 @@ void PipelineCache::SubmitSpeculativeShader(
                 Shader::Maxwell::ConvertLegacyToGeneric(program, rt);
             }
             auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, rt, program, binding);
-            const u64 texture_key = ComputeTextureKeyExcludingHandles(
-                env.CapturedTextureTypes(), env.CapturedTexturePixelFormats(),
-                env.CapturedPhase4PrototypeHandles());
+            const u64 texture_key = ComputeTextureKey(env.CapturedTextureTypes(),
+                                                       env.CapturedTexturePixelFormats());
+            // Phase 4 narrow prototype's texture_key fix is NOT applied here -- confirmed by
+            // an actual build (not assumed, and an earlier version of this comment wrongly
+            // assumed otherwise): `env` in this function is VideoCommon::
+            // SpeculativeShaderEnvironment, which does not derive from GenericEnvironment and
+            // has no CapturedPhase4PrototypeHandles() to exclude with. Same treatment as the
+            // FileEnvironment branches elsewhere in this file -- reduced-capability path, no
+            // exclusion applied, plain ComputeTextureKey.
             // SpirvRelevantHash(stage), not Hash() — see the same swap and its
             // rationale in CreateGraphicsPipeline() above. Matters doubly here:
             // this is the SAME function that produces the actual translated SPIR-V

@@ -32,10 +32,22 @@ struct GraphicsPipelineCacheKey {
     // once per real draw in CreateGraphicsPipeline (vk_pipeline_cache.cpp, where env access
     // exists) and carried here so MakePipeline (vk_graphics_pipeline.cpp, which only has this
     // key + the cached Shader::Info, not the original env) knows what to supply as this
-    // shader's VkSpecializationInfo value. false (the default, matching the hardcoded
+    // shader's VkSpecializationInfo value. 0 (the default, matching the hardcoded
     // SpecConstantFalse in spirv_emit_context.cpp) for every shader that doesn't have the
     // marked slot at all -- only meaningful when at least one stage's Shader::Info has a
     // texture_descriptors entry with phase4_prototype_polymorphic set.
+    //
+    // u64, not bool, and no default member initializer -- both fixed after a real build caught
+    // them: a default member initializer (`= false`) makes default construction non-trivial
+    // (breaks is_trivially_constructible_v, confirmed by an actual compile, not just read
+    // about); a trailing 1-byte bool needs padding to round the struct back up to this
+    // struct's 8-byte alignment (from unique_hashes), and that padding's indeterminate value
+    // breaks has_unique_object_representations_v (also confirmed by the same real build, not
+    // assumed). A full u64 needs no padding either side, since unique_hashes + state.Size()
+    // was already a multiple of 8 for the has_unique_object_representations_v assert to have
+    // passed before this field existed at all. Zero-initialized the same way every other field
+    // here already is: via GraphicsPipelineCacheKey key{} at its declaration
+    // (vk_pipeline_cache.h), not a per-member default.
     //
     // Deliberately part of this key (not stored/tracked separately): this struct IS the
     // pipeline-identity key two draws get compared by (see the has_unique_object_
@@ -43,7 +55,7 @@ struct GraphicsPipelineCacheKey {
     // adding it here is what makes two real draws needing different values for this one slot
     // correctly become two different VkPipeline objects instead of silently reusing whichever
     // was created first.
-    bool phase4_prototype_needs_array_variant = false;
+    u64 phase4_prototype_needs_array_variant;
 
     size_t Hash() const noexcept;
 
