@@ -579,16 +579,43 @@ void PipelineCache::EvictOldPipelines() {
 // out-of-range cases, so an unrelated shader reading garbage here is, at worst, exactly as safe
 // as any other out-of-range cbuf read already is elsewhere in this codebase.
 bool PipelineCache::ResolvePhase4PrototypeSpecValue() const {
-    constexpr size_t kFragmentStageIndex = 4; // Shader::Stage::Fragment via StageFromIndex(4),
-                                              // confirmed against GraphicsEnvironment's own
-                                              // ShaderType::Pixel -> stage_index=4 mapping.
-    constexpr u32 kPrototypeCbufIndex = 2;
-    constexpr u32 kPrototypeCbufOffset = 192;
-    if (graphics_key.unique_hashes[kFragmentStageIndex] == 0) {
+    // Two different indices for two different arrays, both real, both required -- conflating
+    // them is exactly what caused the freeze a real build surfaced. unique_hashes (this
+    // function's first check, and the key phase4_prototype_fragment_shader_table above is
+    // keyed by) is populated in ShaderCache::RefreshStages via a direct
+    // static_cast<ShaderType>(index) -- confirmed by reading that function, not assumed -- so
+    // it uses the RAW hardware ShaderType numbering (VertexA=0, VertexB=1, TessellationInit=2,
+    // Tessellation=3, Geometry=4, Pixel=5). shader_stages (this function's second check, the
+    // actual cbuf read) uses the SOFTWARE Shader::Stage numbering instead (VertexB=0, ...,
+    // Fragment=4) -- confirmed against GraphicsEnvironment's own ShaderType::Pixel ->
+    // stage_index=4 mapping. CreateGraphicsPipeline's own `stage_index = index - 1` (this same
+    // file) is the concrete conversion between the two, and is what pins these two numbers
+    // down as correct rather than assumed.
+    constexpr size_t kFragmentHardwareIndex = 5;    // ShaderType::Pixel, for unique_hashes only.
+    constexpr size_t kFragmentSoftwareIndex = 4;    // Shader::Stage::Fragment, for shader_stages.
+    const u64 fragment_hash{graphics_key.unique_hashes[kFragmentHardwareIndex]};
+    if (fragment_hash == 0) {
         return false; // No fragment shader bound at all.
     }
-    const auto& cbuf{
-        maxwell3d->state.shader_stages[kFragmentStageIndex].const_buffers[kPrototypeCbufIndex]};
+
+    // The actual fix for the freeze: only ever do the speculative cbuf read for a fragment
+    // shader CONFIRMED (via real Shader::Info, recorded in CreateGraphicsPipeline the one time
+    // this shader was actually translated) to have the marked descriptor. Every other
+    // fragment shader -- the overwhelming majority -- returns false here without touching GPU
+    // memory at all, every single draw, forever, once seen once. A shader not yet in the table
+    // (never translated) also returns false rather than guessing: reading cbuf 2 offset 192
+    // speculatively for a genuinely unknown shader is exactly the behavior that turned
+    // unrelated per-draw application data into a constantly-changing graphics_key and froze
+    // real gameplay -- not worth doing even once more now that it's understood.
+    const auto it{phase4_prototype_fragment_shader_table.find(fragment_hash)};
+    if (it == phase4_prototype_fragment_shader_table.end() || !it->second) {
+        return false;
+    }
+
+    constexpr u32 kPrototypeCbufIndex = 2;
+    constexpr u32 kPrototypeCbufOffset = 192;
+    const auto& cbuf{maxwell3d->state.shader_stages[kFragmentSoftwareIndex]
+                          .const_buffers[kPrototypeCbufIndex]};
     if (!cbuf.enabled || kPrototypeCbufOffset >= cbuf.size) {
         return false;
     }
@@ -952,6 +979,23 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         Shader::IR::Program& program{programs[index]};
         const size_t stage_index{index - 1};
         infos[stage_index] = &program.info;
+
+        // Phase 4 narrow prototype: this is the one place real Shader::Info exists for a
+        // freshly-translated fragment shader (stage_index 4 == Shader::Stage::Fragment, per
+        // StageFromIndex -- NOT the same as key.unique_hashes' own index 5 for this same
+        // stage, ShaderType::Pixel's raw hardware position; index here is 1 less than that
+        // because this loop's `index` uses the raw ShaderType numbering directly, same as
+        // key.unique_hashes, while stage_index is already converted). Recording once here
+        // means ResolvePhase4PrototypeSpecValue never needs to guess for a shader it's already
+        // seen -- see phase4_prototype_fragment_shader_table's doc comment, vk_pipeline_cache.h.
+        if (stage_index == 4) {
+            const bool has_marked_slot{std::ranges::any_of(
+                program.info.texture_descriptors,
+                [](const Shader::TextureDescriptor& desc) {
+                    return desc.phase4_prototype_polymorphic;
+                })};
+            phase4_prototype_fragment_shader_table[key.unique_hashes[index]] = has_marked_slot;
+        }
 
         const auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage)};
         ConvertLegacyToGeneric(program, runtime_info);

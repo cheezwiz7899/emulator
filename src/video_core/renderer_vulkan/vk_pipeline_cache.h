@@ -12,6 +12,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include <ankerl/unordered_dense.h>
+
 #include "common/common_types.h"
 #include "common/thread_worker.h"
 #include "shader_recompiler/frontend/ir/basic_block.h"
@@ -179,13 +181,36 @@ public:
     bool use_asynchronous_shaders{};
     bool use_vulkan_pipeline_cache{};
 
+    // Phase 4 narrow prototype's actual fix for the runaway-pipeline-creation freeze a real
+    // build surfaced: ResolvePhase4PrototypeSpecValue() must NOT blindly read cbuf 2 offset
+    // 192 for every fragment-shaded draw regardless of relevance -- for shaders that don't
+    // actually have the marked descriptor, that memory is ordinary application data (often
+    // changing every draw by design), and reinterpreting it as a texture handle produces an
+    // unstable graphics_key that defeats pipeline caching entirely. Populated once per
+    // fragment shader, in CreateGraphicsPipeline (where real Shader::Info is available, see
+    // that function's doc comment at the population site), keyed by that shader's own
+    // unique_hash (graphics_key.unique_hashes[5] -- ShaderType::Pixel's raw index, NOT 4;
+    // see ResolvePhase4PrototypeSpecValue's doc comment for why those two numbers are both
+    // real and both needed for different arrays). true only for the 12 real shaders this
+    // prototype targets; false (not absent) for every other fragment shader once seen once,
+    // so ResolvePhase4PrototypeSpecValue can skip the read entirely for known-irrelevant
+    // shaders without re-deciding it every draw.
+    //
+    // ankerl::unordered_dense::map, not std::unordered_map: this is read once per draw call
+    // for every fragment-shaded draw (via ResolvePhase4PrototypeSpecValue, called from
+    // CurrentGraphicsPipeline, on the hot path this whole fix exists to keep cheap and stable)
+    // -- exactly the read-heavy, write-rare, u64-keyed pattern SpirvCache's own entries_/
+    // unique_hashes_/keys_by_hash_ (spirv_cache.h) already use unordered_dense for, in this
+    // same codebase. u64 keys need no custom hasher, same as those.
+    mutable ankerl::unordered_dense::map<u64, bool> phase4_prototype_fragment_shader_table;
+
     // Phase 4 narrow prototype's graphics_cache lookup-timing fix. Called from
     // CurrentGraphicsPipeline(), after RefreshStages()/state.Refresh() but before the
     // graphics_cache/Next() lookups that graphics_key feeds -- see this method's definition in
     // vk_pipeline_cache.cpp for the full reasoning and its real, flagged limitations (assumes
-    // no secondary cbuf combine for this one hardcoded slot; runs unconditionally for every
-    // draw with an active fragment stage rather than only shaders that actually have the
-    // marked descriptor, since Shader::Info isn't available yet at this point either).
+    // no secondary cbuf combine for this one hardcoded slot; gated by
+    // phase4_prototype_fragment_shader_table above rather than running unconditionally, after
+    // an earlier version of this method did exactly that and froze real gameplay).
     bool ResolvePhase4PrototypeSpecValue() const;
 
     GraphicsPipelineCacheKey graphics_key{};
