@@ -28,7 +28,7 @@ void Break(Core::System& system, BreakReason reason, u64 info1, u64 info2) {
         has_dumped_buffer = true;
     };
 
-    const auto& current_process = GetCurrentProcess(system.Kernel());
+    auto& current_process = GetCurrentProcess(system.Kernel());
     const bool is_hbl = current_process.IsHbl();
     const bool is_application = current_process.IsApplication();
 
@@ -117,13 +117,26 @@ void Break(Core::System& system, BreakReason reason, u64 info1, u64 info2) {
 
     if (should_break && !is_hbl) {
         auto* thread = system.Kernel().GetCurrentEmuThread();
-        if (system.DebuggerEnabled()) {
-            system.GetDebugger().NotifyThreadStopped(thread);
+
+        if (is_application || system.DebuggerEnabled()) {
+            if (system.DebuggerEnabled()) {
+                system.GetDebugger().NotifyThreadStopped(thread);
+            }
+            LOG_CRITICAL(Debug_Emulated,
+                         "Suspending thread due to unrecoverable break (hbl={}, reason={:#X})",
+                         is_hbl, reason);
+            thread->RequestSuspend(Kernel::SuspendType::Debug);
+        } else {
+            // Library/system applet, no debugger attached, and try_recover() above only
+            // covers is_application. Suspending forever hangs the whole session with no
+            // way for the caller to notice its applet died; real hardware just ends the
+            // applet. Terminate the process instead so AM's normal applet-completion
+            // handling can run.
+            LOG_CRITICAL(Debug_Emulated,
+                         "Terminating applet process due to unrecoverable break (reason={:#X})",
+                         reason);
+            current_process.Exit();
         }
-        LOG_CRITICAL(Debug_Emulated,
-                     "Suspending thread due to unrecoverable break (hbl={}, reason={:#X})",
-                     is_hbl, reason);
-        thread->RequestSuspend(Kernel::SuspendType::Debug);
     }
 }
 
