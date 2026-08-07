@@ -652,16 +652,19 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         // own to identify RDNA2 hardware. RADV reports the chip family codename inside
         // VkPhysicalDeviceProperties::deviceName (e.g. "AMD Radeon 780M Graphics (RADV
         // PHOENIX)"), so use that to exclude the newer families this workaround was
-        // never intended for. See citron-neo/emulator issue: RADV + Tomodachi Life
-        // crash on RDNA3 APUs (e.g. Phoenix/780M) caused by this workaround
-        // misidentifying RDNA3 as RDNA2.
-        static constexpr std::array<std::string_view, 11> non_rdna2_radv_codenames{{
+        // never intended for.
+        static constexpr std::array<std::string_view, 19> non_rdna2_radv_codenames{{
             // RDNA3 / RDNA3.5 discrete and APU families
             "NAVI31", "NAVI32", "NAVI33",
             "PHOENIX", "PHOENIX2", "HAWK_POINT", "HAWK POINT",
             "STRIX", "STRIX_HALO", "STRIX HALO",
+            "KRACKAN1",
+            // GFX target aliases for RDNA3.5 (older Mesa naming)
+            "GFX1150", "GFX1151", "GFX1152",
             // RDNA4
             "NAVI4",
+            // GFX target aliases for RDNA4 and future variants (older Mesa naming)
+            "GFX1200", "GFX1201", "GFX1210",
         }};
         const std::string_view device_name{properties.properties.deviceName};
         const bool is_known_non_rdna2 =
