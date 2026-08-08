@@ -87,6 +87,7 @@ private:
     bool m_is_application{};
     bool m_is_default_application_system_resource{};
     bool m_is_hbl{};
+    bool m_crashed_from_exception{};
     std::array<char, 13> m_name{};
     std::atomic<u16> m_num_running_threads{};
     Svc::CreateProcessFlag m_flags{};
@@ -263,6 +264,16 @@ public:
 
     bool IsHbl() const {
         return m_is_hbl;
+    }
+
+    bool CrashedFromException() const {
+        return m_crashed_from_exception;
+    }
+
+    // One-way: once set, this process's death is attributed to an unrecoverable break for
+    // the rest of its lifetime, regardless of what Exit()/Terminate() do to m_state afterward.
+    void SetCrashedFromException() {
+        m_crashed_from_exception = true;
     }
 
     u32 GetAllocateOption() const {

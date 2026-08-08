@@ -135,6 +135,7 @@ void Break(Core::System& system, BreakReason reason, u64 info1, u64 info2) {
             LOG_CRITICAL(Debug_Emulated,
                          "Terminating applet process due to unrecoverable break (reason={:#X})",
                          reason);
+            current_process.SetCrashedFromException();
             current_process.Exit();
         }
     }

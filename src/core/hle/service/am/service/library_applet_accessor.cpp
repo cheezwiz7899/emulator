@@ -63,8 +63,8 @@ Result ILibraryAppletAccessor::IsCompleted(Out<bool> out_is_completed) {
 }
 
 Result ILibraryAppletAccessor::GetResult() {
-    LOG_DEBUG(Service_AM, "called");
     std::scoped_lock lk{m_applet->lock};
+    LOG_INFO(Service_AM, "called, terminate_result={:#x}", m_applet->terminate_result.raw);
     R_RETURN(m_applet->terminate_result);
 }
 
@@ -105,14 +105,15 @@ Result ILibraryAppletAccessor::PushInData(SharedPointer<IStorage> storage) {
 }
 
 Result ILibraryAppletAccessor::PopOutData(Out<SharedPointer<IStorage>> out_storage) {
-    LOG_DEBUG(Service_AM, "called");
     if (auto caller_applet = m_applet->caller_applet.lock(); caller_applet) {
         caller_applet->lifecycle_manager.GetSystemEvent().Signal();
         caller_applet->lifecycle_manager.RequestResumeNotification();
         caller_applet->lifecycle_manager.GetSystemEvent().Clear();
         caller_applet->lifecycle_manager.UpdateRequestedFocusState();
     }
-    R_RETURN(m_broker->GetOutData().Pop(out_storage.Get()));
+    const Result pop_result = m_broker->GetOutData().Pop(out_storage.Get());
+    LOG_INFO(Service_AM, "called, pop_result={:#x}", pop_result.raw);
+    R_RETURN(pop_result);
 }
 
 Result ILibraryAppletAccessor::PushInteractiveInData(SharedPointer<IStorage> storage) {

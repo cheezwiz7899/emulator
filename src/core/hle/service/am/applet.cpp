@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "core/core.h"
+#include "core/hle/service/am/am_results.h"
 #include "core/hle/service/am/applet.h"
 #include "core/hle/service/am/applet_manager.h"
 
@@ -68,6 +69,13 @@ void Applet::SetInteractibleLocked(bool interactible) {
 }
 
 void Applet::OnProcessTerminatedLocked() {
+    if (terminate_result == ResultSuccess && process->GetHandle()->CrashedFromException()) {
+        LOG_WARNING(Service_AM,
+                    "Applet process crashed rather than exiting gracefully; reporting {:#x} "
+                    "via GetResult so the caller doesn't read this as success",
+                    ResultLibraryAppletTerminated.raw);
+        terminate_result = ResultLibraryAppletTerminated;
+    }
     is_completed = true;
     state_changed_event.Signal();
 }
