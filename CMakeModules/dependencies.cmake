@@ -415,8 +415,8 @@ if (NOT TARGET sirit)
     endif()
     CPMAddPackage(
         NAME sirit
-        GITHUB_REPOSITORY yuzu-mirror/sirit
-        GIT_TAG ab75463999f4f3291976b079d42d52ee91eebf3f
+        GITHUB_REPOSITORY cheezwiz7899/ym-sirit
+        GIT_TAG 994c6d63a0d6e67781c956864edfe3b6ab0fea7d
     )
     if (CITRON_CLANGCL AND TARGET sirit)
         get_target_property(_sirit_compile_options sirit COMPILE_OPTIONS)
