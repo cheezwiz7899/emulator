@@ -607,8 +607,20 @@ bool PipelineCache::ResolvePhase4PrototypeSpecValue() const {
     // speculatively for a genuinely unknown shader is exactly the behavior that turned
     // unrelated per-draw application data into a constantly-changing graphics_key and froze
     // real gameplay -- not worth doing even once more now that it's understood.
-    const auto it{phase4_prototype_fragment_shader_table.find(fragment_hash)};
-    if (it == phase4_prototype_fragment_shader_table.end() || !it->second) {
+    //
+    // shared_lock, released before the GPU read below: extract a plain bool from the iterator
+    // while the lock is held (see phase4_prototype_fragment_shader_table_mutex's doc comment,
+    // vk_pipeline_cache.h, for why an unsynchronized read here was itself a real bug, not just
+    // the write) -- the iterator itself would not be safe to keep using once the lock releases,
+    // and the GPU read that follows doesn't touch this table at all, so there's no reason to
+    // hold the lock any longer than the lookup itself needs.
+    bool shader_has_marked_slot = false;
+    {
+        std::shared_lock lock{phase4_prototype_fragment_shader_table_mutex};
+        const auto it{phase4_prototype_fragment_shader_table.find(fragment_hash)};
+        shader_has_marked_slot = it != phase4_prototype_fragment_shader_table.end() && it->second;
+    }
+    if (!shader_has_marked_slot) {
         return false;
     }
 
@@ -994,6 +1006,11 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 [](const Shader::TextureDescriptor& desc) {
                     return desc.phase4_prototype_polymorphic;
                 })};
+            // See phase4_prototype_fragment_shader_table_mutex's doc comment,
+            // vk_pipeline_cache.h -- this function can run on a worker thread
+            // (workers.QueueWork, the boot-time bulk pipeline-loading path), so this write
+            // needs real synchronization, not just the table itself existing.
+            std::unique_lock lock{phase4_prototype_fragment_shader_table_mutex};
             phase4_prototype_fragment_shader_table[key.unique_hashes[index]] = has_marked_slot;
         }
 

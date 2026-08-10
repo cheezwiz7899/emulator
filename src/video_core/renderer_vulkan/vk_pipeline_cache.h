@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <memory>
+#include <shared_mutex>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -202,6 +203,22 @@ public:
     // -- exactly the read-heavy, write-rare, u64-keyed pattern SpirvCache's own entries_/
     // unique_hashes_/keys_by_hash_ (spirv_cache.h) already use unordered_dense for, in this
     // same codebase. u64 keys need no custom hasher, same as those.
+    //
+    // phase4_prototype_fragment_shader_table_mutex: a REAL, separate bug the very next real
+    // test found -- CreateGraphicsPipeline (the write site) is called from workers.QueueWork()
+    // for the boot-time bulk pipeline-loading path (confirmed by reading that call site
+    // directly, not assumed), meaning multiple worker threads can write this table
+    // concurrently during exactly the "compiling shaders" bulk-load phase, while
+    // CurrentGraphicsPipelineSlowPath's synchronous path (the live draw-time miss case) and
+    // ResolvePhase4PrototypeSpecValue's reads happen on the main/render thread at the same
+    // time -- an unsynchronized concurrent read/write on a container with no built-in thread
+    // safety, which is exactly the kind of bug that can corrupt internal hash-table state and
+    // hang rather than crash cleanly. std::shared_mutex, not a plain mutex, mirroring
+    // SpirvCache's own mutex_ (spirv_cache.h) exactly -- same shape of problem, hot-path reads
+    // outnumbering rare writes by a huge margin, so std::shared_lock for reads and
+    // std::unique_lock for writes (matching SpirvCache's own real usage, confirmed by reading
+    // it, not assumed) is the right tool, not just a correct one.
+    mutable std::shared_mutex phase4_prototype_fragment_shader_table_mutex;
     mutable ankerl::unordered_dense::map<u64, bool> phase4_prototype_fragment_shader_table;
 
     // Phase 4 narrow prototype's graphics_cache lookup-timing fix. Called from
