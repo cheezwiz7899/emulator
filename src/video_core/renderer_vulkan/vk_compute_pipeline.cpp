@@ -45,7 +45,9 @@ ComputePipeline::ComputePipeline(const Device& device_, vk::PipelineCache& pipel
 
     auto func{[this, &descriptor_pool, shader_notify, pipeline_statistics] {
         DescriptorLayoutBuilder builder{device};
-        builder.SetSplit(device.IsKhrPushDescriptorSupported());
+        // DIAGNOSTIC: see matching note in vk_graphics_pipeline.cpp. Revert before
+        // merging - this is a bisection tool, not a fix.
+        builder.SetSplit(false && device.IsKhrPushDescriptorSupported());
         builder.Add(info, VK_SHADER_STAGE_COMPUTE_BIT);
 
         split_descriptor_sets = builder.IsSplit();

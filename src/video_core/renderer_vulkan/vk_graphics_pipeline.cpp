@@ -54,7 +54,11 @@ constexpr size_t LARGE_IMAGE_DESCRIPTOR_COUNT = 1024;
 
 DescriptorLayoutBuilder MakeBuilder(const Device& device, std::span<const Shader::Info> infos) {
     DescriptorLayoutBuilder builder{device};
-    builder.SetSplit(device.IsKhrPushDescriptorSupported());
+    // DIAGNOSTIC: force off to test whether the split uniform/resource descriptor
+    // set path (PR184, "Perf/bindless cbuf cache") is responsible for the
+    // RADV+Tomodachi Life crash. Revert this before merging anything -
+    // it is a bisection tool, not a fix.
+    builder.SetSplit(false && device.IsKhrPushDescriptorSupported());
     for (size_t index = 0; index < infos.size(); ++index) {
         static constexpr std::array stages{
             VK_SHADER_STAGE_VERTEX_BIT,
