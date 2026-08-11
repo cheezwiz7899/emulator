@@ -666,22 +666,48 @@ void GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                 (descriptor_set_cache_rr + 1) % DESC_SET_CACHE_SIZE;
             return fresh;
         };
-        if (descriptor_set_layout) {
-            if (uses_push_descriptor) {
-                cmdbuf.PushDescriptorSetWithTemplateKHR(*descriptor_update_template,
-                                                        *pipeline_layout, 0, descriptor_data);
-            } else {
-                const VkDescriptorSet ds = get_or_alloc(descriptor_allocator,
-                                                        descriptor_update_template);
-                cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout, 0,
-                                          ds, nullptr);
+        // DescriptorAllocator::Commit() can throw VK_ERROR_OUT_OF_POOL_MEMORY (via
+        // AllocateDescriptors) if a single set's requirements exceed what a freshly
+        // grown pool can satisfy. This runs on the Vulkan worker thread with no
+        // caller-side try/catch, so an uncaught throw here is an unhandled
+        // exception on a background thread -> std::terminate() -> silent abort
+        // with no log output. Bindless-heavy shaders (large texture-array
+        // descriptor counts) are the most likely to hit this, and set 1
+        // (resource_set_layout) is new/unproven relative to set 0. Catch and
+        // fail this pipeline gracefully instead of taking down the process.
+        try {
+            if (descriptor_set_layout) {
+                if (uses_push_descriptor) {
+                    cmdbuf.PushDescriptorSetWithTemplateKHR(*descriptor_update_template,
+                                                            *pipeline_layout, 0, descriptor_data);
+                } else {
+                    const VkDescriptorSet ds = get_or_alloc(descriptor_allocator,
+                                                            descriptor_update_template);
+                    cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout, 0,
+                                              ds, nullptr);
+                }
             }
-        }
-        if (resource_set_layout) {
-            const VkDescriptorSet rs = get_or_alloc(resource_descriptor_allocator,
-                                                    resource_update_template);
-            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout, 1,
-                                      rs, nullptr);
+            if (resource_set_layout) {
+                const VkDescriptorSet rs = get_or_alloc(resource_descriptor_allocator,
+                                                        resource_update_template);
+                cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout, 1,
+                                          rs, nullptr);
+            }
+        } catch (const vk::Exception& exception) {
+            LOG_CRITICAL(Render_Vulkan,
+                        "Descriptor set allocation failed mid-draw: hash={:016X}, "
+                        "split_sets={}, num_textures={}, exception={}. Disabling this "
+                        "pipeline instead of crashing.",
+                        key.Hash(), split_descriptor_sets, num_textures, exception.what());
+            build_failed.store(true, std::memory_order::release);
+            return;
+        } catch (const std::exception& exception) {
+            LOG_CRITICAL(Render_Vulkan,
+                        "Unexpected exception during descriptor set binding: hash={:016X}, "
+                        "exception={}. Disabling this pipeline instead of crashing.",
+                        key.Hash(), exception.what());
+            build_failed.store(true, std::memory_order::release);
+            return;
         }
     });
 }

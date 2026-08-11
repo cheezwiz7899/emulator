@@ -320,22 +320,43 @@ void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                 (descriptor_set_cache_rr + 1) % DESC_SET_CACHE_SIZE;
             return fresh;
         };
-        if (descriptor_set_layout) {
-            if (uses_push_descriptor) {
-                cmdbuf.PushDescriptorSetWithTemplateKHR(*descriptor_update_template,
-                                                        *pipeline_layout, 0, descriptor_data);
-            } else {
-                const VkDescriptorSet ds = get_or_alloc(descriptor_allocator,
-                                                        descriptor_update_template);
-                cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout, 0,
-                                          ds, nullptr);
+        // See GraphicsPipeline::ConfigureDraw for why this needs a try/catch:
+        // DescriptorAllocator::Commit() can throw VK_ERROR_OUT_OF_POOL_MEMORY on
+        // this worker thread with no caller-side handler, which otherwise means
+        // an uncaught exception -> std::terminate() -> silent process abort.
+        try {
+            if (descriptor_set_layout) {
+                if (uses_push_descriptor) {
+                    cmdbuf.PushDescriptorSetWithTemplateKHR(*descriptor_update_template,
+                                                            *pipeline_layout, 0, descriptor_data);
+                } else {
+                    const VkDescriptorSet ds = get_or_alloc(descriptor_allocator,
+                                                            descriptor_update_template);
+                    cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout, 0,
+                                              ds, nullptr);
+                }
             }
-        }
-        if (resource_set_layout) {
-            const VkDescriptorSet rs = get_or_alloc(resource_descriptor_allocator,
-                                                    resource_update_template);
-            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout, 1,
-                                      rs, nullptr);
+            if (resource_set_layout) {
+                const VkDescriptorSet rs = get_or_alloc(resource_descriptor_allocator,
+                                                        resource_update_template);
+                cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout, 1,
+                                          rs, nullptr);
+            }
+        } catch (const vk::Exception& exception) {
+            LOG_CRITICAL(Render_Vulkan,
+                        "Descriptor set allocation failed mid-dispatch: split_sets={}, "
+                        "num_textures={}, exception={}. Skipping this dispatch's descriptor "
+                        "bind instead of crashing.",
+                        split_descriptor_sets,
+                        Shader::NumDescriptors(info.texture_descriptors), exception.what());
+            return;
+        } catch (const std::exception& exception) {
+            LOG_CRITICAL(Render_Vulkan,
+                        "Unexpected exception during compute descriptor set binding: "
+                        "exception={}. Skipping this dispatch's descriptor bind instead of "
+                        "crashing.",
+                        exception.what());
+            return;
         }
     });
 }
