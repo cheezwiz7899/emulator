@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstddef>
+#include <type_traits>
 
 #include <boost/container/small_vector.hpp>
 
@@ -153,6 +154,47 @@ private:
             ++set.binding;
             set.num_descriptors += descriptors[i].count;
             shared_offset += sizeof(DescriptorUpdateEntry);
+            // Phase 4 narrow prototype -- the actual, confirmed cause of a real crash (an
+            // access violation inside vkUpdateDescriptorSets, deep in nvoglv64.dll, per a real
+            // WinDbg crash dump analysis, not inferred from a log). DefineTextures
+            // (spirv_emit_context.cpp) declares an extra OpVariable/binding for a descriptor
+            // marked phase4_prototype_polymorphic, and PushImageDescriptors (this file)
+            // already pushes a second data entry for it -- but this function, which builds
+            // the actual VkDescriptorSetLayout (set.bindings) and descriptor update template
+            // (set.entries) those other two assume already exists, never knew about the extra
+            // binding at all. The result: PushImageDescriptors was writing a second
+            // descriptor's worth of data into a layout that was only ever sized for one,
+            // which is exactly the kind of mismatch that reads/writes past a driver-side
+            // buffer's real bounds.
+            //
+            // if constexpr + is_same_v, not a runtime check: Add() is one template shared by
+            // every descriptor category this class handles (constant buffers, storage
+            // buffers, texture buffers, image buffers, textures, images) -- most of those
+            // element types have no phase4_prototype_polymorphic field at all, so this must
+            // not compile a member-access into instantiations where the field doesn't exist.
+            if constexpr (std::is_same_v<std::decay_t<decltype(descriptors[i])>,
+                                         Shader::TextureDescriptor>) {
+                if (descriptors[i].phase4_prototype_polymorphic) {
+                    set.bindings.push_back({
+                        .binding = set.binding,
+                        .descriptorType = type,
+                        .descriptorCount = descriptors[i].count,
+                        .stageFlags = stage,
+                        .pImmutableSamplers = nullptr,
+                    });
+                    set.entries.push_back({
+                        .dstBinding = set.binding,
+                        .dstArrayElement = 0,
+                        .descriptorCount = descriptors[i].count,
+                        .descriptorType = type,
+                        .offset = shared_offset,
+                        .stride = sizeof(DescriptorUpdateEntry),
+                    });
+                    ++set.binding;
+                    set.num_descriptors += descriptors[i].count;
+                    shared_offset += sizeof(DescriptorUpdateEntry);
+                }
+            }
         }
     }
 
