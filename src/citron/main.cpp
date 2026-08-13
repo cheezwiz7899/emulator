@@ -91,6 +91,8 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include <QFileDialog>
 #include <QGuiApplication>
 #include <QInputDialog>
+#include <QJsonArray>
+#include <QJsonDocument>
 #include <QMessageBox>
 #include <QProgressDialog>
 #include <QPushButton>
@@ -892,8 +894,11 @@ void GMainWindow::WebBrowserOpenWebPage(const std::string& main_url,
                                         const std::string& additional_args, bool is_local) {
 #ifdef CITRON_USE_QT_WEB_ENGINE
 
-    // Raw input breaks with the web applet, Disable web applets if enabled
-    if (UISettings::values.disable_web_applet || Settings::values.enable_raw_input) {
+    // Settings::values.disable_web_applet is now checked earlier, in WebBrowser::Execute()
+    // (applet_web_browser.cpp) before the frontend is ever invoked at all - see the comment on
+    // that setting for why. Raw input specifically still breaks the Qt WebEngine widget itself,
+    // so that check stays here rather than moving to the frontend-agnostic service layer.
+    if (Settings::values.enable_raw_input) {
         emit WebBrowserClosed(Service::AM::Frontend::WebExitReason::WindowClosed,
                               "http://localhost/");
         return;
@@ -952,6 +957,7 @@ void GMainWindow::WebBrowserOpenWebPage(const std::string& main_url,
     }
 
     bool exit_check = false;
+    bool interactive_poll_pending = false;
 
     // TODO (Morph): Remove this
     QAction* exit_action = new QAction(tr("Disable Web Applet"), this);
@@ -963,7 +969,7 @@ void GMainWindow::WebBrowserOpenWebPage(const std::string& main_url,
                "applet?\n(This can be re-enabled in the Debug settings.)"),
             QMessageBox::Yes | QMessageBox::No);
         if (result == QMessageBox::Yes) {
-            UISettings::values.disable_web_applet = true;
+            Settings::values.disable_web_applet = true;
             web_applet->SetFinished(true);
         }
     });
@@ -984,6 +990,22 @@ void GMainWindow::WebBrowserOpenWebPage(const std::string& main_url,
                 });
 
             exit_check = true;
+        }
+
+        // Drain any messages the page queued via the injected window.nx.sendMessage bridge
+        // (e.g. ARCropolis's mod-manager UI sends {"ChangeAll": ...} on toggles and "Closure"
+        // when the user backs out) and forward each one to the guest as interactive-out data.
+        if (!interactive_poll_pending) {
+            interactive_poll_pending = true;
+            web_applet->page()->runJavaScript(
+                QStringLiteral("(function() { var m = citron_outgoing_messages; "
+                               "citron_outgoing_messages = []; return m; })();"),
+                [&](const QVariant& variant) {
+                    interactive_poll_pending = false;
+                    for (const auto& entry : variant.toList()) {
+                        emit WebBrowserInteractiveDataReceived(entry.toString().toStdString());
+                    }
+                });
         }
 
         if (web_applet->GetCurrentURL().contains(QStringLiteral("localhost"))) {
@@ -1033,6 +1055,29 @@ void GMainWindow::WebBrowserRequestExit() {
         web_applet->SetExitReason(Service::AM::Frontend::WebExitReason::ExitRequested);
         web_applet->SetFinished(true);
     }
+#endif
+}
+
+void GMainWindow::WebBrowserDeliverInteractiveData(const std::string& data) {
+#ifdef CITRON_USE_QT_WEB_ENGINE
+    if (!web_applet) {
+        // The guest pushed interactive data after the page was already closed (or before it
+        // opened); there is nothing listening on the page side, so just drop it.
+        return;
+    }
+
+    // QJsonDocument only serializes an object or array at the top level, so wrap the arbitrary
+    // (and otherwise unescaped) guest-provided string in a single-element array purely to get
+    // correct JSON/JS-string-literal escaping out of it.
+    const QJsonArray wrapper{QJsonValue(QString::fromStdString(data))};
+    const QString escaped_data =
+        QString::fromUtf8(QJsonDocument(wrapper).toJson(QJsonDocument::Compact));
+
+    // Dispatch as a "message" event so window.nx.addEventListener("message", ...) listeners
+    // (the same bridge real hardware uses) receive it with the original string as e.data.
+    web_applet->page()->runJavaScript(
+        QStringLiteral("window.dispatchEvent(new MessageEvent('message', { data: (%1)[0] }));")
+            .arg(escaped_data));
 #endif
 }
 

@@ -194,6 +194,9 @@ signals:
                                           std::u16string submitted_text, s32 cursor_position);
     void WebBrowserExtractOfflineRomFS();
     void WebBrowserClosed(Service::AM::Frontend::WebExitReason exit_reason, std::string last_url);
+    /// Emitted when the page open in the web applet sends an outgoing message via the injected
+    /// window.nx.sendMessage bridge (e.g. ARCropolis's mod-manager UI requesting closure).
+    void WebBrowserInteractiveDataReceived(std::string data);
     void SigInterrupt();
     void ConfigurationSaved();
 public slots:
@@ -224,6 +227,10 @@ public slots:
     void WebBrowserOpenWebPage(const std::string& main_url, const std::string& additional_args,
                                bool is_local);
     void WebBrowserRequestExit();
+    /// Delivers data pushed by the guest (WebBrowser::ExecuteInteractive) into the page currently
+    /// open in the web applet, dispatched as a "message" event so window.nx.addEventListener
+    /// ("message", ...) listeners (used e.g. for ARCropolis's "GetModSize" reply) receive it.
+    void WebBrowserDeliverInteractiveData(const std::string& data);
     void OnAppFocusStateChanged(Qt::ApplicationState state);
     void OnTasStateChanged();
     void IncrementInstallProgress();

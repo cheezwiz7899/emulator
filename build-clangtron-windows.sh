@@ -1960,6 +1960,12 @@ build_common_cmake_args() {
         "-DCITRON_USE_CPM=ON"
         "-DCITRON_CHECK_SUBMODULES=OFF"
         "-DCPM_SOURCE_CACHE=${CMAKE_CPM_CACHE}"
+        # clang-cl targets win64_msvc2022_64 via aqt, which is exactly the one target Qt
+        # WebEngine (Chromium) actually supports on Windows - see qt_download.cmake and
+        # https://doc.qt.io/qt-6/qtwebengine-platform-notes.html ("does not compile with
+        # MinGW"). Nothing here enables it for llvm-mingw builds; that's intentionally left
+        # at CMake's own default (OFF), since it cannot work there regardless of this flag.
+        "-DCITRON_USE_QT_WEB_ENGINE=ON"
         "-Wno-dev"
     )
     [[ -n "${VULKAN_HEADERS_STUB_DIR}" ]] && _CMAKE_ARGS+=(

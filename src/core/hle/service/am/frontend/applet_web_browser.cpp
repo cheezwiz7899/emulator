@@ -6,6 +6,7 @@
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
+#include "common/settings.h"
 #include "common/string_util.h"
 #include "core/core.h"
 #include "core/file_sys/content_archive.h"
@@ -303,10 +304,33 @@ Result WebBrowser::GetStatus() const {
 }
 
 void WebBrowser::ExecuteInteractive() {
-    UNIMPLEMENTED_MSG("WebSession is not implemented");
+    // The guest (e.g. ARCropolis's native code replying to a "GetModSize" request sent from its
+    // page's JS via window.nx.sendMessage) is pushing data into the still-open applet. Forward it
+    // to the frontend so it can be delivered into the page as a "message" event, mirroring the
+    // same window.nx.addEventListener("message", ...) bridge real hardware exposes.
+    const auto storage = PopInteractiveInData();
+
+    if (!storage) {
+        LOG_WARNING(Service_AM, "Received interactive data request with no data available");
+        return;
+    }
+
+    const auto& data = storage->GetData();
+    frontend.SendInteractiveData(std::string(data.begin(), data.end()));
 }
 
 void WebBrowser::Execute() {
+    // Checked here rather than per-frontend (e.g. previously only inside Qt's
+    // GMainWindow::WebBrowserOpenWebPage, gated behind #ifdef CITRON_USE_QT_WEB_ENGINE) so the
+    // behavior is identical for every frontend and independent of whether Qt WebEngine is even
+    // compiled in - see the comment on Settings::values.disable_web_applet for why this exists
+    // and why it defaults to off.
+    if (Settings::values.disable_web_applet) {
+        LOG_WARNING(Service_AM, "Web applet is disabled via settings, closing immediately");
+        WebBrowserExit(WebExitReason::WindowClosed);
+        return;
+    }
+
     switch (web_arg_header.shim_kind) {
     case ShimKind::Shop:
         ExecuteShop();
@@ -436,6 +460,29 @@ void WebBrowser::InitializeOffline() {
 
     offline_document = Common::FS::ConcatPathSafe(
         offline_cache_dir, fmt::format("{}/{}", additional_paths, document_path));
+
+    // Mirror real hardware's LayeredFS behavior for the offline "manual" HtmlDocument page: SD
+    // mod frameworks such as ARCropolis (via skyline_web's OfflineWebSession) write their own
+    // content directly to sd:/atmosphere/contents/<title_id>/manual_html/html-document/... and
+    // rely on the OS transparently substituting it for the title's real HtmlDocument content -
+    // that's the whole trick that lets a mod manager UI hijack this applet in the first place.
+    // Previously nothing here ever looked at that SD location, only Citron's own NCA-extraction
+    // cache above, so pages like ARCropolis's mod-manager/workspace/config resolved to a path
+    // nothing had ever written to and silently failed to display anything.
+    if (document_kind == DocumentKind::OfflineHtmlPage) {
+        const auto sd_mod_root =
+            system.GetFileSystemController().GetSDMCModificationLoadRoot(title_id);
+
+        if (sd_mod_root != nullptr) {
+            const auto sd_override_document = Common::FS::ConcatPathSafe(
+                std::filesystem::path{sd_mod_root->GetFullPath()},
+                fmt::format("manual_html/{}/{}", additional_paths, document_path));
+
+            if (Common::FS::Exists(sd_override_document)) {
+                offline_document = sd_override_document;
+            }
+        }
+    }
 }
 
 void WebBrowser::InitializeShare() {}
@@ -462,13 +509,17 @@ void WebBrowser::ExecuteLogin() {
 }
 
 void WebBrowser::ExecuteOffline() {
-    // TODO (Morph): This is a hack for WebSession foreground web applets such as those used by
-    //               Super Mario 3D All-Stars.
-    // TODO (Morph): Implement WebSession.
-    if (applet_mode == LibraryAppletMode::AllForegroundInitiallyHidden) {
-        LOG_WARNING(Service_AM, "WebSession is not implemented");
-        return;
-    }
+    // Foreground "WebSession" applets (LibraryAppletMode::AllForegroundInitiallyHidden) are used
+    // by both Super Mario 3D All-Stars and by SSBU mod frameworks such as ARCropolis (whose
+    // mod-manager, workspace-selector, and config-editor UIs all open via skyline_web's
+    // OfflineWebSession, which requests this exact mode). They are otherwise opened the same way
+    // as a regular offline page below; what makes them a "session" is that they rely on the
+    // interactive data channel below (see the interactive_data_callback passed to
+    // OpenLocalWebPage, and ExecuteInteractive) for their actual back-and-forth instead of only a
+    // one-shot final result. Previously this bailed out here without ever opening the page or
+    // signaling completion, which left the calling guest thread blocked forever waiting on an
+    // applet that had never actually started - i.e. a permanent hang the instant a session-mode
+    // offline page was requested.
 
     const auto main_url = GetMainURL(Common::FS::PathToUTF8String(offline_document));
 
@@ -491,6 +542,10 @@ void WebBrowser::ExecuteOffline() {
         Common::FS::PathToUTF8String(offline_document), [this] { ExtractOfflineRomFS(); },
         [this](WebExitReason exit_reason, std::string last_url) {
             WebBrowserExit(exit_reason, last_url);
+        },
+        [this](std::string data) {
+            std::vector<u8> out_data(data.begin(), data.end());
+            PushInteractiveOutData(std::make_shared<IStorage>(system, std::move(out_data)));
         });
 }
 

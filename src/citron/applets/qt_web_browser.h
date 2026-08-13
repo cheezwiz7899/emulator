@@ -199,15 +199,23 @@ public:
     void Close() const override;
     void OpenLocalWebPage(const std::string& local_url,
                           ExtractROMFSCallback extract_romfs_callback_,
-                          OpenWebPageCallback callback_) const override;
+                          OpenWebPageCallback callback_,
+                          InteractiveDataCallback interactive_data_callback_ = {}) const override;
 
-    void OpenExternalWebPage(const std::string& external_url,
-                             OpenWebPageCallback callback_) const override;
+    void OpenExternalWebPage(const std::string& external_url, OpenWebPageCallback callback_,
+                             InteractiveDataCallback interactive_data_callback_ = {}) const override;
+
+    /// Called by the AM service (WebBrowser::ExecuteInteractive) whenever the guest pushes
+    /// interactive-in data while the applet is open. Relayed to the GUI thread so it can be
+    /// dispatched into the page as a "message" event, matching the real NX web bridge.
+    void SendInteractiveData(const std::string& data) const override;
 
 signals:
     void MainWindowOpenWebPage(const std::string& main_url, const std::string& additional_args,
                                bool is_local) const;
     void MainWindowRequestExit() const;
+    /// Emitted to hand data received from the guest to the GUI thread for delivery into the page.
+    void MainWindowSendInteractiveData(const std::string& data) const;
 
 private:
     void MainWindowExtractOfflineRomFS();
@@ -215,6 +223,11 @@ private:
     void MainWindowWebBrowserClosed(Service::AM::Frontend::WebExitReason exit_reason,
                                     std::string last_url);
 
+    /// Invoked (via GMainWindow::WebBrowserInteractiveDataReceived) whenever the page running
+    /// inside the applet sends an outgoing message via the injected window.nx.sendMessage bridge.
+    void MainWindowInteractiveDataReceived(std::string data);
+
     mutable ExtractROMFSCallback extract_romfs_callback;
     mutable OpenWebPageCallback callback;
+    mutable InteractiveDataCallback interactive_data_callback;
 };

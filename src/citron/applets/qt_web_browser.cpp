@@ -395,24 +395,31 @@ QtWebBrowser::QtWebBrowser(GMainWindow& main_window) {
             &GMainWindow::WebBrowserOpenWebPage, Qt::QueuedConnection);
     connect(this, &QtWebBrowser::MainWindowRequestExit, &main_window,
             &GMainWindow::WebBrowserRequestExit, Qt::QueuedConnection);
+    connect(this, &QtWebBrowser::MainWindowSendInteractiveData, &main_window,
+            &GMainWindow::WebBrowserDeliverInteractiveData, Qt::QueuedConnection);
     connect(&main_window, &GMainWindow::WebBrowserExtractOfflineRomFS, this,
             &QtWebBrowser::MainWindowExtractOfflineRomFS, Qt::QueuedConnection);
     connect(&main_window, &GMainWindow::WebBrowserClosed, this,
             &QtWebBrowser::MainWindowWebBrowserClosed, Qt::QueuedConnection);
+    connect(&main_window, &GMainWindow::WebBrowserInteractiveDataReceived, this,
+            &QtWebBrowser::MainWindowInteractiveDataReceived, Qt::QueuedConnection);
 }
 
 QtWebBrowser::~QtWebBrowser() = default;
 
 void QtWebBrowser::Close() const {
     callback = {};
+    interactive_data_callback = {};
     emit MainWindowRequestExit();
 }
 
 void QtWebBrowser::OpenLocalWebPage(const std::string& local_url,
                                     ExtractROMFSCallback extract_romfs_callback_,
-                                    OpenWebPageCallback callback_) const {
+                                    OpenWebPageCallback callback_,
+                                    InteractiveDataCallback interactive_data_callback_) const {
     extract_romfs_callback = std::move(extract_romfs_callback_);
     callback = std::move(callback_);
+    interactive_data_callback = std::move(interactive_data_callback_);
 
     const auto index = local_url.find('?');
 
@@ -424,8 +431,10 @@ void QtWebBrowser::OpenLocalWebPage(const std::string& local_url,
 }
 
 void QtWebBrowser::OpenExternalWebPage(const std::string& external_url,
-                                       OpenWebPageCallback callback_) const {
+                                       OpenWebPageCallback callback_,
+                                       InteractiveDataCallback interactive_data_callback_) const {
     callback = std::move(callback_);
+    interactive_data_callback = std::move(interactive_data_callback_);
 
     const auto index = external_url.find('?');
 
@@ -437,6 +446,10 @@ void QtWebBrowser::OpenExternalWebPage(const std::string& external_url,
     }
 }
 
+void QtWebBrowser::SendInteractiveData(const std::string& data) const {
+    emit MainWindowSendInteractiveData(data);
+}
+
 void QtWebBrowser::MainWindowExtractOfflineRomFS() {
     extract_romfs_callback();
 }
@@ -445,5 +458,11 @@ void QtWebBrowser::MainWindowWebBrowserClosed(Service::AM::Frontend::WebExitReas
                                               std::string last_url) {
     if (callback) {
         callback(exit_reason, last_url);
+    }
+}
+
+void QtWebBrowser::MainWindowInteractiveDataReceived(std::string data) {
+    if (interactive_data_callback) {
+        interactive_data_callback(std::move(data));
     }
 }

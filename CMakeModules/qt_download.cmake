@@ -70,6 +70,16 @@ endif()
 # ── Determine target platform ──────────────────────────────────────────────────
 # WIN32 is TRUE both for native MSYS2 builds and for Linux→Windows cross-compile
 # because the CMAKE_SYSTEM_NAME is Windows in both cases.
+#
+# _QT_WEBENGINE_SUPPORTED tracks whether the qtwebengine module can actually be
+# downloaded/used for the resolved target at all. Per Qt's own platform notes
+# (https://doc.qt.io/qt-6/qtwebengine-platform-notes.html), WebEngine embeds
+# Chromium, which currently does not compile with MinGW on Windows - this is a
+# hard Chromium-level limitation, not something aqt or a different module
+# selection can work around. It works for MSVC (and therefore clang-cl, which
+# is MSVC-ABI-compatible and is what this project's Windows builds actually
+# use it with), Linux, and macOS.
+set(_QT_WEBENGINE_SUPPORTED TRUE)
 if (WIN32)
     set(_QT_OS        "windows")
     set(_QT_TARGET    "desktop")
@@ -79,6 +89,7 @@ if (WIN32)
     else()
         set(_QT_ARCH      "win64_llvm_mingw")
         set(_QT_DIR_NAME  "llvm-mingw_64")
+        set(_QT_WEBENGINE_SUPPORTED FALSE)
     endif()
     set(_QT_CMAKE_SUB "lib/cmake/Qt6")
 else()
@@ -136,27 +147,44 @@ else()
         message(STATUS "[Qt] Qt ${CITRON_QT_VERSION} target downloaded")
     endif()
 
-    # Download additional modules (imageformats, svg).
+    # Download additional modules (imageformats, svg, tools, and - when requested and
+    # supported - webengine).
     # Note: qtmultimedia is intentionally NOT downloaded here — it isn't used
     # by citron-neo on Qt6+.
+    set(_QT_ADDL_MODULES qttools qtimageformats qtsvg)
+    set(_QT_WEBENGINE_CMAKE "${_QT_TARGET_DIR}/lib/cmake/Qt6WebEngineCore/Qt6WebEngineCoreConfig.cmake")
+    if (CITRON_USE_QT_WEB_ENGINE)
+        if (_QT_WEBENGINE_SUPPORTED)
+            list(APPEND _QT_ADDL_MODULES qtwebengine qtpositioning qtwebchannel)
+        else()
+            message(WARNING
+                "[Qt] CITRON_USE_QT_WEB_ENGINE is ON, but qtwebengine is not available for "
+                "${_QT_ARCH} (Qt WebEngine embeds Chromium, which does not compile with MinGW "
+                "on Windows - this is a Qt/Chromium limitation, not an aqt packaging gap). "
+                "Use the MSVC/clang-cl toolchain instead if you need the web applet frontend; "
+                "the build will proceed without it and CITRON_USE_QT_WEB_ENGINE will have no "
+                "effect for this target.")
+        endif()
+    endif()
     set(_QT_SVG_CMAKE  "${_QT_TARGET_DIR}/lib/cmake/Qt6Svg/Qt6SvgConfig.cmake")
     # Qt6CoreTools ships with qtbase itself, so it can't be used to detect a
     # missing qttools module. Qt6LinguistTools is only installed by qttools,
     # so use that as the presence check instead.
     set(_QT_TOOL_CMAKE "${_QT_TARGET_DIR}/lib/cmake/Qt6LinguistTools/Qt6LinguistToolsConfig.cmake")
-    if (NOT EXISTS "${_QT_SVG_CMAKE}" OR NOT EXISTS "${_QT_TOOL_CMAKE}")
-        message(STATUS "[Qt] Downloading Qt ${CITRON_QT_VERSION} additional modules (qttools, qtimageformats, qtsvg)...")
+    if (NOT EXISTS "${_QT_SVG_CMAKE}" OR NOT EXISTS "${_QT_TOOL_CMAKE}"
+            OR (CITRON_USE_QT_WEB_ENGINE AND _QT_WEBENGINE_SUPPORTED AND NOT EXISTS "${_QT_WEBENGINE_CMAKE}"))
+        message(STATUS "[Qt] Downloading Qt ${CITRON_QT_VERSION} additional modules (${_QT_ADDL_MODULES})...")
         execute_process(
             COMMAND ${_AQT_EXECUTABLE} install-qt
                     ${_QT_OS} ${_QT_TARGET}
                     ${CITRON_QT_VERSION} ${_QT_ARCH}
                     --outputdir "${CITRON_QT_BASE_DIR}"
-                    --modules qttools qtimageformats qtsvg
+                    --modules ${_QT_ADDL_MODULES}
             RESULT_VARIABLE _qt_addl_result
             OUTPUT_QUIET ERROR_QUIET
         )
         if (NOT _qt_addl_result EQUAL 0)
-            message(WARNING "[Qt] Additional module install failed (qttools/qtimageformats/qtsvg) — build may fail")
+            message(WARNING "[Qt] Additional module install failed (${_QT_ADDL_MODULES}) — build may fail")
         endif()
     endif()
 

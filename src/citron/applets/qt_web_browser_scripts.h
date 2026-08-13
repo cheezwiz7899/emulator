@@ -92,6 +92,10 @@ window.addEventListener("gamepaddisconnected", function(e) {
 constexpr char WINDOW_NX_SCRIPT[] = R"(
 var end_applet = false;
 var citron_key_callbacks = [];
+// Outgoing window.nx.sendMessage() calls are queued here and drained by the emulator on the
+// GUI thread, which forwards each entry to the guest as interactive-out data. This is what
+// lets pages such as ARCropolis's mod manager actually signal state changes and closure.
+var citron_outgoing_messages = [];
 
 (function() {
     class WindowNX {
@@ -117,7 +121,9 @@ var citron_key_callbacks = [];
         }
 
         sendMessage(message) {
-            console.log("nx.sendMessage is not implemented, message=%s", message);
+            console.log("nx.sendMessage called, message=%s", message);
+
+            citron_outgoing_messages.push(message);
         }
 
         setCursorScrollSpeed(scroll_speed) {

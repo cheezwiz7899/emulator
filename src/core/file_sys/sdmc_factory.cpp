@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <memory>
+#include "common/fs/fs.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/sdmc_factory.h"
 #include "core/file_sys/vfs/vfs.h"
@@ -9,7 +10,14 @@
 
 namespace FileSys {
 
-constexpr u64 SDMC_TOTAL_SIZE = 35733492472; // random shit
+// Fallback capacity used only if the real host filesystem query below fails (e.g. the backing
+// path is temporarily unavailable). Previously this constant was used unconditionally as the
+// entire "SD card", which reports a fixed ~33.28 GiB regardless of the actual host drive - any
+// user whose real sdmc/ directory (mods, saves, installed content, ARCropolis's own SD-card
+// content under atmosphere/contents/, etc.) approaches or exceeds that made every subsequent
+// write look like the SD card was full to the guest, independent of how much real disk space
+// was actually free.
+constexpr u64 SDMC_TOTAL_SIZE = 35733492472;
 
 SDMCFactory::SDMCFactory(VirtualDir sd_dir_, VirtualDir sd_mod_dir_)
     : sd_dir(std::move(sd_dir_)), sd_mod_dir(std::move(sd_mod_dir_)),
@@ -52,11 +60,20 @@ VirtualDir SDMCFactory::GetImageDirectory() const {
 }
 
 u64 SDMCFactory::GetSDMCFreeSpace() const {
-    return GetSDMCTotalSpace() - sd_dir->GetSize();
+    if (Common::FS::GetTotalSpaceSize(sd_dir->GetFullPath()) == 0) {
+        // The real host query below failed (returns 0 on failure) - most likely the backing
+        // path isn't available for some reason. Fall back to the old synthetic-capacity
+        // behavior rather than reporting 0 free space, which would make every subsequent write
+        // look like the SD card is full regardless of how much real disk space exists.
+        return GetSDMCTotalSpace() - sd_dir->GetSize();
+    }
+
+    return Common::FS::GetFreeSpaceSize(sd_dir->GetFullPath());
 }
 
 u64 SDMCFactory::GetSDMCTotalSpace() const {
-    return SDMC_TOTAL_SIZE;
+    const auto host_total_space = Common::FS::GetTotalSpaceSize(sd_dir->GetFullPath());
+    return host_total_space != 0 ? host_total_space : SDMC_TOTAL_SIZE;
 }
 
 } // namespace FileSys
