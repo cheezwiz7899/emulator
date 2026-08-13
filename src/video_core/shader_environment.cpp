@@ -3,11 +3,16 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <ranges>
+#include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -209,6 +214,152 @@ u64 GenericEnvironment::CalculateHash() const {
     return Common::CityHash64(data.get(), size);
 }
 
+namespace {
+// Phase 4 (specialization-constant texture-type resolution) feasibility instrumentation —
+// see handoff_04_specialization_constants_investigation.md item 2 and the doc comments on
+// RecordResolvedTextureType()/RecordResolvedTexturePixelFormat() in environment.h.
+//
+// UNVERIFIED: written without the ability to build or run this codebase (no GPU, no
+// display, no game content available in the environment that wrote this). Cross-checked by
+// hand against every call site, struct, and function it touches, but has not been compiled,
+// let alone run against a real play session. Treat this as a reviewed-on-paper starting
+// point, not landed working diagnostic code — build it and sanity-check the log output
+// against one or two known shaders before trusting any distinct-count number it reports.
+//
+// Keyed by (unique_hash, MakeCbufKey(cbuf_index, cbuf_offset)) — unique_hash is memoized
+// per-GenericEnvironment-instance (texture_slot_diag_hash_cache, shader_environment.h) rather
+// than recomputed per call, since CalculateHash() re-reads and re-hashes the whole shader's
+// GPU-memory bytes every time and this can fire once per texture instruction in a shader.
+//
+// Guarded by one mutex rather than anything lock-free: this only fires on a shader
+// TRANSLATION (i.e. a cache MISS — see LogTextureSlotVarianceReportThrottled()'s doc comment
+// for why a cache HIT can never introduce a new distinct value and is therefore safe to not
+// separately observe), which is already infrequent relative to draw calls, so a mutex is
+// simpler and safer here than optimizing for contention that most likely does not exist.
+//
+// Two independent maps, not one combined (type, format) map: see RecordResolvedTextureType/
+// RecordResolvedTexturePixelFormat's shared doc comment in environment.h for why the two
+// reads aren't reliably paired at a single call site.
+std::mutex g_texture_slot_variance_mutex;
+std::unordered_map<u64, std::unordered_map<u64, std::unordered_set<Shader::TextureType>>>
+    g_texture_types_seen;
+std::unordered_map<u64, std::unordered_map<u64, std::unordered_set<Shader::TexturePixelFormat>>>
+    g_pixel_formats_seen;
+
+// Matches SpirvCache::SaveThrottled's throttling intent (spirv_cache.cpp) — bound log volume
+// over a long session instead of printing on every call. A flat call-count window (not
+// time-based) is enough since call frequency here already tracks translation frequency,
+// itself already infrequent relative to draws.
+constexpr size_t kLogEveryNCalls = 200;
+std::atomic<size_t> g_report_call_count{0};
+} // namespace
+
+void GenericEnvironment::RecordResolvedTextureType(u32 cbuf_index, u32 cbuf_offset, u32 handle,
+                                                    Shader::TextureType type) {
+    if (!texture_slot_diag_hash_cache) {
+        texture_slot_diag_hash_cache = CalculateHash();
+    }
+    std::scoped_lock lock{g_texture_slot_variance_mutex};
+    auto& slot_set = g_texture_types_seen[*texture_slot_diag_hash_cache]
+                                          [MakeCbufKey(cbuf_index, cbuf_offset)];
+    const bool newly_distinct = slot_set.insert(type).second;
+
+    // Phase 4 narrow prototype's texture_key fix — see CapturedPhase4PrototypeHandles's doc
+    // comment in shader_environment.h. Independent of the newly_distinct/diagnostic logging
+    // below: needs every resolved handle for this slot recorded, not just the ones that
+    // introduce a new distinct value.
+    if (Shader::IsPhase4PrototypeSlot(cbuf_index, cbuf_offset)) {
+        phase4_prototype_handles.insert(handle);
+    }
+
+    // Fired only on a genuinely NEW distinct value for a slot that already had at least one —
+    // i.e. exactly the "variance" events the aggregate histogram in
+    // LogTextureSlotVarianceReportThrottled() counts, logged individually and immediately
+    // (not throttled: real session data so far shows these are rare — order of 10, not
+    // thousands — so there's no log-spam risk the way there would be for the per-instruction
+    // recording this function does on every call). TextureType values are logged as their
+    // raw underlying u32 rather than a name — see shader_info.h's `enum class TextureType`
+    // for the mapping (0=Color1D, 1=ColorArray1D, 2=Color2D, 3=ColorArray2D, 4=Color3D,
+    // 5=ColorCube, 6=ColorArrayCube, 7=Buffer, 8=Color2DRect) — no existing fmt::formatter
+    // for this enum was found to reuse, and guessing at one risked a compile error this
+    // session has no way to catch.
+    if (newly_distinct && slot_set.size() > 1) {
+        std::string values;
+        for (const Shader::TextureType seen : slot_set) {
+            values += fmt::format("{}{}", values.empty() ? "" : ",",
+                                   static_cast<u32>(seen));
+        }
+        LOG_INFO(Render_Vulkan,
+                 "Texture slot variance (TextureType) NEW distinct value: shader unique_hash="
+                 "{:016x} cbuf_index={} cbuf_offset={} newly observed type={} — slot's full "
+                 "distinct set so far: [{}]",
+                 *texture_slot_diag_hash_cache, cbuf_index, cbuf_offset,
+                 static_cast<u32>(type), values);
+    }
+}
+
+void GenericEnvironment::RecordResolvedTexturePixelFormat(u32 cbuf_index, u32 cbuf_offset,
+                                                           Shader::TexturePixelFormat format) {
+    if (!texture_slot_diag_hash_cache) {
+        texture_slot_diag_hash_cache = CalculateHash();
+    }
+    std::scoped_lock lock{g_texture_slot_variance_mutex};
+    g_pixel_formats_seen[*texture_slot_diag_hash_cache][MakeCbufKey(cbuf_index, cbuf_offset)]
+        .insert(format);
+}
+
+void GenericEnvironment::LogTextureSlotVarianceReportThrottled() {
+    if (g_report_call_count.fetch_add(1) % kLogEveryNCalls != 0) {
+        return;
+    }
+    std::scoped_lock lock{g_texture_slot_variance_mutex};
+    // Histogram: how many (shader, slot) pairs saw exactly N distinct values, N = 1..5+. A
+    // slot that only ever saw 1 distinct value needs no specialization at all — its current
+    // single fixed OpTypeImage is already correct for every real draw seen so far.
+    //
+    // A cache HIT is never observed here, and does not need to be: a hit only happens when
+    // texture_key already matches a stored entry, and texture_key is derived from the
+    // resolved type/format (ComputeTextureKey, spirv_cache.cpp) — so a hit is, by
+    // construction, always a repeat of an already-recorded value, never a new one. Only
+    // translations (== misses) can introduce a new distinct value, and only translations
+    // reach this recorder, so the histogram is sound without separately instrumenting hits.
+    //
+    // CAVEAT — read before treating the PixelFormat report as equally actionable to the
+    // TextureType report: for ordinary SAMPLED textures (Info::texture_descriptors), pixel
+    // format never becomes part of the emitted OpTypeImage at all (spirv_emit_context.cpp's
+    // ImageType(EmitContext&, const TextureDescriptor&) hardcodes spv::ImageFormat::Unknown
+    // unconditionally — TextureDescriptor has no format field to begin with, see
+    // shader_info.h). Pixel-format variance only has SPIR-V-correctness consequences for
+    // STORAGE images (Info::image_descriptors, which DOES carry ImageFormat and DOES bake it
+    // into OpTypeImage), plus one narrow unrelated case (the !support_snorm_render_buffer
+    // texel-fetch workaround, texture_pass.cpp). This instrumentation does not distinguish
+    // which category a given slot resolves to — the counts below mix both. A high distinct
+    // PixelFormat count is not by itself evidence that specialization constants are needed;
+    // cross-reference against whether that same slot's instructions are ever ImageRead/
+    // ImageWrite/ImageAtomic (storage) before treating it as load-bearing.
+    auto summarize = [](const auto& seen_map, const char* label) {
+        std::array<size_t, 5> bucket{}; // bucket[4] == "5 or more"
+        size_t total_slots = 0;
+        size_t max_distinct = 0;
+        for (const auto& [unique_hash, slots] : seen_map) {
+            for (const auto& [slot_key, values] : slots) {
+                ++total_slots;
+                const size_t distinct = values.size();
+                max_distinct = std::max(max_distinct, distinct);
+                bucket[std::min<size_t>(distinct, 5) - 1]++;
+            }
+        }
+        LOG_INFO(Render_Vulkan,
+                 "Texture slot variance ({}): {} distinct (shader, slot) pairs observed so "
+                 "far — {} saw exactly 1 distinct value, {} saw 2, {} saw 3, {} saw 4, {} saw "
+                 "5+. Max distinct value count for any single slot: {}.",
+                 label, total_slots, bucket[0], bucket[1], bucket[2], bucket[3], bucket[4],
+                 max_distinct);
+    };
+    summarize(g_texture_types_seen, "TextureType");
+    summarize(g_pixel_formats_seen, "TexturePixelFormat, sampled+storage mixed -- see caveat above");
+}
+
 void GenericEnvironment::Dump(u64 pipeline_hash, u64 shader_hash) {
     DumpImpl(pipeline_hash, shader_hash, code, read_highest, read_lowest, initial_offset, stage);
 }
@@ -355,6 +506,51 @@ Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, 
     Tegra::Texture::TICEntry entry;
     gpu_memory->ReadBlock(descriptor_addr, &entry, sizeof(entry));
     return entry;
+}
+
+// Phase 4 narrow prototype's graphics_cache lookup-timing fix (see
+// PipelineCache::ResolvePhase4PrototypeSpecValue, vk_pipeline_cache.cpp, for why this is
+// needed: that function runs BEFORE any Environment exists, so it can't call
+// GenericEnvironment::ReadTextureInfo/GraphicsEnvironment::ReadTextureType directly -- both
+// need a live instance). Duplicates GenericEnvironment::ReadTextureInfo's body exactly, just
+// taking gpu_memory as an explicit parameter instead of implicit instance state (its only
+// dependency on `this` in the original) -- copied character for character from the function
+// immediately above, not reimplemented from scratch, specifically to avoid the two silently
+// drifting apart. Calls ConvertTextureType (this file's anonymous namespace, line ~61)
+// directly by unqualified lookup -- legal and safe: anonymous-namespace members are visible to
+// the rest of this translation unit's enclosing namespace from their point of declaration
+// onward, and this function is defined later in the same file, same as every other place in
+// this file that already calls ConvertTextureType unqualified.
+//
+// UNVERIFIED, same standing as everything else in this session's citron-side work: reasoned
+// through and copied from real existing code, not guessed, but not compiled (no toolchain
+// available here).
+Shader::TextureType ResolveTextureTypeFromRawHandle(Tegra::MemoryManager& gpu_memory,
+                                                     GPUVAddr tic_addr, u32 tic_limit,
+                                                     bool via_header_index, u32 raw) {
+    const auto handle{Tegra::Texture::TexturePair(raw, via_header_index)};
+    Tegra::Texture::TICEntry entry;
+    if (handle.first > tic_limit) {
+        // Mirrors ReadTextureInfo's out-of-range fallback exactly -- same safe default
+        // (A8B8G8R8_UNORM, Texture2D), deliberately without the sentinel-detection logging
+        // ReadTextureInfo has: that logging exists to catch translation-time anomalies in a
+        // shader's actual handle-resolution reads, not to log every draw's speculative,
+        // possibly-irrelevant read of a hardcoded cbuf coordinate that may not even mean
+        // anything for whichever shader happens to be bound (see the caller's doc comment for
+        // why this gets called unconditionally rather than only for known-relevant shaders).
+        entry = Tegra::Texture::TICEntry{};
+        entry.format.Assign(Tegra::Texture::TextureFormat::A8B8G8R8);
+        entry.r_type.Assign(Tegra::Texture::ComponentType::UNORM);
+        entry.g_type.Assign(Tegra::Texture::ComponentType::UNORM);
+        entry.b_type.Assign(Tegra::Texture::ComponentType::UNORM);
+        entry.a_type.Assign(Tegra::Texture::ComponentType::UNORM);
+        entry.texture_type.Assign(Tegra::Texture::TextureType::Texture2D);
+    } else {
+        const GPUVAddr descriptor_addr{tic_addr +
+                                       handle.first * sizeof(Tegra::Texture::TICEntry)};
+        gpu_memory.ReadBlock(descriptor_addr, &entry, sizeof(entry));
+    }
+    return ConvertTextureType(entry);
 }
 
 GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,

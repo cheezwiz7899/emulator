@@ -36,6 +36,18 @@ struct TextureDefinition {
     Id image_type;
     u32 count;
     bool is_multisample;
+    // Phase 4 narrow prototype (specialization-constant texture-type resolution). Only ever
+    // populated for the one hardcoded (cbuf_index=2, cbuf_offset=192) slot -- see
+    // TextureDescriptor::phase4_prototype_polymorphic's doc comment in shader_info.h. When
+    // is_phase4_polymorphic is false (every ordinary descriptor), the alt_*/spec_const_id
+    // fields are unused/default. When true, `id`/`sampled_type`/`image_type` above describe
+    // the canonical (Color2D) variant as usual, and these describe the second (ColorArray2D)
+    // variant plus the boolean spec constant selecting between them.
+    bool is_phase4_polymorphic{false};
+    Id alt_id{};
+    Id alt_sampled_type{};
+    Id alt_image_type{};
+    Id spec_const_id{};
 };
 
 struct TextureBufferDefinition {

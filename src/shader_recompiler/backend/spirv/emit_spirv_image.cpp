@@ -555,9 +555,52 @@ Id EmitImageFetch(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, Id c
 Id EmitImageQueryDimensions(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, Id lod,
                             const IR::Value& skip_mips_val) {
     const auto info{inst->Flags<IR::TextureInstInfo>()};
-    const Id image{TextureImage(ctx, info, index)};
-    const Id zero{ctx.u32_zero_value};
     const bool skip_mips{skip_mips_val.U1()};
+    const Id zero{ctx.u32_zero_value};
+
+    if (const TextureDefinition& maybe_poly{ctx.textures.at(info.descriptor_index)};
+        maybe_poly.is_phase4_polymorphic) {
+        // Phase 4 narrow prototype (specialization-constant texture-type resolution) -- only
+        // ever true for the one hardcoded slot texture_pass.cpp marks (see
+        // TextureDescriptor::phase4_prototype_polymorphic's doc comment, shader_info.h).
+        // info.type is always the canonical Color2D value here -- texture_pass.cpp never
+        // lets it be anything else for this slot -- so the switch below (the ordinary,
+        // non-polymorphic path) is never what actually decides the real type; this branch,
+        // selecting at runtime via the spec constant, is. Mirrors
+        // spec_const_texture_type.spvasm exactly, independently validated with spirv-val
+        // under both vulkan1.4 and vulkan1.1 target environments (see the writeup).
+        //
+        // Assumes maybe_poly.count == 1 (no descriptor-array indexing) for both variants --
+        // true for this one real slot per the empirical data this prototype targets, but not
+        // checked here. A general version would need to handle count > 1 the same way
+        // TextureImage() does for the ordinary path below.
+        const Id is_2d_label{ctx.OpLabel()};
+        const Id is_array_label{ctx.OpLabel()};
+        const Id merge_label{ctx.OpLabel()};
+        ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+        ctx.OpBranchConditional(maybe_poly.spec_const_id, is_array_label, is_2d_label);
+
+        ctx.AddLabel(is_2d_label);
+        const Id img_2d{
+            ctx.OpImage(maybe_poly.image_type, ctx.OpLoad(maybe_poly.sampled_type, maybe_poly.id))};
+        const Id mips_2d{skip_mips ? zero : ctx.OpImageQueryLevels(ctx.U32[1], img_2d)};
+        const Id query_2d{ctx.OpImageQuerySizeLod(ctx.U32[2], img_2d, lod)};
+        const Id result_2d{ctx.OpCompositeConstruct(ctx.U32[4], query_2d, zero, mips_2d)};
+        ctx.OpBranch(merge_label);
+
+        ctx.AddLabel(is_array_label);
+        const Id img_array{ctx.OpImage(maybe_poly.alt_image_type,
+                                       ctx.OpLoad(maybe_poly.alt_sampled_type, maybe_poly.alt_id))};
+        const Id mips_array{skip_mips ? zero : ctx.OpImageQueryLevels(ctx.U32[1], img_array)};
+        const Id query_array{ctx.OpImageQuerySizeLod(ctx.U32[3], img_array, lod)};
+        const Id result_array{ctx.OpCompositeConstruct(ctx.U32[4], query_array, mips_array)};
+        ctx.OpBranch(merge_label);
+
+        ctx.AddLabel(merge_label);
+        return ctx.OpPhi(ctx.U32[4], result_2d, is_2d_label, result_array, is_array_label);
+    }
+
+    const Id image{TextureImage(ctx, info, index)};
     const auto mips{[&] { return skip_mips ? zero : ctx.OpImageQueryLevels(ctx.U32[1], image); }};
     const bool is_msaa{IsTextureMsaa(ctx, info)};
     const bool uses_lod{!is_msaa && info.type != TextureType::Buffer};

@@ -222,6 +222,14 @@ struct TextureDescriptor {
     u32 secondary_shift_left;
     u32 count;
     u32 size_shift;
+    // Phase 4 narrow prototype (specialization-constant texture-type resolution) --
+    // hardcoded to the one real, empirically-identified (cbuf_index=2, cbuf_offset=192)
+    // pattern from handoff_04's investigation (Color2D/ColorArray2D variance, 12 real TotK
+    // shaders). NOT a general mechanism -- see the accompanying writeup for what a real,
+    // shipped version of this would need beyond this one hardcoded case. Deliberately left
+    // out of the operator<=>/Add() dedup predicate below: it doesn't change what makes two
+    // descriptors "the same" for caching purposes, only how this one gets emitted.
+    bool phase4_prototype_polymorphic = false;
 
     auto operator<=>(const TextureDescriptor&) const = default;
 };

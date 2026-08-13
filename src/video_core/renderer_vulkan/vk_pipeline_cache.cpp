@@ -63,6 +63,7 @@ using VideoCommon::SpirvKey;
 using VideoCommon::ComputeCbufKey;
 using VideoCommon::ComputeCbufKeyExcludingTextureHandles;
 using VideoCommon::ComputeTextureKey;
+using VideoCommon::ComputeTextureKeyExcludingHandles;
 using VideoCommon::ComputeBindingKey;
 using VideoCommon::ComputeWorkgroupKey;
 using VideoCommon::FoldViewportTransformState;
@@ -555,12 +556,110 @@ void PipelineCache::EvictOldPipelines() {
     }
 }
 
+// Phase 4 narrow prototype's graphics_cache lookup-timing fix. The problem this solves:
+// graphics_key (unique_hashes + fixed-function state) gets looked up in graphics_cache/
+// current_pipeline->Next() BEFORE any Shader::Environment exists -- CurrentGraphicsPipeline()
+// only reaches CreateGraphicsPipeline() (where env access and this slot's real resolution
+// already happen, see the texture_key fix above) on a cache MISS. Without this,
+// phase4_prototype_needs_array_variant only ever gets a real value after the lookup its whole
+// purpose depends on has already happened.
+//
+// Reads the (cbuf_index=2, cbuf_offset=192) raw handle directly from GPU state and resolves
+// its TextureType, mirroring GraphicsEnvironment::ReadCbufValue/ReadTextureType's actual GPU
+// access exactly (confirmed by reading both, not assumed) but without needing a live
+// GraphicsEnvironment instance -- ResolveTextureTypeFromRawHandle (shader_environment.h/.cpp)
+// is the shared piece both this and the real environment path use.
+//
+// Two real, deliberate simplifications, not oversights:
+// - Assumes no secondary cbuf combine for this one slot (GetTextureHandle, texture_pass.cpp,
+//   can OR together two separate cbuf reads via has_secondary/secondary_cbuf_index/
+//   secondary_cbuf_offset when a descriptor needs it). Not confirmed either way for the real
+//   slot this prototype targets -- this session has no way to inspect that shader's actual
+//   descriptor fields directly. If it turns out this slot does use a secondary combine, this
+//   function silently resolves the wrong handle. Flagging plainly rather than guessing further.
+// - Runs unconditionally for every draw with an active fragment stage, not just draws using
+//   one of the 12 real shaders this prototype targets -- Shader::Info (which would say "this
+//   shader actually has the marked descriptor") isn't available at this point any more than
+//   the environment is. Reading garbage cbuf content for unrelated fragment shaders is safe
+//   (see below), but see this function's use in CurrentGraphicsPipeline for why it could still
+//   theoretically add spurious graphics_key entropy for shaders that don't actually care.
+//
+// Returns false (the same default the SPIR-V's spec constant itself defaults to) whenever cbuf
+// 2 isn't enabled or offset 192 is out of range for the currently-bound fragment shader --
+// exactly the same safe-fallback shape ReadCbufValue/ReadTextureInfo already use for their own
+// out-of-range cases, so an unrelated shader reading garbage here is, at worst, exactly as safe
+// as any other out-of-range cbuf read already is elsewhere in this codebase.
+bool PipelineCache::ResolvePhase4PrototypeSpecValue() const {
+    // Two different indices for two different arrays, both real, both required -- conflating
+    // them is exactly what caused the freeze a real build surfaced. unique_hashes (this
+    // function's first check, and the key phase4_prototype_fragment_shader_table above is
+    // keyed by) is populated in ShaderCache::RefreshStages via a direct
+    // static_cast<ShaderType>(index) -- confirmed by reading that function, not assumed -- so
+    // it uses the RAW hardware ShaderType numbering (VertexA=0, VertexB=1, TessellationInit=2,
+    // Tessellation=3, Geometry=4, Pixel=5). shader_stages (this function's second check, the
+    // actual cbuf read) uses the SOFTWARE Shader::Stage numbering instead (VertexB=0, ...,
+    // Fragment=4) -- confirmed against GraphicsEnvironment's own ShaderType::Pixel ->
+    // stage_index=4 mapping. CreateGraphicsPipeline's own `stage_index = index - 1` (this same
+    // file) is the concrete conversion between the two, and is what pins these two numbers
+    // down as correct rather than assumed.
+    constexpr size_t kFragmentHardwareIndex = 5;    // ShaderType::Pixel, for unique_hashes only.
+    constexpr size_t kFragmentSoftwareIndex = 4;    // Shader::Stage::Fragment, for shader_stages.
+    const u64 fragment_hash{graphics_key.unique_hashes[kFragmentHardwareIndex]};
+    if (fragment_hash == 0) {
+        return false; // No fragment shader bound at all.
+    }
+
+    // The actual fix for the freeze: only ever do the speculative cbuf read for a fragment
+    // shader CONFIRMED (via real Shader::Info, recorded in CreateGraphicsPipeline the one time
+    // this shader was actually translated) to have the marked descriptor. Every other
+    // fragment shader -- the overwhelming majority -- returns false here without touching GPU
+    // memory at all, every single draw, forever, once seen once. A shader not yet in the table
+    // (never translated) also returns false rather than guessing: reading cbuf 2 offset 192
+    // speculatively for a genuinely unknown shader is exactly the behavior that turned
+    // unrelated per-draw application data into a constantly-changing graphics_key and froze
+    // real gameplay -- not worth doing even once more now that it's understood.
+    //
+    // shared_lock, released before the GPU read below: extract a plain bool from the iterator
+    // while the lock is held (see phase4_prototype_fragment_shader_table_mutex's doc comment,
+    // vk_pipeline_cache.h, for why an unsynchronized read here was itself a real bug, not just
+    // the write) -- the iterator itself would not be safe to keep using once the lock releases,
+    // and the GPU read that follows doesn't touch this table at all, so there's no reason to
+    // hold the lock any longer than the lookup itself needs.
+    bool shader_has_marked_slot = false;
+    {
+        std::shared_lock lock{phase4_prototype_fragment_shader_table_mutex};
+        const auto it{phase4_prototype_fragment_shader_table.find(fragment_hash)};
+        shader_has_marked_slot = it != phase4_prototype_fragment_shader_table.end() && it->second;
+    }
+    if (!shader_has_marked_slot) {
+        return false;
+    }
+
+    constexpr u32 kPrototypeCbufIndex = 2;
+    constexpr u32 kPrototypeCbufOffset = 192;
+    const auto& cbuf{maxwell3d->state.shader_stages[kFragmentSoftwareIndex]
+                          .const_buffers[kPrototypeCbufIndex]};
+    if (!cbuf.enabled || kPrototypeCbufOffset >= cbuf.size) {
+        return false;
+    }
+    const u32 handle{gpu_memory->Read<u32>(cbuf.address + kPrototypeCbufOffset)};
+    const auto& regs{maxwell3d->regs};
+    const bool via_header_index{regs.sampler_binding == Tegra::Engines::Maxwell3D::Regs::SamplerBinding::ViaHeaderBinding};
+    const Shader::TextureType resolved{VideoCommon::ResolveTextureTypeFromRawHandle(
+        *gpu_memory, regs.tex_header.Address(), regs.tex_header.limit, via_header_index, handle)};
+    return resolved == Shader::TextureType::ColorArray2D;
+}
+
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     if (!RefreshStages(graphics_key.unique_hashes)) {
         current_pipeline = nullptr;
         return nullptr;
     }
     graphics_key.state.Refresh(*maxwell3d, dynamic_features);
+    // Phase 4 narrow prototype's graphics_cache lookup-timing fix -- must happen here, after
+    // unique_hashes/state are current but before current_pipeline->Next()/graphics_cache are
+    // consulted below, since graphics_key IS the lookup key both of those use.
+    graphics_key.phase4_prototype_needs_array_variant = ResolvePhase4PrototypeSpecValue();
 
     if (current_pipeline) {
         GraphicsPipeline* const next{current_pipeline->Next(graphics_key)};
@@ -904,6 +1003,28 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         const size_t stage_index{index - 1};
         infos[stage_index] = &program.info;
 
+        // Phase 4 narrow prototype: this is the one place real Shader::Info exists for a
+        // freshly-translated fragment shader (stage_index 4 == Shader::Stage::Fragment, per
+        // StageFromIndex -- NOT the same as key.unique_hashes' own index 5 for this same
+        // stage, ShaderType::Pixel's raw hardware position; index here is 1 less than that
+        // because this loop's `index` uses the raw ShaderType numbering directly, same as
+        // key.unique_hashes, while stage_index is already converted). Recording once here
+        // means ResolvePhase4PrototypeSpecValue never needs to guess for a shader it's already
+        // seen -- see phase4_prototype_fragment_shader_table's doc comment, vk_pipeline_cache.h.
+        if (stage_index == 4) {
+            const bool has_marked_slot{std::ranges::any_of(
+                program.info.texture_descriptors,
+                [](const Shader::TextureDescriptor& desc) {
+                    return desc.phase4_prototype_polymorphic;
+                })};
+            // See phase4_prototype_fragment_shader_table_mutex's doc comment,
+            // vk_pipeline_cache.h -- this function can run on a worker thread
+            // (workers.QueueWork, the boot-time bulk pipeline-loading path), so this write
+            // needs real synchronization, not just the table itself existing.
+            std::unique_lock lock{phase4_prototype_fragment_shader_table_mutex};
+            phase4_prototype_fragment_shader_table[key.unique_hashes[index]] = has_marked_slot;
+        }
+
         const auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage)};
         ConvertLegacyToGeneric(program, runtime_info);
         // SPIR-V cache check
@@ -944,8 +1065,16 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                                    file_env_stage->CapturedTextureHandleCbufKeys())
                              : 0;
         const u64 texture_key =
-            gen_env_stage    ? ComputeTextureKey(gen_env_stage->CapturedTextureTypes(),
-                                                 gen_env_stage->CapturedTexturePixelFormats())
+            // Phase 4 narrow prototype's texture_key fix: exclude handles resolved for the
+            // one hardcoded polymorphic slot, so its two real variants hash the same instead
+            // of fragmenting the cache. FileEnvironment falls back to plain ComputeTextureKey
+            // -- it doesn't derive from GenericEnvironment, so it has no
+            // CapturedPhase4PrototypeHandles() to exclude with, same reasoning as the cbuf_key
+            // narrowing diagnostic just below already applies to that path.
+            gen_env_stage    ? ComputeTextureKeyExcludingHandles(
+                                   gen_env_stage->CapturedTextureTypes(),
+                                   gen_env_stage->CapturedTexturePixelFormats(),
+                                   gen_env_stage->CapturedPhase4PrototypeHandles())
             : file_env_stage ? ComputeTextureKey(file_env_stage->CapturedTextureTypes(),
                                                  file_env_stage->CapturedTexturePixelFormats())
                              : 0;
@@ -1057,6 +1186,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 if (!spirv_cache_filename.empty()) {
                     serialization_thread.QueueWork([this] { spirv_cache.SaveThrottled(spirv_cache_filename); });
                 }
+                // Phase 4 feasibility instrumentation — see LogTextureSlotVarianceReportThrottled's
+                // doc comment in shader_environment.h. Unconditional (not gated on
+                // spirv_cache_filename): unrelated to whether disk persistence is configured.
+                VideoCommon::GenericEnvironment::LogTextureSlotVarianceReportThrottled();
             }
             code.reserve(std::max<size_t>(code.size(), 16 * 1024 / sizeof(u32)));
         }
@@ -1187,8 +1320,14 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
                                                            file_env->CapturedTextureHandleCbufKeys())
                    : 0;
     const u64 texture_key_c =
-        gen_env    ? ComputeTextureKey(gen_env->CapturedTextureTypes(),
-                                       gen_env->CapturedTexturePixelFormats())
+        // Phase 4 narrow prototype's texture_key fix — see the matching comment in
+        // CreateGraphicsPipeline() above. This hardcoded slot is graphics-content-shaped
+        // (a portal/particle effect), so this branch firing in practice is unlikely, but the
+        // fix is applied here too for correctness rather than assuming compute never touches
+        // it.
+        gen_env    ? ComputeTextureKeyExcludingHandles(gen_env->CapturedTextureTypes(),
+                                                       gen_env->CapturedTexturePixelFormats(),
+                                                       gen_env->CapturedPhase4PrototypeHandles())
         : file_env ? ComputeTextureKey(file_env->CapturedTextureTypes(),
                                        file_env->CapturedTexturePixelFormats())
                    : 0;
@@ -1237,6 +1376,9 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
             serialization_thread.QueueWork([this] {
                 spirv_cache.SaveThrottled(spirv_cache_filename); });
         }
+        // Phase 4 feasibility instrumentation — see the matching comment at the
+        // CreateGraphicsPipeline call site above.
+        VideoCommon::GenericEnvironment::LogTextureSlotVarianceReportThrottled();
     }
     // Ensure the upload copy has enough capacity on the cache-hit path too.
     code.reserve(std::max<size_t>(code.size(), 16 * 1024 / sizeof(u32)));
@@ -1419,7 +1561,15 @@ void PipelineCache::SubmitSpeculativeShader(
                 Shader::Maxwell::ConvertLegacyToGeneric(program, rt);
             }
             auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, rt, program, binding);
-            const u64 texture_key = ComputeTextureKey(env.CapturedTextureTypes(), env.CapturedTexturePixelFormats());
+            const u64 texture_key = ComputeTextureKey(env.CapturedTextureTypes(),
+                                                       env.CapturedTexturePixelFormats());
+            // Phase 4 narrow prototype's texture_key fix is NOT applied here -- confirmed by
+            // an actual build (not assumed, and an earlier version of this comment wrongly
+            // assumed otherwise): `env` in this function is VideoCommon::
+            // SpeculativeShaderEnvironment, which does not derive from GenericEnvironment and
+            // has no CapturedPhase4PrototypeHandles() to exclude with. Same treatment as the
+            // FileEnvironment branches elsewhere in this file -- reduced-capability path, no
+            // exclusion applied, plain ComputeTextureKey.
             // SpirvRelevantHash(stage), not Hash() — see the same swap and its
             // rationale in CreateGraphicsPipeline() above. Matters doubly here:
             // this is the SAME function that produces the actual translated SPIR-V
@@ -1456,6 +1606,9 @@ void PipelineCache::SubmitSpeculativeShader(
                     spirv_cache.SaveThrottled(spirv_cache_filename);
                 });
             }
+            // Phase 4 feasibility instrumentation — see the matching comment at the
+            // CreateGraphicsPipeline call site above.
+            VideoCommon::GenericEnvironment::LogTextureSlotVarianceReportThrottled();
         } catch (...) {}
     });
 }
