@@ -114,6 +114,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include <QtConcurrent/QtConcurrent>
 
 #ifdef HAVE_SDL2
+#define SDL_MAIN_HANDLED
 #include <SDL.h> // For SDL ScreenSaver functions
 #endif
 
@@ -6830,6 +6831,13 @@ static void SetHighDPIAttributes() {
 #endif
 
 int main(int argc, char* argv[]) {
+#ifdef HAVE_SDL2
+    // SDL_MAIN_HANDLED (see the SDL.h include above) stops SDL from trying to
+    // supply its own main()/WinMain(); we provide main() directly, so SDL
+    // needs to be told we're ready before any other SDL call.
+    SDL_SetMainReady();
+#endif
+
     // 1. Detect Gamescope/Steam Deck hardware
     const bool is_gamescope = UISettings::IsGamescope();
 
