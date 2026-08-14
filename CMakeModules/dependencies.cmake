@@ -553,7 +553,6 @@ set(CITRON_XCB_KEYSYMS_VER "0.4.1" CACHE STRING "XCB keysyms version")
 set(CITRON_XCB_RENDERUTIL_VER "0.3.10" CACHE STRING "XCB renderutil version")
 set(CITRON_XCB_WM_VER "0.4.2" CACHE STRING "XCB wm version")
 
-set(CITRON_VULKAN_LOADER_TAG "vulkan-sdk-1.4.350.0" CACHE STRING "Vulkan-Loader/Vulkan-Headers git tag (packaging use only, not a compile-time dependency)")
 # ── Tracy (optional profiler) ─────────────────────────────────────────────────
 # Fetched only when CITRON_ENABLE_TRACY=ON.  TRACY_ENABLE must be set before
 # CPMAddPackage so the client library and application agree on configuration.
@@ -650,16 +649,6 @@ if (ENABLE_QT AND NOT USE_SYSTEM_QT)
     if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
         include(${CMAKE_SOURCE_DIR}/CMakeModules/xcb_build.cmake)
     endif()
-endif()
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Vulkan loader (packaging only — not a link-time dependency of anything)
-# ═══════════════════════════════════════════════════════════════════════════════
-# Deliberately not nested under the Qt block above: citron-cmd (SDL2, no Qt)
-# needs Vulkan too, and neither actually links the loader at compile time —
-# see vulkan_loader_build.cmake's own header comment for why this exists.
-if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    include(${CMAKE_SOURCE_DIR}/CMakeModules/vulkan_loader_build.cmake)
 endif()
 
 message(STATUS "[CPM] All dependency packages configured")

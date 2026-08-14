@@ -74,6 +74,8 @@
 #   --tracy-alloc         Enable Tracy heap allocator tracking (default off, requires --tracy)
 #   --relwithdebinfo      Include debug symbols alongside optimizations
 #   --clang-version N     Clang version to use (default: 21)
+#   --container           Build in the reusable Arch container (default: auto)
+#   --native              Do not enter a container
 #   --help, -h            Show this message
 #
 # TYPICAL WORKFLOWS:
@@ -137,6 +139,58 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ -f "${SCRIPT_DIR}/CMakeLists.txt" ]] \
     || { echo "[ERROR] CMakeLists.txt not found next to this script." >&2; exit 1; }
+
+# =============================================================================
+# Reusable pkgforge Arch build container
+# =============================================================================
+# CI and self-builds use the same pkgforge base image.  CPM dependencies
+# remain built by CMake inside the mounted checkout; `setup` installs Citron's
+# toolchain and package/runtime inputs inside the container.
+_container_mode="${CITRON_CONTAINER_MODE:-auto}"
+_inside_arch="${CITRON_IN_ARCH_CONTAINER:-0}"
+_forward_args=()
+for _arg in "$@"; do
+    case "${_arg}" in
+        --inside-arch-container) _inside_arch=1 ;;
+        --container) _container_mode=container ;;
+        --native) _container_mode=native ;;
+        *) _forward_args+=("${_arg}") ;;
+    esac
+done
+set -- "${_forward_args[@]}"
+
+# Existing CI workflow containers do not need Docker-in-Docker while the
+# workflow is being migrated to this entry point.
+if [[ -f /etc/arch-release && -f /.dockerenv ]]; then
+    _inside_arch=1
+    export CITRON_IN_ARCH_CONTAINER=1
+fi
+
+if [[ "${_inside_arch}" != 1 && "${_container_mode}" != native ]]; then
+    _container_runtime="${CITRON_CONTAINER_RUNTIME:-}"
+    if [[ -z "${_container_runtime}" ]]; then
+        command -v docker >/dev/null 2>&1 && _container_runtime=docker
+        command -v podman >/dev/null 2>&1 && _container_runtime=${_container_runtime:-podman}
+    fi
+    if [[ -z "${_container_runtime}" ]]; then
+        if [[ "${_container_mode}" = container ]]; then
+            echo "[ERROR] --container requested but neither docker nor podman was found." >&2
+            exit 1
+        fi
+        echo "[WARN] No container runtime found; using native build. Pass --container to require Arch." >&2
+    else
+        _container_image="${CITRON_ARCH_IMAGE:-ghcr.io/pkgforge-dev/archlinux:latest}"
+        _container_env=( -e CITRON_IN_ARCH_CONTAINER=1 )
+        for _name in CLANG_VERSION BUILD_ROOT JOBS LTO_MODE PGO_MODE UNITY_BUILD DEVEL CPM_SOURCE_CACHE; do
+            [[ -z "${!_name+x}" ]] || _container_env+=( -e "${_name}" )
+        done
+        exec "${_container_runtime}" run --rm --init \
+            "${_container_env[@]}" \
+            -v "${SCRIPT_DIR}:/workspace" -w /workspace \
+            "${_container_image}" \
+            bash ./build-citron-linux.sh --inside-arch-container "$@"
+    fi
+fi
 
 # =============================================================================
 # Configuration defaults
@@ -561,6 +615,23 @@ _setup_pacman() {
 
     # Optional: bundled into the AppImage by package-citron-linux.sh if present.
     $SUDO pacman -S --needed --noconfirm gamemode 2>/dev/null || true
+
+    # If in an arch container, use pkgforge's debloated packages
+    if [[ "${CITRON_IN_ARCH_CONTAINER:-0}" = 1 && -f /etc/arch-release ]]; then
+        local debloated_helper
+        debloated_helper="$(mktemp)"
+        curl -fL --retry 30 \
+            "https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/e9414c02f713359b551bcfa3832576d2992b13da/useful-tools/get-debloated-pkgs.sh" \
+            -o "${debloated_helper}"
+        chmod +x "${debloated_helper}"
+        info "Installing pkgforge debloated Mesa/LLVM runtime packages..."
+        if [[ "$(uname -m)" = x86_64 ]]; then
+            "${debloated_helper}" --add-mesa --prefer-nano intel-media-driver-mini
+        else
+            "${debloated_helper}" --add-mesa --prefer-nano
+        fi
+        rm -f "${debloated_helper}"
+    fi
 
     # Arch ships unversioned tools — symlink to versioned names
     for tool in clang clang++ lld llvm-profdata llvm-bolt merge-fdata; do
@@ -1381,7 +1452,6 @@ build_appimage_stage() {
     DESTDIR="${install_root}" \
     CITRON_QT_PATH="${CITRON_QT_PATH}" \
     CITRON_XCB_PATH="${CITRON_XCB_PATH:-}" \
-    CITRON_VULKAN_LOADER_PATH="${CITRON_VULKAN_LOADER_PATH:-}" \
         bash "${SCRIPT_DIR}/AppImageBuilder/package-citron-linux.sh" \
         || error "package-citron-linux.sh failed for ${stage_name}"
 

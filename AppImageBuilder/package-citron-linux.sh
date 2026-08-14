@@ -18,14 +18,13 @@
 #   OUTPATH         Output dir for finished artifacts (default: $PWD/dist)
 #   DESTDIR         Staging root under which citron was installed (/usr layout)
 #   STRACE_MODE     dlopen/LD_DEBUG scan on startup (default: 0)
-#   DEPLOY_VULKAN   Bundle Vulkan loader (default: 1)
+#   DEPLOY_VULKAN   Deploy bundled Vulkan/Mesa support (default: 1)
 #   DEPLOY_OPENGL   Bundle Mesa OpenGL/EGL/GLX (default: 0)
 #   DEPLOY_PIPEWIRE Bundle PipeWire tree (default: 0)
 #   DEPLOY_GLIBC    Bundle glibc from Arch container (default: 1)
 #   DEPLOY_GTK      Bundle GTK modules (default: 0)
 #   CITRON_QT_PATH  CPM Qt6 prefix
 #   CITRON_XCB_PATH CPM XCB prefix
-#   CITRON_VULKAN_LOADER_PATH CPM Vulkan loader lib dir
 
 set -ex
 
@@ -74,10 +73,12 @@ fi
 
 # ── quick-sharun deployment flags ───────────────────────────────────────────
 export STRACE_MODE="${STRACE_MODE:-0}"
+# Bundle the portable Vulkan loader and open Mesa driver closure.  A runtime
+# hook appends only proprietary host NVIDIA ICDs.
 export DEPLOY_VULKAN="${DEPLOY_VULKAN:-1}"
 export DEPLOY_OPENGL="${DEPLOY_OPENGL:-0}"
 export DEPLOY_PIPEWIRE="${DEPLOY_PIPEWIRE:-0}"
-# DEPLOY_GLIBC=1: Bundle glibc from Arch container (glibc 2.41+) for broad host compatibility.
+# DEPLOY_GLIBC=1: Bundle glibc from Arch container for broad host compatibility.
 export DEPLOY_GLIBC="${DEPLOY_GLIBC:-1}"
 # DEPLOY_GTK=0: GTK3 is not bundled. libqgtk3.so is purged in cleanup below to force Qt
 # to use D-Bus libqxdgdesktopportal.so, avoiding host GTK module crashes on GTK distros.
@@ -123,14 +124,11 @@ EXTRA_LIBS=""
 GAMEMODE_LIB="$(ldconfig -p 2>/dev/null | awk '/libgamemode\.so/ {print $NF; exit}')"
 [ -n "$GAMEMODE_LIB" ] && EXTRA_LIBS="$EXTRA_LIBS $GAMEMODE_LIB"
 
-# libLLVM is a hard dep of radeonsi_drv_video.so but is NOT in quick-sharun's default
-# ANYLINUX_DO_NOT_LOAD_LIBS exclusion list. Append it so lookup falls through to the host.
-# Same for libudev.so* - must use host system's udev daemon protocol.
-# Append to any caller-provided value rather than overwriting it.
+# libudev always uses the host daemon protocol.
 if [ -n "${ANYLINUX_DO_NOT_LOAD_LIBS:-}" ]; then
-    export ANYLINUX_DO_NOT_LOAD_LIBS="${ANYLINUX_DO_NOT_LOAD_LIBS}:libLLVM.so*:libudev.so*"
+    export ANYLINUX_DO_NOT_LOAD_LIBS="${ANYLINUX_DO_NOT_LOAD_LIBS}:libudev.so*"
 else
-    export ANYLINUX_DO_NOT_LOAD_LIBS="libLLVM.so*:libudev.so*"
+    export ANYLINUX_DO_NOT_LOAD_LIBS="libudev.so*"
 fi
 
 # shellcheck disable=SC2086
@@ -149,14 +147,8 @@ if [ -n "${CITRON_QT_PATH:-}" ] && [ -d "${CITRON_QT_PATH}/translations" ]; then
           ./AppDir/usr/share/qt6/translations/linguist*.qm 2>/dev/null || true
 fi
 
-# Vulkan loader: Replace quick-sharun's system glob with CPM-built loader if path is provided.
-if [ -n "${CITRON_VULKAN_LOADER_PATH:-}" ] && [ -d "${CITRON_VULKAN_LOADER_PATH}" ]; then
-    find ./AppDir/lib -maxdepth 1 -iname 'libvulkan.so*' -delete 2>/dev/null || true
-    cp -P "${CITRON_VULKAN_LOADER_PATH}"/libvulkan.so* ./AppDir/lib/
-fi
-
 # ── Post-dep-scan cleanup ────────────────────────────────────────────────────
-# Stage ld-linux into AppDir/shared/lib/ for sharun AppRun.lib
+# Stage ld-linux into AppDir/shared/lib/ for sharun AppRun.lib.
 _interp=$(patchelf --print-interpreter "${DESTDIR}/usr/bin/citron" 2>/dev/null)
 if [ -z "${_interp}" ]; then
     _interp=$(readelf -l "${DESTDIR}/usr/bin/citron" 2>/dev/null \
@@ -170,32 +162,21 @@ else
     printf 'WARNING: could not determine PT_INTERP of citron; AppImage may fail with "Interpreter not found!"\n' >&2
 fi
 
-# Remove unused OpenGL/Mesa bloat (citron uses Vulkan only). Keep libqxcb-egl-integration.so.
-find "${_appdir}" -name 'libqxcb-glx-integration.so' -delete 2>/dev/null || true
-find "${_appdir}" -name 'libgallium-*.so'            -delete 2>/dev/null || true
-find "${_appdir}" -name 'libLLVM.so.*'               -delete 2>/dev/null || true
-find "${_appdir}" -path '*/dri/*'                    -delete 2>/dev/null || true
-find "${_appdir}" -name 'libxcb-glx.so*'             -delete 2>/dev/null || true
+# quick-sharun owns the complete Vulkan/Mesa closure.  Do not prune graphics
+# drivers or LLVM here: that would create an unsupported partial driver stack.
 # libqgtk3.so: Qt GTK3 platform theme. Purged to force Qt to use D-Bus libqxdgdesktopportal.so,
 # preventing host GTK module crashes on GTK desktops (Linux Mint, Ubuntu GNOME, XFCE).
 find "${_appdir}" -name 'libqgtk3.so'                -delete 2>/dev/null || true
+# Keep quick-sharun's bundled loader as the portable default. A runtime hook
+# below provides an explicit host-loader escape hatch before Citron starts.
 # use host libudev
 find "${_appdir}" -name 'libudev.so.*'               -delete 2>/dev/null || true
 
-# Sanity check: confirm citron and the bundled Vulkan loader don't have an
-# unresolved dependency, and confirm which loader actually shipped. Runs
-# after cleanup, not before — an earlier version of this ran before the
-# Vulkan loader override above and consequently always showed the
-# pre-override state, never catching that the override wasn't happening.
+# Sanity check: confirm citron's final AppDir dependencies after cleanup.
 # Grep the build log for "ldd:" to find this.
 if [ "${PACKAGE_DIAGNOSTICS:-1}" = "1" ]; then
     echo "ldd: citron"
     ldd "${_appdir}/shared/bin/citron" 2>&1 || true
-    _vk="$(find "${_appdir}" -iname 'libvulkan.so.1' 2>/dev/null | head -1)"
-    if [ -n "${_vk}" ]; then
-        echo "shipped Vulkan loader: ${_vk}"
-        ldd "${_vk}" 2>&1 || true
-    fi
 fi
 
 # qt.conf next to the real citron binary in shared/bin/, not usr/bin/.
@@ -223,16 +204,6 @@ if [ "${DEVEL:-false}" = 'true' ]; then
     sed -i 's|^Name=citron$|Name=citron nightly|' ./AppDir/*.desktop 2>/dev/null || true
 fi
 
-# Allow the host's Vulkan ICD to override the bundled loader at runtime.
-# Replace-or-append rather than truncate: quick-sharun's own deployment pass
-# writes its own entries to this same .env (GTK/Qt renderer settings,
-# ANYLINUX_DO_NOT_LOAD_LIBS, etc.) and a truncating write here would discard
-# them.
-sed -i '/^SHARUN_ALLOW_SYS_VKICD=/d' ./AppDir/.env 2>/dev/null || true
-printf 'SHARUN_ALLOW_SYS_VKICD=1\n' >> ./AppDir/.env
-
-
-
 # PGO profile data next to the running AppImage on exit ($APPIMAGE is
 # exported by sharun's AppRun at runtime). Can't live in .env: that file is
 # parsed by a plain key=value dotenv reader and can't execute
@@ -247,57 +218,81 @@ chmod +x ./AppDir/bin/01-llvm-profile.hook
 
 # hwaccel hook: VAAPI, VDPAU, Vulkan video decode.
 #
-# VAAPI: libva.so has "/usr/lib/dri" compiled in as its default driver path
-# (Arch convention). Works on Arch/CachyOS and some Debian/Ubuntu hosts.
-# Fedora keeps drivers under /usr/lib64/dri only — hardcoded lookup finds
-# nothing there. LIBVA_DRIVERS_PATH is libva's own override; probe common
-# distro paths and set it to whichever one has the actual driver.
+# VAAPI: open Mesa drivers are bundled under AppDir/lib/dri.  Only proprietary
+# NVIDIA uses host video drivers; an NVIDIA PCI ID can also mean Mesa NVK.
 #
-# VDPAU: without a GLX context, libvdpau defaults to "nvidia" regardless of
-# hardware. Force VDPAU_DRIVER=radeonsi on AMD hosts; skip on NVIDIA
-# (proprietary driver provides correct GLX-based detection independently).
+# VDPAU: select bundled radeonsi on AMD systems unless proprietary NVIDIA is
+# installed; the latter supplies its own matching host implementation.
 #
 # Vulkan video: RADV decode extensions are off by default on most Mesa/HW
 # combos. Set both RADV_PERFTEST and RADV_EXPERIMENTAL for forward/backward
 # compat (unknown names are silently ignored).
 cat <<-'HOOK_EOF' > ./AppDir/bin/02-hwaccel.hook
 #!/bin/sh
-if [ -z "${LIBVA_DRIVERS_PATH:-}" ]; then
-    for _d in /usr/lib64/dri /usr/lib/x86_64-linux-gnu/dri /usr/lib/dri /run/opengl-driver/lib/dri; do
-        if [ -e "${_d}/radeonsi_drv_video.so" ] || [ -e "${_d}/iHD_drv_video.so" ] \
-            || [ -e "${_d}/nouveau_drv_video.so" ] || [ -e "${_d}/nvidia_drv_video.so" ]; then
-            export LIBVA_DRIVERS_PATH="${_d}"
-            break
-        fi
-    done
-fi
-
-case ",${RADV_PERFTEST:-}," in
-    *,video_decode,*) ;;
-    ,,) export RADV_PERFTEST=video_decode ;;
-    *) export RADV_PERFTEST="${RADV_PERFTEST},video_decode" ;;
-esac
-export RADV_EXPERIMENTAL="${RADV_EXPERIMENTAL:+${RADV_EXPERIMENTAL},}video_decode"
-
-if [ -z "${VDPAU_DRIVER:-}" ]; then
-    _nvidia_vdpau=""
-    for _d in /usr/lib64 /usr/lib/x86_64-linux-gnu /usr/lib /usr/lib/vdpau; do
-        if [ -e "${_d}/vdpau/libvdpau_nvidia.so" ] || [ -e "${_d}/libvdpau_nvidia.so" ]; then
-            _nvidia_vdpau=1
-            break
-        fi
-    done
-    if [ -z "${_nvidia_vdpau}" ]; then
-        _amd_vdpau=""
-        for _d in /usr/lib64/vdpau /usr/lib/x86_64-linux-gnu/vdpau /usr/lib/vdpau /usr/lib64 /usr/lib; do
-            if [ -e "${_d}/libvdpau_radeonsi.so" ]; then
-                _amd_vdpau=1
-                break
+_citron_has_amd=""
+_citron_has_proprietary_nvidia=""
+for _vendor in /sys/class/drm/card*/device/vendor; do
+    case "$(cat "${_vendor}" 2>/dev/null)" in
+        0x1002) _citron_has_amd=1 ;;
+        0x10de)
+            # NVK/Nouveau also reports NVIDIA's PCI vendor ID.  Treat it as
+            # proprietary only when the host exposes NVIDIA's actual driver.
+            [ -r /proc/driver/nvidia/version ] && _citron_has_proprietary_nvidia=1
+            if [ -z "${_citron_has_proprietary_nvidia}" ]; then
+                for _citron_nvidia_dir in \
+                    /usr/share/vulkan/icd.d \
+                    /etc/vulkan/icd.d \
+                    /run/opengl-driver/share/vulkan/icd.d; do
+                    for _citron_nvidia_icd in "${_citron_nvidia_dir}"/*nvidia*.json; do
+                        [ -r "${_citron_nvidia_icd}" ] || continue
+                        _citron_has_proprietary_nvidia=1
+                        break 2
+                    done
+                done
             fi
+            ;;
+    esac
+done
+
+# Open drivers use the bundled closure.  Proprietary NVIDIA remains host-side
+# because its ICD and video drivers must match the installed kernel module.
+if [ -z "${LIBVA_DRIVERS_PATH:-}" ]; then
+    if [ -z "${_citron_has_proprietary_nvidia}" ] && [ -d "${APPDIR}/lib/dri" ]; then
+        export LIBVA_DRIVERS_PATH="${APPDIR}/lib/dri"
+    else
+        for _d in /usr/lib64/dri /usr/lib/x86_64-linux-gnu/dri /usr/lib/dri /run/opengl-driver/lib/dri; do
+            for _va in "${_d}"/*_drv_video.so; do
+                [ -e "${_va}" ] || continue
+                export LIBVA_DRIVERS_PATH="${_d}"
+                break 2
+            done
         done
-        [ -z "${_amd_vdpau}" ] || export VDPAU_DRIVER=radeonsi
     fi
 fi
+
+# On an AMD + NVK hybrid system libva otherwise chooses nouveau first, even
+# though only radeonsi supplies the usable bundled VAAPI implementation.
+if [ -z "${LIBVA_DRIVER_NAME:-}" ] && [ -n "${_citron_has_amd}" ] \
+    && [ -z "${_citron_has_proprietary_nvidia}" ] \
+    && [ -e "${APPDIR}/lib/dri/radeonsi_drv_video.so" ]; then
+    export LIBVA_DRIVER_NAME=radeonsi
+fi
+
+if [ -n "${_citron_has_amd}" ]; then
+    case ",${RADV_PERFTEST:-}," in
+        *,video_decode,*) ;;
+        ,,) export RADV_PERFTEST=video_decode ;;
+        *) export RADV_PERFTEST="${RADV_PERFTEST},video_decode" ;;
+    esac
+    export RADV_EXPERIMENTAL="${RADV_EXPERIMENTAL:+${RADV_EXPERIMENTAL},}video_decode"
+fi
+
+if [ -z "${VDPAU_DRIVER:-}" ] && [ -n "${_citron_has_amd}" ] \
+    && [ -z "${_citron_has_proprietary_nvidia}" ] \
+    && [ -e "${APPDIR}/lib/vdpau/libvdpau_radeonsi.so" ]; then
+    export VDPAU_DRIVER=radeonsi
+fi
+
 HOOK_EOF
 chmod +x ./AppDir/bin/02-hwaccel.hook
 
