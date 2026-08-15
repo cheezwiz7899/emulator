@@ -135,9 +135,13 @@ u64 FoldBindingKey(u64 runtime_key, u64 binding_key);
 //
 // On-disk format (spirv_cache.bin):
 //   8 bytes   magic "citrspv\0"
-//   u32       version (currently 6 — see SPIRV_CACHE_VERSION in the .cpp; a
+//   u32       version (see SPIRV_CACHE_VERSION and its version-history comment
+//             in the .cpp for the current value and why each bump happened; a
 //             mismatch discards the whole file rather than trying to
-//             interpret entries in a layout they weren't written in)
+//             interpret entries in a layout they weren't written in — this
+//             comment deliberately doesn't restate the number so it can't go
+//             stale the way it just did, having still said "currently 6"
+//             through both the v7 and v8 bumps)
 //   u32       num_entries
 //   per entry:
 //     u64     unique_hash

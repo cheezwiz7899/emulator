@@ -13,7 +13,28 @@
 
 namespace {
 constexpr std::array<char, 8> SPIRV_CACHE_MAGIC{'c', 'i', 't', 'r', 's', 'p', 'v', '\0'};
-constexpr u32 SPIRV_CACHE_VERSION = 7; // v7: cbuf_key now excludes texture-handle-only
+constexpr u32 SPIRV_CACHE_VERSION = 8; // v8: texture_key now excludes the one Phase-4
+                                        // -prototype-marked slot's resolved handle for shaders that
+                                        // have it (ComputeTextureKeyExcludingHandles,
+                                        // vk_pipeline_cache.cpp's CreateGraphicsPipeline/
+                                        // CreateComputePipeline — see the "Phase 4 narrow
+                                        // prototype's texture_key fix" comments there). Same
+                                        // category of change as v7's cbuf_key narrowing below,
+                                        // not a coincidence: no on-disk byte format change, but
+                                        // the VALUE stored under texture_key now means something
+                                        // different, for the small set of shaders that touch that
+                                        // one slot, than it did under v7 and earlier. Old entries
+                                        // for those shaders aren't wrong under the new scheme,
+                                        // just silently unreachable (a stale cross-version entry
+                                        // just fails to match, same as any other cache miss) —
+                                        // but left unbumped, that would muddy any future
+                                        // texture_key-related diagnostics the same way mixing
+                                        // cbuf_key schemes would have before v7's bump (see
+                                        // handoff notes for this investigation if resuming the
+                                        // thread on why that reasoning applies equally here).
+                                        // Bumping forces a clean full rebuild instead, same
+                                        // reasoning as v7's and v6's bundled bumps;
+                                        // (v7: cbuf_key now excludes texture-handle-only
                                         // reads (ComputeCbufKeyExcludingTextureHandles,
                                         // vk_pipeline_cache.cpp's CreateGraphicsPipeline/
                                         // CreateComputePipeline — see the "PHASE 1 —

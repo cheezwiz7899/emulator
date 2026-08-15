@@ -650,6 +650,74 @@ bool PipelineCache::ResolvePhase4PrototypeSpecValue() const {
     return resolved == Shader::TextureType::ColorArray2D;
 }
 
+// Phase 3 groundwork — see this method's doc comment in vk_pipeline_cache.h for what it's
+// measuring and why. Diagnostic only: nothing here changes what gets cached, guessed, or
+// served — this purely observes the real, already-computed values CreateGraphicsPipeline()
+// passes it and reports on their shape.
+void PipelineCache::RecordPhase3RuntimeVariantDiagnostic(u64 unique_hash,
+                                                          u64 diag_base_runtime_hash) const {
+    // Capped exactly like SpirvCache's own keys_by_hash_ (spirv_cache.cpp) and for the same
+    // reason: hitting the cap IS the answer for a hash that hits it ("too high-cardinality
+    // for a small scan-time guess to plausibly cover"), not a gap in the measurement.
+    constexpr size_t kMaxTrackedVariantsForDiagnostics = 8;
+    bool should_log = false;
+    {
+        std::unique_lock lock{phase3_diag_runtime_variants_mutex};
+        auto& variants = phase3_diag_cbuf_zero_runtime_variants_by_hash[unique_hash];
+        if (std::find(variants.begin(), variants.end(), diag_base_runtime_hash) == variants.end() &&
+            variants.size() < kMaxTrackedVariantsForDiagnostics) {
+            variants.push_back(diag_base_runtime_hash);
+        }
+        // Time-throttled the same way SpirvCache::SaveThrottled's default cadence is (30s) —
+        // this runs on whatever worker thread CreateGraphicsPipeline() happens to be on, so
+        // logging unconditionally on every call would repeat the exact "measurable per-call
+        // cost, once caused a real hang" mistake this investigation already made once with
+        // the original cbuf-narrowing diagnostic (see SPIRV_CACHE_VERSION's comment,
+        // spirv_cache.cpp). The write above is cheap regardless (capped vector, at most one
+        // linear scan over <=8 elements); only the histogram pass below needs throttling.
+        const auto now = std::chrono::steady_clock::now();
+        if (now - phase3_diag_last_log_time >= std::chrono::seconds{30}) {
+            phase3_diag_last_log_time = now;
+            should_log = true;
+        }
+    }
+    if (!should_log) {
+        return;
+    }
+    // Re-takes the lock shared/read-only for the histogram pass rather than holding the
+    // exclusive lock from above across it — this is O(hashes tracked so far), typically a
+    // few thousand at most for a full game, but there's no reason to block concurrent
+    // CreateGraphicsPipeline() calls on other worker threads for a read-only report.
+    std::array<size_t, 4> buckets{}; // [0]=1 variant, [1]=2-3, [2]=4-7, [3]=8+ (capped)
+    size_t total_hashes = 0;
+    {
+        std::shared_lock lock{phase3_diag_runtime_variants_mutex};
+        for (const auto& [hash, variants] : phase3_diag_cbuf_zero_runtime_variants_by_hash) {
+            ++total_hashes;
+            const size_t n = variants.size();
+            if (n <= 1) {
+                ++buckets[0];
+            } else if (n <= 3) {
+                ++buckets[1];
+            } else if (n <= 7) {
+                ++buckets[2];
+            } else {
+                ++buckets[3];
+            }
+        }
+    }
+    LOG_INFO(Render_Vulkan,
+             "Phase 3 groundwork: of {} graphics shaders seen with a real, cbuf_key==0 draw "
+             "so far, {} showed exactly 1 distinct core-RuntimeInfo state, {} showed 2-3, {} "
+             "showed 4-7, {} showed 8+ (capped — true count may be higher). Diagnostic only, "
+             "nothing currently acts on this. Low cardinality across most hashes would say "
+             "scan-time multi-variant guessing (Phase 3) could plausibly help now that Phase "
+             "1 narrowed cbuf_key; a lot of 8+ hashes would say this hits the same structural "
+             "ceiling the removed second viewport-transform-state guess already found once, "
+             "just now confirmed with cbuf's blocking accounted for.",
+             total_hashes, buckets[0], buckets[1], buckets[2], buckets[3]);
+}
+
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     if (!RefreshStages(graphics_key.unique_hashes)) {
         current_pipeline = nullptr;
@@ -1183,6 +1251,18 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 spirv_cache.Insert(spirv_key, code, binding, /*is_speculative=*/false,
                                   diag_base_runtime_hash, binding_key,
                                   diag_cbuf_key_excl_texture_handles);
+                // Phase 3 groundwork — see RecordPhase3RuntimeVariantDiagnostic's doc
+                // comment (vk_pipeline_cache.h) for what this measures. Gated on cbuf_key
+                // == 0 specifically (not just has_real_specialization_context, which the
+                // Insert() above already required): that's the population a speculative
+                // entry could ever match at all, since InsertSpeculative() hardcodes
+                // cbuf_key=0 unconditionally — cbuf_key != 0 real inserts are already
+                // structurally unreachable by any speculative entry regardless of this
+                // diagnostic's outcome, so they're not part of the question being asked.
+                if (cbuf_key == 0) {
+                    RecordPhase3RuntimeVariantDiagnostic(key.unique_hashes[index],
+                                                          diag_base_runtime_hash);
+                }
                 if (!spirv_cache_filename.empty()) {
                     serialization_thread.QueueWork([this] { spirv_cache.SaveThrottled(spirv_cache_filename); });
                 }

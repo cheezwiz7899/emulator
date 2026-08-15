@@ -4,7 +4,9 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <memory>
@@ -229,6 +231,56 @@ public:
     // phase4_prototype_fragment_shader_table above rather than running unconditionally, after
     // an earlier version of this method did exactly that and froze real gameplay).
     bool ResolvePhase4PrototypeSpecValue() const;
+
+    // ---- Phase 3 groundwork (diagnostic only — nothing below reads these back or
+    // changes caching/guessing behavior; see RecordPhase3RuntimeVariantDiagnostic()'s
+    // definition in vk_pipeline_cache.cpp for the full rationale) ----
+    //
+    // Tracks, per graphics unique_hash, the distinct "core RuntimeInfo" values
+    // (diag_base_runtime_hash — see its declaration in CreateGraphicsPipeline(), which
+    // deliberately excludes the binding-offset fold, the same split
+    // RuntimeCoreComponentNeverMatchedCount()/RuntimeBindingComponentNeverMatchedCount()
+    // already rely on in spirv_cache.h) observed among REAL, non-speculative graphics
+    // inserts whose narrowed cbuf_key == 0 — exactly the population Phase 1 grew (a
+    // stable 33-34% baseline to 41-46%, see SpirvCache::real_cbuf_zero_count_) and
+    // exactly the population a speculative entry could ever hope to match, since
+    // InsertSpeculative() always hardcodes cbuf_key=0. This is what answers Phase 3's
+    // actual open question empirically instead of by argument: low cardinality per hash
+    // would mean a small scan-time multi-variant guess could plausibly enumerate real
+    // states now that cbuf isn't blocking them; hitting the cap on most hashes would
+    // mean the opposite — the same kind of structural ceiling the removed second
+    // viewport-transform-state guess already hit once (see PreCacheShaders' comment in
+    // citron/main.cpp for that experiment and why it was removed rather than refined),
+    // just not yet re-measured with cbuf's blocking narrowed out of the way.
+    //
+    // Deliberately NOT folded into SpirvCache::Insert() (spirv_cache.h/.cpp) even
+    // though that already has an established, very similar capped-per-hash pattern
+    // (keys_by_hash_) — that function is shared with CreateComputePipeline(), which
+    // passes its own workgroup_key through the exact same diag_base_runtime_hash
+    // parameter slot (see that function's own declaration of the name); tracking
+    // indiscriminately there would silently mix two unrelated quantities into one
+    // histogram. Living here instead, populated only from CreateGraphicsPipeline(),
+    // keeps it unambiguously graphics-only.
+    //
+    // Own dedicated shared_mutex rather than reusing phase4_prototype_fragment_shader_table_mutex
+    // above: unrelated data, and this is written from exactly the same worker-thread
+    // context that table's own doc comment already explains (CreateGraphicsPipeline runs
+    // under workers.QueueWork() during boot-time bulk pipeline loading, concurrently with
+    // the live draw-time path on the main/render thread), so it needs the same kind of
+    // real synchronization, not a borrowed lock that would make this diagnostic's writes
+    // block that table's unrelated reads or vice versa.
+    mutable std::shared_mutex phase3_diag_runtime_variants_mutex;
+    mutable ankerl::unordered_dense::map<u64, std::vector<u64>> phase3_diag_cbuf_zero_runtime_variants_by_hash;
+    mutable std::chrono::steady_clock::time_point phase3_diag_last_log_time{};
+
+    // Records one observation for the diagnostic above (capped at 8 distinct values per
+    // hash — hitting the cap is itself the useful signal, not a measurement failure; see
+    // the field's own doc comment) and, at most every 30 seconds, logs a cardinality
+    // histogram across every hash tracked so far. Called only from
+    // CreateGraphicsPipeline(), only where the insert is real (not speculative) and
+    // cbuf_key == 0 — see that call site for why those two gates are what make the data
+    // meaningful. Safe to call from any worker thread.
+    void RecordPhase3RuntimeVariantDiagnostic(u64 unique_hash, u64 diag_base_runtime_hash) const;
 
     GraphicsPipelineCacheKey graphics_key{};
     GraphicsPipeline* current_pipeline{};
