@@ -42,6 +42,12 @@ function(copy_citron_Qt6_deps target_dir)
                 Qt6WebEngineCore$<$<CONFIG:Debug>:d>.*
                 Qt6WebEngineWidgets$<$<CONFIG:Debug>:d>.*
                 QtWebEngineProcess$<$<CONFIG:Debug>:d>.*
+                Qt6Quick$<$<CONFIG:Debug>:d>.*
+                Qt6QuickWidgets$<$<CONFIG:Debug>:d>.*
+                Qt6Qml$<$<CONFIG:Debug>:d>.*
+                Qt6QmlModels$<$<CONFIG:Debug>:d>.*
+                Qt6WebChannel$<$<CONFIG:Debug>:d>.*
+                Qt6Positioning$<$<CONFIG:Debug>:d>.*
             )
             windows_copy_files(${target_dir} ${Qt6_RESOURCES_DIR} ${DLL_DEST}
                 icudtl.dat
