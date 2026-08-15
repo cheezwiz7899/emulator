@@ -124,12 +124,6 @@ EXTRA_LIBS=""
 GAMEMODE_LIB="$(ldconfig -p 2>/dev/null | awk '/libgamemode\.so/ {print $NF; exit}')"
 [ -n "$GAMEMODE_LIB" ] && EXTRA_LIBS="$EXTRA_LIBS $GAMEMODE_LIB"
 
-# libudev always uses the host daemon protocol.
-if [ -n "${ANYLINUX_DO_NOT_LOAD_LIBS:-}" ]; then
-    export ANYLINUX_DO_NOT_LOAD_LIBS="${ANYLINUX_DO_NOT_LOAD_LIBS}:libudev.so*"
-else
-    export ANYLINUX_DO_NOT_LOAD_LIBS="libudev.so*"
-fi
 
 # shellcheck disable=SC2086
 ./quick-sharun "${DESTDIR}/usr/bin/citron"* $EXTRA_LIBS
@@ -169,8 +163,6 @@ fi
 find "${_appdir}" -name 'libqgtk3.so'                -delete 2>/dev/null || true
 # Keep quick-sharun's bundled loader as the portable default. A runtime hook
 # below provides an explicit host-loader escape hatch before Citron starts.
-# use host libudev
-find "${_appdir}" -name 'libudev.so.*'               -delete 2>/dev/null || true
 
 # Sanity check: confirm citron's final AppDir dependencies after cleanup.
 # Grep the build log for "ldd:" to find this.

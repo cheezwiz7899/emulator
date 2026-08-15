@@ -63,6 +63,11 @@ if (MINGW OR (${CMAKE_SYSTEM_NAME} MATCHES "Linux") OR APPLE)
             --enable-static)
     else()
         set(LIBUSB_LIBRARIES "${LIBUSB_PREFIX}/libusb/.libs/libusb-1.0.a" CACHE PATH "libusb library path" FORCE)
+
+        set(LIBUSB_CONFIGURE_ARGS
+            --disable-shared
+            --enable-static
+            --disable-udev)
     endif()
 
     set(LIBUSB_INCLUDE_DIRS "${LIBUSB_SRC_DIR}/libusb" CACHE PATH "libusb headers path" FORCE)
@@ -111,15 +116,6 @@ if (MINGW OR (${CMAKE_SYSTEM_NAME} MATCHES "Linux") OR APPLE)
     target_link_libraries(usb INTERFACE "${LIBUSB_LIBRARIES}")
     target_include_directories(usb INTERFACE "${LIBUSB_INCLUDE_DIRS}")
 
-    if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
-        find_package(PkgConfig)
-        pkg_check_modules(LIBUDEV REQUIRED libudev)
-
-        if (LIBUDEV_FOUND)
-            target_include_directories(usb INTERFACE "${LIBUDEV_INCLUDE_DIRS}")
-            target_link_libraries(usb INTERFACE "${LIBUDEV_STATIC_LIBRARIES}")
-        endif()
-    endif()
 else() # MINGW OR (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
     # Ensure libusb compiles with UTF-8 encoding on MSVC
     if(MSVC)
