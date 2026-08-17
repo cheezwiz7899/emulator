@@ -532,6 +532,8 @@ struct Values {
         ExtendedDynamicState::EDS3,
         "extended_dynamic_state",
         Category::RendererAdvanced};
+    SwitchableSetting<bool> vertex_input_dynamic_state{
+        linkage, true, "vertex_input_dynamic_state", Category::RendererAdvanced};
     SwitchableSetting<bool> use_conditional_rendering{linkage, true, "use_conditional_rendering",
                                                       Category::RendererAdvanced};
     SwitchableSetting<bool> android_arm64_register_guards{

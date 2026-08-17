@@ -30,6 +30,7 @@
     <!-- Home strings -->
     <string name="home_games">Games</string>
     <string name="home_search">Search</string>
+    <string name="home_multiplayer">Multiplayer</string>
     <string name="home_settings">Settings</string>
     <string name="empty_gamelist">No files were found or no game directory has been selected yet.</string>
     <string name="search_and_filter_games">Search and filter games</string>
@@ -438,30 +439,92 @@
     <string name="preferences_theme">Theme and color</string>
     <string name="preferences_debug">Debug</string>
     <string name="preferences_debug_description">CPU/GPU debugging, graphics API, fastmem</string>
-    <string name="preferences_network">Network</string>
-    <string name="preferences_network_description">Network interface and airplane mode settings</string>
     <string name="preferences_zep_zone">Zep Zone</string>
     <string name="preferences_zep_zone_description">Advanced emulation settings</string>
     <string name="preferences_applets_android">Applets on Android</string>
     <string name="preferences_applets_android_description">System applet configuration settings</string>
 
-    <!-- Network Settings Headers -->
-    <string name="network_settings_header">Network Settings</string>
+    <!-- Multiplayer -->
     <string name="airplane_mode">Airplane Mode</string>
-    <string name="airplane_mode_description">Disable all network functionality, similar to Nintendo Switch airplane mode</string>
+    <string name="airplane_mode_multiplayer_description">Disable network functionality. Creating or joining a room turns this off automatically.</string>
     <string name="direct_connect">Direct Connect</string>
-    <string name="direct_connect_description">Join an existing multiplayer room by address</string>
-    <string name="direct_connect_status">Status: %1$s</string>
     <string name="direct_connect_connect">Connect</string>
     <string name="direct_connect_host">Server address</string>
     <string name="direct_connect_port">Port</string>
     <string name="direct_connect_nickname">Nickname</string>
+    <string name="direct_connect_password">Password (optional)</string>
     <string name="direct_connect_connecting">Connecting…</string>
     <string name="direct_connect_connected">Connected</string>
     <string name="direct_connect_disconnected">Disconnected</string>
     <string name="direct_connect_failed">Unable to connect to the room</string>
-    <string name="direct_connect_invalid_input">Enter a server address, port, and 4-20 character nickname.</string>
+    <string name="direct_connect_invalid_input">Enter a server address, valid port, and 4–20 character ASCII nickname.</string>
     <string name="direct_connect_disconnect">Disconnect</string>
+    <string name="multiplayer_ascii_identifier_hint">4–20 ASCII letters, numbers, spaces, or . _ - only</string>
+    <string name="multiplayer_invalid_identifier">Use 4–20 ASCII letters, numbers, spaces, or . _ -</string>
+    <string name="multiplayer_invalid_host">Enter a valid server address.</string>
+    <string name="multiplayer_invalid_port">Enter a port from 1 to 65535.</string>
+    <string name="multiplayer_invalid_player_count">Enter 2 to 16 players.</string>
+
+    <string name="host_room_unlisted">Create Unlisted Room</string>
+    <string name="host_room_name">Room name</string>
+    <string name="host_room_description">Room description (optional)</string>
+    <string name="host_room_max_players">Max players</string>
+    <string name="host_room_create">Create</string>
+    <string name="host_room_creating">Creating room…</string>
+    <string name="host_room_invalid_input">Use 4–20 ASCII characters for the room name and nickname, a valid port, and 2–16 players.</string>
+    <string name="multiplayer_airplane_mode_disabled">Airplane Mode was turned off for multiplayer.</string>
+
+    <string name="room_title">Multiplayer Room</string>
+    <string name="multiplayer_status">Status</string>
+    <string name="multiplayer_status_disconnected">Not connected</string>
+    <string name="multiplayer_status_connecting">Connecting…</string>
+    <string name="multiplayer_status_connected">Connected to a room</string>
+    <string name="multiplayer_status_hosting">Hosting a room</string>
+    <string name="multiplayer_status_host_disconnected">Hosting; local connection was lost</string>
+    <string name="multiplayer_actions_description">Create or join a room before starting a game. Room names and nicknames are protocol identifiers and only support ASCII; descriptions and chat support international text.</string>
+    <string name="multiplayer_leave_complete">Left the multiplayer room.</string>
+    <string name="multiplayer_close_complete">Closed the multiplayer room.</string>
+    <string name="room_open">Open Current Room</string>
+    <string name="room_summary">%1$s · %2$s/%3$s members</string>
+    <string name="room_no_description">No room description</string>
+    <string name="room_connected_port">Connected on port %1$s</string>
+    <string name="room_connected_game">Playing %1$s · port %2$s</string>
+    <string name="room_members">Members</string>
+    <string name="room_chat">Chat</string>
+    <string name="room_message">Message</string>
+    <string name="room_message_too_long">Message must be 500 UTF-8 bytes or fewer.</string>
+    <string name="room_message_send_failed">Message was not sent. Check the room connection.</string>
+    <string name="room_send">Send</string>
+    <string name="room_leave">Leave Room</string>
+    <string name="room_close_hosted">Close Room</string>
+    <string name="room_chat_line">%1$s: %2$s</string>
+    <string name="room_chat_line_self">You: %1$s</string>
+    <string name="room_member_joined">• %1$s joined</string>
+    <string name="room_member_left">• %1$s left</string>
+    <string name="room_member_kicked">• %1$s was kicked</string>
+    <string name="room_member_banned">• %1$s was banned</string>
+    <string name="room_member_unbanned">• %1$s was unbanned</string>
+
+    <string name="multiplayer_error_lost_connection">Connection to the room was lost.</string>
+    <string name="multiplayer_error_kicked">You were kicked by the room host.</string>
+    <string name="multiplayer_error_name_collision">That nickname is already in use.</string>
+    <string name="multiplayer_error_ip_collision">The assigned network address is already in use.</string>
+    <string name="multiplayer_error_wrong_version">The room uses an incompatible network version.</string>
+    <string name="multiplayer_error_wrong_password">The room password is incorrect.</string>
+    <string name="multiplayer_error_could_not_connect">The room did not respond. Check its address and port.</string>
+    <string name="multiplayer_error_room_full">The room is full.</string>
+    <string name="multiplayer_error_banned">You are banned from this room.</string>
+    <string name="multiplayer_error_permission_denied">You do not have permission to perform that action.</string>
+    <string name="multiplayer_error_no_such_user">That room member no longer exists.</string>
+    <string name="multiplayer_error_network_not_initialized">Room networking is not initialized. Restart Citron and try again.</string>
+    <string name="multiplayer_error_invalid_arguments">The room settings are invalid.</string>
+    <string name="multiplayer_error_no_network_interface">No usable network interface is available. Check Wi-Fi or mobile data.</string>
+    <string name="multiplayer_error_room_unavailable">The room networking service is unavailable. Restart Citron and try again.</string>
+    <string name="multiplayer_error_room_already_open">A room is already being hosted. Close it before creating another.</string>
+    <string name="multiplayer_error_member_busy">A room connection is already active or in progress.</string>
+    <string name="multiplayer_error_could_not_create_room">Unable to open the room port. Choose another port or close the app using it.</string>
+    <string name="multiplayer_error_local_join_failed">The room opened, but the host could not join it locally.</string>
+    <string name="multiplayer_error_unknown">Unable to connect to the room.</string>
 
     <!-- Zep Zone Headers -->
     <string name="memory_layout_header">Memory Layout</string>
@@ -1327,6 +1390,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
     <string name="astc_recompression_description">Controls how ASTC textures are recompressed when GPU doesn\'t support them natively.</string>
     <string name="extended_dynamic_state">Extended Dynamic State</string>
     <string name="extended_dynamic_state_description">Controls which Vulkan Extended Dynamic State features are enabled. EDS3 (default) enables all features for maximum compatibility. EDS2/EDS1 limit features for troubleshooting graphics issues. Disabled turns off all EDS features. Try lower settings if you experience rendering problems in some games.</string>
+    <string name="vertex_input_dynamic_state">Vertex Input Dynamic State (VIDS)</string>
+    <string name="vertex_input_dynamic_state_description">Uses dynamic vertex input while EDS3 is enabled. Disable this to troubleshoot missing, gray, or corrupted 3D rendering on some GPU drivers.</string>
     <string name="use_conditional_rendering">Use Conditional Rendering</string>
     <string name="use_conditional_rendering_description">Enables conditional rendering based on query results. Disabling this can fix flickering objects in some games but may impact performance. Try disabling if you see objects appearing and disappearing rapidly.</string>
     <string name="frame_skipping">Frame Skipping</string>

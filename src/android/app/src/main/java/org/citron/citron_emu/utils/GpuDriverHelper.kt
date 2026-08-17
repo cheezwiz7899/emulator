@@ -12,8 +12,6 @@ import java.io.IOException
 import org.citron.citron_emu.NativeLibrary
 import org.citron.citron_emu.CitronApplication
 import org.citron.citron_emu.features.settings.model.StringSetting
-import java.io.FileNotFoundException
-import java.util.zip.ZipException
 import java.util.zip.ZipFile
 
 object GpuDriverHelper {
@@ -191,8 +189,11 @@ object GpuDriverHelper {
                     }
                 }
             }
-        } catch (_: ZipException) {
-        } catch (_: FileNotFoundException) {
+        } catch (exception: IOException) {
+            Log.debug(
+                "[GpuDriverHelper] Failed to read GPU driver metadata from ${driver.path}: " +
+                    exception.message
+            )
         }
         return GpuDriverMetadata()
     }
@@ -225,6 +226,27 @@ object GpuDriverHelper {
     // Parse the custom driver metadata to retrieve the name.
     val installedCustomDriverData: GpuDriverMetadata
         get() = GpuDriverMetadata(File(driverInstallationPath + META_JSON_FILENAME))
+
+    @Synchronized
+    fun resolveCustomDriverFile(): File {
+        val driverPath = StringSetting.DRIVER_PATH.getString()
+        val missingPerGameDriver =
+            NativeConfig.isPerGameConfigLoaded() &&
+                !StringSetting.DRIVER_PATH.global &&
+                driverPath.isNotEmpty() &&
+                !File(driverPath).isFile
+
+        if (!missingPerGameDriver) {
+            return File(driverPath)
+        }
+
+        // A globally removed driver may still be referenced by a per-game override. Persist
+        // the fallback so future launches use the current global driver instead of repeatedly
+        // trying to open a stale path.
+        StringSetting.DRIVER_PATH.global = true
+        NativeConfig.savePerGameConfig()
+        return File(StringSetting.DRIVER_PATH.getString(needsGlobal = true))
+    }
 
     val customDriverSettingData: GpuDriverMetadata
         get() = getMetadataFromZip(File(StringSetting.DRIVER_PATH.getString()))

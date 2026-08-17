@@ -11,16 +11,22 @@
 // macros) a no-op, and these types are baked into Xbyak class layouts. A mismatch
 // across TUs is an ODR violation; the symptom is std::length_error on first insert.
 //
-// dynarmic/backend/x64/xbyak.h defines the same values; src/dynarmic/common/x64/xbyak.h
-// forwards here instead of to dynarmic's copy so there's one source of truth.
+// Gated on DYNARMIC_XBYAK_CUSTOM_CONTAINERS (src/common/CMakeLists.txt) instead
+// of unconditional, so a build that somehow doesn't propagate the define falls
+// back to Xbyak's own containers on both sides instead of mismatching silently.
+// dynarmic/common/x64/xbyak.h checks the same flag and, when it's set, includes
+// dynarmic_xbyak_abi.h (next to this file) instead of defining its own copy of
+// Common::X64
 //
-// Note: dynarmic's common/xbyak.h also defines CMP_*, IsWithin2G, CallFarFunction --
+// Note: dynarmic's common/x64/xbyak.h also defines CMP_*, IsWithin2G, CallFarFunction --
 // don't add them here, equivalents already exist in xbyak_util.h.
+#ifdef DYNARMIC_XBYAK_CUSTOM_CONTAINERS
 #include <ankerl/unordered_dense.h>
 #include <boost/unordered_map.hpp>
 #define XBYAK_STD_UNORDERED_SET ankerl::unordered_dense::set
 #define XBYAK_STD_UNORDERED_MAP ankerl::unordered_dense::map
 #define XBYAK_STD_UNORDERED_MULTIMAP boost::unordered_multimap
+#endif
 
 #ifdef __GNUC__
 #pragma GCC diagnostic ignored "-Wconversion"

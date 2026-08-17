@@ -32,6 +32,7 @@ enum class BooleanSetting(override val key: String) : AbstractBooleanSetting {
     SHOW_SHADER_BUILDING_OVERLAY("show_shader_building_overlay"),
     SHOW_PERFORMANCE_GRAPH("show_performance_graph"),
     USE_CONDITIONAL_RENDERING("use_conditional_rendering"),
+    RENDERER_VERTEX_INPUT_DYNAMIC_STATE("vertex_input_dynamic_state"),
     ANDROID_ARM64_REGISTER_GUARDS("android_arm64_register_guards"),
     AIRPLANE_MODE("airplane_mode"),
 
