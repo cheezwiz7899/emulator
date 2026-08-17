@@ -1,14 +1,26 @@
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -19,7 +19,12 @@ if(WIN32)
+@@ -17,22 +17,26 @@ if(APPLE)
  endif()
+ if(WIN32)
+   list(APPEND SDL2COMPAT_SRCS
+-    "src/sdl2_mslibc.c"
+     "src/version.rc"
+   )
+ endif()
++# When SDL_LIBC is ON the caller links the MSVC CRT (/MD or /MDd), so SDL's
++# own C-runtime reimplementations and MASM stdlib stubs are unnecessary.
++# Skipping them avoids:
++#   - _fltused undefined symbol: lld-link discards the selectany definition
++#     in sdl2_mslibc.c under LTO when the MASM stub is also absent.
++#   - A1013 fatal error: passing clang-cl flags (-Wundef, /W3, etc.) to
++#     ml64.exe, which does not understand them.
++option(SDL_LIBC "Use the system C library (skip MASM/C stdlib reimpl)" ON)
++if(WIN32 AND NOT SDL_LIBC)
++  list(APPEND SDL2COMPAT_SRCS "src/sdl2_mslibc.c")
++endif()
  if(MSVC)
 -  if(SDL_CPU_X64)
-+  # When SDL_LIBC is ON the caller links the MSVC CRT (/MD or /MDd), so SDL's
-+  # own MASM reimplementations of stdlib functions are unnecessary.  Skip them
-+  # to avoid passing clang-cl compiler flags (e.g. -Wundef, /W3) to ml64.exe,
-+  # which does not understand them and dies with A1013.
-+  option(SDL_LIBC "Use the system C library (skip MASM stdlib reimpl)" ON)
 +  if(SDL_CPU_X64 AND NOT SDL_LIBC)
      list(APPEND SDL2COMPAT_SRCS
        "src/sdl2_mslibc_x64.masm"

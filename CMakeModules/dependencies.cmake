@@ -361,7 +361,7 @@ if (CITRON_USE_EXTERNAL_SDL2 AND NOT TARGET SDL2::SDL2)
     CPMAddPackage(
         NAME SDL3
         GITHUB_REPOSITORY libsdl-org/SDL
-        GIT_TAG release-3.4.12
+        GIT_TAG f87239e71e42da91ca317a12eefb82cfbf3393eb # release-3.4.12
         SYSTEM YES
         OPTIONS
             "SDL_SHARED ON"
@@ -387,7 +387,7 @@ if (CITRON_USE_EXTERNAL_SDL2 AND NOT TARGET SDL2::SDL2)
     CPMAddPackage(
         NAME SDL2
         GITHUB_REPOSITORY libsdl-org/sdl2-compat
-        GIT_TAG release-2.32.56
+        GIT_TAG 1321b6c2857022a016280ecc8ed890d1d64c5213 # release-2.32.56
         SYSTEM YES
         PATCHES
             "${CMAKE_SOURCE_DIR}/patches/sdl2compat-no-masm-with-libc.patch"
@@ -398,6 +398,22 @@ if (CITRON_USE_EXTERNAL_SDL2 AND NOT TARGET SDL2::SDL2)
             "SDL2COMPAT_WERROR OFF"
             "SDL_LIBC ON"
     )
+
+    # Redirect SDL runtime DLL output to a staging directory separate from
+    # bin/.  Both sdl2-compat and SDL3-shared inherit CMAKE_RUNTIME_OUTPUT_DIRECTORY
+    # (set to bin/) from the parent project, which means $<TARGET_FILE:SDL2>
+    # resolves to bin/SDL2.dll — the same location copy_citron_sdl_runtime
+    # would copy it to.  cmake -E copy_if_different from a file to its own
+    # directory prints an error and ninja stops.  A dedicated staging dir keeps
+    # $<TARGET_FILE:SDL2> distinct from $<TARGET_FILE_DIR:citron>.
+    foreach(_sdl_out_target IN ITEMS SDL3-shared SDL2)
+        if (TARGET ${_sdl_out_target})
+            set_target_properties(${_sdl_out_target} PROPERTIES
+                RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/sdl-staging"
+            )
+        endif()
+    endforeach()
+    unset(_sdl_out_target)
 
     # Post-configure: strip any inherited -Werror / /WX from SDL3 and SDL2
     # targets.  Citron's clang-cl build passes these flags through
@@ -474,8 +490,12 @@ if (CITRON_USE_EXTERNAL_SDL2 AND NOT TARGET SDL2::SDL2)
     )
 endif()
 
-# sdl2-compat dlopens SDL3, so Windows cannot discover SDL3 by walking the
-# executable import table. Deploy both runtime DLLs next to each frontend.
+# copy_citron_sdl_runtime(<target>)
+# On Windows CPM builds: copies SDL2.dll and SDL3.dll next to <target> after
+# build.  sdl2-compat dlopens SDL3, so SDL3 is absent from the PE import table
+# and CopyMinGWDeps' import-table scan cannot find it.
+# On all other configurations this is a no-op so it is safe to call
+# unconditionally from src/citron/CMakeLists.txt and src/citron_cmd/CMakeLists.txt.
 function(copy_citron_sdl_runtime target)
     if (WIN32 AND CITRON_USE_EXTERNAL_SDL2 AND TARGET SDL2 AND TARGET SDL3-shared)
         add_dependencies(${target} SDL2 SDL3-shared)

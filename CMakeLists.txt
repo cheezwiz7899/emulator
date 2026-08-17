@@ -379,6 +379,15 @@ endif()
 
 # Enforce the search mode of non-required packages for better and shorter failure messages
 
+# copy_citron_sdl_runtime is defined in CMakeModules/dependencies.cmake for CPM
+# builds where the SDL2/SDL3 targets exist.  Define it here as a no-op so that
+# src/citron/CMakeLists.txt and src/citron_cmd/CMakeLists.txt can call it
+# unconditionally on all build configurations (macOS, native MSVC, etc.).
+if (NOT COMMAND copy_citron_sdl_runtime)
+    function(copy_citron_sdl_runtime target)
+    endfunction()
+endif()
+
 # Find Boost and its components.
 # 'process' is optional. The build will continue if it's not found.
 if (NOT TARGET Boost::context)
