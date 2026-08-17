@@ -124,6 +124,15 @@ EXTRA_LIBS=""
 GAMEMODE_LIB="$(ldconfig -p 2>/dev/null | awk '/libgamemode\.so/ {print $NF; exit}')"
 [ -n "$GAMEMODE_LIB" ] && EXTRA_LIBS="$EXTRA_LIBS $GAMEMODE_LIB"
 
+# sdl2-compat dlopens SDL3, so neither SDL3 nor its runtime-only SDL2
+# compatibility library is fully discoverable from citron's ELF dependency
+# graph. build-citron-linux.sh stages their exact shared objects here.
+for _sdl_runtime in "${DESTDIR}/usr/lib"/libSDL2-2.0.so.* \
+                    "${DESTDIR}/usr/lib"/libSDL3.so.*; do
+    [ -f "${_sdl_runtime}" ] || continue
+    EXTRA_LIBS="$EXTRA_LIBS ${_sdl_runtime}"
+done
+
 
 # shellcheck disable=SC2086
 ./quick-sharun "${DESTDIR}/usr/bin/citron"* $EXTRA_LIBS

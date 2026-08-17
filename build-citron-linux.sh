@@ -1397,6 +1397,7 @@ build_appimage_stage() {
     local install_root="${build_dir}/install-root"
     rm -rf "${install_root}"
     mkdir -p "${install_root}/usr/bin" \
+             "${install_root}/usr/lib" \
              "${install_root}/usr/share/applications" \
              "${install_root}/usr/share/icons/hicolor/scalable/apps" \
              "${install_root}/usr/share/icons/hicolor/256x256/apps" \
@@ -1409,6 +1410,25 @@ build_appimage_stage() {
     [[ -f "${build_dir}/bin/citron" ]] \
         || error "citron binary not found at ${build_dir}/bin/citron"
     cp "${build_dir}/bin/citron" "${install_root}/usr/bin/citron"
+
+    # sdl2-compat dlopens SDL3, so SDL3 is absent from citron's ELF NEEDED
+    # entries and quick-sharun cannot find it through its normal scan. CMake
+    # emits the exact two runtime paths for this configuration; stage them so
+    # package-citron-linux.sh can pass both to quick-sharun explicitly.
+    local sdl_runtime_manifest sdl_runtime soname
+    sdl_runtime_manifest="$(find "${build_dir}" -maxdepth 1 -type f -name 'citron-sdl-runtime-libs-*.txt' -print -quit)"
+    [[ -n "${sdl_runtime_manifest}" ]] \
+        || error "sdl2-compat runtime manifest missing from ${build_dir}"
+    while IFS= read -r sdl_runtime; do
+        [[ -n "${sdl_runtime}" ]] || continue
+        [[ -f "${sdl_runtime}" ]] \
+            || error "sdl2-compat runtime library missing: ${sdl_runtime}"
+        cp -L "${sdl_runtime}" "${install_root}/usr/lib/"
+        soname="$(patchelf --print-soname "${sdl_runtime}" 2>/dev/null || true)"
+        if [[ -n "${soname}" ]]; then
+            ln -sf "$(basename "${sdl_runtime}")" "${install_root}/usr/lib/${soname}"
+        fi
+    done < "${sdl_runtime_manifest}"
 
     cp "${SCRIPT_DIR}/dist/org.citron_emu.citron.desktop" \
         "${install_root}/usr/share/applications/"

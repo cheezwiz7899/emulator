@@ -351,17 +351,52 @@ endif()
 # ── SDL2 ──────────────────────────────────────────────────────────────────────
 if (CITRON_USE_EXTERNAL_SDL2 AND NOT TARGET SDL2::SDL2)
     CPMAddPackage(
-        NAME SDL2
+        NAME SDL3
         GITHUB_REPOSITORY libsdl-org/SDL
-        GIT_TAG release-2.32.10
+        GIT_TAG release-3.4.12
         OPTIONS
-            "SDL_SHARED OFF"
-            "SDL_STATIC ON"
-            "SDL_TEST OFF"
-            "SDL_FORCE_STATIC_VCRT OFF"
+            "SDL_SHARED ON"
+            "SDL_STATIC OFF"
+            "SDL_TEST_LIBRARY OFF"
+            "SDL_TESTS OFF"
+            "SDL_INSTALL OFF"
+            "SDL_HIDAPI ON"
             "SDL_HIDAPI_LIBUSB ON"
     )
+    CPMAddPackage(
+        NAME SDL2
+        GITHUB_REPOSITORY libsdl-org/sdl2-compat
+        GIT_TAG release-2.32.56
+        OPTIONS
+            "SDL2COMPAT_TESTS OFF"
+            "SDL2COMPAT_INSTALL OFF"
+            "SDL2COMPAT_STATIC OFF"
+    )
+
+    # sdl2-compat loads SDL3 itself rather than linking it. Make SDL3 an
+    # explicit build dependency and publish both shared objects for packagers.
+    add_dependencies(SDL2 SDL3-shared)
+    file(GENERATE
+        OUTPUT "${CMAKE_BINARY_DIR}/citron-sdl-runtime-libs-$<CONFIG>.txt"
+        CONTENT "$<TARGET_FILE:SDL2>\n$<TARGET_FILE:SDL3::SDL3-shared>\n"
+    )
 endif()
+
+# sdl2-compat dlopens SDL3, so Windows cannot discover SDL3 by walking the
+# executable import table. Deploy both runtime DLLs next to each frontend.
+function(copy_citron_sdl_runtime target)
+    if (WIN32 AND CITRON_USE_EXTERNAL_SDL2 AND TARGET SDL2 AND TARGET SDL3-shared)
+        add_dependencies(${target} SDL2 SDL3-shared)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:SDL2>" "$<TARGET_FILE_DIR:${target}>"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:SDL3::SDL3-shared>" "$<TARGET_FILE_DIR:${target}>"
+            COMMENT "Deploying sdl2-compat and SDL3 for ${target}"
+            VERBATIM
+        )
+    endif()
+endfunction()
 
 # ── tzdb_to_nx ────────────────────────────────────────────────────────────────
 # On POSIX hosts: fetch source via CPM; nx_tzdb/CMakeLists.txt builds zic and
