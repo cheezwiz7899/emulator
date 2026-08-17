@@ -571,6 +571,7 @@ _setup_apt() {
         libxkbcommon-x11-dev libxss-dev \
         libxcb1-dev libxcb-cursor-dev libxcb-image0-dev \
         libxcb-render-util0-dev libxinerama-dev \
+        libxcursor-dev \
         libgles-dev \
         || warn "Some optional X11/XCB extension packages unavailable — optional display features may be limited"
 
@@ -626,6 +627,7 @@ _setup_pacman() {
         libxkbcommon-x11 libxss \
         libxcb xcb-util-cursor xcb-util-image \
         xcb-util-renderutil libxinerama \
+        libxcursor \
         2>/dev/null || warn "Some optional X11/XCB extension packages unavailable — optional display features may be limited"
 
     # Optional: bundled into the AppImage by package-citron-linux.sh if present.
@@ -711,6 +713,7 @@ _setup_dnf() {
         libxkbcommon-x11-devel libXScrnSaver-devel \
         libxcb-devel xcb-util-cursor-devel xcb-util-image-devel \
         xcb-util-renderutil-devel libXinerama-devel \
+        libXcursor-devel \
         2>/dev/null || warn "Some optional X11/XCB extension packages unavailable — optional display features may be limited"
 
     # Optional: bundled into the AppImage by package-citron-linux.sh if present.
@@ -762,6 +765,7 @@ _setup_yum() {
         libxkbcommon-x11-devel libXScrnSaver-devel \
         libxcb-devel xcb-util-cursor-devel xcb-util-image-devel \
         xcb-util-renderutil-devel libXinerama-devel \
+        libXcursor-devel \
         2>/dev/null || warn "Some optional X11/XCB extension packages unavailable — optional display features may be limited"
 
     # Optional: bundled into the AppImage by package-citron-linux.sh if present.
@@ -812,6 +816,7 @@ _setup_zypper() {
         libxkbcommon-x11-devel libXss-devel \
         libxcb-devel xcb-util-cursor-devel xcb-util-image-devel \
         xcb-util-renderutil-devel libXinerama-devel Mesa-libGLESv2-devel \
+        libXcursor-devel \
         2>/dev/null || warn "Some optional X11/XCB extension packages unavailable — optional display features may be limited"
 
     # Optional: bundled into the AppImage by package-citron-linux.sh if present.
@@ -860,6 +865,7 @@ _setup_emerge() {
         x11-libs/libXScrnSaver \
         x11-libs/libxcb x11-libs/xcb-util-cursor x11-libs/xcb-util-image \
         x11-libs/xcb-util-renderutil x11-libs/libXinerama \
+        x11-libs/libXcursor \
         2>/dev/null || warn "Some optional X11/XCB extension packages unavailable — optional display features may be limited"
 
     # Optional: bundled into the AppImage by package-citron-linux.sh if present.
@@ -1425,7 +1431,7 @@ build_appimage_stage() {
             || error "sdl2-compat runtime library missing: ${sdl_runtime}"
         cp -L "${sdl_runtime}" "${install_root}/usr/lib/"
         soname="$(patchelf --print-soname "${sdl_runtime}" 2>/dev/null || true)"
-        if [[ -n "${soname}" ]]; then
+        if [[ -n "${soname}" && "${soname}" != "$(basename "${sdl_runtime}")" ]]; then
             ln -sf "$(basename "${sdl_runtime}")" "${install_root}/usr/lib/${soname}"
         fi
     done < "${sdl_runtime_manifest}"
