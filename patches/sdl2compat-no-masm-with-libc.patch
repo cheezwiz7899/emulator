@@ -1,0 +1,25 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -19,7 +19,12 @@ if(WIN32)
+ endif()
+ if(MSVC)
+-  if(SDL_CPU_X64)
++  # When SDL_LIBC is ON the caller links the MSVC CRT (/MD or /MDd), so SDL's
++  # own MASM reimplementations of stdlib functions are unnecessary.  Skip them
++  # to avoid passing clang-cl compiler flags (e.g. -Wundef, /W3) to ml64.exe,
++  # which does not understand them and dies with A1013.
++  option(SDL_LIBC "Use the system C library (skip MASM stdlib reimpl)" ON)
++  if(SDL_CPU_X64 AND NOT SDL_LIBC)
+     list(APPEND SDL2COMPAT_SRCS
+       "src/sdl2_mslibc_x64.masm"
+     )
+     enable_language(ASM_MASM)
+     set_property(SOURCE "src/sdl2_mslibc_x64.masm" PROPERTY LANGUAGE "ASM_MASM")
+-  elseif(SDL_CPU_ARM64)
++  elseif(SDL_CPU_ARM64 AND NOT SDL_LIBC)
+     list(APPEND SDL2COMPAT_SRCS
+       "src/sdl2_mslibc_arm64.masm"
+     )
+     enable_language(ASM_MARMASM)
+     set_property(SOURCE "src/sdl2_mslibc_arm64.masm" PROPERTY LANGUAGE "ASM_MARMASM")
+   elseif(SDL_CPU_ARM32)

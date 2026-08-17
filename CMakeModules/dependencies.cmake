@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2026 citron Emulator Project
+﻿# SPDX-FileCopyrightText: 2026 citron Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
 # CMakeModules/dependencies.cmake
@@ -350,10 +350,19 @@ endif()
 
 # ── SDL2 ──────────────────────────────────────────────────────────────────────
 if (CITRON_USE_EXTERNAL_SDL2 AND NOT TARGET SDL2::SDL2)
+    # SDL3 — runtime backing for sdl2-compat.
+    # SYSTEM YES: marks SDL3's include dirs as system headers so Citron's
+    # own strict warning flags inherited from CMAKE_C_FLAGS do not apply to
+    # SDL3's headers when included transitively by Citron code.
+    # SDL_WERROR OFF: prevents SDL3's SDL_AddCommonCompilerFlags from adding /WX.
+    # SDL_LIBC ON: SDL3 defaults this ON (SDL_LIBC_DEFAULT ON), but explicit
+    # here to avoid the MASM stdlib reimplementation — SDL3 guards its MASM
+    # source with `if(MSVC AND NOT SDL_LIBC)`.
     CPMAddPackage(
         NAME SDL3
         GITHUB_REPOSITORY libsdl-org/SDL
         GIT_TAG release-3.4.12
+        SYSTEM YES
         OPTIONS
             "SDL_SHARED ON"
             "SDL_STATIC OFF"
@@ -362,16 +371,99 @@ if (CITRON_USE_EXTERNAL_SDL2 AND NOT TARGET SDL2::SDL2)
             "SDL_INSTALL OFF"
             "SDL_HIDAPI ON"
             "SDL_HIDAPI_LIBUSB ON"
+            "SDL_WERROR OFF"
+            "SDL_LIBC ON"
     )
+
+    # sdl2-compat — SDL2 API compatibility layer on top of SDL3.
+    # SYSTEM YES: same rationale as SDL3 above.
+    # SDL2COMPAT_WERROR OFF: prevents SDL_AddCommonCompilerFlags from adding /WX.
+    # SDL_LIBC ON + patch: sdl2-compat's MASM guard is bare `if(MSVC)` with no
+    # SDL_LIBC check, unlike SDL3.  The patch adds `AND NOT SDL_LIBC` so that
+    # sdl2_mslibc_x64.masm is skipped when linking the system CRT (/MD).
+    # NOTE: if this pin is bumped, check whether sdl2-compat has adopted the
+    # SDL_LIBC guard upstream (matching SDL3's behaviour); if so, drop the patch.
+    # If not, refresh the patch against the new CMakeLists.txt line numbers.
     CPMAddPackage(
         NAME SDL2
         GITHUB_REPOSITORY libsdl-org/sdl2-compat
         GIT_TAG release-2.32.56
+        SYSTEM YES
+        PATCHES
+            "${CMAKE_SOURCE_DIR}/patches/sdl2compat-no-masm-with-libc.patch"
         OPTIONS
             "SDL2COMPAT_TESTS OFF"
             "SDL2COMPAT_INSTALL OFF"
             "SDL2COMPAT_STATIC OFF"
+            "SDL2COMPAT_WERROR OFF"
+            "SDL_LIBC ON"
     )
+
+    # Post-configure: strip any inherited -Werror / /WX from SDL3 and SDL2
+    # targets.  Citron's clang-cl build passes these flags through
+    # CMAKE_C_FLAGS / CMAKE_CXX_FLAGS, and CPM sub-projects inherit them.
+    # sdl2_compat.c and SDL_dynapi.c emit hundreds of -Wunsafe-buffer-usage,
+    # -Wmissing-prototypes, and related diagnostics that are harmless in
+    # third-party code but cause clang-cl to exit non-zero when -Werror is
+    # active.  Suppressing on the targets is the correct scope: we want
+    # these checks to remain active for Citron's own first-party code.
+    foreach(_sdl_target IN ITEMS SDL3-shared SDL2)
+        if (TARGET ${_sdl_target})
+            if (MSVC)
+                target_compile_options(${_sdl_target} PRIVATE
+                    /W0
+                    /clang:-Wno-unsafe-buffer-usage
+                    /clang:-Wno-unsafe-pointer-arithmetic
+                    /clang:-Wno-missing-prototypes
+                    /clang:-Wno-missing-variable-declarations
+                    /clang:-Wno-sign-conversion
+                    /clang:-Wno-cast-qual
+                    /clang:-Wno-cast-align
+                    /clang:-Wno-implicit-int-conversion
+                    /clang:-Wno-shorten-64-to-32
+                    /clang:-Wno-float-conversion
+                    /clang:-Wno-double-promotion
+                    /clang:-Wno-reserved-identifier
+                    /clang:-Wno-reserved-macro-identifier
+                    /clang:-Wno-extra-semi
+                    /clang:-Wno-extra-semi-stmt
+                    /clang:-Wno-switch-default
+                    /clang:-Wno-switch-enum
+                    /clang:-Wno-pre-c11-compat
+                    /clang:-Wno-bad-function-cast
+                    /clang:-Wno-strict-prototypes
+                    /clang:-Wno-unused-macros
+                    /clang:-Wno-nonportable-system-include-path
+                    /clang:-Wno-date-time
+                )
+            else()
+                # GCC/Clang on Linux/macOS.
+                target_compile_options(${_sdl_target} PRIVATE
+                    -Wno-error
+                    -Wno-unsafe-buffer-usage
+                    -Wno-unsafe-pointer-arithmetic
+                    -Wno-missing-prototypes
+                    -Wno-missing-variable-declarations
+                    -Wno-sign-conversion
+                    -Wno-cast-qual
+                    -Wno-cast-align
+                    -Wno-implicit-int-conversion
+                    -Wno-shorten-64-to-32
+                    -Wno-float-conversion
+                    -Wno-double-promotion
+                    -Wno-reserved-identifier
+                    -Wno-reserved-macro-identifier
+                    -Wno-extra-semi
+                    -Wno-extra-semi-stmt
+                    -Wno-switch-default
+                    -Wno-switch-enum
+                    -Wno-unused-macros
+                    -Wno-date-time
+                )
+            endif()
+        endif()
+    endforeach()
+    unset(_sdl_target)
 
     # sdl2-compat loads SDL3 itself rather than linking it. Make SDL3 an
     # explicit build dependency and publish both shared objects for packagers.
