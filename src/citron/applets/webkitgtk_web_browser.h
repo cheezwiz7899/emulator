@@ -2,30 +2,23 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
 // WebKitGTK backend for the web browser applet. Alternative to QtNXWebEngineView
-// (qt_web_browser.h) -- CPM/system-package policy and bundle size are why this exists
-// at all, see CMakeModules/webview_native_deps.cmake.
+// (qt_web_browser.h).
 //
-// Method surface mirrors QtNXWebEngineView exactly, confirmed by
-// `grep -n "web_applet->" src/citron/main.cpp` against the real tree, not guessed:
-// LoadLocalWebPage, LoadExternalWebPage, IsFinished, SetFinished, GetExitReason,
-// SetExitReason, GetLastURL, SetLastURL, GetCurrentURL, plus QWidget's own
-// hide/move/resize/show/setFocus (free via inheritance below) and two new
-// backend-agnostic methods -- EvaluateJavaScript, SetPageZoomFactor -- that replace
-// the QtWebEngine-specific `web_applet->page()->runJavaScript(...)` /
-// `web_applet->setZoomFactor(...)` call sites (main.cpp:947,983,1001,1079). Same two
-// methods added as thin wrappers to QtNXWebEngineView so all backends share one call
-// site -- see the main.cpp/qt_web_browser.h diff in this same patch.
+// v2 of this file. v1 covered the bridge mechanism only (script injection, message
+// handlers, nav interception, eval) and missed real functionality that lives in
+// qt_web_browser.cpp outside main.cpp's call sites: font loading/injection, the
+// input thread that actually drives footer-callback/D-pad navigation, user agent,
+// persistent storage, focus-first-link, and the window.close() exit path. Found on
+// a full re-read of qt_web_browser.cpp, not assumed complete after the first pass.
 //
 // UNCOMPILED. No Qt6 + WebKitGTK combined toolchain in the sandbox this was written
-// in. Bridge mechanism itself (script injection, message handlers, nav interception,
-// eval) is the same logic already compiled and run in bridge_spike.c this session --
-// reshaped into this class, not re-derived. The embedding piece
-// (QWindow::fromWinId + createWindowContainer, X11-only) is new in this patch,
-// unverified -- see the file's Embed() implementation for the honesty notes on that.
+// in -- see webkitgtk_web_browser.cpp's own header for what WAS compile-checked
+// this round.
 
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <string>
 #include <thread>
@@ -38,6 +31,8 @@
 
 #include "core/frontend/applets/web_browser.h"
 
+class InputInterpreter;
+
 class GMainWindow;
 
 namespace Core {
@@ -48,15 +43,25 @@ namespace InputCommon {
 class InputSubsystem;
 }
 
+namespace Core::HID {
+enum class NpadButton : u64;
+}
+
 #ifdef CITRON_USE_WEBKITGTK_WEB_ENGINE
 
-// Package/registration-point wiring (QtWebBrowser's OpenLocalWebPage/
-// OpenExternalWebPage/SendInteractiveData, all backend-agnostic signal emitters
-// already) is UNCHANGED by this backend -- only the concrete view type GMainWindow
-// constructs and drives changes, via the ActiveWebEngineView alias
-// (main.h/main.cpp diff, same patch).
 class WebKitGTKView : public QWidget {
 public:
+    // Mirrors QtNXWebEngineView::UserAgent (qt_web_browser.h) exactly -- same enum,
+    // same values, same purpose (Nintendo*Browser UA string suffix).
+    enum class UserAgent {
+        WebApplet,
+        ShopN,
+        LoginApplet,
+        ShareApplet,
+        LobbyApplet,
+        WifiWebAuthApplet,
+    };
+
     explicit WebKitGTKView(GMainWindow& main_window, Core::System& system,
                            InputCommon::InputSubsystem* input_subsystem_);
     ~WebKitGTKView() override;
@@ -73,42 +78,33 @@ public:
     [[nodiscard]] const std::string& GetLastURL() const { return last_url; }
     void SetLastURL(std::string last_url_) { last_url = std::move(last_url_); }
 
-    // Backed by the decide-policy NAVIGATION_ACTION handler's captured URL --
-    // ported equivalent of UrlRequestInterceptor::GetRequestedURL()
-    // (util/url_request_interceptor.cpp), see bridge_spike.c's on_decide_policy for
-    // the already-verified version of this exact logic.
     [[nodiscard]] QString GetCurrentURL() const;
 
-    // Replaces web_applet->page()->runJavaScript(script, callback) uniformly across
-    // all backends (main.cpp:983,1001,1079). Same signature/semantics as
-    // QWebEnginePage::runJavaScript's 2-arg overload: fire-and-forget if callback
-    // is null.
     void EvaluateJavaScript(const QString& script,
                             std::function<void(const QVariant&)> callback = {});
-
-    // Replaces web_applet->setZoomFactor(...) (main.cpp:947). WebKitGTK equivalent:
-    // webkit_web_view_set_zoom_level, confirmed present in the installed 2.52.3
-    // headers used for bridge_spike.c this session.
     void SetPageZoomFactor(qreal factor);
 
     void hide();
 
 private:
-    // Real Qt mechanism for embedding a foreign native window as a QWidget,
-    // confirmed via Qt 6.11/6.8 official "Window Embedding Example" docs this
-    // session: QWindow::fromWinId(WId) + QWidget::createWindowContainer(QWindow*).
-    // Confirmed native handle types per that same doc: HWND (Windows),
-    // xcb_window_t (Linux), NSView (macOS) -- X11 only, no Wayland type listed.
-    //
-    // NOT VERIFIED ON WAYLAND. Checked for a Wayland path (xdg-foreign protocol,
-    // Qt's Wayland plugin references it) and separately confirmed GTK itself has no
-    // Wayland subsurface support (GNOME discourse, direct statement) -- real open
-    // question, not resolved here. FallbackToTopLevelWindow() below is the
-    // pragmatic non-blocking answer: detect X11 vs Wayland at runtime via
-    // QGuiApplication::platformName(), embed on X11, fall back to a separate
-    // top-level GtkWindow on Wayland (worse UX, ships, doesn't block on the harder
-    // problem -- also literally what bridge_spike.c's spike already does, not
-    // hidden as a coincidence).
+    void SetUserAgent(UserAgent user_agent);
+    void LoadExtractedFonts();   // local pages only, mirrors LoadExtractedFonts()
+    void FocusFirstLinkElement(); // both local and external, mirrors same-named method
+
+    void StartInputThread();
+    void StopInputThread();
+    void InputThreadLoop();
+    // Sends a synthesized DOM KeyboardEvent via eval instead of Qt's
+    // QCoreApplication::postEvent(focusProxy(), ...) -- deliberate deviation, not
+    // an oversight. postEvent-to-focusProxy relies on the target being a real
+    // Qt-integrated widget; a createWindowContainer-embedded foreign window's key
+    // events are handled by GTK's own native event loop, not Qt's, so postEvent
+    // would very likely never reach the page at all. Dispatching a synthetic
+    // KeyboardEvent through the same eval path already proven for everything else
+    // sidesteps that entirely and works identically regardless of embed vs
+    // fallback-toplevel path (Embed()/FallbackToTopLevelWindow()).
+    void SendKeyEvent(const QString& key, const QString& code, int key_code);
+
     QWidget* Embed(QWidget* parent);
     void FallbackToTopLevelWindow();
 
@@ -116,6 +112,7 @@ private:
     static void OnNxControl(WebKitUserContentManager*, WebKitJavascriptResult*, gpointer);
     static gboolean OnDecidePolicy(WebKitWebView*, WebKitPolicyDecision*,
                                    WebKitPolicyDecisionType, gpointer);
+    static void OnClose(WebKitWebView*, gpointer); // JS window.close() -- WindowClosed exit
 
     GMainWindow& main_window;
     GtkWidget* gtk_window = nullptr; // only set if FallbackToTopLevelWindow() path taken
@@ -124,7 +121,11 @@ private:
 
     Core::System& system;
     InputCommon::InputSubsystem* input_subsystem;
+    std::unique_ptr<InputInterpreter> input_interpreter;
+    std::thread input_thread;
+    std::atomic<bool> input_thread_running{};
 
+    bool is_local = false;
     std::atomic<bool> finished{false};
     Service::AM::Frontend::WebExitReason exit_reason{};
     std::string last_url;

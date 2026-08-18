@@ -1,18 +1,99 @@
 // SPDX-FileCopyrightText: Copyright 2026 citron Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// Ported from qt_web_browser_scripts.h WINDOW_NX_SCRIPT. Actually compiled + run this
-// session as nx_shim.js against WebKitGTK 2.52.3 (bridge_spike.c) -- all 5 legs passing,
-// see that files git history/session notes. Byte-identical here except the 2 mechanism
-// changes documented below, same as the original nx_shim.js header.
-//
-//   1. sendMessage(): array push -> window.webkit.messageHandlers.nxMessage.postMessage()
-//   2. endApplet(): bool set -> window.webkit.messageHandlers.nxControl.postMessage()
-//
-// citron_key_callbacks (footer dispatch) unchanged -- native-polls-input -> eval-into-page
-// is not platform-specific, same reasoning as the Qt original.
+// All 5 scripts qt_web_browser_scripts.h defines (NX_FONT_CSS, LOAD_NX_FONT,
+// FOCUS_LINK_ELEMENT_SCRIPT, GAMEPAD_SCRIPT, WINDOW_NX_SCRIPT), byte-identical
+// except WINDOW_NX_SCRIPT's 2 documented mechanism changes (see that block below).
+// Missed all but WINDOW_NX_SCRIPT in the first pass of this patch -- found on a
+// full re-read of qt_web_browser.cpp before calling anything ready to ship.
 
 #pragma once
+
+constexpr char WEBKITGTK_NX_FONT_CSS[] = R"(
+(function() {
+    css = document.createElement('style');
+    css.type = 'text/css';
+    css.id = 'nx_font';
+    css.innerText = `
+/* FontStandard */
+@font-face {
+    font-family: 'FontStandard';
+    src: url('%1') format('truetype');
+}
+
+/* FontChineseSimplified */
+@font-face {
+    font-family: 'FontChineseSimplified';
+    src: url('%2') format('truetype');
+}
+
+/* FontExtendedChineseSimplified */
+@font-face {
+    font-family: 'FontExtendedChineseSimplified';
+    src: url('%3') format('truetype');
+}
+
+/* FontChineseTraditional */
+@font-face {
+    font-family: 'FontChineseTraditional';
+    src: url('%4') format('truetype');
+}
+
+/* FontKorean */
+@font-face {
+    font-family: 'FontKorean';
+    src: url('%5') format('truetype');
+}
+
+/* FontNintendoExtended */
+@font-face {
+    font-family: 'NintendoExt003';
+    src: url('%6') format('truetype');
+}
+
+/* FontNintendoExtended2 */
+@font-face {
+    font-family: 'NintendoExt003';
+    src: url('%7') format('truetype');
+}
+`;
+
+    document.head.appendChild(css);
+})();
+)";
+
+constexpr char WEBKITGTK_LOAD_NX_FONT[] = R"(
+(function() {
+    var elements = document.querySelectorAll("*");
+
+    for (var i = 0; i < elements.length; i++) {
+        var style = window.getComputedStyle(elements[i], null);
+        if (style.fontFamily.includes("Arial") || style.fontFamily.includes("Calibri") ||
+            style.fontFamily.includes("Century") || style.fontFamily.includes("Times New Roman")) {
+            elements[i].style.fontFamily = "FontStandard, FontChineseSimplified, FontExtendedChineseSimplified, FontChineseTraditional, FontKorean, NintendoExt003";
+        } else {
+            elements[i].style.fontFamily = style.fontFamily + ", FontStandard, FontChineseSimplified, FontExtendedChineseSimplified, FontChineseTraditional, FontKorean, NintendoExt003";
+        }
+    }
+})();
+)";
+
+constexpr char WEBKITGTK_FOCUS_LINK_ELEMENT_SCRIPT[] = R"(
+if (document.getElementsByTagName("a").length > 0) {
+    document.getElementsByTagName("a")[0].focus();
+}
+)";
+
+constexpr char WEBKITGTK_GAMEPAD_SCRIPT[] = R"(
+window.addEventListener("gamepadconnected", function(e) {
+    console.log("Gamepad connected at index %d: %s. %d buttons, %d axes.",
+        e.gamepad.index, e.gamepad.id, e.gamepad.buttons.length, e.gamepad.axes.length);
+});
+
+window.addEventListener("gamepaddisconnected", function(e) {
+    console.log("Gamepad disconnected from index %d: %s", e.gamepad.index, e.gamepad.id);
+});
+)";
 
 constexpr char WEBKITGTK_NX_SCRIPT[] = R"(
 // Ported from src/citron/applets/qt_web_browser_scripts.h:92-204 (WINDOW_NX_SCRIPT).

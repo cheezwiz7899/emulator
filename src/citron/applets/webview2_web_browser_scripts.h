@@ -1,12 +1,97 @@
 // SPDX-FileCopyrightText: Copyright 2026 citron Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// Ported from qt_web_browser_scripts.h WINDOW_NX_SCRIPT. Same content as
-// nx_shim_webview2.js (this session, earlier) -- envelope-tagged endApplet,
-// window.chrome.webview.postMessage for sendMessage. Never compiled/run,
-// no WebView2 runtime in this sandbox -- see webview2_web_browser.h header.
+// All 5 scripts, same set/provenance as webkitgtk_web_browser_scripts.h. See
+// that file's header for why this exists (missed on first pass, found on full
+// re-read of qt_web_browser.cpp).
 
 #pragma once
+
+constexpr wchar_t WEBVIEW2_NX_FONT_CSS[] = LR"(
+(function() {
+    css = document.createElement('style');
+    css.type = 'text/css';
+    css.id = 'nx_font';
+    css.innerText = `
+/* FontStandard */
+@font-face {
+    font-family: 'FontStandard';
+    src: url('%1') format('truetype');
+}
+
+/* FontChineseSimplified */
+@font-face {
+    font-family: 'FontChineseSimplified';
+    src: url('%2') format('truetype');
+}
+
+/* FontExtendedChineseSimplified */
+@font-face {
+    font-family: 'FontExtendedChineseSimplified';
+    src: url('%3') format('truetype');
+}
+
+/* FontChineseTraditional */
+@font-face {
+    font-family: 'FontChineseTraditional';
+    src: url('%4') format('truetype');
+}
+
+/* FontKorean */
+@font-face {
+    font-family: 'FontKorean';
+    src: url('%5') format('truetype');
+}
+
+/* FontNintendoExtended */
+@font-face {
+    font-family: 'NintendoExt003';
+    src: url('%6') format('truetype');
+}
+
+/* FontNintendoExtended2 */
+@font-face {
+    font-family: 'NintendoExt003';
+    src: url('%7') format('truetype');
+}
+`;
+
+    document.head.appendChild(css);
+})();
+)";
+
+constexpr wchar_t WEBVIEW2_LOAD_NX_FONT[] = LR"(
+(function() {
+    var elements = document.querySelectorAll("*");
+
+    for (var i = 0; i < elements.length; i++) {
+        var style = window.getComputedStyle(elements[i], null);
+        if (style.fontFamily.includes("Arial") || style.fontFamily.includes("Calibri") ||
+            style.fontFamily.includes("Century") || style.fontFamily.includes("Times New Roman")) {
+            elements[i].style.fontFamily = "FontStandard, FontChineseSimplified, FontExtendedChineseSimplified, FontChineseTraditional, FontKorean, NintendoExt003";
+        } else {
+            elements[i].style.fontFamily = style.fontFamily + ", FontStandard, FontChineseSimplified, FontExtendedChineseSimplified, FontChineseTraditional, FontKorean, NintendoExt003";
+        }
+    }
+})();
+)";
+
+constexpr wchar_t WEBVIEW2_FOCUS_LINK_ELEMENT_SCRIPT[] = LR"(
+if (document.getElementsByTagName("a").length > 0) {
+    document.getElementsByTagName("a")[0].focus();
+}
+)";
+
+constexpr wchar_t WEBVIEW2_GAMEPAD_SCRIPT[] = LR"(
+window.addEventListener("gamepadconnected", function(e) {
+    console.log("Gamepad connected at index %d: %s. %d buttons, %d axes.",
+        e.gamepad.index, e.gamepad.id, e.gamepad.buttons.length, e.gamepad.axes.length);
+});
+
+window.addEventListener("gamepaddisconnected", function(e) {
+    console.log("Gamepad disconnected from index %d: %s", e.gamepad.index, e.gamepad.id);
+});
+)";
 
 constexpr wchar_t WEBVIEW2_NX_SCRIPT[] = LR"(
 // Ported from src/citron/applets/qt_web_browser_scripts.h:92-204 (WINDOW_NX_SCRIPT),
