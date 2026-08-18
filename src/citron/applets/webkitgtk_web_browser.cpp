@@ -27,6 +27,13 @@
 #include <QVBoxLayout>
 #include <QWindow>
 
+// The header only forward-declares these (see its own comment on why) -- the
+// real definitions belong here, the one place that actually calls into them,
+// scoped with -DQT_NO_KEYWORDS (src/citron/CMakeLists.txt) to dodge the
+// signals/slots collision these bring in alongside the Qt includes above.
+#include <gtk/gtk.h>
+#include <webkit2/webkit2.h>
+
 #include <gdk/gdk.h>
 #if defined(GDK_WINDOWING_X11)
 #include <gdk/gdkx.h>
@@ -500,8 +507,9 @@ void WebKitGTKView::OnNxControl(WebKitUserContentManager*, WebKitJavascriptResul
     g_free(str_value);
 }
 
-gboolean WebKitGTKView::OnDecidePolicy(WebKitWebView*, WebKitPolicyDecision* decision,
-                                       WebKitPolicyDecisionType decision_type, gpointer user_data) {
+int WebKitGTKView::OnDecidePolicy(WebKitWebView*, WebKitPolicyDecision* decision,
+                                  int decision_type_raw, gpointer user_data) {
+    auto decision_type = static_cast<WebKitPolicyDecisionType>(decision_type_raw);
     auto* self = static_cast<WebKitGTKView*>(user_data);
     if (decision_type != WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION) {
         return FALSE;

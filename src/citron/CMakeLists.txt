@@ -605,6 +605,16 @@ if (CITRON_USE_WEBKITGTK_WEB_ENGINE)
     # calls -- system libraries, not CPM, see that file's policy note.
     target_link_libraries(citron PRIVATE PkgConfig::WEBKITGTK PkgConfig::GTK3)
     target_compile_definitions(citron PRIVATE -DCITRON_USE_WEBKITGTK_WEB_ENGINE)
+
+    # Found via a real compile-check this session, not theoretical: Qt's
+    # signals/slots macros collide with GLib/GTK headers that use those exact
+    # identifiers as plain struct field names, in any translation unit that
+    # includes both. Scoped to ONLY this one file -- NOT target-wide, since
+    # qt_web_browser.h/.cpp and other Qt files elsewhere in this target use bare
+    # emit/signals:/slots: throughout and would break if QT_NO_KEYWORDS applied
+    # to the whole citron target.
+    set_source_files_properties(applets/webkitgtk_web_browser.cpp PROPERTIES
+        COMPILE_DEFINITIONS "QT_NO_KEYWORDS")
 endif ()
 
 if (CITRON_USE_WEBVIEW2_WEB_ENGINE)

@@ -25,8 +25,30 @@
 
 #ifdef CITRON_USE_WEBKITGTK_WEB_ENGINE
 #include <QWidget>
-#include <gtk/gtk.h>
-#include <webkit2/webkit2.h>
+
+// Forward declarations only -- NOT #include <gtk/gtk.h> / <webkit2/webkit2.h>
+// here. This header is now transitively included by main.cpp (via the
+// ActiveWebEngineView alias machinery), and GTK/GLib headers define struct
+// fields literally named "signals"/"slots" that collide with Qt's macros of the
+// same name -- main.cpp uses bare emit/signals:/slots: throughout, so it can
+// never see the real GTK headers. Only webkitgtk_web_browser.cpp (which needs
+// the real definitions to actually call these APIs) includes the real headers,
+// scoped there with -DQT_NO_KEYWORDS (src/citron/CMakeLists.txt). Found this the
+// hard way via a real compile-check this session, not anticipated up front.
+//
+// GObject/GTK opaque types are typedef'd structs (typedef struct _X X;) in their
+// real headers -- matching the same underlying tag name here is
+// forward-declaration-compatible with the real definition when the .cpp sees
+// both, not a conflicting redeclaration.
+extern "C" {
+typedef struct _GtkWidget GtkWidget;
+typedef struct _WebKitWebView WebKitWebView;
+typedef struct _WebKitUserContentManager WebKitUserContentManager;
+typedef struct _WebKitJavascriptResult WebKitJavascriptResult;
+typedef struct _WebKitPolicyDecision WebKitPolicyDecision;
+typedef void* gpointer; // matches glib's own typedef; avoids pulling glib.h in
+                        // just for this one alias
+}
 #endif
 
 #include "core/frontend/applets/web_browser.h"
@@ -110,9 +132,16 @@ private:
 
     static void OnNxMessage(WebKitUserContentManager*, WebKitJavascriptResult*, gpointer);
     static void OnNxControl(WebKitUserContentManager*, WebKitJavascriptResult*, gpointer);
-    static gboolean OnDecidePolicy(WebKitWebView*, WebKitPolicyDecision*,
-                                   WebKitPolicyDecisionType, gpointer);
-    static void OnClose(WebKitWebView*, gpointer); // JS window.close() -- WindowClosed exit
+    // decision_type is WebKitPolicyDecisionType (a plain C enum, not forward-
+    // declarable without its full enumerator list) -- erased to int here, the
+    // real typed signature is registered with g_signal_connect from the .cpp,
+    // where the full header IS visible. GTK dispatches by the signal name
+    // string, not by the C function pointer's declared type matching some
+    // caller-visible declaration, so this erasure is safe: G_CALLBACK() is a
+    // blind reinterpret_cast in GTK's own macro, not something this header's
+    // declared signature needs to match exactly for the connection to work.
+    static int OnDecidePolicy(WebKitWebView*, WebKitPolicyDecision*, int, gpointer);
+    static void OnClose(WebKitWebView*, gpointer);
 
     GMainWindow& main_window;
     GtkWidget* gtk_window = nullptr; // only set if FallbackToTopLevelWindow() path taken
