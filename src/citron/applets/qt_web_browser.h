@@ -4,9 +4,11 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <thread>
 
 #include <QObject>
+#include <QVariant>
 
 #ifdef CITRON_USE_QT_WEB_ENGINE
 #include <QWebEngineView>
@@ -98,6 +100,14 @@ public:
      * @return Currently requested URL
      */
     [[nodiscard]] QString GetCurrentURL() const;
+
+    // Thin wrappers so main.cpp's call sites are backend-agnostic across
+    // QtNXWebEngineView / WebKitGTKView / WebView2View. Added alongside those two
+    // new backends rather than only in them, so there's exactly one call-site
+    // convention, not a special case for the original backend.
+    void EvaluateJavaScript(const QString& script,
+                            std::function<void(const QVariant&)> callback = {});
+    void SetPageZoomFactor(qreal factor) { setZoomFactor(factor); }
 
 public slots:
     void hide();

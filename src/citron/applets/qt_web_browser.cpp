@@ -190,6 +190,15 @@ QString QtNXWebEngineView::GetCurrentURL() const {
     return url_interceptor->GetRequestedURL().toString();
 }
 
+void QtNXWebEngineView::EvaluateJavaScript(const QString& script,
+                                           std::function<void(const QVariant&)> callback) {
+    if (callback) {
+        page()->runJavaScript(script, std::move(callback));
+    } else {
+        page()->runJavaScript(script);
+    }
+}
+
 void QtNXWebEngineView::hide() {
     SetFinished(true);
     StopInputThread();

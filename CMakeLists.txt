@@ -78,6 +78,15 @@ option(CITRON_USE_LLVM_DEMANGLE "Search for and link against a system LLVM for C
 option(CITRON_USE_QT_MULTIMEDIA "Use QtMultimedia for Camera" OFF)
 
 option(CITRON_USE_QT_WEB_ENGINE "Use QtWebEngine for web applet implementation" OFF)
+# Platform-native alternatives to CITRON_USE_QT_WEB_ENGINE -- see
+# CMakeModules/webview_native_deps.cmake for the dependency wiring and
+# src/citron/applets/web{kitgtk,view2}_web_browser.{h,cpp} for the implementations.
+# Default OFF: WebKitGTK path is unvalidated on real NVIDIA hardware as of this
+# patch (DMABUF renderer risk, see webkitgtk_web_browser.h); WebView2 path has
+# never been compiled at all (no Windows/WebView2 SDK toolchain available where
+# this patch was written). Neither should default ON until that changes.
+option(CITRON_USE_WEBKITGTK_WEB_ENGINE "Use WebKitGTK for web applet implementation (Linux)" OFF)
+option(CITRON_USE_WEBVIEW2_WEB_ENGINE "Use WebView2 for web applet implementation (Windows)" OFF)
 
 option(ENABLE_UNITY_BUILD "Enables the unity build" OFF)
 
@@ -374,6 +383,7 @@ if (CITRON_USE_CPM)
     option(CPM_USE_LOCAL_PACKAGES "Prefer system find_package over CPM fetch" OFF)
     include(${CMAKE_SOURCE_DIR}/CMakeModules/CPM.cmake)
     include(${CMAKE_SOURCE_DIR}/CMakeModules/dependencies.cmake)
+    include(${CMAKE_SOURCE_DIR}/CMakeModules/webview_native_deps.cmake)
 endif()
 
 # Enforce the search mode of non-required packages for better and shorter failure messages

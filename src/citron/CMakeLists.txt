@@ -48,6 +48,12 @@ add_executable(citron
     applets/qt_web_browser.cpp
     applets/qt_web_browser.h
     applets/qt_web_browser_scripts.h
+    applets/webkitgtk_web_browser.cpp
+    applets/webkitgtk_web_browser.h
+    applets/webkitgtk_web_browser_scripts.h
+    applets/webview2_web_browser.cpp
+    applets/webview2_web_browser.h
+    applets/webview2_web_browser_scripts.h
     bootmanager.cpp
     bootmanager.h
     controller_overlay.cpp
@@ -591,6 +597,21 @@ endif ()
 if (CITRON_USE_QT_WEB_ENGINE)
     target_link_libraries(citron PRIVATE Qt6::WebEngineCore Qt6::WebEngineWidgets)
     target_compile_definitions(citron PRIVATE -DCITRON_USE_QT_WEB_ENGINE)
+endif ()
+
+if (CITRON_USE_WEBKITGTK_WEB_ENGINE)
+    # PkgConfig::WEBKITGTK / PkgConfig::GTK3 come from
+    # CMakeModules/webview_native_deps.cmake's pkg_check_modules(... IMPORTED_TARGET ...)
+    # calls -- system libraries, not CPM, see that file's policy note.
+    target_link_libraries(citron PRIVATE PkgConfig::WEBKITGTK PkgConfig::GTK3)
+    target_compile_definitions(citron PRIVATE -DCITRON_USE_WEBKITGTK_WEB_ENGINE)
+endif ()
+
+if (CITRON_USE_WEBVIEW2_WEB_ENGINE)
+    # WIL::WIL / WebView2::WebView2 come from
+    # CMakeModules/webview_native_deps.cmake's CPMAddPackage calls.
+    target_link_libraries(citron PRIVATE WIL::WIL WebView2::WebView2)
+    target_compile_definitions(citron PRIVATE -DCITRON_USE_WEBVIEW2_WEB_ENGINE)
 endif ()
 
 if (CITRON_ENABLE_PGO_GENERATE AND MSVC)

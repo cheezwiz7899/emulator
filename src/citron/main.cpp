@@ -44,6 +44,8 @@
 #include "applets/qt_profile_select.h"
 #include "applets/qt_software_keyboard.h"
 #include "applets/qt_web_browser.h"
+#include "applets/webkitgtk_web_browser.h"
+#include "applets/webview2_web_browser.h"
 #include "citron/custom_metadata.h"
 #include "citron/multiplayer/state.h"
 #include "citron/util/controller_navigation.h"
@@ -893,19 +895,31 @@ void GMainWindow::SoftwareKeyboardExit() {
 
 void GMainWindow::WebBrowserOpenWebPage(const std::string& main_url,
                                         const std::string& additional_args, bool is_local) {
-#ifdef CITRON_USE_QT_WEB_ENGINE
+#if defined(CITRON_USE_QT_WEB_ENGINE) || defined(CITRON_USE_WEBKITGTK_WEB_ENGINE) || \
+    defined(CITRON_USE_WEBVIEW2_WEB_ENGINE)
 
     // Settings::values.disable_web_applet is now checked earlier, in WebBrowser::Execute()
     // (applet_web_browser.cpp) before the frontend is ever invoked at all - see the comment on
     // that setting for why. Raw input specifically still breaks the Qt WebEngine widget itself,
     // so that check stays here rather than moving to the frontend-agnostic service layer.
+    // Kept for the WebKitGTK/WebView2 backends too even though this hasn't been confirmed to
+    // affect them specifically -- neither has been exercised with raw input at all yet (no
+    // hardware validation for either as of this patch), so this errs toward the known-safe
+    // restriction rather than assuming a different rendering/input stack is unaffected. Worth
+    // re-testing per backend once real hardware validation happens for each.
     if (Settings::values.enable_raw_input) {
         emit WebBrowserClosed(Service::AM::Frontend::WebExitReason::WindowClosed,
                               "http://localhost/");
         return;
     }
 
+#if defined(CITRON_USE_QT_WEB_ENGINE)
     web_applet = new QtNXWebEngineView(this, *system, input_subsystem.get());
+#elif defined(CITRON_USE_WEBKITGTK_WEB_ENGINE)
+    web_applet = new WebKitGTKView(*this, *system, input_subsystem.get());
+#elif defined(CITRON_USE_WEBVIEW2_WEB_ENGINE)
+    web_applet = new WebView2View(*this, *system, input_subsystem.get());
+#endif
 
     ui->action_Pause->setEnabled(false);
     ui->action_Restart->setEnabled(false);
@@ -944,8 +958,8 @@ void GMainWindow::WebBrowserOpenWebPage(const std::string& main_url,
         const auto& layout = render_window->GetFramebufferLayout();
         web_applet->resize(layout.screen.GetWidth(), layout.screen.GetHeight());
         web_applet->move(layout.screen.left, (layout.screen.top) + menuBar()->height());
-        web_applet->setZoomFactor(static_cast<qreal>(layout.screen.GetWidth()) /
-                                  static_cast<qreal>(Layout::ScreenUndocked::Width));
+        web_applet->SetPageZoomFactor(static_cast<qreal>(layout.screen.GetWidth()) /
+                                      static_cast<qreal>(Layout::ScreenUndocked::Width));
 
         web_applet->setFocus();
         web_applet->show();
@@ -957,8 +971,10 @@ void GMainWindow::WebBrowserOpenWebPage(const std::string& main_url,
         loading_progress.setValue(3);
     }
 
+#if defined(CITRON_USE_QT_WEB_ENGINE)
     bool exit_check = false;
     bool interactive_poll_pending = false;
+#endif
 
     // TODO (Morph): Remove this
     QAction* exit_action = new QAction(tr("Disable Web Applet"), this);
@@ -979,6 +995,7 @@ void GMainWindow::WebBrowserOpenWebPage(const std::string& main_url,
     while (!web_applet->IsFinished()) {
         QCoreApplication::processEvents();
 
+#if defined(CITRON_USE_QT_WEB_ENGINE)
         if (!exit_check) {
             web_applet->page()->runJavaScript(
                 QStringLiteral("end_applet;"), [&](const QVariant& variant) {
@@ -1017,6 +1034,18 @@ void GMainWindow::WebBrowserOpenWebPage(const std::string& main_url,
 
             web_applet->SetLastURL(web_applet->GetCurrentURL().toStdString());
         }
+#else
+        // WebKitGTKView / WebView2View: nothing to poll here. end_applet and
+        // citron_outgoing_messages don't exist in their ported shim (nx_shim.js /
+        // nx_shim_webview2.js) at all -- both were replaced with direct
+        // message-handler pushes (OnNxControl / OnNxMessage firing the instant an
+        // event happens), and the localhost callback-URL check moved into
+        // OnDecidePolicy / OnNavigationStarting firing at navigation-decision time
+        // instead of being polled against GetCurrentURL() here. IsFinished(),
+        // GetExitReason(), and GetLastURL() are already current by the time this
+        // loop reads them. This loop's only remaining job for these two backends
+        // is pumping the Qt event loop while modal-waiting.
+#endif
 
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
@@ -1051,7 +1080,8 @@ void GMainWindow::WebBrowserOpenWebPage(const std::string& main_url,
 }
 
 void GMainWindow::WebBrowserRequestExit() {
-#ifdef CITRON_USE_QT_WEB_ENGINE
+#if defined(CITRON_USE_QT_WEB_ENGINE) || defined(CITRON_USE_WEBKITGTK_WEB_ENGINE) || \
+    defined(CITRON_USE_WEBVIEW2_WEB_ENGINE)
     if (web_applet) {
         web_applet->SetExitReason(Service::AM::Frontend::WebExitReason::ExitRequested);
         web_applet->SetFinished(true);
@@ -1060,7 +1090,14 @@ void GMainWindow::WebBrowserRequestExit() {
 }
 
 void GMainWindow::WebBrowserDeliverInteractiveData(const std::string& data) {
-#ifdef CITRON_USE_QT_WEB_ENGINE
+#if defined(CITRON_USE_QT_WEB_ENGINE) || defined(CITRON_USE_WEBKITGTK_WEB_ENGINE) || \
+    defined(CITRON_USE_WEBVIEW2_WEB_ENGINE)
+    // Backend-agnostic since EvaluateJavaScript was added: escaping stays in one
+    // place (Qt's own QJsonDocument, more robust than a hand-rolled per-backend
+    // escaper) and every backend goes through the same dispatch script. The
+    // WebKitGTKView/WebView2View spikes this was ported from each had their own
+    // hand-rolled JSON escaper for this exact job before this unification --
+    // dropped in favor of reusing Qt's, one implementation instead of three.
     if (!web_applet) {
         // The guest pushed interactive data after the page was already closed (or before it
         // opened); there is nothing listening on the page side, so just drop it.
@@ -1076,7 +1113,7 @@ void GMainWindow::WebBrowserDeliverInteractiveData(const std::string& data) {
 
     // Dispatch as a "message" event so window.nx.addEventListener("message", ...) listeners
     // (the same bridge real hardware uses) receive it with the original string as e.data.
-    web_applet->page()->runJavaScript(
+    web_applet->EvaluateJavaScript(
         QStringLiteral("window.dispatchEvent(new MessageEvent('message', { data: (%1)[0] }));")
             .arg(escaped_data));
 #endif
