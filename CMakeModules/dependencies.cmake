@@ -426,32 +426,38 @@ if (CITRON_USE_EXTERNAL_SDL2 AND NOT TARGET SDL2::SDL2)
     foreach(_sdl_target IN ITEMS SDL3-shared SDL2)
         if (TARGET ${_sdl_target})
             if (MSVC)
-                target_compile_options(${_sdl_target} PRIVATE
-                    /W0
-                    /clang:-Wno-unsafe-buffer-usage
-                    /clang:-Wno-unsafe-pointer-arithmetic
-                    /clang:-Wno-missing-prototypes
-                    /clang:-Wno-missing-variable-declarations
-                    /clang:-Wno-sign-conversion
-                    /clang:-Wno-cast-qual
-                    /clang:-Wno-cast-align
-                    /clang:-Wno-implicit-int-conversion
-                    /clang:-Wno-shorten-64-to-32
-                    /clang:-Wno-float-conversion
-                    /clang:-Wno-double-promotion
-                    /clang:-Wno-reserved-identifier
-                    /clang:-Wno-reserved-macro-identifier
-                    /clang:-Wno-extra-semi
-                    /clang:-Wno-extra-semi-stmt
-                    /clang:-Wno-switch-default
-                    /clang:-Wno-switch-enum
-                    /clang:-Wno-pre-c11-compat
-                    /clang:-Wno-bad-function-cast
-                    /clang:-Wno-strict-prototypes
-                    /clang:-Wno-unused-macros
-                    /clang:-Wno-nonportable-system-include-path
-                    /clang:-Wno-date-time
-                )
+                # /W0 silences all MSVC-dialect warnings on these third-party targets.
+                # /clang:-Wno-* flags suppress Clang front-end diagnostics and are only
+                # valid under clang-cl (CMAKE_C_COMPILER_ID == "Clang").  Plain cl.exe
+                # does not understand the /clang: prefix and would error.
+                target_compile_options(${_sdl_target} PRIVATE /W0)
+                if (CMAKE_C_COMPILER_ID STREQUAL "Clang")
+                    target_compile_options(${_sdl_target} PRIVATE
+                        /clang:-Wno-unsafe-buffer-usage
+                        /clang:-Wno-unsafe-pointer-arithmetic
+                        /clang:-Wno-missing-prototypes
+                        /clang:-Wno-missing-variable-declarations
+                        /clang:-Wno-sign-conversion
+                        /clang:-Wno-cast-qual
+                        /clang:-Wno-cast-align
+                        /clang:-Wno-implicit-int-conversion
+                        /clang:-Wno-shorten-64-to-32
+                        /clang:-Wno-float-conversion
+                        /clang:-Wno-double-promotion
+                        /clang:-Wno-reserved-identifier
+                        /clang:-Wno-reserved-macro-identifier
+                        /clang:-Wno-extra-semi
+                        /clang:-Wno-extra-semi-stmt
+                        /clang:-Wno-switch-default
+                        /clang:-Wno-switch-enum
+                        /clang:-Wno-pre-c11-compat
+                        /clang:-Wno-bad-function-cast
+                        /clang:-Wno-strict-prototypes
+                        /clang:-Wno-unused-macros
+                        /clang:-Wno-nonportable-system-include-path
+                        /clang:-Wno-date-time
+                    )
+                endif()
             else()
                 # GCC/Clang on Linux/macOS.
                 target_compile_options(${_sdl_target} PRIVATE

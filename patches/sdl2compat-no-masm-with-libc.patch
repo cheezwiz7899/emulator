@@ -1,7 +1,6 @@
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -239,18 +239,28 @@
-
  if(WIN32)
    list(APPEND SDL2COMPAT_SRCS
 -    "src/sdl2_mslibc.c"
@@ -32,3 +31,20 @@
      list(APPEND SDL2COMPAT_SRCS
        "src/sdl2_mslibc_arm64.masm"
      )
+     enable_language(ASM_MARMASM)
+     set_property(SOURCE "src/sdl2_mslibc_arm64.masm" PROPERTY LANGUAGE "ASM_MARMASM")
+   elseif(SDL_CPU_ARM32)
+@@ -383,10 +393,12 @@
+ if(MSVC)
+   # Don't try to link with the default set of libraries.
+-  target_compile_options(SDL2 PRIVATE "$<$<COMPILE_LANGUAGE:C>:/GS->")
++  if(NOT SDL_LIBC)
++    target_compile_options(SDL2 PRIVATE "$<$<COMPILE_LANGUAGE:C>:/GS->")
++  endif()
+   if(SDL_CPU_X86)  # don't emit SSE2 in x86 builds
+     target_compile_options(SDL2 PRIVATE "$<$<COMPILE_LANGUAGE:C>:/arch:SSE>")
+   endif()
+-  if(NOT MSVC_CLANG AND NOT SDL_CPU_ARM32)
++  if(NOT MSVC_CLANG AND NOT SDL_CPU_ARM32 AND NOT SDL_LIBC)
+     set_property(TARGET SDL2 APPEND_STRING PROPERTY LINK_FLAGS " /NODEFAULTLIB")
+   endif()
