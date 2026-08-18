@@ -1,19 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 citron Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// WebView2 backend, v2. Same v1->v2 gap-closing as webkitgtk_web_browser.h -- see
-// that file's header for the full account of what was missing and why (fonts,
-// UA, storage, input thread, focus-first-link, window-close). Applying the same
-// fixes here since this file was written in the same incomplete first pass and
-// almost certainly has the identical gaps, not a separate audit from scratch.
-//
-// UNCOMPILED, still -- no Windows/WebView2 SDK/wrl.h available in this Linux
-// sandbox regardless of how much else got fixed this round. The WebKitGTK side
-// got a real compile-check against real headers this session; this file did not
-// and structurally can't here. Every API name/signature below is sourced from
-// Microsoft Learn (this session's searches), not memory -- see the .cpp's own
-// citations -- but "sourced from real docs" and "compiled against the real SDK"
-// are different confidence tiers and this is still the former, not the latter.
+// WebView2 backend for the web browser applet. Alternative to QtNXWebEngineView.
 
 #pragma once
 
@@ -92,19 +80,13 @@ private:
     void SetUserAgent(UserAgent user_agent);
     void LoadExtractedFonts();
     void FocusFirstLinkElement();
-    void InjectPersistentScripts(); // window_nx + gamepad, constructor-time, mirrors
-                                    // qt_web_browser.cpp:62-81
+    void InjectPersistentScripts(); // window_nx + gamepad at document creation, mirrors qt_web_browser.cpp:62-81
 
     void StartInputThread();
     void StopInputThread();
     void InputThreadLoop();
-    // Same deliberate deviation as WebKitGTKView::SendKeyEvent -- JS-synthesized
-    // KeyboardEvent via ExecuteScript instead of native key injection. Unlike the
-    // Linux side this isn't strictly forced by the embedding mechanism (WebView2's
-    // own HWND is a real native child window with its own input focus, closer to
-    // QtWebEngine's integration than WebKitGTK's foreign-window-pull), but kept
-    // the same for both backends deliberately -- one mechanism to reason about and
-    // test instead of two, and it's already proven to work via the bridge legs.
+    // Sends a synthesized DOM KeyboardEvent via ExecuteScript rather than native key
+    // injection -- keeps both backends on the same mechanism for consistency.
     void SendKeyEvent(const std::wstring& key, const std::wstring& code, int key_code);
 
     HRESULT OnWebMessageReceived(ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs*);

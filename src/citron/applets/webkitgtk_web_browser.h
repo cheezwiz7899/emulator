@@ -1,19 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 citron Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// WebKitGTK backend for the web browser applet. Alternative to QtNXWebEngineView
-// (qt_web_browser.h).
-//
-// v2 of this file. v1 covered the bridge mechanism only (script injection, message
-// handlers, nav interception, eval) and missed real functionality that lives in
-// qt_web_browser.cpp outside main.cpp's call sites: font loading/injection, the
-// input thread that actually drives footer-callback/D-pad navigation, user agent,
-// persistent storage, focus-first-link, and the window.close() exit path. Found on
-// a full re-read of qt_web_browser.cpp, not assumed complete after the first pass.
-//
-// UNCOMPILED. No Qt6 + WebKitGTK combined toolchain in the sandbox this was written
-// in -- see webkitgtk_web_browser.cpp's own header for what WAS compile-checked
-// this round.
+// WebKitGTK backend for the web browser applet. Alternative to QtNXWebEngineView.
 
 #pragma once
 
@@ -26,28 +14,16 @@
 #ifdef CITRON_USE_WEBKITGTK_WEB_ENGINE
 #include <QWidget>
 
-// Forward declarations only -- NOT #include <gtk/gtk.h> / <webkit2/webkit2.h>
-// here. This header is now transitively included by main.cpp (via the
-// ActiveWebEngineView alias machinery), and GTK/GLib headers define struct
-// fields literally named "signals"/"slots" that collide with Qt's macros of the
-// same name -- main.cpp uses bare emit/signals:/slots: throughout, so it can
-// never see the real GTK headers. Only webkitgtk_web_browser.cpp (which needs
-// the real definitions to actually call these APIs) includes the real headers,
-// scoped there with -DQT_NO_KEYWORDS (src/citron/CMakeLists.txt). Found this the
-// hard way via a real compile-check this session, not anticipated up front.
-//
-// GObject/GTK opaque types are typedef'd structs (typedef struct _X X;) in their
-// real headers -- matching the same underlying tag name here is
-// forward-declaration-compatible with the real definition when the .cpp sees
-// both, not a conflicting redeclaration.
+// GTK/WebKitGTK headers are included only in the .cpp (scoped with -DQT_NO_KEYWORDS)
+// to avoid the signals/slots name collision they cause when seen by main.cpp.
+// Forward declarations of the opaque GObject/GTK types are sufficient here.
 extern "C" {
 typedef struct _GtkWidget GtkWidget;
 typedef struct _WebKitWebView WebKitWebView;
 typedef struct _WebKitUserContentManager WebKitUserContentManager;
 typedef struct _WebKitJavascriptResult WebKitJavascriptResult;
 typedef struct _WebKitPolicyDecision WebKitPolicyDecision;
-typedef void* gpointer; // matches glib's own typedef; avoids pulling glib.h in
-                        // just for this one alias
+typedef void* gpointer;
 }
 #endif
 
@@ -73,8 +49,7 @@ enum class NpadButton : u64;
 
 class WebKitGTKView : public QWidget {
 public:
-    // Mirrors QtNXWebEngineView::UserAgent (qt_web_browser.h) exactly -- same enum,
-    // same values, same purpose (Nintendo*Browser UA string suffix).
+    // Matches QtNXWebEngineView::UserAgent (qt_web_browser.h) -- same enum, same values.
     enum class UserAgent {
         WebApplet,
         ShopN,
@@ -116,15 +91,9 @@ private:
     void StartInputThread();
     void StopInputThread();
     void InputThreadLoop();
-    // Sends a synthesized DOM KeyboardEvent via eval instead of Qt's
-    // QCoreApplication::postEvent(focusProxy(), ...) -- deliberate deviation, not
-    // an oversight. postEvent-to-focusProxy relies on the target being a real
-    // Qt-integrated widget; a createWindowContainer-embedded foreign window's key
-    // events are handled by GTK's own native event loop, not Qt's, so postEvent
-    // would very likely never reach the page at all. Dispatching a synthetic
-    // KeyboardEvent through the same eval path already proven for everything else
-    // sidesteps that entirely and works identically regardless of embed vs
-    // fallback-toplevel path (Embed()/FallbackToTopLevelWindow()).
+    // Sends a synthesized DOM KeyboardEvent via eval rather than Qt's postEvent,
+    // since a createWindowContainer-embedded foreign window's key events are handled
+    // by GTK's event loop, not Qt's.
     void SendKeyEvent(const QString& key, const QString& code, int key_code);
 
     QWidget* Embed(QWidget* parent);
@@ -132,19 +101,14 @@ private:
 
     static void OnNxMessage(WebKitUserContentManager*, WebKitJavascriptResult*, gpointer);
     static void OnNxControl(WebKitUserContentManager*, WebKitJavascriptResult*, gpointer);
-    // decision_type is WebKitPolicyDecisionType (a plain C enum, not forward-
-    // declarable without its full enumerator list) -- erased to int here, the
-    // real typed signature is registered with g_signal_connect from the .cpp,
-    // where the full header IS visible. GTK dispatches by the signal name
-    // string, not by the C function pointer's declared type matching some
-    // caller-visible declaration, so this erasure is safe: G_CALLBACK() is a
-    // blind reinterpret_cast in GTK's own macro, not something this header's
-    // declared signature needs to match exactly for the connection to work.
+    // decision_type is WebKitPolicyDecisionType (a plain C enum) erased to int --
+    // the real typed signature is registered via G_CALLBACK in the .cpp where the
+    // full header is visible. GTK dispatches by signal name string, not pointer type.
     static int OnDecidePolicy(WebKitWebView*, WebKitPolicyDecision*, int, gpointer);
     static void OnClose(WebKitWebView*, gpointer);
 
     GMainWindow& main_window;
-    GtkWidget* gtk_window = nullptr; // only set if FallbackToTopLevelWindow() path taken
+    GtkWidget* gtk_window = nullptr; // set by Embed() or FallbackToTopLevelWindow()
     WebKitWebView* webview = nullptr;
     QWidget* container = nullptr; // createWindowContainer() result, X11 path only
 

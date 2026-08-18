@@ -902,11 +902,8 @@ void GMainWindow::WebBrowserOpenWebPage(const std::string& main_url,
     // (applet_web_browser.cpp) before the frontend is ever invoked at all - see the comment on
     // that setting for why. Raw input specifically still breaks the Qt WebEngine widget itself,
     // so that check stays here rather than moving to the frontend-agnostic service layer.
-    // Kept for the WebKitGTK/WebView2 backends too even though this hasn't been confirmed to
-    // affect them specifically -- neither has been exercised with raw input at all yet (no
-    // hardware validation for either as of this patch), so this errs toward the known-safe
-    // restriction rather than assuming a different rendering/input stack is unaffected. Worth
-    // re-testing per backend once real hardware validation happens for each.
+    // Kept for WebKitGTK/WebView2 too -- neither has been hardware-validated yet,
+    // so this errs toward the known-safe restriction.
     if (Settings::values.enable_raw_input) {
         emit WebBrowserClosed(Service::AM::Frontend::WebExitReason::WindowClosed,
                               "http://localhost/");
@@ -1035,16 +1032,10 @@ void GMainWindow::WebBrowserOpenWebPage(const std::string& main_url,
             web_applet->SetLastURL(web_applet->GetCurrentURL().toStdString());
         }
 #else
-        // WebKitGTKView / WebView2View: nothing to poll here. end_applet and
-        // citron_outgoing_messages don't exist in their ported shim (nx_shim.js /
-        // nx_shim_webview2.js) at all -- both were replaced with direct
-        // message-handler pushes (OnNxControl / OnNxMessage firing the instant an
-        // event happens), and the localhost callback-URL check moved into
-        // OnDecidePolicy / OnNavigationStarting firing at navigation-decision time
-        // instead of being polled against GetCurrentURL() here. IsFinished(),
-        // GetExitReason(), and GetLastURL() are already current by the time this
-        // loop reads them. This loop's only remaining job for these two backends
-        // is pumping the Qt event loop while modal-waiting.
+        // WebKitGTK/WebView2: end_applet and citron_outgoing_messages are replaced
+        // by push-based handlers (OnNxControl/OnNxMessage, OnNavigationStarting).
+        // IsFinished()/GetExitReason()/GetLastURL() are already current; this loop
+        // only needs to pump the Qt event loop while modal-waiting.
 #endif
 
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -1092,12 +1083,8 @@ void GMainWindow::WebBrowserRequestExit() {
 void GMainWindow::WebBrowserDeliverInteractiveData(const std::string& data) {
 #if defined(CITRON_USE_QT_WEB_ENGINE) || defined(CITRON_USE_WEBKITGTK_WEB_ENGINE) || \
     defined(CITRON_USE_WEBVIEW2_WEB_ENGINE)
-    // Backend-agnostic since EvaluateJavaScript was added: escaping stays in one
-    // place (Qt's own QJsonDocument, more robust than a hand-rolled per-backend
-    // escaper) and every backend goes through the same dispatch script. The
-    // WebKitGTKView/WebView2View spikes this was ported from each had their own
-    // hand-rolled JSON escaper for this exact job before this unification --
-    // dropped in favor of reusing Qt's, one implementation instead of three.
+    // EvaluateJavaScript is backend-agnostic; escaping via QJsonDocument in one place
+    // instead of per-backend.
     if (!web_applet) {
         // The guest pushed interactive data after the page was already closed (or before it
         // opened); there is nothing listening on the page side, so just drop it.
@@ -6869,10 +6856,7 @@ static void SetHighDPIAttributes() {
 
 int main(int argc, char* argv[]) {
 #ifdef HAVE_SDL2
-    // SDL_MAIN_HANDLED (see the SDL.h include above) stops SDL from trying to
-    // supply its own main()/WinMain(); we provide main() directly, so SDL
-    // needs to be told we're ready before any other SDL call.
-    SDL_SetMainReady();
+    SDL_SetMainReady(); // required when SDL_MAIN_HANDLED is defined
 #endif
 
     // 1. Detect Gamescope/Steam Deck hardware

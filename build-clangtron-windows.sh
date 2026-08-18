@@ -1960,19 +1960,9 @@ build_common_cmake_args() {
         "-DCITRON_USE_CPM=ON"
         "-DCITRON_CHECK_SUBMODULES=OFF"
         "-DCPM_SOURCE_CACHE=${CMAKE_CPM_CACHE}"
-        # clang-cl targets win64_msvc2022_64 via aqt, which is exactly the one target Qt
-        # WebEngine (Chromium) actually supports on Windows - see qt_download.cmake and
-        # https://doc.qt.io/qt-6/qtwebengine-platform-notes.html ("does not compile with
-        # MinGW"). Nothing here enables it for llvm-mingw builds; that's intentionally left
-        # at CMake's own default (OFF), since it cannot work there regardless of this flag.
-        #
-        # CITRON_USE_WEBVIEW2_WEB_ENGINE is the bundle-size replacement for this (~460MB ->
-        # a small loader), see CMakeModules/webview_native_deps.cmake. Left OFF here
-        # deliberately, not forgotten: it's never been compiled, let alone run, against the
-        # real WebView2 SDK as of this patch. Flip the two lines below for a validation
-        # build once that changes -- not wired to auto-switch, so a stale checkout doesn't
-        # silently start shipping unvalidated code as the default.
         "-DCITRON_USE_QT_WEB_ENGINE=ON"
+        # WebView2 backend: left OFF; never compiled against the real SDK.
+        # Swap these two lines once that changes.
         # "-DCITRON_USE_QT_WEB_ENGINE=OFF"
         # "-DCITRON_USE_WEBVIEW2_WEB_ENGINE=ON"
         "-Wno-dev"
@@ -4768,45 +4758,19 @@ stage_clangcl() {
     local pgo_link_flags_batch="${pgo_link_flags//%/%%}"
     local pgo_flags_dash_batch="${pgo_flags_dash//%/%%}"
 
-    # NOTE: CITRON_ENABLE_LTO and CITRON_ENABLE_PGO_GENERATE/USE are deliberately left
-    # OFF below, even though this build may genuinely be doing LTO/PGO via the raw
-    # /clang:-flto=... and /clang:-fprofile-instr-... flags already baked into
-    # CMAKE_C/CXX_FLAGS_${config} above. Do NOT "fix" these to reflect real state --
-    # turning them ON activates CMake-native, MSVC-flavored codepaths that fire
-    # whenever MSVC==TRUE (true for clang-cl) and stack incompatible flags on top of
-    # the script's own Clang-native ones:
-    #   - citron_configure_lto() (called from common/core/video_core/shader_recompiler/
-    #     network/audio_core/hid_core/input_common/frontend_common/web_service) sets
-    #     CMake's INTERPROCEDURAL_OPTIMIZATION property, which for an MSVC-ABI compiler
-    #     means CMake injects /GL at compile time and expects /LTCG at link time --
-    #     MSVC's own whole-program-optimization mechanism, not Clang's bitcode LTO.
-    #   - the top-level `if (MSVC) ... add_link_options(/LTCG)` block (CMakeLists.txt)
-    #     fires on the same OR condition.
-    #   - citron_configure_pgo()'s MSVC branch adds /FASTGENPROFILE, /PGD:, and
-    #     /USEPROFILE:PGD= link options -- MSVC's .pgd-based PGO, a completely
-    #     different, incompatible system from Clang's .profraw/.profdata instr-PGO
-    #     the script already sets up via -fprofile-instr-generate/-fprofile-instr-use.
-    #   - PGO.cmake's `if (MSVC) ... add_compile_options(/GL)` block fires too, and is
-    #     not gated by CITRON_PGO_FLAGS_MANAGED_BY_SCRIPT (that guard only wraps the
-    #     GNU/Clang branch, not the MSVC one).
-    # TracyClient's own LTO/PGO opt-out in dependencies.cmake does not depend on these
-    # vars being accurate -- it unconditionally forces INTERPROCEDURAL_OPTIMIZATION
-    # FALSE and appends -fno-lto/-fno-profile-* as target-level compile options on
-    # TracyClient regardless, so Tracy stays correctly isolated either way.
+    # CITRON_ENABLE_LTO and CITRON_ENABLE_PGO_GENERATE/USE are deliberately left OFF.
+    # Turning them ON activates MSVC-flavored LTO/PGO codepaths (citron_configure_lto,
+    # citron_configure_pgo, PGO.cmake) that conflict with the Clang-native flags this
+    # script already sets via CMAKE_C/CXX_FLAGS and CITRON_CLANGCL_PGO_COMPILE_FLAGS.
+    # TracyClient's opt-out in dependencies.cmake is unaffected either way.
     local _clangcl_lto_cmake="OFF"
     local _clangcl_pgo_generate="OFF"
     local _clangcl_pgo_use="OFF"
 
-    # CITRON_USE_QT_WEB_ENGINE=ON below is unchanged from before this patch -- still the
-    # ~460MB QtWebEngine bundle. CITRON_USE_WEBVIEW2_WEB_ENGINE (see
-    # CMakeModules/webview_native_deps.cmake) is the replacement this patch adds, left OFF
-    # here deliberately: never compiled against the real WebView2 SDK as of this patch, so
-    # not switched on for what generates an actual release .cmd. For a validation build,
-    # edit the two flags in the heredoc below by hand (CITRON_USE_QT_WEB_ENGINE=OFF,
-    # CITRON_USE_WEBVIEW2_WEB_ENGINE=ON) rather than scripting the toggle here -- this
-    # heredoc is real cmd.exe content once written out, and inserting an automated switch
-    # inside a caret-continued command block isn't something to do without a Windows box to
-    # actually verify the batch syntax against.
+    # CITRON_USE_QT_WEB_ENGINE=ON below is unchanged. CITRON_USE_WEBVIEW2_WEB_ENGINE
+    # (see CMakeModules/webview_native_deps.cmake) is the replacement, left OFF here
+    # pending validation. To try it, edit the two flags in the heredoc below by hand
+    # (CITRON_USE_QT_WEB_ENGINE=OFF, CITRON_USE_WEBVIEW2_WEB_ENGINE=ON).
     cat > "${build_dir}/build-clang-cl.cmd" <<CLANGCL_CMD_EOF
 @echo off
 setlocal

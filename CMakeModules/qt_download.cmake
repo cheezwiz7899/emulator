@@ -115,16 +115,12 @@ else()
 endif()
 
 # ── Download target Qt ────────────────────────────────────────────────────────
-# _QT_TARGET_DIR/_QT_TARGET_CMAKE are computed up front (not only inside the
-# aqt-managed branch) so Qt6_DIR can be checked against the exact path aqt
-# would manage, not just checked for existence. That distinction matters
-# because Qt6_DIR is set as a FORCEd CACHE variable below: once a prior
-# configure has populated it, a bare "is Qt6_DIR valid" check takes the
-# shortcut on every later configure and never reaches the additional-modules
-# check further down — so e.g. turning CITRON_USE_QT_WEB_ENGINE on in an
-# existing build dir would silently never download qtwebengine. A genuinely
-# external Qt6_DIR (system Qt, manual -DQt6_DIR=...) won't match this path
-# and is still left untouched by the shortcut below.
+# _QT_TARGET_DIR/_QT_TARGET_CMAKE are computed up front so Qt6_DIR can be
+# compared against the exact aqt-managed path. This matters because Qt6_DIR is
+# a FORCEd CACHE variable: on subsequent configures the shortcut below skips the
+# additional-modules check, so toggling CITRON_USE_QT_WEB_ENGINE in an existing
+# build dir would silently skip the qtwebengine download without this comparison.
+# An externally-provided Qt6_DIR that doesn't match this path is left untouched.
 set(_QT_TARGET_DIR   "${CITRON_QT_BASE_DIR}/${CITRON_QT_VERSION}/${_QT_DIR_NAME}")
 set(_QT_TARGET_CMAKE "${_QT_TARGET_DIR}/${_QT_CMAKE_SUB}/Qt6Config.cmake")
 get_filename_component(_QT_AQT_CMAKE_DIR "${_QT_TARGET_CMAKE}" DIRECTORY)
@@ -137,24 +133,10 @@ if (Qt6_DIR AND EXISTS "${Qt6_DIR}/Qt6Config.cmake" AND NOT ("${Qt6_DIR}" STREQU
     endif()
 else()
     # Modules to request via aqt's -m flag.
-    #
-    # qtimageformats is a normal addon module for 6.9.3 on every target this
-    # project builds for — confirmed directly against
-    # `aqt list-qt <host> desktop --modules 6.9.3 <arch>` for win64_msvc2022_64,
-    # win64_llvm_mingw, linux_gcc_64, and linux_gcc_arm64.
-    #
-    # qtsvg and qttools are NOT in any of those four module lists. Qt folded
-    # QtSvg and the Qt6LinguistTools CMake package into the base/essentials
-    # install for 6.9.x, so they're no longer separately installable addons
-    # on any platform — requesting them via -m makes aqt fail outright
-    # ("were not found while parsing XML of package information"), which is
-    # what was actually failing, not a CMake-side bug. There's no renamed
-    # equivalent to swap in; they just ship with the base install now. If a
-    # future Qt/aqt release reintroduces them as separate addons, re-add
-    # them here.
-    #
-    # Note: qtmultimedia is intentionally NOT downloaded here — it isn't used
-    # by citron-neo on Qt6+.
+    # qtimageformats is a normal addon for 6.9.3 on all targets.
+    # qtsvg and qttools are NOT addon modules in 6.9.x -- they ship with the base
+    # install; requesting them via -m makes aqt fail. qtmultimedia is intentionally
+    # excluded as it is not used by citron-neo on Qt6+.
     set(_QT_ADDL_MODULES qtimageformats)
     set(_QT_WEBENGINE_CMAKE "${_QT_TARGET_DIR}/lib/cmake/Qt6WebEngineCore/Qt6WebEngineCoreConfig.cmake")
     if (CITRON_USE_QT_WEB_ENGINE)
@@ -178,17 +160,10 @@ else()
     set(_QT_TOOL_CMAKE "${_QT_TARGET_DIR}/lib/cmake/Qt6LinguistTools/Qt6LinguistToolsConfig.cmake")
 
     if (NOT EXISTS "${_QT_TARGET_CMAKE}")
-        # Fresh install: request the base and every additional module in a
-        # single aqt invocation, instead of a base call followed by a
-        # separate modules-only call into the same --outputdir. The
-        # modules-only follow-up has been observed to fail outright right
-        # after a CPM cache wipe — i.e. with nothing stale on disk, and with
-        # the argv aqt actually receives confirmed correct (dumped and
-        # checked directly) — which points at running install-qt a second
-        # time against a directory the first call just populated, not at
-        # the argument list. One call removes that second invocation
-        # entirely for the common fresh-install case.
-        message(STATUS "[Qt] Downloading Qt ${CITRON_QT_VERSION} ${_QT_ARCH} via aqt (modules: ${_QT_ADDL_MODULES})...")
+        # Fresh install: request base and all additional modules in a single aqt
+        # invocation. A separate modules-only follow-up call has been observed to
+        # fail after a cache wipe even with correct argv.
+                message(STATUS "[Qt] Downloading Qt ${CITRON_QT_VERSION} ${_QT_ARCH} via aqt (modules: ${_QT_ADDL_MODULES})...")
         file(MAKE_DIRECTORY "${CITRON_QT_BASE_DIR}")
 
         execute_process(
@@ -202,20 +177,11 @@ else()
             ERROR_VARIABLE  _qt_error
         )
         if (NOT _qt_result EQUAL 0)
-            # FATAL_ERROR, not WARNING + return(): return() here only unwinds
-            # this include()'d file — verified empirically that it does NOT
-            # stop dependencies.cmake or CMakeLists.txt, both of which keep
-            # running after their respective include() calls. With Qt6_DIR
-            # left unset, a later find_package(Qt6 ...) elsewhere in the
-            # project can silently succeed against whatever Qt6 happens to be
-            # on CMAKE_PREFIX_PATH instead (e.g. an MSYS2 shell's own
-            # /clang64 Qt6, built for the MinGW-w64 runtime) — the configure
-            # "succeeds", moc/uic/compile all run against that Qt, and the
-            # build only fails hundreds of steps later at link time with an
-            # unrelated-looking error (missing mingw32.lib when linking an
-            # MSVC-ABI/clang-cl+lld-link binary). Fail loud, immediately,
-            # here instead.
-            message(FATAL_ERROR
+            # FATAL_ERROR not WARNING: return() only unwinds this include()'d file.
+            # A WARNING leaves Qt6_DIR unset, allowing a later find_package to silently
+            # pick up whatever Qt6 is on CMAKE_PREFIX_PATH (e.g. MSYS2's Qt), producing
+            # a link failure hundreds of steps later instead of a clear configure error.
+                        message(FATAL_ERROR
                 "[Qt] aqt install failed (exit ${_qt_result}): ${_qt_error}\n"
                 "     Pass -DQt6_DIR=... manually or ensure aqt is installed.")
         endif()

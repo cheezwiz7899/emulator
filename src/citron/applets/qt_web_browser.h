@@ -101,10 +101,7 @@ public:
      */
     [[nodiscard]] QString GetCurrentURL() const;
 
-    // Thin wrappers so main.cpp's call sites are backend-agnostic across
-    // QtNXWebEngineView / WebKitGTKView / WebView2View. Added alongside those two
-    // new backends rather than only in them, so there's exactly one call-site
-    // convention, not a special case for the original backend.
+    // Backend-agnostic wrappers used by main.cpp across all three web engine backends.
     void EvaluateJavaScript(const QString& script,
                             std::function<void(const QVariant&)> callback = {});
     void SetPageZoomFactor(qreal factor) { setZoomFactor(factor); }

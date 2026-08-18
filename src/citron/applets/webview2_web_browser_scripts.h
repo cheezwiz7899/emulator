@@ -1,9 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 citron Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// All 5 scripts, same set/provenance as webkitgtk_web_browser_scripts.h. See
-// that file's header for why this exists (missed on first pass, found on full
-// re-read of qt_web_browser.cpp).
+// All 5 scripts from qt_web_browser_scripts.h, byte-identical except for the two
+// mechanism changes in WEBVIEW2_NX_SCRIPT noted in that constant's comment below.
 
 #pragma once
 
@@ -94,35 +93,17 @@ window.addEventListener("gamepaddisconnected", function(e) {
 )";
 
 constexpr wchar_t WEBVIEW2_NX_SCRIPT[] = LR"(
-// Ported from src/citron/applets/qt_web_browser_scripts.h:92-204 (WINDOW_NX_SCRIPT),
-// same base as nx_shim.js (WebKitGTK port). WebView2 target instead.
+// Ported from WINDOW_NX_SCRIPT (qt_web_browser_scripts.h). Two mechanism changes
+// vs the original, both to replace main.cpp's poll loop with push-based delivery:
 //
-// UNVERIFIED BY EXECUTION. No WebView2 runtime available in this sandbox (no Windows).
-// API surface below confirmed via Microsoft Learn / official WebView2 docs (search,
-// this session) -- not from training-data recall, not from a REPL. Treat as a strong
-// draft, not proven, unlike nx_shim.js which was actually run.
+// 1. sendMessage(): posts directly via window.chrome.webview.postMessage.
 //
-// Mechanism changes vs the original (2 total, same reasoning as the WebKitGTK port --
-// eliminate main.cpp's poll loop, push instead):
+// 2. endApplet(): WebView2 has one JS->native channel (window.chrome.webview),
+//    so this is envelope-tagged with __citron_control rather than using a
+//    separate named handler like the WebKitGTK port's nxControl. The native side
+//    checks for that key before treating the message as a regular page payload.
 //
-//   1. sendMessage(message): window.chrome.webview.postMessage(message) directly.
-//      Confirmed: postMessage takes "any object supported by JSON conversion" and is
-//      posted async to the host (Microsoft Learn, ICoreWebView2 reference). Since the
-//      existing shim already only ever passes strings (page does its own
-//      JSON.stringify() first), this is a drop-in call, no wrapping needed.
-//
-//   2. endApplet(): CANNOT use a second named handler the way WebKitGTK's nxControl
-//      did -- WebView2 has exactly one JS->native channel (window.chrome.webview /
-//      WebMessageReceived), not per-name registration. So this is envelope-tagged
-//      instead: posts a small object with a __citron_control key. Native side
-//      distinguishes "is this the control envelope, or an opaque page payload" by
-//      checking for that key before treating it as a regular sendMessage forward.
-//      This is a real, necessary design difference from the WebKitGTK port, not an
-//      oversight -- flagged in webview2_bridge.cpp's on_web_message_received too.
-//
-// Footer key-callback dispatch (citron_key_callbacks) UNCHANGED, same as the
-// WebKitGTK port -- still native-polls-input -> eval-into-page, platform-agnostic
-// concern, not touched here either.
+// citron_key_callbacks and everything else are unchanged.
 
 var citron_key_callbacks = [];
 

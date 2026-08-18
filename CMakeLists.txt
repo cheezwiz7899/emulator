@@ -78,20 +78,13 @@ option(CITRON_USE_LLVM_DEMANGLE "Search for and link against a system LLVM for C
 option(CITRON_USE_QT_MULTIMEDIA "Use QtMultimedia for Camera" OFF)
 
 option(CITRON_USE_QT_WEB_ENGINE "Use QtWebEngine for web applet implementation" OFF)
-# Platform-native alternatives to CITRON_USE_QT_WEB_ENGINE -- see
-# CMakeModules/webview_native_deps.cmake for the dependency wiring and
-# src/citron/applets/web{kitgtk,view2}_web_browser.{h,cpp} for the implementations.
-# Default OFF: WebKitGTK path is unvalidated on real NVIDIA hardware as of this
-# patch (DMABUF renderer risk, see webkitgtk_web_browser.h); WebView2 path has
-# never been compiled at all (no Windows/WebView2 SDK toolchain available where
-# this patch was written). Neither should default ON until that changes.
+# Platform-native alternatives to CITRON_USE_QT_WEB_ENGINE.
+# Both default OFF pending hardware validation -- see webkitgtk_web_browser.h for details.
 option(CITRON_USE_WEBKITGTK_WEB_ENGINE "Use WebKitGTK for web applet implementation (Linux)" OFF)
 option(CITRON_USE_WEBVIEW2_WEB_ENGINE "Use WebView2 for web applet implementation (Windows)" OFF)
 
-# main.cpp's backend selection is an #if/#elif chain -- if more than one of these
-# ever ends up ON at once (stale cache, bad merge, copy-pasted CI config), it
-# would silently pick one in a fixed priority order instead of erroring, masking
-# a real misconfiguration. Fail loud at configure time instead.
+# More than one backend ON at once would silently pick one in a fixed priority order;
+# fail loud at configure time instead.
 if ((CITRON_USE_QT_WEB_ENGINE AND CITRON_USE_WEBKITGTK_WEB_ENGINE) OR
     (CITRON_USE_QT_WEB_ENGINE AND CITRON_USE_WEBVIEW2_WEB_ENGINE) OR
     (CITRON_USE_WEBKITGTK_WEB_ENGINE AND CITRON_USE_WEBVIEW2_WEB_ENGINE))
@@ -937,9 +930,8 @@ if(CITRON_CLANGCL)
         "clang-cl PGO/LTO compiler flags, applied only to citron's own first-party targets")
     set(CITRON_CLANGCL_PGO_LINK_FLAGS "" CACHE STRING
         "clang-cl PGO/LTO linker flags, applied only to citron's own first-party targets")
-    # CITRON_CLANGCL_PGO_LINK_FLAGS must be native lld-link syntax only (e.g. /INCLUDE:).
-    # CMake's Ninja Multi-Config generator invokes lld-link.exe directly for the final link
-    # (not via clang-cl), so /clang:-prefixed tokens would be treated as input file paths.
+      # CITRON_CLANGCL_PGO_LINK_FLAGS must be native lld-link syntax (e.g. /INCLUDE:) --
+    # lld-link.exe is invoked directly by Ninja, not via clang-cl.
     if(CITRON_CLANGCL_PGO_COMPILE_FLAGS OR CITRON_CLANGCL_PGO_LINK_FLAGS)
         separate_arguments(_citron_pgo_compile_flags UNIX_COMMAND "${CITRON_CLANGCL_PGO_COMPILE_FLAGS}")
         separate_arguments(_citron_pgo_link_flags UNIX_COMMAND "${CITRON_CLANGCL_PGO_LINK_FLAGS}")

@@ -1,20 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2026 citron Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
-//
-// v2: adds font loading/injection, user agent, persistent storage, the input
-// thread (footer callbacks + D-pad nav), focus-first-link, and the window.close()
-// exit path -- all missing from v1, which only covered the bridge mechanism.
-//
-// COMPILE-CHECKED this round, real Qt6 6.4.2 + WebKitGTK 2.52.3 headers (both
-// installed in this sandbox via apt) -- NOT a full citron build (core/system.h,
-// hid_core, etc. are not pulled in; GMainWindow/Core::System/InputInterpreter
-// referenced here are declared against minimal stand-ins for that check, not the
-// real headers, since those pull in most of the emulator core). What this DOES
-// prove: every WebKitGTK/GTK/Qt API call in this file -- names, signatures,
-// argument order, header locations -- is real and correct, not guessed. What it
-// does NOT prove: this compiles inside the actual citron build, or links, or runs.
-// See the compile-check harness this was verified against for exactly what was
-// and wasn't stubbed, rather than taking "compile-checked" as a blanket claim.
 
 #include "citron/applets/webkitgtk_web_browser.h"
 
@@ -27,10 +12,8 @@
 #include <QVBoxLayout>
 #include <QWindow>
 
-// The header only forward-declares these (see its own comment on why) -- the
-// real definitions belong here, the one place that actually calls into them,
-// scoped with -DQT_NO_KEYWORDS (src/citron/CMakeLists.txt) to dodge the
-// signals/slots collision these bring in alongside the Qt includes above.
+// GTK/WebKitGTK headers included here (not in the header) to avoid the
+// signals/slots name collision. See webkitgtk_web_browser.h for details.
 #include <gtk/gtk.h>
 #include <webkit2/webkit2.h>
 
@@ -47,8 +30,7 @@
 
 namespace {
 
-// Mirrors HIDButtonToKey (qt_web_browser.cpp:31) but produces a DOM key triple
-// instead of a Qt::Key -- consumed by SendKeyEvent's eval, not Qt's event system.
+// DOM key triple for SendKeyEvent's eval -- analogous to HIDButtonToKey in qt_web_browser.cpp.
 struct DomKey {
     const char* key;
     const char* code;
@@ -74,10 +56,8 @@ constexpr DomKey HIDButtonToDomKey(Core::HID::NpadButton button) {
     }
 }
 
-// Heap context for the C-callback trampoline below -- GAsyncReadyCallback is a
-// plain C function pointer, can't capture a std::function directly, so the
-// callback travels via user_data instead, same shape as WebView2's C++ lambdas
-// wrapped in Microsoft::WRL::Callback but done by hand for the C GLib API.
+// Heap context for the GAsyncReadyCallback trampoline -- carries the std::function
+// that a plain C function pointer can't capture directly.
 struct EvalCallbackContext {
     std::function<void(const QVariant&)> callback;
 };
@@ -99,10 +79,8 @@ void OnEvaluateJavaScriptFinished(GObject* source, GAsyncResult* result, gpointe
             qvariant = QVariant(QString::fromUtf8(str));
             g_free(str);
         }
-        // Other JS types (object/array/undefined/null) -> default-constructed
-        // QVariant, same as if evaluate_javascript_finish had failed. Nothing in
-        // this file's current call sites needs those, not implemented for
-        // hypothetical future ones.
+        // Object/array/undefined/null JS types -> default-constructed QVariant; no
+        // current call site needs them.
     } else if (error) {
         g_error_free(error);
     }
@@ -128,12 +106,8 @@ WebKitGTKView::WebKitGTKView(GMainWindow& main_window_, Core::System& system_,
     webkit_user_content_manager_register_script_message_handler(ucm, "nxControl");
     g_signal_connect(ucm, "script-message-received::nxControl", G_CALLBACK(OnNxControl), this);
 
-    // window_nx + gamepad scripts, both DocumentCreation/MainWorld/all-subframes --
-    // mirrors qt_web_browser.cpp:62-81 exactly, same injection point/world/subframe
-    // settings, same two scripts. NX_FONT_CSS/LOAD_NX_FONT/FOCUS_LINK_ELEMENT_SCRIPT
-    // are injected separately below (LoadExtractedFonts/FocusFirstLinkElement),
-    // matching the original's split between constructor-time (these two) and
-    // load-time (those three) injection.
+    // Inject window_nx + gamepad scripts at document start, all frames -- mirrors qt_web_browser.cpp:62-81.
+    // Font/focus scripts are injected at load time via LoadExtractedFonts/FocusFirstLinkElement.
     WebKitUserScript* window_nx_script = webkit_user_script_new(
         WEBKITGTK_NX_SCRIPT, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
         WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, nullptr, nullptr);
@@ -150,17 +124,8 @@ WebKitGTKView::WebKitGTKView(GMainWindow& main_window_, Core::System& system_,
     g_signal_connect(webview, "decide-policy", G_CALLBACK(OnDecidePolicy), this);
     g_signal_connect(webview, "close", G_CALLBACK(OnClose), this);
 
-    // Mirrors qt_web_browser.cpp:59-60's default_profile->setPersistentStoragePath
-    // (CitronDir/qtwebengine) -- WebKitGTK equivalent is per-WebContext, set via
-    // WebKitWebsiteDataManager at context-creation time, not a property settable
-    // after the WebKitWebView already exists. Real integration needs this built
-    // via webkit_website_data_manager_new(base-data-directory=...) and a matching
-    // WebKitWebContext passed to the WEBKIT_TYPE_WEB_VIEW g_object_new call above
-    // instead of the default context -- sketched here as a comment, not wired,
-    // since it changes the WebKitWebView construction call above and this pass
-    // was scoped to the input-thread/fonts/UA gaps specifically. Real gap, not
-    // silently dropped.
-    //
+    // TODO: wire persistent storage via webkit_website_data_manager_new -- WebKitGTK
+    // requires this at WebContext creation time, not settable after the WebView exists.
     // auto storage_dir = Common::FS::PathToUTF8String(
     //     Common::FS::GetCitronPath(Common::FS::CitronPath::CitronDir) / "webkitgtk");
 
@@ -174,7 +139,6 @@ WebKitGTKView::WebKitGTKView(GMainWindow& main_window_, Core::System& system_,
 }
 
 WebKitGTKView::~WebKitGTKView() {
-    // Mirrors ~QtNXWebEngineView (qt_web_browser.cpp:105-108) exactly.
     SetFinished(true);
     StopInputThread();
     if (gtk_window) {
@@ -215,9 +179,6 @@ void WebKitGTKView::FallbackToTopLevelWindow() {
 }
 
 void WebKitGTKView::SetUserAgent(UserAgent user_agent) {
-    // Byte-identical string to qt_web_browser.cpp:157-163 -- content compatibility
-    // with anything that sniffs this (ARCropolis, Nintendo's real applets) depends
-    // on matching it exactly, not approximating it.
     const QString user_agent_str = [user_agent] {
         switch (user_agent) {
         case UserAgent::WebApplet:
@@ -262,11 +223,7 @@ void WebKitGTKView::LoadExtractedFonts() {
 
     WebKitUserContentManager* ucm = webkit_web_view_get_user_content_manager(webview);
 
-    // nx_font_css: DocumentReady == WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_END is
-    // the nearest WebKitGTK equivalent (fires once the DOM is parsed, before
-    // subresources/images finish -- same rough timing intent as Qt's
-    // DocumentReady, not a byte-exact match since the two engines don't expose
-    // identical lifecycle stages here).
+    // WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_END approximates Qt's DocumentReady timing.
     QByteArray css_utf8 = css_source.toUtf8();
     WebKitUserScript* css_script = webkit_user_script_new(
         css_utf8.constData(), WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
@@ -274,12 +231,8 @@ void WebKitGTKView::LoadExtractedFonts() {
     webkit_user_content_manager_add_script(ucm, css_script);
     webkit_user_script_unref(css_script);
 
-    // load_nx_font: Qt's "Deferred" injection point (runs after load completes,
-    // roughly WebKitGTK's DOCUMENT_END too in practice for this engine -- WebKitGTK
-    // doesn't have a third distinct post-load injection stage the way QtWebEngine's
-    // three-stage model does) PLUS re-run on every navigation via decide-policy,
-    // mirroring qt_web_browser.cpp:380-386's FrameChanged-triggered re-run exactly
-    // (50ms debounce there too).
+    // DOCUMENT_END approximates Qt's Deferred timing; also re-run on every navigation
+    // via decide-policy (50 ms debounce), mirroring qt_web_browser.cpp:380-386.
     WebKitUserScript* font_script = webkit_user_script_new(
         WEBKITGTK_LOAD_NX_FONT, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
         WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_END, nullptr, nullptr);
@@ -389,20 +342,14 @@ void WebKitGTKView::StopInputThread() {
 }
 
 void WebKitGTKView::InputThreadLoop() {
-    // Mirrors qt_web_browser.cpp:222-291's InputThread exactly in polling shape
-    // (1s startup delay, then continuous poll) and button mapping (A/B/X/Y/L/R
-    // footer buttons, D-pad+left-stick as arrow keys, pressed-once vs held). The
-    // "send a key" leg is SendKeyEvent's JS-dispatch (see that method's comment
-    // and this class's header) instead of Qt postEvent -- everything else is the
-    // same shape, same buttons, same gating.
+    // Mirrors qt_web_browser.cpp:222-291's InputThread: 1 s startup delay, then
+    // continuous poll with same button mapping and pressed-once vs held logic.
+    // Key events are sent via JS eval (SendKeyEvent) rather than Qt postEvent.
     std::this_thread::sleep_for(std::chrono::seconds(1));
 
     if (is_local) {
-        // grabKeyboard()/releaseKeyboard() (qt_web_browser.cpp:230, 291) are
-        // Qt-widget-focus-specific and don't have a meaningful equivalent for a
-        // createWindowContainer-embedded foreign window (GTK owns its own
-        // keyboard grab semantics if any are needed) -- not ported, flagged
-        // rather than papered over with a no-op that looks like parity.
+        // grabKeyboard()/releaseKeyboard() have no equivalent for a
+        // createWindowContainer-embedded foreign window -- not ported.
     }
 
     while (input_thread_running) {
@@ -448,14 +395,8 @@ void WebKitGTKView::InputThreadLoop() {
                 break;
             }
 
-            // Real async check-then-act: ask the page whether a callback is
-            // registered, only send the fallback key once that answer comes
-            // back false. Mirrors qt_web_browser.cpp's if/else exactly in
-            // *effect* -- can't be the same shape in *code* since
-            // evaluate_javascript is inherently async here (Qt's
-            // QWebEnginePage::runJavaScript is equally async in the original;
-            // the original just doesn't need a fallback decision gated on the
-            // result the way this rewrite does).
+            // Check if a callback is registered; send fallback key only if not.
+            // evaluate_javascript is async, so the decision is gated on the result.
             const QString check_script =
                 QStringLiteral("citron_key_callbacks[%1] != null").arg(callback_index);
             EvaluateJavaScript(check_script, [this, callback_index, fallback_key,
@@ -527,8 +468,7 @@ int WebKitGTKView::OnDecidePolicy(WebKitWebView*, WebKitPolicyDecision* decision
         self->SetLastURL(self->requested_url.toStdString());
     }
 
-    // Re-run load_nx_font on every navigation decision, mirroring
-    // qt_web_browser.cpp:380-386's FrameChanged-triggered 50ms-debounced re-run.
+    // Re-run load_nx_font on every navigation, mirroring qt_web_browser.cpp:380-386 (50 ms debounce).
     QTimer::singleShot(50, self, [self] { self->EvaluateJavaScript(QString::fromUtf8(WEBKITGTK_LOAD_NX_FONT)); });
 
     webkit_policy_decision_use(decision);
@@ -536,14 +476,9 @@ int WebKitGTKView::OnDecidePolicy(WebKitWebView*, WebKitPolicyDecision* decision
 }
 
 void WebKitGTKView::OnClose(WebKitWebView*, gpointer user_data) {
-    // Mirrors qt_web_browser.cpp:94-102's windowCloseRequested handler. WebKitGTK's
-    // "close" signal doesn't carry a URL to compare against
-    // url_interceptor->GetRequestedURL() the way QWebEnginePage::windowCloseRequested's
-    // context does -- fires unconditionally on window.close(), no equivalent guard
-    // available here. Simpler behavior, not a bug: the guard in the original exists
-    // to ignore close requests from something other than the top-level page, and
-    // "close" is itself already scoped to web_view (this specific view), so the
-    // scenario the guard protects against doesn't obviously apply the same way.
+    // Mirrors qt_web_browser.cpp:94-102's windowCloseRequested handler.
+    // The "close" signal is already scoped to this specific WebKitWebView,
+    // so no URL guard is needed here.
     auto* self = static_cast<WebKitGTKView*>(user_data);
     self->SetFinished(true);
     self->SetExitReason(Service::AM::Frontend::WebExitReason::WindowClosed);

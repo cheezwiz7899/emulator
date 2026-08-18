@@ -600,26 +600,19 @@ if (CITRON_USE_QT_WEB_ENGINE)
 endif ()
 
 if (CITRON_USE_WEBKITGTK_WEB_ENGINE)
-    # PkgConfig::WEBKITGTK / PkgConfig::GTK3 come from
-    # CMakeModules/webview_native_deps.cmake's pkg_check_modules(... IMPORTED_TARGET ...)
-    # calls -- system libraries, not CPM, see that file's policy note.
+    # PkgConfig::WEBKITGTK / PkgConfig::GTK3 from CMakeModules/webview_native_deps.cmake.
     target_link_libraries(citron PRIVATE PkgConfig::WEBKITGTK PkgConfig::GTK3)
     target_compile_definitions(citron PRIVATE -DCITRON_USE_WEBKITGTK_WEB_ENGINE)
 
-    # Found via a real compile-check this session, not theoretical: Qt's
-    # signals/slots macros collide with GLib/GTK headers that use those exact
-    # identifiers as plain struct field names, in any translation unit that
-    # includes both. Scoped to ONLY this one file -- NOT target-wide, since
-    # qt_web_browser.h/.cpp and other Qt files elsewhere in this target use bare
-    # emit/signals:/slots: throughout and would break if QT_NO_KEYWORDS applied
-    # to the whole citron target.
+    # QT_NO_KEYWORDS scoped to this file only -- GTK/GLib headers define struct fields
+    # named "signals" and "slots" which collide with Qt's macros of the same name.
+    # Other files in this target use bare emit/signals:/slots: and must not see this flag.
     set_source_files_properties(applets/webkitgtk_web_browser.cpp PROPERTIES
         COMPILE_DEFINITIONS "QT_NO_KEYWORDS")
 endif ()
 
 if (CITRON_USE_WEBVIEW2_WEB_ENGINE)
-    # WIL::WIL / WebView2::WebView2 come from
-    # CMakeModules/webview_native_deps.cmake's CPMAddPackage calls.
+    # WIL::WIL / WebView2::WebView2 from CMakeModules/webview_native_deps.cmake.
     target_link_libraries(citron PRIVATE WIL::WIL WebView2::WebView2)
     target_compile_definitions(citron PRIVATE -DCITRON_USE_WEBVIEW2_WEB_ENGINE)
 endif ()

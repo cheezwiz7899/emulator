@@ -170,12 +170,9 @@ _set_derived_paths() {
     BUILD_BOLT="${BUILD_ROOT}/bolt"
     PROFILE_DIR="${BUILD_ROOT}/pgo-profiles"
     BOLT_PROFILE_DIR="${BUILD_ROOT}/bolt-profiles"
-    # Build-scoped home for tools this script installs for its own use (BOLT
-    # binaries, currently) instead of a shared system location. Never write
-    # to /usr or /usr/local here: this must stay safe to run locally without
-    # sudo and without clobbering anything already on the system outside the
-    # build tree.
-    BUILD_TOOLS_BIN="${BUILD_ROOT}/tools/bin"
+        # Build-local directory for tools this script installs (e.g. BOLT binaries).
+        # Never writes to /usr or /usr/local; safe to run without sudo.
+        BUILD_TOOLS_BIN="${BUILD_ROOT}/tools/bin"
     BUILD_TOOLS_LIB="${BUILD_ROOT}/tools/lib"
     PATH="${BUILD_TOOLS_BIN}:${PATH}"
 }
@@ -1056,15 +1053,8 @@ build_common_cmake_args() {
         "-DCITRON_CHECK_SUBMODULES=OFF"
         "-DCITRON_USE_LLVM_DEMANGLE=OFF"
         "-DCITRON_USE_QT_WEB_ENGINE=OFF"
-        # QtWebEngine already off here (good, no ~460MB bundle on Linux) -- but without
-        # CITRON_USE_WEBKITGTK_WEB_ENGINE also on, this build ships NO web browser applet
-        # at all (falls to the no-op stub, core/frontend/applets/web_browser.cpp). Left OFF
-        # here deliberately, not forgotten: the WebKitGTK backend compile-checks clean
-        # against real Qt6+WebKitGTK headers as of this patch, but has never run under a
-        # real GPU (DMABUF renderer risk) or a real Wayland session (embedding gap, no
-        # fallback validated) -- see webkitgtk_web_browser.h's own header for both. Flip
-        # this on for a validation build once either of those is confirmed on real hardware,
-        # not as part of the default pipeline this script feeds yet.
+        # WebKitGTK backend: left OFF pending GPU/Wayland validation.
+        # Flip to ON for a validation build once confirmed on real hardware.
         # "-DCITRON_USE_WEBKITGTK_WEB_ENGINE=ON"
         "-DCITRON_USE_QT_MULTIMEDIA=OFF"
         "-DQT_NO_PRIVATE_MODULE_WARNING=ON"

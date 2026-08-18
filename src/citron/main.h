@@ -61,13 +61,8 @@ class QtAmiiboSettingsDialog;
 class QtControllerSelectorDialog;
 class QtProfileSelectionDialog;
 class QtSoftwareKeyboardDialog;
-// web_applet's concrete type is chosen per build, same single-backend-per-binary
-// shape as the rest of this backend selection (CITRON_USE_QT_WEB_ENGINE /
-// CITRON_USE_WEBKITGTK_WEB_ENGINE / CITRON_USE_WEBVIEW2_WEB_ENGINE are mutually
-// exclusive build options, never combined). Falls back to QtNXWebEngineView's
-// forward declaration when none are set, matching today's behavior exactly: an
-// always-forward-declared, never-completely-defined pointer that's never
-// dereferenced because every use site is behind the matching #ifdef too.
+// web_applet's concrete type is chosen per build; the three backend defines are
+// mutually exclusive. Falls back to QtNXWebEngineView when none are set.
 #if defined(CITRON_USE_WEBKITGTK_WEB_ENGINE)
 class WebKitGTKView;
 using ActiveWebEngineView = WebKitGTKView;
@@ -247,10 +242,8 @@ public slots:
     /// open in the web applet, dispatched as a "message" event so window.nx.addEventListener
     /// ("message", ...) listeners (used e.g. for ARCropolis's "GetModSize" reply) receive it.
     void WebBrowserDeliverInteractiveData(const std::string& data);
-    /// Push-based counterpart to WebBrowserOpenWebPage's poll-and-drain loop
-    /// (QtWebEngine path only) -- WebKitGTKView/WebView2View call this directly
-    /// from their own message-handler callbacks the moment a message arrives,
-    /// instead of GMainWindow polling citron_outgoing_messages on a timer.
+    /// Push-based path for WebKitGTK/WebView2 backends: called directly from their
+    /// message-handler callbacks instead of being polled by the event loop.
     void ForwardWebBrowserInteractiveData(const std::string& data) {
         emit WebBrowserInteractiveDataReceived(data);
     }

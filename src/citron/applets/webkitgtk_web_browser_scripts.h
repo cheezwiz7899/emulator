@@ -1,11 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 citron Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// All 5 scripts qt_web_browser_scripts.h defines (NX_FONT_CSS, LOAD_NX_FONT,
-// FOCUS_LINK_ELEMENT_SCRIPT, GAMEPAD_SCRIPT, WINDOW_NX_SCRIPT), byte-identical
-// except WINDOW_NX_SCRIPT's 2 documented mechanism changes (see that block below).
-// Missed all but WINDOW_NX_SCRIPT in the first pass of this patch -- found on a
-// full re-read of qt_web_browser.cpp before calling anything ready to ship.
+// All 5 scripts from qt_web_browser_scripts.h, byte-identical except for the two
+// mechanism changes in WEBKITGTK_NX_SCRIPT noted in that constant's comment below.
 
 #pragma once
 
@@ -96,34 +93,16 @@ window.addEventListener("gamepaddisconnected", function(e) {
 )";
 
 constexpr char WEBKITGTK_NX_SCRIPT[] = R"(
-// Ported from src/citron/applets/qt_web_browser_scripts.h:92-204 (WINDOW_NX_SCRIPT).
-// Everything is byte-identical to that file EXCEPT two mechanism changes, both
-// called out in handoff v2 Part 2 ("WebKitGTK's message-handler mechanism is
-// arguably cleaner than the current sendMessage-outgoing-queue-poll design
-// already in qt_web_browser.cpp -- worth reconsidering that part of the bridge
-// design during the port rather than transplanting it as-is"):
+// Ported from WINDOW_NX_SCRIPT (qt_web_browser_scripts.h). Two mechanism changes
+// vs the original, both to replace main.cpp's poll loop with push-based delivery:
 //
-//   1. sendMessage(message): originally pushed onto a `citron_outgoing_messages`
-//      array that main.cpp then drained by round-tripping a runJavaScript eval
-//      every ~1ms (main.cpp:1001-1003). Replaced with a direct
-//      window.webkit.messageHandlers.nxMessage.postMessage(message) push --
-//      no native-side poll loop needed at all, WebKitGTK delivers it as a
-//      script-message-received signal.
+// 1. sendMessage(): posts directly via window.webkit.messageHandlers.nxMessage
+//    instead of pushing onto citron_outgoing_messages for main.cpp to drain.
 //
-//   2. endApplet(): originally set a module-level `end_applet` boolean that
-//      main.cpp polled via a second runJavaScript eval every loop iteration
-//      (main.cpp:983-991, "end_applet;"). Replaced with a
-//      nxControl.postMessage(...) push, same reasoning as (1).
+// 2. endApplet(): posts via nxControl instead of setting an end_applet boolean
+//    that main.cpp polled via runJavaScript.
 //
-// `end_applet` and `citron_outgoing_messages` vars are dropped since nothing
-// reads them anymore under the push design. citron_key_callbacks is UNCHANGED --
-// footer-button dispatch is still native-polls-input -> eval-into-page, which
-// is inherent to how gamepad input has to be polled regardless of backend, not
-// the same "smell" as the outgoing-message array. Not touched, not in scope.
-//
-// Everything else (WindowNXFooter, WindowNXPlayReport, all stub methods,
-// console.log wording) is untouched on purpose -- minimum diff from
-// proven-correct source.
+// citron_key_callbacks and everything else are unchanged.
 
 var citron_key_callbacks = [];
 

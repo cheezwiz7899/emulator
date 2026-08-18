@@ -1,24 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 citron Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// v2: adds font loading/injection, user agent, persistent storage, input thread,
-// focus-first-link, window-close-requested -- see header comment and
-// webkitgtk_web_browser.h/.cpp for the full account of why this v2 pass exists.
-//
-// Engine-model adaptation worth stating plainly rather than leaving implicit:
-// WebView2 has exactly ONE native script-injection point
-// (AddScriptToExecuteOnDocumentCreated, fires very early). QtWebEngine has three
-// distinct stages (DocumentCreation/DocumentReady/Deferred) that
-// qt_web_browser.cpp actually uses for different scripts at different times. This
-// file gets that 3-stage timing back by hooking add_NavigationCompleted and
-// running the "should run after load" scripts (fonts, focus-first-link) via
-// ExecuteScript from there instead of a second native injection point that
-// doesn't exist on this platform. Same practical effect, different mechanism --
-// same kind of adaptation as the Linux side's DOCUMENT_END-for-both approximation,
-// not hidden as if it were a native 1:1 match.
-//
-// UNCOMPILED -- see this file's header for the confidence-tier note (sourced from
-// docs, not compiled against the real SDK, unlike the Linux side this round).
+// WebView2 has one script-injection point (AddScriptToExecuteOnDocumentCreated).
+// "Runs after load" scripts (fonts, focus-first-link) are handled via
+// NavigationCompleted + ExecuteScript instead of a second native injection stage.
 
 #include "citron/applets/webview2_web_browser.h"
 
@@ -62,10 +47,8 @@ constexpr DomKey HIDButtonToDomKey(Core::HID::NpadButton button) {
     }
 }
 
-// %1-style Qt-arg substitution doesn't exist for plain std::wstring -- the CSS
-// script needs 7 positional substitutions, same job QString::arg() does on the
-// Linux side. Minimal, only handles what NX_FONT_CSS actually needs (7 sequential
-// %N placeholders), not a general templating engine.
+// QString::arg()-style %N substitution for std::wstring -- handles the 7 positional
+// placeholders needed by NX_FONT_CSS.
 std::wstring SubstitutePlaceholders(std::wstring script, const std::vector<std::wstring>& args) {
     for (size_t i = 0; i < args.size(); i++) {
         std::wstring placeholder = L"%" + std::to_wstring(i + 1);
@@ -94,20 +77,10 @@ WebView2View::~WebView2View() {
 }
 
 void WebView2View::InitWebView2() {
-    // Mirrors qt_web_browser.cpp:59-60's setPersistentStoragePath -- userDataFolder
-    // is CreateCoreWebView2EnvironmentWithOptions's 2nd param, was nullptr
-    // (WebView2's own default location) in the v1 draft. Real fix, not cosmetic:
-    // a nullptr userDataFolder means profile data lands wherever WebView2's
-    // default happens to be for this install rather than citron's own directory,
-    // same class of gap as the storage-path TODO the Linux side still carries
-    // (that one's still a real gap; this one's now closed).
+    // Store profile data in citron's cache dir, mirroring qt_web_browser.cpp:59-60.
     auto storage_dir = Common::FS::PathToUTF8String(
         Common::FS::GetCitronPath(Common::FS::CitronPath::CacheDir) / "webview2");
-    std::wstring user_data_folder(storage_dir.begin(), storage_dir.end()); // ASCII-path
-                                                                           // scope limit,
-                                                                           // same as
-                                                                           // elsewhere
-                                                                           // this session
+    std::wstring user_data_folder(storage_dir.begin(), storage_dir.end()); // ASCII paths only
 
     CreateCoreWebView2EnvironmentWithOptions(
         nullptr, user_data_folder.c_str(), nullptr,
@@ -142,8 +115,7 @@ void WebView2View::InitWebView2() {
                                     }).Get(),
                                 nullptr);
 
-                            // Mirrors qt_web_browser.cpp:94-102's
-                            // windowCloseRequested (JS window.close()).
+                            // Mirrors qt_web_browser.cpp:94-102's windowCloseRequested.
                             webview->add_WindowCloseRequested(
                                 Callback<ICoreWebView2WindowCloseRequestedEventHandler>(
                                     [this](ICoreWebView2* sender, IUnknown* args) -> HRESULT {
@@ -151,13 +123,8 @@ void WebView2View::InitWebView2() {
                                     }).Get(),
                                 nullptr);
 
-                            // NavigationCompleted drives the "runs after load"
-                            // scripts (fonts, focus-first-link) AND doubles as the
-                            // re-run-on-every-navigation trigger, same combined
-                            // role FrameChanged plays on the Qt/WebKitGTK sides --
-                            // one hook instead of two since WebView2 doesn't
-                            // distinguish "just navigated" from "frame changed"
-                            // the way the interceptor-based platforms do.
+                            // NavigationCompleted runs "after load" scripts and
+                            // re-runs LOAD_NX_FONT on every navigation.
                             webview->add_NavigationCompleted(
                                 Callback<ICoreWebView2NavigationCompletedEventHandler>(
                                     [this](ICoreWebView2*, ICoreWebView2NavigationCompletedEventArgs*) -> HRESULT {
@@ -172,7 +139,7 @@ void WebView2View::InitWebView2() {
 }
 
 void WebView2View::InjectPersistentScripts() {
-    // window_nx + gamepad, constructor-time, mirrors qt_web_browser.cpp:62-81.
+    // window_nx + gamepad at document creation, mirrors qt_web_browser.cpp:62-81.
     webview->AddScriptToExecuteOnDocumentCreated(
         WEBVIEW2_NX_SCRIPT,
         Callback<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler>(
@@ -200,9 +167,7 @@ void WebView2View::SetUserAgent(UserAgent user_agent) {
     if (!webview) return;
     wil::com_ptr<ICoreWebView2Settings> settings;
     webview->get_Settings(&settings);
-    // ICoreWebView2Settings2 "continues" ICoreWebView2Settings (COM interface
-    // versioning) -- confirmed via Microsoft Learn this session, put_UserAgent
-    // lives on the extended interface, not the base one.
+    // put_UserAgent is on ICoreWebView2Settings2, not the base ICoreWebView2Settings.
     auto settings2 = settings.try_query<ICoreWebView2Settings2>();
     if (settings2) {
         settings2->put_UserAgent(full_ua.c_str());
@@ -221,11 +186,8 @@ void WebView2View::LoadExtractedFonts() {
                                fonts_dir + L"FontNintendoExtended.ttf",
                                fonts_dir + L"FontNintendoExtended2.ttf"});
 
-    // Wrapped in a DOMContentLoaded listener -- approximates Qt's DocumentReady
-    // injection-point timing, since AddScriptToExecuteOnDocumentCreated alone
-    // fires too early (before the DOM this script walks even exists). Same
-    // approximation reasoning as the Linux side's DOCUMENT_END choice, different
-    // mechanism because this platform's injection API is single-stage.
+    // Wrap in a DOMContentLoaded listener to approximate Qt's DocumentReady timing,
+    // since AddScriptToExecuteOnDocumentCreated fires before the DOM exists.
     std::wstring wrapped_css =
         L"window.addEventListener('DOMContentLoaded', function() { "
         L"var s = document.createElement('style'); s.textContent = \"" +
@@ -235,8 +197,7 @@ void WebView2View::LoadExtractedFonts() {
         Callback<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler>(
             [](HRESULT, PCWSTR) -> HRESULT { return S_OK; }).Get());
 
-    // LOAD_NX_FONT itself runs via NavigationCompleted (see InitWebView2), not
-    // injected here -- this method's remaining job is just the CSS half.
+    // LOAD_NX_FONT runs via NavigationCompleted (see InitWebView2).
 }
 
 void WebView2View::FocusFirstLinkElement() {
@@ -280,11 +241,9 @@ void WebView2View::EvaluateJavaScript(const QString& script, std::function<void(
         Callback<ICoreWebView2ExecuteScriptCompletedHandler>(
             [callback](HRESULT, PCWSTR result_json) -> HRESULT {
                 if (!callback) return S_OK;
-                // result_json is the JSON-encoded JS result (ExecuteScript's own
-                // contract, confirmed via Microsoft Learn this session) --
-                // handles the boolean/number/string cases the footer-callback
-                // check actually needs. Not a general JSON parser.
-                QString result = QString::fromWCharArray(result_json ? result_json : L"null");
+        // result_json is JSON-encoded (ExecuteScript contract) -- handles the
+        // boolean/number/string cases the footer-callback check needs.
+        QString result = QString::fromWCharArray(result_json ? result_json : L"null");
                 QVariant qvariant;
                 if (result == QStringLiteral("true")) {
                     qvariant = QVariant(true);
@@ -339,8 +298,7 @@ void WebView2View::StopInputThread() {
 }
 
 void WebView2View::InputThreadLoop() {
-    // Same shape/reasoning as WebKitGTKView::InputThreadLoop -- see that file's
-    // comment, not repeating the full rationale here.
+    // Same shape as WebKitGTKView::InputThreadLoop.
     std::this_thread::sleep_for(std::chrono::seconds(1));
 
     while (input_thread_running) {
@@ -415,16 +373,14 @@ void WebView2View::SyncBounds() {
 HRESULT WebView2View::OnWebMessageReceived(ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* args) {
     wil::unique_cotaskmem_string message_raw;
     if (FAILED(args->TryGetWebMessageAsString(&message_raw))) {
-        // Control-envelope path -- was "sketched not wired" in v1, closing it now.
+        // Control-envelope path for endApplet -- WebView2 has one JS->native channel,
+        // so endApplet is tagged with __citron_control rather than a separate handler.
         wil::unique_cotaskmem_string json_raw;
         if (FAILED(args->get_WebMessageAsJson(&json_raw))) {
             return S_OK;
         }
         std::wstring json(json_raw.get());
-        // Narrow, deliberate check: only ever looking for this exact citron-owned
-        // sentinel shape, not general JSON parsing. See nx_shim_webview2.js for
-        // why this is envelope-tagged at all (WebView2 has one JS->native
-        // channel, unlike WebKitGTK's separate nxMessage/nxControl handlers).
+        // Check for the citron-owned control sentinel before treating as a page message.
         if (json.find(L"__citron_control") != std::wstring::npos &&
             json.find(L"endApplet") != std::wstring::npos) {
             SetFinished(true);
@@ -450,9 +406,7 @@ HRESULT WebView2View::OnNavigationStarting(ICoreWebView2*, ICoreWebView2Navigati
 }
 
 HRESULT WebView2View::OnWindowCloseRequested(ICoreWebView2*, IUnknown*) {
-    // Mirrors qt_web_browser.cpp:94-102. No URL-match guard available here either
-    // (same note as WebKitGTKView::OnClose) -- this event is already scoped to
-    // this specific ICoreWebView2 instance, same reasoning for why that's fine.
+    // Mirrors qt_web_browser.cpp:94-102. Event is scoped to this ICoreWebView2 instance.
     SetFinished(true);
     SetExitReason(Service::AM::Frontend::WebExitReason::WindowClosed);
     return S_OK;
