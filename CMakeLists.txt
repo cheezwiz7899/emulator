@@ -88,6 +88,18 @@ option(CITRON_USE_QT_WEB_ENGINE "Use QtWebEngine for web applet implementation" 
 option(CITRON_USE_WEBKITGTK_WEB_ENGINE "Use WebKitGTK for web applet implementation (Linux)" OFF)
 option(CITRON_USE_WEBVIEW2_WEB_ENGINE "Use WebView2 for web applet implementation (Windows)" OFF)
 
+# main.cpp's backend selection is an #if/#elif chain -- if more than one of these
+# ever ends up ON at once (stale cache, bad merge, copy-pasted CI config), it
+# would silently pick one in a fixed priority order instead of erroring, masking
+# a real misconfiguration. Fail loud at configure time instead.
+if ((CITRON_USE_QT_WEB_ENGINE AND CITRON_USE_WEBKITGTK_WEB_ENGINE) OR
+    (CITRON_USE_QT_WEB_ENGINE AND CITRON_USE_WEBVIEW2_WEB_ENGINE) OR
+    (CITRON_USE_WEBKITGTK_WEB_ENGINE AND CITRON_USE_WEBVIEW2_WEB_ENGINE))
+    message(FATAL_ERROR "CITRON_USE_QT_WEB_ENGINE, CITRON_USE_WEBKITGTK_WEB_ENGINE, and "
+                        "CITRON_USE_WEBVIEW2_WEB_ENGINE are mutually exclusive -- exactly "
+                        "one web-browser-applet backend can be compiled in per build.")
+endif()
+
 option(ENABLE_UNITY_BUILD "Enables the unity build" OFF)
 
 option(ENABLE_CUBEB "Enables the cubeb audio backend" ON)

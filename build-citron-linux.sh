@@ -1056,6 +1056,16 @@ build_common_cmake_args() {
         "-DCITRON_CHECK_SUBMODULES=OFF"
         "-DCITRON_USE_LLVM_DEMANGLE=OFF"
         "-DCITRON_USE_QT_WEB_ENGINE=OFF"
+        # QtWebEngine already off here (good, no ~460MB bundle on Linux) -- but without
+        # CITRON_USE_WEBKITGTK_WEB_ENGINE also on, this build ships NO web browser applet
+        # at all (falls to the no-op stub, core/frontend/applets/web_browser.cpp). Left OFF
+        # here deliberately, not forgotten: the WebKitGTK backend compile-checks clean
+        # against real Qt6+WebKitGTK headers as of this patch, but has never run under a
+        # real GPU (DMABUF renderer risk) or a real Wayland session (embedding gap, no
+        # fallback validated) -- see webkitgtk_web_browser.h's own header for both. Flip
+        # this on for a validation build once either of those is confirmed on real hardware,
+        # not as part of the default pipeline this script feeds yet.
+        # "-DCITRON_USE_WEBKITGTK_WEB_ENGINE=ON"
         "-DCITRON_USE_QT_MULTIMEDIA=OFF"
         "-DQT_NO_PRIVATE_MODULE_WARNING=ON"
         "-DENABLE_QT_TRANSLATION=ON"

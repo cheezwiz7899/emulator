@@ -1965,7 +1965,16 @@ build_common_cmake_args() {
         # https://doc.qt.io/qt-6/qtwebengine-platform-notes.html ("does not compile with
         # MinGW"). Nothing here enables it for llvm-mingw builds; that's intentionally left
         # at CMake's own default (OFF), since it cannot work there regardless of this flag.
+        #
+        # CITRON_USE_WEBVIEW2_WEB_ENGINE is the bundle-size replacement for this (~460MB ->
+        # a small loader), see CMakeModules/webview_native_deps.cmake. Left OFF here
+        # deliberately, not forgotten: it's never been compiled, let alone run, against the
+        # real WebView2 SDK as of this patch. Flip the two lines below for a validation
+        # build once that changes -- not wired to auto-switch, so a stale checkout doesn't
+        # silently start shipping unvalidated code as the default.
         "-DCITRON_USE_QT_WEB_ENGINE=ON"
+        # "-DCITRON_USE_QT_WEB_ENGINE=OFF"
+        # "-DCITRON_USE_WEBVIEW2_WEB_ENGINE=ON"
         "-Wno-dev"
     )
     [[ -n "${VULKAN_HEADERS_STUB_DIR}" ]] && _CMAKE_ARGS+=(
@@ -4788,6 +4797,16 @@ stage_clangcl() {
     local _clangcl_pgo_generate="OFF"
     local _clangcl_pgo_use="OFF"
 
+    # CITRON_USE_QT_WEB_ENGINE=ON below is unchanged from before this patch -- still the
+    # ~460MB QtWebEngine bundle. CITRON_USE_WEBVIEW2_WEB_ENGINE (see
+    # CMakeModules/webview_native_deps.cmake) is the replacement this patch adds, left OFF
+    # here deliberately: never compiled against the real WebView2 SDK as of this patch, so
+    # not switched on for what generates an actual release .cmd. For a validation build,
+    # edit the two flags in the heredoc below by hand (CITRON_USE_QT_WEB_ENGINE=OFF,
+    # CITRON_USE_WEBVIEW2_WEB_ENGINE=ON) rather than scripting the toggle here -- this
+    # heredoc is real cmd.exe content once written out, and inserting an automated switch
+    # inside a caret-continued command block isn't something to do without a Windows box to
+    # actually verify the batch syntax against.
     cat > "${build_dir}/build-clang-cl.cmd" <<CLANGCL_CMD_EOF
 @echo off
 setlocal
