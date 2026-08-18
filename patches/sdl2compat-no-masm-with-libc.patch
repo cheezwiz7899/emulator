@@ -1,7 +1,7 @@
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -17,22 +17,26 @@ if(APPLE)
- endif()
+@@ -239,18 +239,28 @@
+
  if(WIN32)
    list(APPEND SDL2COMPAT_SRCS
 -    "src/sdl2_mslibc.c"
@@ -32,6 +32,3 @@
      list(APPEND SDL2COMPAT_SRCS
        "src/sdl2_mslibc_arm64.masm"
      )
-     enable_language(ASM_MARMASM)
-     set_property(SOURCE "src/sdl2_mslibc_arm64.masm" PROPERTY LANGUAGE "ASM_MARMASM")
-   elseif(SDL_CPU_ARM32)
