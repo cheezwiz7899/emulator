@@ -1440,7 +1440,7 @@ build_appimage_stage() {
     local install_root="${build_dir}/install-root"
     rm -rf "${install_root}"
     mkdir -p "${install_root}/usr/bin" \
-             "${install_root}/usr/lib" \
+             "${install_root}/usr/bin/lib" \
              "${install_root}/usr/share/applications" \
              "${install_root}/usr/share/icons/hicolor/scalable/apps" \
              "${install_root}/usr/share/icons/hicolor/256x256/apps" \
@@ -1454,10 +1454,9 @@ build_appimage_stage() {
         || error "citron binary not found at ${build_dir}/bin/citron"
     cp "${build_dir}/bin/citron" "${install_root}/usr/bin/citron"
 
-    # sdl2-compat dlopens SDL3, so SDL3 is absent from citron's ELF NEEDED
-    # entries and quick-sharun cannot find it through its normal scan. CMake
-    # emits the exact two runtime paths for this configuration; stage them so
-    # package-citron-linux.sh can pass both to quick-sharun explicitly.
+    # sdl2-compat is a real link dep, resolved via citron's rpath from
+    # usr/bin/lib below. SDL3 is dlopen'd at runtime (invisible to ELF
+    # scanning), so package-citron-linux.sh bundles it explicitly.
     local sdl_runtime_manifest sdl_runtime soname
     sdl_runtime_manifest="$(find "${build_dir}" -maxdepth 1 -type f -name 'citron-sdl-runtime-libs-*.txt' -print -quit)"
     [[ -n "${sdl_runtime_manifest}" ]] \
@@ -1466,10 +1465,10 @@ build_appimage_stage() {
         [[ -n "${sdl_runtime}" ]] || continue
         [[ -f "${sdl_runtime}" ]] \
             || error "sdl2-compat runtime library missing: ${sdl_runtime}"
-        cp -L "${sdl_runtime}" "${install_root}/usr/lib/"
+        cp -L "${sdl_runtime}" "${install_root}/usr/bin/lib/"
         soname="$(patchelf --print-soname "${sdl_runtime}" 2>/dev/null || true)"
         if [[ -n "${soname}" && "${soname}" != "$(basename "${sdl_runtime}")" ]]; then
-            ln -sf "$(basename "${sdl_runtime}")" "${install_root}/usr/lib/${soname}"
+            ln -sf "$(basename "${sdl_runtime}")" "${install_root}/usr/bin/lib/${soname}"
         fi
     done < "${sdl_runtime_manifest}"
 

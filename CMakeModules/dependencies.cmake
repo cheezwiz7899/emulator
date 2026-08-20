@@ -415,6 +415,15 @@ if (CITRON_USE_EXTERNAL_SDL2 AND NOT TARGET SDL2::SDL2)
     endforeach()
     unset(_sdl_out_target)
 
+    if (UNIX AND NOT APPLE AND TARGET SDL2)
+        # sdl2-compat's own BUILD_RPATH->SDL3-shared trick (its own
+        # CMakeLists.txt) is neutralized by CMAKE_BUILD_WITH_INSTALL_RPATH
+        # TRUE above: CMake uses INSTALL_RPATH instead for every target,
+        # build tree or not. copy_citron_sdl_runtime() places SDL2 and SDL3
+        # side by side, so plain $ORIGIN is enough for SDL2 to dlopen SDL3.
+        set_property(TARGET SDL2 PROPERTY INSTALL_RPATH "$ORIGIN")
+    endif()
+
     # Post-configure: strip any inherited -Werror / /WX from SDL3 and SDL2
     # targets.  Citron's clang-cl build passes these flags through
     # CMAKE_C_FLAGS / CMAKE_CXX_FLAGS, and CPM sub-projects inherit them.
@@ -500,6 +509,11 @@ endif()
 # On Windows CPM builds: copies SDL2.dll and SDL3.dll next to <target> after
 # build.  sdl2-compat dlopens SDL3, so SDL3 is absent from the PE import table
 # and CopyMinGWDeps' import-table scan cannot find it.
+# On Linux CPM builds: unlike the old statically-linked SDL2, sdl2-compat is
+# shared and citron links SDL2::SDL2 directly, but nothing puts the .so
+# anywhere citron's rpath ($ORIGIN/lib) can find it. Stage SONAME-named
+# copies of both SDL2 and SDL3 into <target>/lib to match -- SDL2 needs
+# SDL3 right next to it too, see the INSTALL_RPATH fix above.
 # On all other configurations this is a no-op so it is safe to call
 # unconditionally from src/citron/CMakeLists.txt and src/citron_cmd/CMakeLists.txt.
 function(copy_citron_sdl_runtime target)
@@ -511,6 +525,18 @@ function(copy_citron_sdl_runtime target)
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "$<TARGET_FILE:SDL3::SDL3-shared>" "$<TARGET_FILE_DIR:${target}>"
             COMMENT "Deploying sdl2-compat and SDL3 for ${target}"
+            VERBATIM
+        )
+    elseif (UNIX AND NOT APPLE AND CITRON_USE_EXTERNAL_SDL2 AND TARGET SDL2 AND TARGET SDL3-shared)
+        add_dependencies(${target} SDL2 SDL3-shared)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                "$<TARGET_FILE_DIR:${target}>/lib"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_SONAME_FILE:SDL2>" "$<TARGET_FILE_DIR:${target}>/lib"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_SONAME_FILE:SDL3::SDL3-shared>" "$<TARGET_FILE_DIR:${target}>/lib"
+            COMMENT "Deploying sdl2-compat and SDL3 for ${target} (\$ORIGIN/lib)"
             VERBATIM
         )
     endif()
