@@ -7250,7 +7250,29 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                 }
                 if (sz < 4) return;
 
-                const auto process_blob = [&](const std::vector<u8>& blob, bool is_bnsh_derived) -> bool {
+                // Phase 3 guess refinement. Snapshot of exactly the fields
+                // MakeRuntimeInfo() (vk_pipeline_cache.cpp) pulls from a real
+                // previous_program when deriving a real pipeline's previous_stage_stores
+                // -- see that function for the reference derivation this mirrors
+                // field-for-field. Deliberately NOT holding onto the translated
+                // Shader::IR::Program itself: its IR::Block/IR::Inst graph lives in
+                // per-attempt ObjectPools (see try_translate_at below) that go out of
+                // scope as soon as that lambda returns, so keeping a Program around
+                // across sibling-stage calls would dangle. VaryingState (a bitset<512>
+                // wrapper) and std::map<IR::Attribute,IR::Attribute> are both plain
+                // value types with no pool dependency, so copying just these three
+                // fields out avoids that trap entirely instead of trying to extend any
+                // pool's lifetime.
+                struct PreviousStageStoresSnapshot {
+                    Shader::VaryingState stores{};
+                    std::map<Shader::IR::Attribute, Shader::IR::Attribute> legacy_stores_mapping{};
+                    Shader::VaryingState passthrough{};
+                    bool is_geometry_passthrough{};
+                };
+
+                const auto process_blob = [&](const std::vector<u8>& blob, bool is_bnsh_derived,
+                                              const PreviousStageStoresSnapshot* previous_stage,
+                                              PreviousStageStoresSnapshot* out_stage_snapshot) -> bool {
                     // Claim one of a limited number of diagnostic-logging slots
                     // (thread-safe across the worker pool). diag_slot >= 0 means
                     // this call should log; this is temporary instrumentation to
@@ -7427,10 +7449,38 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                             }
                             Shader::Backend::Bindings binding{};
                             Shader::RuntimeInfo rt{};
-                            // Without a live pipeline key we have no previous-stage stores
-                            // information, so conservatively set all bits — the same thing
-                            // MakeRuntimeInfo does when there is no previous program.
-                            rt.previous_stage_stores.mask.set();
+                            // Phase 3 guess refinement: for every stage except VertexB,
+                            // previous_stage_stores is a real, IS-read field of
+                            // SpirvRelevantHash(stage) (see that function's own comment)
+                            // -- and for a REAL draw it reflects the actual preceding
+                            // stage's real output layout, never the "no previous
+                            // program" sentinel MakeRuntimeInfo only falls back to when
+                            // there genuinely is no previous stage. previous_stage, when
+                            // non-null, is exactly that real data -- captured from
+                            // translating this same BNSH shader program's earlier stage
+                            // moments ago (see process_bnsh_at's stage loop) -- not a
+                            // guess, the same field access MakeRuntimeInfo itself uses.
+                            if (stage != Shader::Stage::VertexB && previous_stage) {
+                                rt.previous_stage_stores = previous_stage->stores;
+                                rt.previous_stage_legacy_stores_mapping =
+                                    previous_stage->legacy_stores_mapping;
+                                if (previous_stage->is_geometry_passthrough) {
+                                    rt.previous_stage_stores.mask |= previous_stage->passthrough.mask;
+                                }
+                            } else {
+                                // VertexB never has a previous program in a real pipeline
+                                // either (see SpirvRelevantHash's own comment on this,
+                                // which is also why VertexB skips this field in the hash
+                                // entirely regardless of what's set here) -- and if this
+                                // stage DOES read the field but no real sibling data is
+                                // available (this program doesn't declare an earlier
+                                // stage, or that stage failed to translate), honesty
+                                // beats a wrong guess: fall back to the same
+                                // conservative "no restriction" sentinel MakeRuntimeInfo
+                                // itself uses in the equivalent real case, rather than
+                                // inventing something with no basis.
+                                rt.previous_stage_stores.mask.set();
+                            }
                             // Triangles are the overwhelmingly common input topology.
                             // Geometry and tessellation shaders that need a different
                             // topology will be recompiled correctly during live play.
@@ -7480,6 +7530,16 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                             if (diag_slot >= 0) {
                                 LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: fully translated OK at entry +{}",
                                          diag_slot, entry_offset_in_payload);
+                            }
+                            // Written only here, on confirmed full success (translate +
+                            // emit + insert all completed) -- not right after
+                            // TranslateProgram above, so a later failure/exception in
+                            // this same attempt can never leave the caller thinking this
+                            // stage succeeded when process_blob is about to return false.
+                            if (out_stage_snapshot) {
+                                *out_stage_snapshot = PreviousStageStoresSnapshot{
+                                    prog.info.stores, prog.info.legacy_stores_mapping,
+                                    prog.info.passthrough, prog.is_geometry_passthrough};
                             }
                             // A second VertexB translate guessing viewport_transform_state=0
                             // used to run here (mirroring PipelineCache::SubmitSpeculativeShader).
@@ -7678,17 +7738,19 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                     std::memcpy(&out, data + off, 8); return true;
                 };
 
-                const auto process_stage_offset = [&](size_t base, u64 stage_offset) {
-                    if (stage_offset == 0) return;
+                const auto process_stage_offset = [&](size_t base, u64 stage_offset,
+                                                       const PreviousStageStoresSnapshot* previous_stage,
+                                                       PreviousStageStoresSnapshot* out_stage_snapshot) -> bool {
+                    if (stage_offset == 0) return false;
                     const size_t code_hdr = base + static_cast<size_t>(stage_offset);
                     u64 control_code_offset{};
                     u64 byte_code_offset{};
                     u32 byte_code_size{};
                     u32 control_code_size{};
-                    if (!read_u64(code_hdr + 0x08, control_code_offset)) return;
-                    if (!read_u64(code_hdr + 0x10, byte_code_offset)) return;
-                    if (!read_u32(code_hdr + 0x18, byte_code_size)) return;
-                    if (!read_u32(code_hdr + 0x1C, control_code_size)) return;
+                    if (!read_u64(code_hdr + 0x08, control_code_offset)) return false;
+                    if (!read_u64(code_hdr + 0x10, byte_code_offset)) return false;
+                    if (!read_u32(code_hdr + 0x18, byte_code_size)) return false;
+                    if (!read_u32(code_hdr + 0x1C, control_code_size)) return false;
 
                     bool succeeded = false;
                     if (byte_code_offset != 0 && byte_code_size > kByteCodePreambleSize) {
@@ -7696,10 +7758,10 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                         const size_t blob_size = byte_code_size - kByteCodePreambleSize;
                         if (blob_start + blob_size <= sz) {
                             succeeded = process_blob(std::vector<u8>(data + blob_start, data + blob_start + blob_size),
-                                                      /*is_bnsh_derived=*/true);
+                                                      /*is_bnsh_derived=*/true, previous_stage, out_stage_snapshot);
                         }
                     }
-                    if (succeeded) return;
+                    if (succeeded) return true;
 
                     // Fallback: try ControlCode instead of ByteCode. This mirrors a
                     // workaround documented by the Switch-modding community for
@@ -7720,10 +7782,11 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                         const size_t blob_start = base + static_cast<size_t>(control_code_offset) + kByteCodePreambleSize;
                         const size_t blob_size = control_code_size - kByteCodePreambleSize;
                         if (blob_start + blob_size <= sz) {
-                            process_blob(std::vector<u8>(data + blob_start, data + blob_start + blob_size),
-                                         /*is_bnsh_derived=*/true);
+                            succeeded = process_blob(std::vector<u8>(data + blob_start, data + blob_start + blob_size),
+                                                      /*is_bnsh_derived=*/true, previous_stage, out_stage_snapshot);
                         }
                     }
+                    return succeeded;
                 };
 
                 const auto process_bnsh_at = [&](size_t base) {
@@ -7746,11 +7809,43 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                         if (binary_offset == 0) continue;
 
                         const size_t prog_hdr = base + static_cast<size_t>(binary_offset);
-                        static constexpr size_t kStageOffsetFields[6] = {0x08, 0x10, 0x18, 0x20, 0x28, 0x30};
-                        for (const size_t field : kStageOffsetFields) {
+                        // Phase 3 guess refinement: fields 0-4 (Vertex, TessControl,
+                        // TessEval, Geometry, Fragment) are a real graphics pipeline
+                        // chain within this one shader program, in this order (matching
+                        // BnshShaderProgramHeader's own layout) -- processed here in
+                        // that same order so each stage's speculative RuntimeInfo can
+                        // use the ACTUAL preceding stage's real stores/legacy-stores/
+                        // passthrough data (see PreviousStageStoresSnapshot's doc
+                        // comment above process_blob) instead of the "no previous
+                        // program" sentinel, for every stage that isn't VertexB.
+                        // Field 5 (Compute) is a completely separate pipeline type with
+                        // no previous-stage concept at all, so it's handled after this
+                        // loop, deliberately excluded from the chain in both directions.
+                        static constexpr size_t kGraphicsStageOffsetFields[5] = {0x08, 0x10, 0x18, 0x20, 0x28};
+                        std::optional<PreviousStageStoresSnapshot> previous_stage_snapshot;
+                        for (const size_t field : kGraphicsStageOffsetFields) {
                             u64 stage_offset{};
                             if (!read_u64(prog_hdr + field, stage_offset)) continue;
-                            process_stage_offset(base, stage_offset);
+                            PreviousStageStoresSnapshot this_stage_snapshot{};
+                            const bool succeeded = process_stage_offset(
+                                base, stage_offset,
+                                previous_stage_snapshot ? &*previous_stage_snapshot : nullptr,
+                                &this_stage_snapshot);
+                            if (succeeded) {
+                                previous_stage_snapshot = this_stage_snapshot;
+                            }
+                            // An absent stage (stage_offset==0, already skipped by the
+                            // `continue` above) or one that failed to translate leaves
+                            // previous_stage_snapshot exactly as it was -- correctly
+                            // chaining through to whichever real stage precedes it, the
+                            // same way a real pipeline naturally skips an absent stage
+                            // (see MakeRuntimeInfo's own previous_program parameter,
+                            // which is computed the same way on the live path).
+                        }
+                        u64 compute_offset{};
+                        if (read_u64(prog_hdr + 0x30, compute_offset) && compute_offset != 0) {
+                            process_stage_offset(base, compute_offset, /*previous_stage=*/nullptr,
+                                                 /*out_stage_snapshot=*/nullptr);
                         }
                     }
                 };
@@ -7778,7 +7873,12 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                     Shader::ProgramHeader sph{}; std::memcpy(&sph,data,sizeof(sph));
                     if (sph.common0.shader_type.Value()>=1 && sph.common0.shader_type.Value()<=5) {
                         ++state->raw_matched;
-                        process_blob(std::vector<u8>(data, data+sz), /*is_bnsh_derived=*/false);
+                        // No BNSH shader-program grouping for a standalone raw-matched
+                        // file, so no real sibling-stage data exists here -- nullptr for
+                        // both falls back to exactly the previous (pre-Phase-3) sentinel
+                        // behavior for this path, unchanged.
+                        process_blob(std::vector<u8>(data, data+sz), /*is_bnsh_derived=*/false,
+                                     /*previous_stage=*/nullptr, /*out_stage_snapshot=*/nullptr);
                     } else {
                         ++state->unrecognized;
                         log_unrecognized_sample();
