@@ -588,15 +588,26 @@ std::optional<SpirvCache::LookupResult> SpirvCache::Lookup(const SpirvKey& key,
                         stored_it != entries_.end() ? stored_it->second.diag_base_runtime_hash : 0;
                     const u64 stored_binding_key =
                         stored_it != entries_.end() ? stored_it->second.diag_binding_key : 0;
+                    // Added alongside the Phase 3 guess-refinement work: nothing above
+                    // this line could previously tell you whether a given mismatch
+                    // sample was against a real entry from earlier in the same session
+                    // (ordinary, expected cardinality — see
+                    // RecordPhase3RuntimeVariantDiagnostic's histogram) or against a
+                    // scanner/live-speculative guess actually missing. Without this,
+                    // "base_runtime DIFFERS" here is ambiguous between "the guess was
+                    // wrong" and "this shader legitimately has 2+ real states" — two
+                    // completely different next steps depending on which.
+                    const bool stored_is_speculative =
+                        stored_it != entries_.end() && stored_it->second.is_speculative;
                     LOG_INFO(Render_Vulkan,
                              "SPIR-V cache field mismatch [{}] (real_context={}): requested "
                              "cbuf={:016x} runtime={:016x} (base_runtime={:016x} binding_key={:016x}) "
-                             "texture={:016x} vs stored cbuf={:016x} runtime={:016x} "
+                             "texture={:016x} vs stored[speculative={}] cbuf={:016x} runtime={:016x} "
                              "(base_runtime={:016x} binding_key={:016x}) texture={:016x} "
                              "(cbuf {}, runtime {} [base_runtime {}, binding_key {}], texture {})",
                              expected, has_real_specialization_context,
                              key.cbuf_key, key.runtime_key, diag_base_runtime_hash, diag_binding_key,
-                             key.texture_key,
+                             key.texture_key, stored_is_speculative,
                              stored.cbuf_key, stored.runtime_key, stored_base_rt, stored_binding_key,
                              stored.texture_key,
                              key.cbuf_key == stored.cbuf_key ? "matches" : "DIFFERS",

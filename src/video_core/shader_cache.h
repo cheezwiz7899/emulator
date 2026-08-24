@@ -146,10 +146,18 @@ private:
     /// @brief Create a new shader entry and register it
     /// GPL hook — called once per unique new shader after registration.
     /// Override in PipelineCache to speculatively pre-translate to SPIR-V.
+    /// previous_stage_unique_hash: the unique_hash of whichever real stage precedes this
+    /// one in the current pipeline (0 if none — first stage, or the slot was empty).
+    /// Only meaningful for graphics; RefreshStages() is the only caller that ever passes
+    /// a nonzero value, since it's the only one iterating a real multi-stage pipeline in
+    /// order (see its own comment). ComputeShader() always passes 0 — compute has no
+    /// previous-stage concept at all.
     virtual void OnNewShaderSeen([[maybe_unused]] GenericEnvironment& env,
-                                 [[maybe_unused]] u64 unique_hash) {}
+                                 [[maybe_unused]] u64 unique_hash,
+                                 [[maybe_unused]] u64 previous_stage_unique_hash) {}
 
-    const ShaderInfo* MakeShaderInfo(GenericEnvironment& env, VAddr cpu_addr);
+    const ShaderInfo* MakeShaderInfo(GenericEnvironment& env, VAddr cpu_addr,
+                                     u64 previous_stage_unique_hash);
 
     Tegra::MaxwellDeviceMemoryManager& device_memory;
 

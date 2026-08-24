@@ -47,6 +47,16 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) {
     dirty[VideoCommon::Dirty::Shaders] = false;
 
     const GPUVAddr base_addr{maxwell3d->regs.program_region.Address()};
+    // Tracks the unique_hash of whichever real stage most recently appeared in this
+    // same loop, in true pipeline order (index 0..5 here already IS pipeline order —
+    // VertexA, VertexB, TessControl, TessEval, Geometry, Pixel/Fragment — see
+    // Regs::ShaderType; this is the raw-hardware numbering, not the separate
+    // Shader::Stage software numbering some other code uses, but the two happen to
+    // agree on ORDER even though their integer values differ — see
+    // vk_pipeline_cache.h's own comment on unique_hashes[5] for that trap). Passed to
+    // OnNewShaderSeen() so a speculative guess for a later stage can use this earlier
+    // stage's REAL translated data instead of an invented sentinel, when available.
+    u64 previous_unique_hash = 0;
     for (size_t index = 0; index < Tegra::Engines::Maxwell3D::Regs::MaxShaderProgram; ++index) {
         if (!maxwell3d->regs.IsShaderConfigEnabled(index)) {
             unique_hashes[index] = 0;
@@ -70,10 +80,14 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) {
         if (!shader_info) {
             const u32 start_address{shader_config.offset};
             GraphicsEnvironment env{*maxwell3d, *gpu_memory, program, base_addr, start_address};
-            shader_info = MakeShaderInfo(env, *cpu_shader_addr);
+            shader_info = MakeShaderInfo(env, *cpu_shader_addr, previous_unique_hash);
         }
         shader_infos[index] = shader_info;
         unique_hashes[index] = shader_info->unique_hash;
+        // Updated unconditionally, whether shader_info came from TryGet() or a fresh
+        // MakeShaderInfo() just above — either way it's the real identity of this
+        // pipeline's actual previous stage, which is all the next iteration needs.
+        previous_unique_hash = shader_info->unique_hash;
     }
     last_shaders_valid = true;
     return true;
@@ -92,7 +106,9 @@ const ShaderInfo* ShaderCache::ComputeShader() {
         return shader;
     }
     ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start};
-    return MakeShaderInfo(env, *cpu_shader_addr);
+    // 0: compute has no previous-stage concept at all, unlike the graphics chain
+    // RefreshStages() walks above.
+    return MakeShaderInfo(env, *cpu_shader_addr, /*previous_stage_unique_hash=*/0);
 }
 
 void ShaderCache::GetGraphicsEnvironments(GraphicsEnvironments& result,
@@ -230,7 +246,8 @@ ShaderCache::Entry* ShaderCache::NewEntry(VAddr addr, VAddr addr_end, ShaderInfo
     return entry_pointer;
 }
 
-const ShaderInfo* ShaderCache::MakeShaderInfo(GenericEnvironment& env, VAddr cpu_addr) {
+const ShaderInfo* ShaderCache::MakeShaderInfo(GenericEnvironment& env, VAddr cpu_addr,
+                                              u64 previous_stage_unique_hash) {
     auto info = std::make_unique<ShaderInfo>();
     if (const std::optional<u64> cached_hash{env.Analyze()}) {
         info->unique_hash = *cached_hash;
@@ -249,7 +266,7 @@ const ShaderInfo* ShaderCache::MakeShaderInfo(GenericEnvironment& env, VAddr cpu
     Register(std::move(info), cpu_addr, size_bytes);
     // Notify the pipeline cache that a new shader has been registered so it can
     // submit it for speculative SPIR-V translation in the background.
-    OnNewShaderSeen(env, unique_hash);
+    OnNewShaderSeen(env, unique_hash, previous_stage_unique_hash);
     return result;
 }
 

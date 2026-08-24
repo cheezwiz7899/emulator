@@ -9,7 +9,9 @@
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
+#include <map>
 #include <memory>
+#include <optional>
 #include <shared_mutex>
 #include <type_traits>
 #include <unordered_map>
@@ -25,6 +27,7 @@
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/object_pool.h"
 #include "shader_recompiler/profile.h"
+#include "shader_recompiler/varying_state.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
@@ -119,12 +122,47 @@ public:
                            const VideoCore::DiskResourceLoadCallback& callback);
 
 private:
+    // Real, non-speculative per-stage translated-shader data, keyed by unique_hash,
+    // captured from CreateGraphicsPipeline()'s own real translations (see the capture
+    // site inside that function's per-stage loop). Same four fields MakeRuntimeInfo()
+    // reads from a real previous_program, for the same reason the scanner's
+    // PreviousStageStoresSnapshot (citron/main.cpp) does — plain value types, no
+    // dependency on the ObjectPools the owning IR::Program's block/instruction graph
+    // actually lives in, so safe to keep around past that Program's own lifetime.
+    // Distinct type from the scanner's, despite matching shape: this one is populated
+    // continuously across an entire live session from real draws (overwritten with the
+    // most recent real observation each time — per Phase 3's own cardinality data, most
+    // shaders only ever show one real state anyway, so "most recent" is usually also
+    // "the only one"), where the scanner's is scoped to one BNSH shader program's five
+    // sibling stages during one boot-time scan pass.
+    struct RealStageStoresSnapshot {
+        Shader::VaryingState stores{};
+        std::map<Shader::IR::Attribute, Shader::IR::Attribute> legacy_stores_mapping{};
+        Shader::VaryingState passthrough{};
+        bool is_geometry_passthrough{};
+    };
+    mutable std::shared_mutex real_stage_stores_mutex;
+    mutable ankerl::unordered_dense::map<u64, RealStageStoresSnapshot> real_stage_stores_by_hash;
+
+    // Looks up real_stage_stores_by_hash for previous_stage_unique_hash (0, or a hash
+    // with no recorded real snapshot yet, both correctly yield std::nullopt — the
+    // caller already handles "no real data" via the same sentinel fallback it used
+    // before this existed). Cheap (single shared-lock map lookup + a small value-type
+    // copy) and safe to call from OnNewShaderSeen()'s caller thread — deliberately
+    // resolved here, synchronously, rather than deferred into the speculative_worker
+    // background thread, so that thread never needs to touch real_stage_stores_mutex
+    // at all.
+    std::optional<RealStageStoresSnapshot> ResolveRealStageStoresSnapshot(
+        u64 previous_stage_unique_hash) const;
+
     void SubmitSpeculativeShader(u64 unique_hash, std::vector<u64> maxwell_code,
                                Shader::Stage stage, u32 local_memory_size,
                                u32 shared_memory_size, std::array<u32, 3> workgroup_size,
                                u32 start_address, u32 texture_bound,
-                               Shader::ProgramHeader sph);
-    void OnNewShaderSeen(VideoCommon::GenericEnvironment& env, u64 unique_hash) override;
+                               Shader::ProgramHeader sph,
+                               std::optional<RealStageStoresSnapshot> previous_stage_snapshot);
+    void OnNewShaderSeen(VideoCommon::GenericEnvironment& env, u64 unique_hash,
+                        u64 previous_stage_unique_hash) override;
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath();
 
     [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) const noexcept;

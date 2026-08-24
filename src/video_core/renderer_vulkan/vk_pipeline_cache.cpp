@@ -1051,6 +1051,23 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         if (programs[index].info.requires_layer_emulation) {
             layer_source_program = &programs[index];
         }
+
+        // Phase 3 guess refinement, GPL live-speculative path: record this stage's
+        // REAL translated data (same four fields MakeRuntimeInfo() below reads from a
+        // real previous_program) keyed by its own unique_hash, so a LATER draw's
+        // speculative guess for whichever stage follows this one (see
+        // OnNewShaderSeen()/ResolveRealStageStoresSnapshot()) can use real data
+        // instead of an invented sentinel. Overwrites any prior entry for this hash
+        // with the most recent real observation — per Phase 3's own cardinality data
+        // most shaders only ever show one real state anyway, so this is usually also
+        // the only one, and even when it isn't, "most recent real state" is a better
+        // starting guess than a sentinel that was never observed at all.
+        {
+            std::unique_lock real_stage_stores_lock{real_stage_stores_mutex};
+            real_stage_stores_by_hash[key.unique_hashes[index]] = RealStageStoresSnapshot{
+                programs[index].info.stores, programs[index].info.legacy_stores_mapping,
+                programs[index].info.passthrough, programs[index].is_geometry_passthrough};
+        }
     }
     std::array<const Shader::Info*, Tegra::Engines::Maxwell3D::Regs::MaxShaderStage> infos{};
     std::array<vk::ShaderModule, Tegra::Engines::Maxwell3D::Regs::MaxShaderStage> modules;
@@ -1594,13 +1611,15 @@ void PipelineCache::SubmitSpeculativeShader(
         Shader::Stage stage, u32 local_memory_size,
         u32 shared_memory_size, std::array<u32, 3> workgroup_size,
         u32 start_address, u32 texture_bound,
-        Shader::ProgramHeader sph) {
+        Shader::ProgramHeader sph,
+        std::optional<RealStageStoresSnapshot> previous_stage_snapshot) {
     if (spirv_cache.ContainsByUniqueHash(unique_hash)) return;
 
     speculative_worker.QueueWork(
         [this, unique_hash, code = std::move(maxwell_code),
          stage, local_memory_size, shared_memory_size,
-         workgroup_size, start_address, texture_bound, sph]() mutable {
+         workgroup_size, start_address, texture_bound, sph,
+         previous_stage_snapshot = std::move(previous_stage_snapshot)]() mutable {
         // Reuse persistent pools to avoid per-translation VirtualAlloc churn.
         spec_pools.ReleaseContents();
 
@@ -1633,8 +1652,32 @@ void PipelineCache::SubmitSpeculativeShader(
 
             Shader::Backend::Bindings binding{};
             Shader::RuntimeInfo rt{};
+            // Phase 3 guess refinement, GPL live-speculative path. Real previous-stage
+            // data when we have it (previous_stage_snapshot — resolved in
+            // OnNewShaderSeen() from real_stage_stores_by_hash, itself populated from
+            // CreateGraphicsPipeline()'s own real per-stage translations earlier in
+            // this same session; see that capture site's comment), the exact same
+            // fields MakeRuntimeInfo() reads from a real previous_program. Falls back
+            // to the conservative "no restriction" sentinel — for EVERY non-VertexB
+            // stage now, not just Fragment as before this session's session: nothing
+            // in this codebase's history suggested Geometry/TessControl/TessEval
+            // getting an unset (all-zero, "stores nothing") default instead of the
+            // same sentinel Fragment already got was ever a deliberate choice, and
+            // an all-zero guess is no more likely to be right than all-ones for a
+            // stage that has a real predecessor.
+            if (stage != Shader::Stage::VertexB) {
+                if (previous_stage_snapshot) {
+                    rt.previous_stage_stores = previous_stage_snapshot->stores;
+                    rt.previous_stage_legacy_stores_mapping =
+                        previous_stage_snapshot->legacy_stores_mapping;
+                    if (previous_stage_snapshot->is_geometry_passthrough) {
+                        rt.previous_stage_stores.mask |= previous_stage_snapshot->passthrough.mask;
+                    }
+                } else {
+                    rt.previous_stage_stores.mask.set();
+                }
+            }
             if (stage == Shader::Stage::Fragment) {
-                rt.previous_stage_stores.mask.set();
                 rt.input_topology = Shader::InputTopology::Triangles;
             }
             if (stage != Shader::Stage::Compute) {
@@ -1693,8 +1736,21 @@ void PipelineCache::SubmitSpeculativeShader(
     });
 }
 
+std::optional<PipelineCache::RealStageStoresSnapshot>
+PipelineCache::ResolveRealStageStoresSnapshot(u64 previous_stage_unique_hash) const {
+    if (previous_stage_unique_hash == 0) {
+        return std::nullopt;
+    }
+    std::shared_lock lock{real_stage_stores_mutex};
+    const auto it = real_stage_stores_by_hash.find(previous_stage_unique_hash);
+    if (it == real_stage_stores_by_hash.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
 void PipelineCache::OnNewShaderSeen(VideoCommon::GenericEnvironment& env,
-                                    u64 unique_hash) {
+                                    u64 unique_hash, u64 previous_stage_unique_hash) {
     if (!Settings::values.use_gpl_speculative_shaders.GetValue()) return;
     if (env.ShaderStage() == Shader::Stage::VertexA) return;
     if (spirv_cache.ContainsByUniqueHash(unique_hash)) return;
@@ -1721,7 +1777,7 @@ void PipelineCache::OnNewShaderSeen(VideoCommon::GenericEnvironment& env,
                             env.ShaderStage(), env.LocalMemorySize(),
                             env.SharedMemorySize(), env.WorkgroupSize(),
                             env.StartAddress(), env.TextureBoundBuffer(),
-                            env.SPH());
+                            env.SPH(), ResolveRealStageStoresSnapshot(previous_stage_unique_hash));
 }
 
 } // namespace Vulkan
