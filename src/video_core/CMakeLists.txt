@@ -202,6 +202,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_update_descriptor.h
     shader_cache.cpp
     shader_cache.h
+    phase4_prototype_slots_file.cpp
+    phase4_prototype_slots_file.h
     spirv_cache.cpp
     spirv_cache.h
     shader_environment.cpp

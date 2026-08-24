@@ -13,7 +13,39 @@
 
 namespace {
 constexpr std::array<char, 8> SPIRV_CACHE_MAGIC{'c', 'i', 't', 'r', 's', 'p', 'v', '\0'};
-constexpr u32 SPIRV_CACHE_VERSION = 7; // v7: cbuf_key now excludes texture-handle-only
+constexpr u32 SPIRV_CACHE_VERSION = 9; // v9: second known Phase 4 prototype slot enabled
+                                        // (cbuf_index=2, cbuf_offset=280 -- 2 real TotK
+                                        // shaders; see Shader::ActivePhase4PrototypeSlots(),
+                                        // environment.h). Same v7/v8 reasoning again,
+                                        // mechanically: no format change, but these 2
+                                        // shaders' texture_key now excludes one more
+                                        // handle read than a pre-v9 entry's would, so old
+                                        // entries for exactly these 2 shaders go silently
+                                        // unreachable rather than wrong. Narrower than v8's
+                                        // trigger (one slot's worth of shaders, not "the
+                                        // mechanism exists at all") but the same category
+                                        // of change, so the same bump-don't-leave-unversioned
+                                        // call applies;
+                                        // (v8: texture_key now excludes texture-handle-only
+                                        // reads at any known Phase 4 prototype slot
+                                        // (ComputeTextureKeyExcludingHandles,
+                                        // Shader::ActivePhase4PrototypeSlots() in environment.h --
+                                        // mirrors v7's ComputeCbufKeyExcludingTextureHandles
+                                        // exactly; see CreateGraphicsPipeline/
+                                        // CreateComputePipeline, vk_pipeline_cache.cpp).
+                                        // This landed with the Phase 1/Phase 4 merge but was
+                                        // deliberately left unversioned pending this exact
+                                        // decision rather than decided unilaterally at merge
+                                        // time. Same reasoning as v7, unchanged: no on-disk
+                                        // format change, but a shader touching a known slot
+                                        // now gets a texture_key computed over strictly fewer
+                                        // reads than a pre-v8 entry's for the identical
+                                        // shader, so an old entry isn't wrong, just silently
+                                        // unreachable -- fine for a cache, but ambiguous for
+                                        // any future texture_key==0-rate or hit-rate
+                                        // diagnostics the same way an unversioned v7 would
+                                        // have been;
+                                        // (v7: cbuf_key now excludes texture-handle-only
                                         // reads (ComputeCbufKeyExcludingTextureHandles,
                                         // vk_pipeline_cache.cpp's CreateGraphicsPipeline/
                                         // CreateComputePipeline — see the "PHASE 1 —
@@ -59,7 +91,7 @@ constexpr u32 SPIRV_CACHE_VERSION = 7; // v7: cbuf_key now excludes texture-hand
                                         // (v4: single-bit ComputeBindingKey; v3: runtime_key
                                         // folds in viewport_transform_state [VertexB] and
                                         // starting Bindings state; v2: adds Bindings
-                                        // end_binding per entry)
+                                        // end_binding per entry)))
 } // anonymous namespace
 
 namespace VideoCommon {

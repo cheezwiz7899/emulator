@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <fstream>
 #include <memory>
+#include <span>
 #include <thread>
 #include <vector>
 
@@ -39,6 +40,7 @@
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/shader_cache.h"
+#include "video_core/phase4_prototype_slots_file.h"
 #include "video_core/spirv_cache.h"
 #include "video_core/shader_environment.h"
 #include "video_core/speculative_shader_environment.h"
@@ -495,6 +497,25 @@ PipelineCache::~PipelineCache() {
     if (!spirv_cache_filename.empty()) {
         spirv_cache.Save(spirv_cache_filename);
     }
+    if (!phase4_prototype_slots_filename.empty()) {
+        // Merge TWO things, not just candidates: whatever LoadDiskResources already
+        // published this boot (Shader::ActivePhase4PrototypeSlots() below reflects that --
+        // this game's prior-session learning, or empty for a fresh profile) plus whatever
+        // TakePhase4PrototypeCandidates newly found THIS session (including anything the
+        // live-growth path in RecordResolvedTextureType already folded in mid-session --
+        // ActivePhase4PrototypeSlots() reflects that too, so this isn't double-counting,
+        // just re-confirming the same state before persisting it). Saving candidates alone
+        // would silently forget every coordinate learned in an EARLIER session the moment
+        // this one ends -- ActivePhase4PrototypeSlots() is what carries that forward.
+        std::vector<Shader::Phase4PrototypeSlot> extra{
+            Shader::ActivePhase4PrototypeSlots().begin(),
+            Shader::ActivePhase4PrototypeSlots().end()};
+        const std::vector<Shader::Phase4PrototypeSlot> candidates{
+            VideoCommon::TakePhase4PrototypeCandidates()};
+        extra.insert(extra.end(), candidates.begin(), candidates.end());
+        VideoCommon::SavePhase4PrototypeSlots(phase4_prototype_slots_filename,
+                                               Shader::MergePhase4PrototypeSlots(extra));
+    }
 
     if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
@@ -559,37 +580,44 @@ void PipelineCache::EvictOldPipelines() {
 // Phase 4 narrow prototype's graphics_cache lookup-timing fix. The problem this solves:
 // graphics_key (unique_hashes + fixed-function state) gets looked up in graphics_cache/
 // current_pipeline->Next() BEFORE any Shader::Environment exists -- CurrentGraphicsPipeline()
-// only reaches CreateGraphicsPipeline() (where env access and this slot's real resolution
-// already happen, see the texture_key fix above) on a cache MISS. Without this,
+// only reaches CreateGraphicsPipeline() (where env access and each known slot's real
+// resolution already happens, see the texture_key fix above) on a cache MISS. Without this,
 // phase4_prototype_needs_array_variant only ever gets a real value after the lookup its whole
 // purpose depends on has already happened.
 //
-// Reads the (cbuf_index=2, cbuf_offset=192) raw handle directly from GPU state and resolves
-// its TextureType, mirroring GraphicsEnvironment::ReadCbufValue/ReadTextureType's actual GPU
-// access exactly (confirmed by reading both, not assumed) but without needing a live
-// GraphicsEnvironment instance -- ResolveTextureTypeFromRawHandle (shader_environment.h/.cpp)
-// is the shared piece both this and the real environment path use.
+// Loops over Shader::ActivePhase4PrototypeSlots() (environment.h) -- was a single hardcoded
+// (cbuf_index=2, cbuf_offset=192) read, widened to loop over however many known slots exist
+// so a second (or third) table entry needs no further change here. For each slot the current
+// fragment shader actually has (per the bitmask below), reads that slot's raw handle directly
+// from GPU state and resolves its TextureType, mirroring
+// GraphicsEnvironment::ReadCbufValue/ReadTextureType's actual GPU access exactly (confirmed by
+// reading both, not assumed) but without needing a live GraphicsEnvironment instance --
+// ResolveTextureTypeFromRawHandle (shader_environment.h/.cpp) is the shared piece both this
+// and the real environment path use.
 //
-// Two real, deliberate simplifications, not oversights:
-// - Assumes no secondary cbuf combine for this one slot (GetTextureHandle, texture_pass.cpp,
+// Two real, deliberate simplifications, not oversights, that now apply per-slot:
+// - Assumes no secondary cbuf combine for any known slot (GetTextureHandle, texture_pass.cpp,
 //   can OR together two separate cbuf reads via has_secondary/secondary_cbuf_index/
-//   secondary_cbuf_offset when a descriptor needs it). Not confirmed either way for the real
-//   slot this prototype targets -- this session has no way to inspect that shader's actual
-//   descriptor fields directly. If it turns out this slot does use a secondary combine, this
-//   function silently resolves the wrong handle. Flagging plainly rather than guessing further.
-// - Runs unconditionally for every draw with an active fragment stage, not just draws using
-//   one of the 12 real shaders this prototype targets -- Shader::Info (which would say "this
-//   shader actually has the marked descriptor") isn't available at this point any more than
-//   the environment is. Reading garbage cbuf content for unrelated fragment shaders is safe
-//   (see below), but see this function's use in CurrentGraphicsPipeline for why it could still
-//   theoretically add spurious graphics_key entropy for shaders that don't actually care.
+//   secondary_cbuf_offset when a descriptor needs it). Not confirmed either way for any real
+//   slot this prototype targets -- this session has no way to inspect those shaders' actual
+//   descriptor fields directly. If a slot turns out to use a secondary combine, this function
+//   silently resolves the wrong handle for that slot specifically. Flagging plainly rather
+//   than guessing further.
+// - Runs unconditionally for every draw with an active fragment stage, not just draws using a
+//   shader with at least one known slot -- Shader::Info (which would say "this shader actually
+//   has slot i") isn't available at this point any more than the environment is. Reading
+//   garbage cbuf content for unrelated fragment shaders is safe (see below), but see this
+//   function's use in CurrentGraphicsPipeline for why it could still theoretically add
+//   spurious graphics_key entropy for shaders that don't actually care.
 //
-// Returns false (the same default the SPIR-V's spec constant itself defaults to) whenever cbuf
-// 2 isn't enabled or offset 192 is out of range for the currently-bound fragment shader --
-// exactly the same safe-fallback shape ReadCbufValue/ReadTextureInfo already use for their own
-// out-of-range cases, so an unrelated shader reading garbage here is, at worst, exactly as safe
-// as any other out-of-range cbuf read already is elsewhere in this codebase.
-bool PipelineCache::ResolvePhase4PrototypeSpecValue() const {
+// Returns 0 (the same default every SPIR-V spec constant itself defaults to, and the same
+// value the caller would compute if this whole function were a no-op) whenever no known slot's
+// cbuf is enabled or in range for the currently-bound fragment shader -- exactly the same
+// safe-fallback shape ReadCbufValue/ReadTextureInfo already use for their own out-of-range
+// cases, so an unrelated shader reading garbage here is, at worst, exactly as safe as any other
+// out-of-range cbuf read already is elsewhere in this codebase. Non-zero bits are OR'd from
+// independent per-slot resolutions, so one slot's result can never overwrite another's.
+u64 PipelineCache::ResolvePhase4PrototypeSpecValue() const {
     // Two different indices for two different arrays, both real, both required -- conflating
     // them is exactly what caused the freeze a real build surfaced. unique_hashes (this
     // function's first check, and the key phase4_prototype_fragment_shader_table above is
@@ -606,48 +634,59 @@ bool PipelineCache::ResolvePhase4PrototypeSpecValue() const {
     constexpr size_t kFragmentSoftwareIndex = 4;    // Shader::Stage::Fragment, for shader_stages.
     const u64 fragment_hash{graphics_key.unique_hashes[kFragmentHardwareIndex]};
     if (fragment_hash == 0) {
-        return false; // No fragment shader bound at all.
+        return 0; // No fragment shader bound at all.
     }
 
-    // The actual fix for the freeze: only ever do the speculative cbuf read for a fragment
-    // shader CONFIRMED (via real Shader::Info, recorded in CreateGraphicsPipeline the one time
-    // this shader was actually translated) to have the marked descriptor. Every other
-    // fragment shader -- the overwhelming majority -- returns false here without touching GPU
-    // memory at all, every single draw, forever, once seen once. A shader not yet in the table
-    // (never translated) also returns false rather than guessing: reading cbuf 2 offset 192
+    // The actual fix for the freeze: only ever do a speculative cbuf read for a slot
+    // CONFIRMED (via real Shader::Info, recorded in CreateGraphicsPipeline the one time this
+    // shader was actually translated) to be present on this fragment shader. A shader with
+    // none of the known slots -- the overwhelming majority -- returns 0 here without touching
+    // GPU memory at all, every single draw, forever, once seen once. A shader not yet in the
+    // table (never translated) also returns 0 rather than guessing: reading a slot's cbuf
     // speculatively for a genuinely unknown shader is exactly the behavior that turned
     // unrelated per-draw application data into a constantly-changing graphics_key and froze
     // real gameplay -- not worth doing even once more now that it's understood.
     //
-    // shared_lock, released before the GPU read below: extract a plain bool from the iterator
-    // while the lock is held (see phase4_prototype_fragment_shader_table_mutex's doc comment,
-    // vk_pipeline_cache.h, for why an unsynchronized read here was itself a real bug, not just
-    // the write) -- the iterator itself would not be safe to keep using once the lock releases,
-    // and the GPU read that follows doesn't touch this table at all, so there's no reason to
-    // hold the lock any longer than the lookup itself needs.
-    bool shader_has_marked_slot = false;
+    // shared_lock, released before the GPU reads below: extract the plain u32 bitmask from the
+    // iterator while the lock is held (see phase4_prototype_fragment_shader_table_mutex's doc
+    // comment, vk_pipeline_cache.h, for why an unsynchronized read here was itself a real bug,
+    // not just the write) -- the iterator itself would not be safe to keep using once the lock
+    // releases, and the GPU reads that follow don't touch this table at all, so there's no
+    // reason to hold the lock any longer than the lookup itself needs.
+    u32 shader_slot_mask = 0;
     {
         std::shared_lock lock{phase4_prototype_fragment_shader_table_mutex};
         const auto it{phase4_prototype_fragment_shader_table.find(fragment_hash)};
-        shader_has_marked_slot = it != phase4_prototype_fragment_shader_table.end() && it->second;
+        shader_slot_mask = it != phase4_prototype_fragment_shader_table.end() ? it->second : 0U;
     }
-    if (!shader_has_marked_slot) {
-        return false;
+    if (shader_slot_mask == 0U) {
+        return 0;
     }
 
-    constexpr u32 kPrototypeCbufIndex = 2;
-    constexpr u32 kPrototypeCbufOffset = 192;
-    const auto& cbuf{maxwell3d->state.shader_stages[kFragmentSoftwareIndex]
-                          .const_buffers[kPrototypeCbufIndex]};
-    if (!cbuf.enabled || kPrototypeCbufOffset >= cbuf.size) {
-        return false;
+    u64 result_mask = 0;
+    const std::span<const Shader::Phase4PrototypeSlot> active_slots{
+        Shader::ActivePhase4PrototypeSlots()};
+    for (size_t slot_id = 0; slot_id < active_slots.size(); ++slot_id) {
+        if ((shader_slot_mask & (1U << slot_id)) == 0U) {
+            continue; // This shader doesn't have this particular known slot.
+        }
+        const Shader::Phase4PrototypeSlot& slot{active_slots[slot_id]};
+        const auto& cbuf{maxwell3d->state.shader_stages[kFragmentSoftwareIndex]
+                              .const_buffers[slot.cbuf_index]};
+        if (!cbuf.enabled || slot.cbuf_offset >= cbuf.size) {
+            continue;
+        }
+        const u32 handle{gpu_memory->Read<u32>(cbuf.address + slot.cbuf_offset)};
+        const auto& regs{maxwell3d->regs};
+        const bool via_header_index{regs.sampler_binding == Tegra::Engines::Maxwell3D::Regs::SamplerBinding::ViaHeaderBinding};
+        const Shader::TextureType resolved{VideoCommon::ResolveTextureTypeFromRawHandle(
+            *gpu_memory, regs.tex_header.Address(), regs.tex_header.limit, via_header_index,
+            handle)};
+        if (resolved == Shader::TextureType::ColorArray2D) {
+            result_mask |= (u64{1} << slot_id);
+        }
     }
-    const u32 handle{gpu_memory->Read<u32>(cbuf.address + kPrototypeCbufOffset)};
-    const auto& regs{maxwell3d->regs};
-    const bool via_header_index{regs.sampler_binding == Tegra::Engines::Maxwell3D::Regs::SamplerBinding::ViaHeaderBinding};
-    const Shader::TextureType resolved{VideoCommon::ResolveTextureTypeFromRawHandle(
-        *gpu_memory, regs.tex_header.Address(), regs.tex_header.limit, via_header_index, handle)};
-    return resolved == Shader::TextureType::ColorArray2D;
+    return result_mask;
 }
 
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
@@ -717,6 +756,17 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         return;
     }
     pipeline_cache_filename = base_dir / "vulkan.bin";
+
+    // Phase 4 adaptive slot learning (handoff_09/handoff_10) -- must run before the SPIR-V
+    // cache load below and before any shader translation this session, since
+    // IsPhase4PrototypeSlot (environment.h), which texture_key computation depends on, reads
+    // whatever table this publishes. Failure-safe: LoadPhase4PrototypeSlots returns {} on any
+    // error, and MergePhase4PrototypeSlots({}) is just an empty table -- a missing/corrupt
+    // file degrades to ordinary pre-Phase-4 behavior for every coordinate, same as a fresh
+    // profile that's never hit this path before, rather than to a crash or a stale state.
+    phase4_prototype_slots_filename = base_dir / "phase4_prototype_slots.bin";
+    Shader::SetActivePhase4PrototypeSlots(Shader::MergePhase4PrototypeSlots(
+        VideoCommon::LoadPhase4PrototypeSlots(phase4_prototype_slots_filename)));
 
     // Load SPIR-V cache — feeds the GPL speculative path and AOT scanner results.
     spirv_cache_filename = base_dir / "spirv_cache.bin";
@@ -1012,17 +1062,24 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         // means ResolvePhase4PrototypeSpecValue never needs to guess for a shader it's already
         // seen -- see phase4_prototype_fragment_shader_table's doc comment, vk_pipeline_cache.h.
         if (stage_index == 4) {
-            const bool has_marked_slot{std::ranges::any_of(
-                program.info.texture_descriptors,
-                [](const Shader::TextureDescriptor& desc) {
-                    return desc.phase4_prototype_polymorphic;
-                })};
+            // Bitmask over Shader::ActivePhase4PrototypeSlots(), not a single any_of bool -- a
+            // shader can in principle have more than one known slot, each needing its own
+            // bit rather than all of them collapsing into one "has some marked slot or other"
+            // flag. desc.phase4_prototype_slot_id is only meaningful when
+            // desc.phase4_prototype_polymorphic is true (see shader_info.h), which is
+            // exactly the condition guarding its use here.
+            u32 marked_slot_mask = 0;
+            for (const Shader::TextureDescriptor& desc : program.info.texture_descriptors) {
+                if (desc.phase4_prototype_polymorphic) {
+                    marked_slot_mask |= (1U << desc.phase4_prototype_slot_id);
+                }
+            }
             // See phase4_prototype_fragment_shader_table_mutex's doc comment,
             // vk_pipeline_cache.h -- this function can run on a worker thread
             // (workers.QueueWork, the boot-time bulk pipeline-loading path), so this write
             // needs real synchronization, not just the table itself existing.
             std::unique_lock lock{phase4_prototype_fragment_shader_table_mutex};
-            phase4_prototype_fragment_shader_table[key.unique_hashes[index]] = has_marked_slot;
+            phase4_prototype_fragment_shader_table[key.unique_hashes[index]] = marked_slot_mask;
         }
 
         const auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage)};

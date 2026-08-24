@@ -11,10 +11,12 @@
 #include <mutex>
 #include <optional>
 #include <ranges>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include "common/assert.h"
 #include "common/cityhash.h"
@@ -219,12 +221,13 @@ namespace {
 // see handoff_04_specialization_constants_investigation.md item 2 and the doc comments on
 // RecordResolvedTextureType()/RecordResolvedTexturePixelFormat() in environment.h.
 //
-// UNVERIFIED: written without the ability to build or run this codebase (no GPU, no
-// display, no game content available in the environment that wrote this). Cross-checked by
-// hand against every call site, struct, and function it touches, but has not been compiled,
-// let alone run against a real play session. Treat this as a reviewed-on-paper starting
-// point, not landed working diagnostic code — build it and sanity-check the log output
-// against one or two known shaders before trusting any distinct-count number it reports.
+// TextureType and TexturePixelFormat: real, confirmed against 5 real sessions across 5
+// different games (TotK, BOTW, Metroid Prime Remastered, Super Mario Odyssey, SSBU) — see
+// handoff_09/handoff_10. Result: TextureType varied in 16 of 8671 observed (shader, slot)
+// pairs (0.185%); TexturePixelFormat varied in 0 of 8671, a dead end on real content so far.
+// IsTexturePixelFormatInteger below is the newest addition, added specifically to keep
+// looking for other axes now that the first two have real numbers behind them rather than
+// concluding no other axis could exist — not yet tested against any real session itself.
 //
 // Keyed by (unique_hash, MakeCbufKey(cbuf_index, cbuf_offset)) — unique_hash is memoized
 // per-GenericEnvironment-instance (texture_slot_diag_hash_cache, shader_environment.h) rather
@@ -237,14 +240,28 @@ namespace {
 // separately observe), which is already infrequent relative to draw calls, so a mutex is
 // simpler and safer here than optimizing for contention that most likely does not exist.
 //
-// Two independent maps, not one combined (type, format) map: see RecordResolvedTextureType/
-// RecordResolvedTexturePixelFormat's shared doc comment in environment.h for why the two
-// reads aren't reliably paired at a single call site.
+// Three independent maps, not one combined struct: see RecordResolvedTextureType/
+// RecordResolvedTexturePixelFormat's shared doc comment in environment.h for why the reads
+// aren't reliably paired at a single call site — IsTexturePixelFormatInteger is called from
+// yet another, mostly-disjoint set of sites (texture_pass.cpp's SNORM-workaround path plus
+// wherever an integer-sampled texture instruction appears), so the same reasoning applies a
+// third time, not just by analogy.
 std::mutex g_texture_slot_variance_mutex;
 std::unordered_map<u64, std::unordered_map<u64, std::unordered_set<Shader::TextureType>>>
     g_texture_types_seen;
 std::unordered_map<u64, std::unordered_map<u64, std::unordered_set<Shader::TexturePixelFormat>>>
     g_pixel_formats_seen;
+std::unordered_map<u64, std::unordered_map<u64, std::unordered_set<bool>>> g_is_integer_seen;
+
+// Phase 4 adaptive slot learning (handoff_09) -- coordinates recorded as candidates THIS
+// session, guarded by g_texture_slot_variance_mutex above since they're only ever touched
+// from inside RecordResolvedTextureType (write) and TakePhase4PrototypeCandidates (read),
+// both already under that lock or taking it themselves. A std::vector, not a set: real counts
+// here are tiny (order of 1-10 per session, matching the variance-event rate this whole
+// mechanism has always seen) and insertion order doesn't matter, so the O(n) dedup check in
+// the write path costs nothing measurable and avoids pulling in a second hasher/set type for
+// a container this small.
+std::vector<Shader::Phase4PrototypeSlot> g_phase4_prototype_candidates;
 
 // Matches SpirvCache::SaveThrottled's throttling intent (spirv_cache.cpp) — bound log volume
 // over a long session instead of printing on every call. A flat call-count window (not
@@ -253,6 +270,11 @@ std::unordered_map<u64, std::unordered_map<u64, std::unordered_set<Shader::Textu
 constexpr size_t kLogEveryNCalls = 200;
 std::atomic<size_t> g_report_call_count{0};
 } // namespace
+
+std::vector<Shader::Phase4PrototypeSlot> TakePhase4PrototypeCandidates() {
+    std::scoped_lock lock{g_texture_slot_variance_mutex};
+    return g_phase4_prototype_candidates;
+}
 
 void GenericEnvironment::RecordResolvedTextureType(u32 cbuf_index, u32 cbuf_offset, u32 handle,
                                                     Shader::TextureType type) {
@@ -295,8 +317,61 @@ void GenericEnvironment::RecordResolvedTextureType(u32 cbuf_index, u32 cbuf_offs
                  "distinct set so far: [{}]",
                  *texture_slot_diag_hash_cache, cbuf_index, cbuf_offset,
                  static_cast<u32>(type), values);
+
+        // Phase 4 adaptive slot learning (handoff_09, revised — see the chat reply for the
+        // real-world reasoning this responds to). This IS the trigger — a coordinate that
+        // just proved it has real variance, and isn't already active (an already-active
+        // slot's own translation-time canonicalization means its variance never reaches this
+        // branch as a genuinely new distinct value in the first place, so the
+        // IsPhase4PrototypeSlot check below is a belt-and-suspenders guard, not the primary
+        // reason this rarely double-fires). Two things happen, not one:
+        //
+        // 1. Grows THIS session's active table immediately — not deferred to next session.
+        // Once a shader's variants are BOTH in the driver's persisted VkPipelineCache blob
+        // (vulkan.bin), Phase 4 in any form does nothing further for THAT shader; the
+        // driver-level cache already skips recompiling it regardless. What immediate growth
+        // actually buys is every OTHER shader referencing the same coordinate that hasn't
+        // been translated yet THIS session (real for TotK: ~15 shaders share the
+        // (2,192)/(2,280) pattern) — each gets the polymorphic treatment from its own first
+        // translation instead of independently rediscovering the same variance later. Safe
+        // to do live, unlike touching an ALREADY-translated shader: this only ever appends
+        // past the end of the current table (MergePhase4PrototypeSlots preserves existing
+        // entries in their existing order, then appends anything new), so no
+        // already-handed-out SpecId or bit position ever moves mid-session — see
+        // Shader::SetActivePhase4PrototypeSlots's doc comment (environment.h) for the full
+        // stability argument.
+        //
+        // 2. Still records to g_phase4_prototype_candidates for cross-session persistence —
+        // covers what (1) doesn't: recovering the benefit after vulkan.bin itself gets
+        // invalidated (a GPU driver update, a manual wipe, a fresh install) without
+        // re-discovering variance the slow way session after session.
+        //
+        // Both under the lock already held above: growing the table is a
+        // read-current/append/publish sequence, and doing it outside this lock would let two
+        // threads both read the same "current" table and each publish their own
+        // one-larger version, silently discarding whichever published first for the rest of
+        // this session — never corrupts anything, but a needless lost learning opportunity.
+        if (!Shader::IsPhase4PrototypeSlot(cbuf_index, cbuf_offset)) {
+            const Shader::Phase4PrototypeSlot new_slot{.cbuf_index = cbuf_index,
+                                                        .cbuf_offset = cbuf_offset};
+            const bool already_recorded{std::ranges::any_of(
+                g_phase4_prototype_candidates,
+                [cbuf_index, cbuf_offset](const Shader::Phase4PrototypeSlot& slot) {
+                    return slot.cbuf_index == cbuf_index && slot.cbuf_offset == cbuf_offset;
+                })};
+            if (!already_recorded) {
+                g_phase4_prototype_candidates.push_back(new_slot);
+            }
+
+            const std::span<const Shader::Phase4PrototypeSlot> current{
+                Shader::ActivePhase4PrototypeSlots()};
+            std::vector<Shader::Phase4PrototypeSlot> grown{current.begin(), current.end()};
+            grown.push_back(new_slot);
+            Shader::SetActivePhase4PrototypeSlots(Shader::MergePhase4PrototypeSlots(grown));
+        }
     }
 }
+
 
 void GenericEnvironment::RecordResolvedTexturePixelFormat(u32 cbuf_index, u32 cbuf_offset,
                                                            Shader::TexturePixelFormat format) {
@@ -306,6 +381,17 @@ void GenericEnvironment::RecordResolvedTexturePixelFormat(u32 cbuf_index, u32 cb
     std::scoped_lock lock{g_texture_slot_variance_mutex};
     g_pixel_formats_seen[*texture_slot_diag_hash_cache][MakeCbufKey(cbuf_index, cbuf_offset)]
         .insert(format);
+}
+
+void GenericEnvironment::RecordResolvedIsTexturePixelFormatInteger(u32 cbuf_index,
+                                                                    u32 cbuf_offset,
+                                                                    bool is_integer) {
+    if (!texture_slot_diag_hash_cache) {
+        texture_slot_diag_hash_cache = CalculateHash();
+    }
+    std::scoped_lock lock{g_texture_slot_variance_mutex};
+    g_is_integer_seen[*texture_slot_diag_hash_cache][MakeCbufKey(cbuf_index, cbuf_offset)]
+        .insert(is_integer);
 }
 
 void GenericEnvironment::LogTextureSlotVarianceReportThrottled() {
@@ -336,7 +422,10 @@ void GenericEnvironment::LogTextureSlotVarianceReportThrottled() {
     // which category a given slot resolves to — the counts below mix both. A high distinct
     // PixelFormat count is not by itself evidence that specialization constants are needed;
     // cross-reference against whether that same slot's instructions are ever ImageRead/
-    // ImageWrite/ImageAtomic (storage) before treating it as load-bearing.
+    // ImageWrite/ImageAtomic (storage) before treating it as load-bearing. IsInteger below
+    // has no equivalent caveat — component type is baked into OpTypeImage's Sampled Type
+    // operand for BOTH sampled and storage images (ImageType, spirv_emit_context.cpp), so any
+    // variance it reports is directly actionable without needing this same cross-reference.
     auto summarize = [](const auto& seen_map, const char* label) {
         std::array<size_t, 5> bucket{}; // bucket[4] == "5 or more"
         size_t total_slots = 0;
@@ -358,6 +447,7 @@ void GenericEnvironment::LogTextureSlotVarianceReportThrottled() {
     };
     summarize(g_texture_types_seen, "TextureType");
     summarize(g_pixel_formats_seen, "TexturePixelFormat, sampled+storage mixed -- see caveat above");
+    summarize(g_is_integer_seen, "IsTexturePixelFormatInteger");
 }
 
 void GenericEnvironment::Dump(u64 pipeline_hash, u64 shader_hash) {

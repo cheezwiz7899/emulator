@@ -1395,12 +1395,22 @@ void EmitContext::DefineImageBuffers(const Info& info, u32& binding) {
 void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_index) {
     textures.reserve(info.texture_descriptors.size());
     for (const TextureDescriptor& desc : info.texture_descriptors) {
+        // Single source of truth for how many bindings this descriptor needs -- see
+        // Phase4PrototypeBindingCount's doc comment (shader_info.h) for why this replaced
+        // two separate inline ++binding calls (one here, one inside the polymorphic branch
+        // below) that used to only agree with DescriptorLayoutBuilder::Add/
+        // PushImageDescriptors (pipeline_helper.h) by construction, not by consulting
+        // anything shared.
+        const u32 base_binding{binding};
+        binding += Phase4PrototypeBindingCount(desc);
+        scaling_index += Phase4PrototypeBindingCount(desc);
+
         const Id image_type{ImageType(*this, desc)};
         const Id sampled_type{TypeSampledImage(image_type)};
         const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, sampled_type)};
         const Id desc_type{DescType(*this, sampled_type, pointer_type, desc.count)};
         const Id id{AddGlobalVariable(desc_type, spv::StorageClass::UniformConstant)};
-        Decorate(id, spv::Decoration::Binding, binding);
+        Decorate(id, spv::Decoration::Binding, base_binding);
         Decorate(id, spv::Decoration::DescriptorSet, ResourceSet(profile));
         Name(id, NameOf(stage, desc, "tex"));
         TextureDefinition definition{
@@ -1414,25 +1424,16 @@ void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_in
         if (profile.supported_spirv >= 0x00010400) {
             interfaces.push_back(id);
         }
-        ++binding;
-        ++scaling_index;
 
         if (desc.phase4_prototype_polymorphic) {
             // Phase 4 narrow prototype (specialization-constant texture-type resolution).
-            // Only ever true for the one hardcoded slot texture_pass.cpp marks -- see
-            // TextureDescriptor::phase4_prototype_polymorphic's doc comment in shader_info.h.
-            // The variable declared just above is always the canonical/primary variant
-            // (Color2D, per texture_pass.cpp's kPrototypeCanonicalType); this block adds the
-            // second (ColorArray2D) variant at the next binding, plus the boolean spec
-            // constant EmitImageQueryDimensions branches on to pick between them.
-            //
-            // Binding-number note: this consumes one binding beyond what a non-prototyped
-            // version of this same shader would use, shifting every descriptor declared
-            // after this one. Acceptable for an isolated, single-slot prototype validating
-            // the mechanism; a general/shippable version would need to reserve extra
-            // bindings up front (e.g. a pre-pass counting polymorphic descriptors before
-            // assigning any binding numbers) so host-side descriptor-set-layout code doesn't
-            // need to special-case a shifting count. Not implemented here.
+            // Only ever true for a known Shader::ActivePhase4PrototypeSlots() entry (environment.h)
+            // -- see TextureDescriptor::phase4_prototype_polymorphic's doc comment in
+            // shader_info.h. The variable declared just above is always the canonical/
+            // primary variant (Color2D, per texture_pass.cpp's kPrototypeCanonicalType);
+            // this block adds the second (ColorArray2D) variant at base_binding + 1, plus
+            // the boolean spec constant EmitImageQueryDimensions branches on to pick between
+            // them.
             TextureDescriptor alt_desc{desc};
             alt_desc.type = TextureType::ColorArray2D;
             const Id alt_image_type{ImageType(*this, alt_desc)};
@@ -1442,21 +1443,21 @@ void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_in
             const Id alt_desc_type{
                 DescType(*this, alt_sampled_type, alt_pointer_type, alt_desc.count)};
             const Id alt_id{AddGlobalVariable(alt_desc_type, spv::StorageClass::UniformConstant)};
-            Decorate(alt_id, spv::Decoration::Binding, binding);
+            Decorate(alt_id, spv::Decoration::Binding, base_binding + 1);
             Decorate(alt_id, spv::Decoration::DescriptorSet, ResourceSet(profile));
             Name(alt_id, "phase4_prototype_tex_array_variant");
             if (profile.supported_spirv >= 0x00010400) {
                 interfaces.push_back(alt_id);
             }
-            ++binding;
-            ++scaling_index;
 
-            // NOTE: SpecId hardcoded to 0 -- fine with exactly one polymorphic slot (this
-            // prototype's only case); a general version would need real allocation (e.g. a
-            // running counter) so multiple polymorphic slots in one shader don't collide.
+            // SpecId is desc.phase4_prototype_slot_id: the descriptor's index into
+            // Shader::ActivePhase4PrototypeSlots() (environment.h), fixed at compile time per known
+            // slot, so multiple polymorphic slots in one shader (or across shaders) get
+            // distinct, consistent SpecIds instead of every one of them colliding on 0.
             const Id spec_const{SpecConstantFalse(U1)};
-            Decorate(spec_const, spv::Decoration::SpecId, 0U);
-            Name(spec_const, "phase4_prototype_is_array_variant");
+            Decorate(spec_const, spv::Decoration::SpecId, desc.phase4_prototype_slot_id);
+            Name(spec_const, fmt::format("phase4_prototype_is_array_variant_slot{}",
+                                          desc.phase4_prototype_slot_id));
 
             definition.is_phase4_polymorphic = true;
             definition.alt_id = alt_id;

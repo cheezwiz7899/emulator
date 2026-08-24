@@ -222,18 +222,43 @@ struct TextureDescriptor {
     u32 secondary_shift_left;
     u32 count;
     u32 size_shift;
-    // Phase 4 narrow prototype (specialization-constant texture-type resolution) --
-    // hardcoded to the one real, empirically-identified (cbuf_index=2, cbuf_offset=192)
-    // pattern from handoff_04's investigation (Color2D/ColorArray2D variance, 12 real TotK
-    // shaders). NOT a general mechanism -- see the accompanying writeup for what a real,
-    // shipped version of this would need beyond this one hardcoded case. Deliberately left
-    // out of the operator<=>/Add() dedup predicate below: it doesn't change what makes two
-    // descriptors "the same" for caching purposes, only how this one gets emitted.
+    // Phase 4 narrow prototype (specialization-constant texture-type resolution) -- set when
+    // (cbuf_index, cbuf_offset) matches a known entry in Shader::ActivePhase4PrototypeSlots()
+    // (environment.h), currently just the one real, empirically-identified
+    // (cbuf_index=2, cbuf_offset=192) pattern from handoff_04's investigation
+    // (Color2D/ColorArray2D variance, 12 real TotK shaders). Still a hand-curated list, not
+    // an automatic mechanism -- see the generalization handoffs for what's deliberately not
+    // attempted yet. Both fields are left out of the operator<=>/Add() dedup predicate below:
+    // phase4_prototype_slot_id is a pure function of cbuf_index/cbuf_offset, which the
+    // predicate already compares, so neither field changes what makes two descriptors "the
+    // same" for caching purposes -- only how this one gets emitted.
     bool phase4_prototype_polymorphic = false;
+    // Index into Shader::ActivePhase4PrototypeSlots() (environment.h) -- also this slot's SpecId
+    // (spirv_emit_context.cpp) and its bit position in
+    // GraphicsPipelineCacheKey::phase4_prototype_needs_array_variant. Only meaningful when
+    // phase4_prototype_polymorphic is true; 0 otherwise (harmless, since nothing reads it
+    // unless the flag is set).
+    u32 phase4_prototype_slot_id = 0;
 
     auto operator<=>(const TextureDescriptor&) const = default;
 };
 using TextureDescriptors = boost::container::small_vector<TextureDescriptor, 12>;
+
+// Number of consecutive bindings/descriptor-slots this texture descriptor actually needs --
+// 1 for an ordinary descriptor, 2 for a Phase 4 prototype polymorphic slot (the canonical
+// variant plus its one alternate; still 2-way only, see the generalization handoffs for why
+// N-way isn't attempted yet). Single source of truth for the three sites that each walk
+// info.texture_descriptors and previously reimplemented "if polymorphic, count 2"
+// independently -- correct as long as all three stayed in sync by hand, which is exactly the
+// kind of fragility this mechanism's real crash history (three call sites, one of them missed
+// on the first pass) argues against leaving as-is: EmitContext::DefineTextures
+// (spirv_emit_context.cpp, SPIR-V binding decorations), DescriptorLayoutBuilder::Add and
+// PushImageDescriptors (pipeline_helper.h, the host-side VkDescriptorSetLayout/update-template
+// and per-draw descriptor-data paths). All three now consult this instead of each carrying
+// their own copy of the rule.
+[[nodiscard]] constexpr u32 Phase4PrototypeBindingCount(const TextureDescriptor& desc) noexcept {
+    return desc.phase4_prototype_polymorphic ? 2 : 1;
+}
 
 struct ImageDescriptor {
     TextureType type;
