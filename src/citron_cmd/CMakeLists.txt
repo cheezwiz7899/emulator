@@ -89,7 +89,7 @@ target_link_libraries(citron-cmd PRIVATE ${PLATFORM_LIBRARIES} Threads::Threads)
 create_resource("../../dist/citron.bmp" "citron_cmd/citron_icon.h" "citron_icon")
 target_include_directories(citron-cmd PRIVATE ${RESOURCES_DIR})
 
-target_link_libraries(citron-cmd PRIVATE SDL2::SDL2 Vulkan::Headers)
+target_link_libraries(citron-cmd PRIVATE SDL3::SDL3 Vulkan::Headers)
 
 if(UNIX AND NOT APPLE)
     install(TARGETS citron-cmd)

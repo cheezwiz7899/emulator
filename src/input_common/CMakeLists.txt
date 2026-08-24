@@ -73,7 +73,7 @@ if (ENABLE_SDL2)
         helpers/joycon_protocol/rumble.cpp
         helpers/joycon_protocol/rumble.h
     )
-    target_link_libraries(input_common PRIVATE SDL2::SDL2)
+    target_link_libraries(input_common PRIVATE SDL3::SDL3)
     target_compile_definitions(input_common PRIVATE HAVE_SDL2)
 endif()
 

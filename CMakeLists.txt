@@ -42,19 +42,17 @@ if (MSVC)
     add_compile_options(/wd4267)  # Suppress size_t conversion warnings
 endif()
 
-# Check if SDL2::SDL2 target exists; if not, create an alias
-if (TARGET SDL2::SDL2-static)
-    add_library(SDL2::SDL2 ALIAS SDL2::SDL2-static)
-elseif (TARGET SDL2::SDL2-shared)
-    add_library(SDL2::SDL2 ALIAS SDL2::SDL2-shared)
-endif()
 
-# SDL2 source compatibility is supplied by sdl2-compat, backed by SDL3.
+# The SDL frontend (windowing, input, audio) is provided natively by SDL3.
+# ENABLE_SDL2/CITRON_USE_EXTERNAL_SDL2 keep their original names for this
+# release to avoid touching every #ifdef HAVE_SDL2 / if(ENABLE_SDL2) site and
+# every build-script invocation across the tree; they now gate the SDL3
+# frontend rather than the old sdl2-compat shim.
 option(ENABLE_SDL2 "Enable the SDL2 frontend" ON)
 # Must precede CITRON_USE_EXTERNAL_SDL2 so non-CPM builds retain the system
-# SDL2 find_package path.
+# SDL3 find_package path.
 option(CITRON_USE_CPM "Use CPM.cmake to fetch dependencies" OFF)
-CMAKE_DEPENDENT_OPTION(CITRON_USE_EXTERNAL_SDL2 "Build sdl2-compat with SDL3" ON "ENABLE_SDL2;CITRON_USE_CPM" OFF)
+CMAKE_DEPENDENT_OPTION(CITRON_USE_EXTERNAL_SDL2 "Build SDL3 via CPM instead of the system/Homebrew copy" ON "ENABLE_SDL2;CITRON_USE_CPM" OFF)
 
 cmake_dependent_option(ENABLE_LIBUSB "Enable the use of LibUSB" ON "NOT ANDROID" OFF)
 
@@ -680,12 +678,12 @@ list(APPEND CITRON_QT_COMPONENTS2 Multimedia)
     set(CITRON_QT_COMPONENTS ${CITRON_QT_COMPONENTS2} PARENT_SCOPE)
     endfunction(set_citron_qt_components)
 
-# find SDL2 exports a bunch of variables that are needed, so its easier to do this outside of the citron_find_package
+# find SDL3 exports a bunch of variables that are needed, so its easier to do this outside of the citron_find_package
 if (ENABLE_SDL2)
     if (CITRON_USE_EXTERNAL_SDL2)
-        message(STATUS "Using SDL2 from externals.")
+        message(STATUS "Using SDL3 from externals.")
     else()
-        find_package(SDL2 2.26.4 REQUIRED)
+        find_package(SDL3 3.2 REQUIRED)
     endif()
 endif()
 

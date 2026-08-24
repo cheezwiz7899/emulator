@@ -15,10 +15,10 @@
 #ifdef CITRON_USE_EXTERNAL_SDL2
 // Include this before SDL.h to prevent the external from including a dummy
 #define USING_GENERATED_CONFIG_H
-#include <SDL_config.h>
+#include <SDL3/SDL_config.h>
 #endif
 
-#include <SDL.h>
+#include <SDL3/SDL.h>
 
 EmuWindow_SDL2_Null::EmuWindow_SDL2_Null(InputCommon::InputSubsystem* input_subsystem_,
                                          Core::System& system_, bool fullscreen)
@@ -26,9 +26,9 @@ EmuWindow_SDL2_Null::EmuWindow_SDL2_Null(InputCommon::InputSubsystem* input_subs
     const std::string window_title = fmt::format("citron {} | {}-{} (Vulkan)", Common::g_build_name,
                                                  Common::g_scm_branch, Common::g_scm_desc);
     render_window =
-        SDL_CreateWindow(window_title.c_str(), SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
-                         Layout::ScreenUndocked::Width, Layout::ScreenUndocked::Height,
-                         SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+        SDL_CreateWindow(window_title.c_str(), Layout::ScreenUndocked::Width,
+                         Layout::ScreenUndocked::Height,
+                         SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
 
     SetWindowIcon();
 

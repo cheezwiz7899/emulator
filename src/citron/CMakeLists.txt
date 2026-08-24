@@ -656,7 +656,7 @@ if (WIN32 AND CITRON_USE_BUNDLED_QT)
 endif()
 
 if (ENABLE_SDL2)
-    target_link_libraries(citron PRIVATE SDL2::SDL2)
+    target_link_libraries(citron PRIVATE SDL3::SDL3)
     target_compile_definitions(citron PRIVATE HAVE_SDL2)
 endif()
 
@@ -669,8 +669,12 @@ elseif(MINGW)
 endif()
 
 if (ENABLE_SDL2)
-    # Must run after CopyMinGWDeps: its stale-DLL cleanup cannot see SDL3,
-    # because sdl2-compat loads it dynamically rather than importing it.
+    # copy_citron_sdl_runtime deploys SDL3.dll explicitly rather than relying on
+    # CopyMinGWDeps' import-table scan to find it. Kept running after
+    # CopyMinGWDeps for safety; unlike the old sdl2-compat setup, SDL3 is now a
+    # normal, directly-imported dependency of citron, so CopyMinGWDeps' own
+    # scan should see it too, but this hasn't been verified against a real
+    # MinGW build.
     copy_citron_sdl_runtime(citron)
 endif()
 

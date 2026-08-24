@@ -124,13 +124,13 @@ EXTRA_LIBS=""
 GAMEMODE_LIB="$(ldconfig -p 2>/dev/null | awk '/libgamemode\.so/ {print $NF; exit}')"
 [ -n "$GAMEMODE_LIB" ] && EXTRA_LIBS="$EXTRA_LIBS $GAMEMODE_LIB"
 
-# SDL3 is dlopen'd by sdl2-compat, invisible to ELF scanning -- bundle it
-# explicitly. libSDL2-2.0.so.0 resolves on its own via
-# citron's rpath (usr/bin/lib, staged below).
-for _sdl_runtime in "${DESTDIR}/usr/bin/lib"/libSDL3.so.*; do
-    [ -f "${_sdl_runtime}" ] || continue
-    EXTRA_LIBS="$EXTRA_LIBS ${_sdl_runtime}"
-done
+# SDL3 used to need bundling here explicitly: sdl2-compat dlopen'd it, which
+# quick-sharun's primary ldd-based scan (a static read of each binary's
+# DT_NEEDED table) can't see. citron now links SDL3::SDL3 directly -- a
+# normal DT_NEEDED entry -- so that same ldd scan finds and bundles it like
+# any other linked dependency. Verified by reading quick-sharun's own
+# _lib4bin_collect_ldd (ldd resolves the full transitive closure, not just
+# direct deps), not by running a full packaging pass end-to-end.
 
 
 # shellcheck disable=SC2086
