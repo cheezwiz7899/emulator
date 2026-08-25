@@ -416,7 +416,7 @@ if (NOT TARGET sirit)
     CPMAddPackage(
         NAME sirit
         GITHUB_REPOSITORY cheezwiz7899/ym-sirit
-        GIT_TAG 994c6d63a0d6e67781c956864edfe3b6ab0fea7d
+        GIT_TAG 79dd8020334e2fd6312046a1ccf1707055cfd9d6
     )
     if (CITRON_CLANGCL AND TARGET sirit)
         get_target_property(_sirit_compile_options sirit COMPILE_OPTIONS)
