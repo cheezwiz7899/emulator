@@ -32,10 +32,16 @@ struct GraphicsPipelineCacheKey {
     // once per real draw in CreateGraphicsPipeline (vk_pipeline_cache.cpp, where env access
     // exists) and carried here so MakePipeline (vk_graphics_pipeline.cpp, which only has this
     // key + the cached Shader::Info, not the original env) knows what to supply as this
-    // shader's VkSpecializationInfo value. 0 (the default, matching the hardcoded
-    // SpecConstantFalse in spirv_emit_context.cpp) for every shader that doesn't have the
-    // marked slot at all -- only meaningful when at least one stage's Shader::Info has a
-    // texture_descriptors entry with phase4_prototype_polymorphic set.
+    // shader's VkSpecializationInfo values.
+    //
+    // A bitmask over Shader::ActivePhase4PrototypeSlots() (environment.h; bit i set means slot i
+    // resolved to its array variant on this draw) -- was a single 0-or-1 value when exactly
+    // one slot could ever be marked polymorphic, reinterpreted (not restructured -- see below)
+    // to carry one independent bit per known slot as soon as a second one could exist. 0 (the
+    // default, matching the hardcoded SpecConstantFalse in spirv_emit_context.cpp) for every
+    // shader that has none of the known slots at all -- only meaningful when at least one
+    // stage's Shader::Info has a texture_descriptors entry with phase4_prototype_polymorphic
+    // set.
     //
     // u64, not bool, and no default member initializer -- both fixed after a real build caught
     // them: a default member initializer (`= false`) makes default construction non-trivial
@@ -47,14 +53,18 @@ struct GraphicsPipelineCacheKey {
     // was already a multiple of 8 for the has_unique_object_representations_v assert to have
     // passed before this field existed at all. Zero-initialized the same way every other field
     // here already is: via GraphicsPipelineCacheKey key{} at its declaration
-    // (vk_pipeline_cache.h), not a per-member default.
+    // (vk_pipeline_cache.h), not a per-member default. That same u64 is exactly why widening
+    // this from one bit's worth of meaning to up to 64 needed no layout change at all: Hash()/
+    // operator==() (vk_pipeline_cache.cpp) already hash/memcmp the raw bytes up to Size()
+    // rather than caring about this field's individual bits, so they pick up the new bits
+    // automatically and correctly, same as any other entropy added to this key.
     //
     // Deliberately part of this key (not stored/tracked separately): this struct IS the
     // pipeline-identity key two draws get compared by (see the has_unique_object_
     // representations_v/trivially-copyable static_asserts below, and Hash()/operator==) --
-    // adding it here is what makes two real draws needing different values for this one slot
-    // correctly become two different VkPipeline objects instead of silently reusing whichever
-    // was created first.
+    // adding it here is what makes two real draws needing a different combination of array
+    // variants correctly become two different VkPipeline objects instead of silently reusing
+    // whichever was created first.
     u64 phase4_prototype_needs_array_variant;
 
     size_t Hash() const noexcept;

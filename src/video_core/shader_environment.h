@@ -44,6 +44,15 @@ namespace VideoCommon {
                                                                   GPUVAddr tic_addr, u32 tic_limit,
                                                                   bool via_header_index, u32 raw);
 
+// Phase 4 adaptive slot learning (handoff_09). Returns every (cbuf_index, cbuf_offset)
+// coordinate GenericEnvironment::RecordResolvedTextureType has recorded as a genuine new
+// variance trigger THIS session that wasn't already an active slot -- a copy, safe to call at
+// any point in the session (e.g. periodic saves) as well as at shutdown. Combine with
+// Shader::MergePhase4PrototypeSlots and persist via SavePhase4PrototypeSlots
+// (phase4_prototype_slots_file.h) -- see PipelineCache::~PipelineCache (vk_pipeline_cache.cpp)
+// for the real call site.
+[[nodiscard]] std::vector<Shader::Phase4PrototypeSlot> TakePhase4PrototypeCandidates();
+
 class GenericEnvironment : public Shader::Environment {
 public:
     explicit GenericEnvironment() = default;
@@ -116,12 +125,18 @@ public:
 
     // See RecordResolvedTextureType()/RecordResolvedTexturePixelFormat()'s doc comment in
     // environment.h. GenericEnvironment is the one override point, same as
-    // ReadCbufValueForTextureHandle above — UNVERIFIED, see the doc comment on these two
-    // functions' definitions in shader_environment.cpp.
+    // ReadCbufValueForTextureHandle above — real and confirmed (5 real sessions' worth of
+    // data behind it now, see handoff_09/handoff_10), not the "unverified when written" state
+    // the first two shipped in.
     void RecordResolvedTextureType(u32 cbuf_index, u32 cbuf_offset, u32 handle,
                                    Shader::TextureType type) override final;
     void RecordResolvedTexturePixelFormat(u32 cbuf_index, u32 cbuf_offset,
                                           Shader::TexturePixelFormat format) override final;
+
+    // Third axis -- see RecordResolvedIsTexturePixelFormatInteger's doc comment in
+    // environment.h for why this one was added. Not yet tested against any real session.
+    void RecordResolvedIsTexturePixelFormatInteger(u32 cbuf_index, u32 cbuf_offset,
+                                                    bool is_integer) override final;
 
     // Phase 4 narrow prototype's texture_key fix. Populated inside RecordResolvedTextureType
     // (shader_environment.cpp) whenever a resolved handle belongs to the one hardcoded

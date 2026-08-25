@@ -209,6 +209,13 @@ public:
 
     VideoCommon::SpirvCache spirv_cache;
     std::filesystem::path spirv_cache_filename;
+    // Cross-session Phase 4 adaptive slot learning -- see Shader::ActivePhase4PrototypeSlots's
+    // doc comment (environment.h) for the full design. Loaded in LoadDiskResources (published
+    // via Shader::SetActivePhase4PrototypeSlots before any shader translation starts -- empty
+    // for a fresh profile, no hardcoded defaults); saved in the destructor from whatever
+    // GenericEnvironment::RecordResolvedTextureType recorded as candidates this session
+    // (VideoCommon::TakePhase4PrototypeCandidates, shader_environment.cpp).
+    std::filesystem::path phase4_prototype_slots_filename;
     Common::ThreadWorker speculative_worker;
     Common::ThreadWorker serialization_thread;
 
@@ -232,10 +239,15 @@ public:
     // that function's doc comment at the population site), keyed by that shader's own
     // unique_hash (graphics_key.unique_hashes[5] -- ShaderType::Pixel's raw index, NOT 4;
     // see ResolvePhase4PrototypeSpecValue's doc comment for why those two numbers are both
-    // real and both needed for different arrays). true only for the 12 real shaders this
-    // prototype targets; false (not absent) for every other fragment shader once seen once,
-    // so ResolvePhase4PrototypeSpecValue can skip the read entirely for known-irrelevant
-    // shaders without re-deciding it every draw.
+    // real and both needed for different arrays).
+    //
+    // Value is a bitmask over Shader::ActivePhase4PrototypeSlots() (environment.h; bit i set means
+    // this shader has a descriptor for slot i), not a plain bool -- was a single bool when
+    // exactly one slot could ever be marked polymorphic, widened so multiple known slots can
+    // be tracked per shader without one colliding into another's entry. 0 (not absent) once a
+    // shader has been seen and has none of the known slots, so ResolvePhase4PrototypeSpecValue
+    // can skip straight to "nothing to do" for known-irrelevant shaders without re-deciding it
+    // every draw; distinguished from "not yet seen" the same way as before, via .contains().
     //
     // ankerl::unordered_dense::map, not std::unordered_map: this is read once per draw call
     // for every fragment-shaded draw (via ResolvePhase4PrototypeSpecValue, called from
@@ -259,16 +271,19 @@ public:
     // std::unique_lock for writes (matching SpirvCache's own real usage, confirmed by reading
     // it, not assumed) is the right tool, not just a correct one.
     mutable std::shared_mutex phase4_prototype_fragment_shader_table_mutex;
-    mutable ankerl::unordered_dense::map<u64, bool> phase4_prototype_fragment_shader_table;
+    mutable ankerl::unordered_dense::map<u64, u32> phase4_prototype_fragment_shader_table;
 
     // Phase 4 narrow prototype's graphics_cache lookup-timing fix. Called from
     // CurrentGraphicsPipeline(), after RefreshStages()/state.Refresh() but before the
     // graphics_cache/Next() lookups that graphics_key feeds -- see this method's definition in
     // vk_pipeline_cache.cpp for the full reasoning and its real, flagged limitations (assumes
-    // no secondary cbuf combine for this one hardcoded slot; gated by
+    // no secondary cbuf combine for any known slot; gated by
     // phase4_prototype_fragment_shader_table above rather than running unconditionally, after
-    // an earlier version of this method did exactly that and froze real gameplay).
-    bool ResolvePhase4PrototypeSpecValue() const;
+    // an earlier version of this method did exactly that and froze real gameplay). Returns a
+    // bitmask (bit i = slot i resolved to its array variant on this draw), directly assignable
+    // to GraphicsPipelineCacheKey::phase4_prototype_needs_array_variant -- widened from a
+    // single bool alongside the table above, for the same reason.
+    u64 ResolvePhase4PrototypeSpecValue() const;
 
     // ---- Phase 3 groundwork (diagnostic only — nothing below reads these back or
     // changes caching/guessing behavior; see RecordPhase3RuntimeVariantDiagnostic()'s

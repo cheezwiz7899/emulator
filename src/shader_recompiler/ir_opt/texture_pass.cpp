@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <bit>
 #include <optional>
+#include <unordered_set>
 
 #include <boost/container/small_vector.hpp>
 
@@ -417,7 +418,11 @@ TexturePixelFormat ReadTexturePixelFormat(Environment& env, const ConstBufferAdd
 }
 
 bool IsTexturePixelFormatInteger(Environment& env, const ConstBufferAddr& cbuf) {
-    return env.IsTexturePixelFormatInteger(GetTextureHandle(env, cbuf));
+    const bool is_integer{env.IsTexturePixelFormatInteger(GetTextureHandle(env, cbuf))};
+    // Third axis of the same instrumentation as ReadTextureType/ReadTexturePixelFormat above
+    // -- see RecordResolvedIsTexturePixelFormatInteger's doc comment in environment.h.
+    env.RecordResolvedIsTexturePixelFormatInteger(cbuf.index, cbuf.offset, is_integer);
+    return is_integer;
 }
 
 class Descriptors {
@@ -564,15 +569,6 @@ void PatchTexelFetch(IR::Block& block, IR::Inst& inst, TexturePixelFormat pixel_
                               ir.FPMul(ir.ConvertSToF(32, 32, ir.BitCast<IR::U32>(w)), max_value));
     inst.ReplaceUsesWith(converted);
 }
-// Phase 4 narrow prototype (specialization-constant texture-type resolution) -- thin
-// ConstBufferAddr-taking wrapper around Shader::IsPhase4PrototypeSlot (environment.h), which
-// is the single shared definition (also used by shader_environment.cpp's texture_key
-// exclusion tracking). Used by both the ImageQueryDimensions case (to canonicalize
-// flags.type) and the TextureDescriptor construction site (to set
-// phase4_prototype_polymorphic) further down in TexturePass.
-bool IsPhase4PrototypeSlot(const ConstBufferAddr& cbuf) {
-    return Shader::IsPhase4PrototypeSlot(cbuf.index, cbuf.offset);
-}
 } // Anonymous namespace
 
 void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo& host_info) {
@@ -592,6 +588,91 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
     std::stable_sort(to_replace.begin(), to_replace.end(), [](const auto& lhs, const auto& rhs) {
         return lhs.cbuf.index < rhs.cbuf.index;
     });
+
+    // Phase 4 correctness scoping. The branch/OpPhi that makes this mechanism actually
+    // correct exists ONLY for ImageQueryDimensions (EmitImageQueryDimensions,
+    // emit_spirv_image.cpp) -- every other texture instruction (Sample, Fetch, Gather, Read,
+    // Write, Gradient, QueryLod) still unconditionally reads through the canonical/primary
+    // descriptor via Texture()/TextureImage() (emit_spirv_image.cpp), with no branch at all.
+    // Marking a slot phase4_prototype_polymorphic when it's ALSO referenced by one of those
+    // other instructions -- which, since descriptors.Add() below merges same-slot references
+    // into one shared TextureDescriptor, is a real structural risk, not a hypothetical one --
+    // would silently sample/fetch/gather through the wrong-typed descriptor whenever the real
+    // content is the array variant. Not observed in any real session across TotK, SMO, or any
+    // other title tested so far, but not proven absent either, and correctly fixing Sample/
+    // Fetch/Gather for the array case needs a synthesized array-layer coordinate that
+    // Color2D-canonicalized IR was never taught to compute -- a materially bigger, less
+    // certain change than declining to apply this optimization where it can't yet be made
+    // correct. Scoped out here instead: any coordinate used by a non-ImageQueryDimensions
+    // texture instruction anywhere in this shader is excluded from phase4 treatment for this
+    // shader specifically -- falls back to the exact ordinary (pre-Phase-4) per-draw
+    // re-translation behavior for that one shader, same as an inactive coordinate would, not
+    // a new code path of its own.
+    // Second, independent scoping condition, found the same way as the first (reading the
+    // real call sites rather than assuming): PipelineCache::ResolvePhase4PrototypeSpecValue
+    // (vk_pipeline_cache.cpp) only ever resolves a slot's real value from the FRAGMENT stage's
+    // cbuf state -- shader_stages[kFragmentSoftwareIndex], hardcoded, no other stage read at
+    // all. MakePipeline (vk_graphics_pipeline.cpp) attaches that one resolved value's
+    // VkSpecializationInfo to whichever stage(s) declared a matching SpecId, without checking
+    // WHICH stage that is -- so a polymorphic descriptor in a non-fragment graphics stage
+    // (vertex, geometry, tessellation) would receive a value resolved from the FRAGMENT
+    // shader's cbuf state at the same slot number, not its own, which is only correct by
+    // coincidence if both stages happen to bind the same texture at the same slot. A compute
+    // shader is worse: ComputePipelineCacheKey carries no phase4 field at all, and
+    // CreateComputePipeline never calls ResolvePhase4PrototypeSpecValue, so a polymorphic
+    // compute descriptor's spec constant would keep SPIR-V's own default (OpSpecConstantFalse
+    // -- always the canonical branch) unconditionally. Same fix shape as above: fragment-only,
+    // whole-program, checked once rather than per instruction since it's a property of the
+    // program, not of any one texture reference in it.
+    const bool is_phase4_safe_stage{program.stage == Shader::Stage::Fragment};
+
+    std::unordered_set<u64> phase4_unsafe_coords;
+    for (const TextureInst& ti : to_replace) {
+        if (ti.inst->GetOpcode() != IR::Opcode::ImageQueryDimensions) {
+            phase4_unsafe_coords.insert((u64{ti.cbuf.index} << 32) | u64{ti.cbuf.offset});
+        }
+    }
+    // Two more scoping conditions, found by asking the same question a third and fourth time
+    // rather than assuming the first two were the whole list: does anything downstream of this
+    // marking depend on an assumption this site never actually checks?
+    //
+    // cbuf.count != 1: Phase4PrototypeBindingCount (shader_info.h) returns 1 or 2 -- how many
+    // EXTRA bindings polymorphism needs -- entirely independent of desc.count, which is how
+    // many array ELEMENTS this one binding already has (a genuine runtime-indexed texture
+    // array, texture[idx], not the Color2D/ColorArray2D dimensionality this mechanism exists
+    // for). ResolvePhase4PrototypeSpecValue (vk_pipeline_cache.cpp) resolves exactly one handle
+    // at the base cbuf offset and applies that one spec-constant value uniformly -- if count>1
+    // ever means N independently-varying array elements, one resolved value can't be right for
+    // all of them. Whether DefineTextures' emission side happens to still be safe for this case
+    // was not traced all the way through; scoped out instead of trusting that chain, the same
+    // choice made for instruction coverage and stage safety above rather than proving it by
+    // more reading.
+    //
+    // cbuf.has_secondary: not a new finding -- ResolvePhase4PrototypeSpecValue's OWN doc
+    // comment (vk_pipeline_cache.cpp) already named this as an unconfirmed assumption
+    // ("Assumes no secondary cbuf combine for any known slot... If it turns out this slot does
+    // use a secondary combine, this function silently resolves the wrong handle") and left it
+    // unconfirmed rather than unsafe-by-construction. GetTextureHandle (texture_pass.cpp) can
+    // OR together two separate cbuf reads via has_secondary/secondary_cbuf_index/
+    // secondary_cbuf_offset when a descriptor needs it; ResolvePhase4PrototypeSpecValue only
+    // ever reads the primary cbuf_index/cbuf_offset. Closing the gap the same way as the other
+    // three rather than leaving it as a named-but-open risk.
+    const auto safe_phase4_slot_id = [&](const ConstBufferAddr& cbuf) -> std::optional<u32> {
+        if (!is_phase4_safe_stage) {
+            return std::nullopt;
+        }
+        if (phase4_unsafe_coords.contains((u64{cbuf.index} << 32) | u64{cbuf.offset})) {
+            return std::nullopt;
+        }
+        if (cbuf.count != 1) {
+            return std::nullopt;
+        }
+        if (cbuf.has_secondary) {
+            return std::nullopt;
+        }
+        return Shader::Phase4PrototypeSlotId(cbuf.index, cbuf.offset);
+    };
+
     Descriptors descriptors{
         program.info.texture_buffer_descriptors,
         program.info.image_buffer_descriptors,
@@ -609,22 +690,69 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
         switch (inst->GetOpcode()) {
         case IR::Opcode::ImageQueryDimensions: {
             const TextureType resolved{ReadTextureType(env, cbuf)};
-            // Phase 4 narrow prototype: this exact (cbuf_index, cbuf_offset) is the one real
-            // pattern handoff_04's investigation identified (12 real TotK shaders, Color2D vs
-            // ColorArray2D, see handoff_04_specialization_constants_investigation.md and the
-            // accompanying findings report). Hardcoded on purpose -- see TextureDescriptor's
-            // phase4_prototype_polymorphic field doc comment for what a general version of
-            // this would need. For this one slot: keep calling ReadTextureType() above (so
-            // the existing distinct-value-tracking instrumentation still sees what this draw
-            // actually resolved to -- that data stays useful even once this prototype is
-            // active), but DON'T bake the real per-draw resolution into flags.type the normal
-            // way. Every translation of this slot -- whichever type this particular draw
-            // resolved to -- assigns the SAME canonical value instead, so every translation
-            // produces an identical TextureDescriptor (same .type, same everything), which is
-            // what makes them dedupe to the one shared, polymorphic SPIR-V module instead of
-            // fragmenting into two cache entries the way an un-prototyped slot would.
+            // Phase 4 (specialization-constant texture-type resolution). Keep calling
+            // ReadTextureType() above regardless (so the existing distinct-value-tracking
+            // instrumentation still sees what this draw actually resolved to -- that data
+            // stays useful, and is how new slots get discovered, even for a slot this
+            // canonicalizes), but for an ACTUALLY safe-to-polymorphize slot (see
+            // safe_phase4_slot_id above -- active, fragment-stage, AND not also touched by a
+            // non-ImageQueryDimensions instruction in this shader), DON'T bake the real
+            // per-draw resolution into flags.type the normal way. Every translation of this slot --
+            // whichever type this particular draw resolved to -- assigns the SAME canonical
+            // value instead, so every translation produces an identical TextureDescriptor
+            // (same .type, same everything), which is what makes them dedupe to the one
+            // shared, polymorphic SPIR-V module instead of fragmenting into two cache entries
+            // the way an un-prototyped slot would.
             constexpr TextureType kPrototypeCanonicalType = TextureType::Color2D;
-            if (IsPhase4PrototypeSlot(cbuf)) {
+            const bool would_be_active{Shader::IsPhase4PrototypeSlot(cbuf.index, cbuf.offset)};
+            const bool is_safe{safe_phase4_slot_id(cbuf).has_value()};
+            if (would_be_active && !is_safe) {
+                // Diagnostic only, not throttled: real data so far suggests this should be
+                // rare (order of a handful of known-slot events per session, not per-draw) --
+                // if this fires often in practice, that itself is worth knowing rather than
+                // hiding behind a throttle. Confirms directly, from a real session, whether
+                // any currently-known coordinate is actually affected by any of the four
+                // scoping conditions rather than leaving it as this session's untested guess.
+                // Four separate messages, not one shared with a reason parameter, specifically
+                // so grepping a log for one exclusion reason doesn't also match another.
+                if (!is_phase4_safe_stage) {
+                    LOG_WARNING(Shader,
+                                "Phase 4: cbuf_index={} cbuf_offset={} is an active slot but "
+                                "this program's stage is not Fragment -- declining to "
+                                "polymorphize it here (falling back to ordinary per-draw "
+                                "re-translation) since only the fragment stage's cbuf state "
+                                "is ever resolved for this mechanism",
+                                cbuf.index, cbuf.offset);
+                }
+                if (phase4_unsafe_coords.contains((u64{cbuf.index} << 32) | u64{cbuf.offset})) {
+                    LOG_WARNING(Shader,
+                                "Phase 4: cbuf_index={} cbuf_offset={} is an active slot but is "
+                                "also referenced by a non-ImageQueryDimensions instruction in "
+                                "this shader -- declining to polymorphize it here (falling back "
+                                "to ordinary per-draw re-translation) since only "
+                                "ImageQueryDimensions has a correct branch for it",
+                                cbuf.index, cbuf.offset);
+                }
+                if (cbuf.count != 1) {
+                    LOG_WARNING(Shader,
+                                "Phase 4: cbuf_index={} cbuf_offset={} is an active slot but "
+                                "count={} (not a single descriptor) -- declining to "
+                                "polymorphize it here (falling back to ordinary per-draw "
+                                "re-translation) since only a single resolved value is ever "
+                                "computed, not one per array element",
+                                cbuf.index, cbuf.offset, cbuf.count);
+                }
+                if (cbuf.has_secondary) {
+                    LOG_WARNING(Shader,
+                                "Phase 4: cbuf_index={} cbuf_offset={} is an active slot but "
+                                "has a secondary cbuf combine -- declining to polymorphize it "
+                                "here (falling back to ordinary per-draw re-translation) since "
+                                "only the primary cbuf read is ever resolved, not the combined "
+                                "handle",
+                                cbuf.index, cbuf.offset);
+                }
+            }
+            if (is_safe) {
                 flags.type.Assign(kPrototypeCanonicalType);
             } else {
                 flags.type.Assign(resolved);
@@ -722,6 +850,18 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                     .size_shift = DESCRIPTOR_SIZE_SHIFT,
                 });
             } else {
+                // Computed once and reused for both fields below rather than calling
+                // safe_phase4_slot_id(cbuf) again, so this site can't end up with a
+                // polymorphic flag and slot_id that were independently looked up and (in
+                // principle, if the table changed between the two calls) disagreed. Uses the
+                // safety-scoped predicate (see its doc comment above, near
+                // phase4_unsafe_coords) rather than calling Shader::Phase4PrototypeSlotId
+                // directly, so this descriptor's flag can never disagree with whether
+                // ImageQueryDimensions' own case (above) actually canonicalized flags.type
+                // for it -- getting those two out of sync would be worse than doing nothing:
+                // a descriptor marked polymorphic whose type was never canonicalized, or
+                // vice versa.
+                const std::optional<u32> phase4_slot_id{safe_phase4_slot_id(cbuf)};
                 index = descriptors.Add(TextureDescriptor{
                     .type = flags.type,
                     .is_depth = flags.is_depth != 0,
@@ -735,7 +875,8 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                     .secondary_shift_left = cbuf.secondary_shift_left,
                     .count = cbuf.count,
                     .size_shift = DESCRIPTOR_SIZE_SHIFT,
-                    .phase4_prototype_polymorphic = IsPhase4PrototypeSlot(cbuf),
+                    .phase4_prototype_polymorphic = phase4_slot_id.has_value(),
+                    .phase4_prototype_slot_id = phase4_slot_id.value_or(0),
                 });
             }
             break;

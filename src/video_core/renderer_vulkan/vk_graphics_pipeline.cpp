@@ -13,6 +13,7 @@
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 
 #include "common/bit_field.h"
+#include "shader_recompiler/environment.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -1063,29 +1064,50 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
     boost::container::static_vector<VkPipelineShaderStageCreateInfo, 5> shader_stages;
 
     // Phase 4 narrow prototype (specialization-constant texture-type resolution). Built once,
-    // referenced by whichever stage(s) actually declared the spec constant -- passing
-    // pSpecializationInfo to a stage that has no SpecId 0 declared at all is harmless (the
-    // driver just has nothing to match the map entry against), so no per-stage value
-    // computation is needed beyond knowing WHICH stages to attach it to.
+    // referenced by whichever stage(s) actually declared a matching SpecId -- passing
+    // pSpecializationInfo to a stage that has none of Shader::ActivePhase4PrototypeSlots()' SpecIds
+    // declared at all is harmless (the driver just has nothing to match those map entries
+    // against), so no per-stage value computation is needed beyond knowing WHICH stages to
+    // attach it to.
+    //
+    // One VkBool32 + one VkSpecializationMapEntry per known slot (Shader::ActivePhase4PrototypeSlots(),
+    // environment.h) -- was a single hardcoded SpecId-0 entry when exactly one slot could ever
+    // exist; widened alongside GraphicsPipelineCacheKey::phase4_prototype_needs_array_variant's
+    // bitmask (vk_pipeline_cache.cpp) so a shader declaring a second known slot's SpecId gets a
+    // real matching entry instead of every stage silently sharing slot 0's value. Plain
+    // (non-static) locals, not static constexpr like the single-entry version this replaces:
+    // the values now depend on key.phase4_prototype_needs_array_variant, and MakePipeline can
+    // run concurrently from worker threads (see phase4_prototype_fragment_shader_table_mutex's
+    // doc comment, vk_pipeline_cache.h, for the same concurrency source elsewhere in this
+    // mechanism), so a shared mutable static here would race the way that table once did.
     //
     // key.phase4_prototype_needs_array_variant was resolved once, at translation time in
     // CreateGraphicsPipeline (vk_pipeline_cache.cpp, where env access exists), and carried
-    // here via the pipeline key specifically so a real draw needing the array variant and one
-    // needing the canonical variant become two different VkPipeline objects (see the key
-    // field's doc comment, vk_graphics_pipeline.h) instead of one draw silently reusing a
-    // pipeline specialized for the other's value.
-    const VkBool32 phase4_spec_value{key.phase4_prototype_needs_array_variant ? VK_TRUE
-                                                                              : VK_FALSE};
-    static constexpr VkSpecializationMapEntry phase4_spec_map_entry{
-        .constantID = 0, // matches the hardcoded SpecId in EmitContext::DefineTextures
-        .offset = 0,
-        .size = sizeof(VkBool32),
-    };
+    // here via the pipeline key specifically so a real draw needing a different combination of
+    // array variants becomes a different VkPipeline object (see the key field's doc comment,
+    // vk_graphics_pipeline.h) instead of one draw silently reusing a pipeline specialized for
+    // a different combination.
+    const std::span<const Shader::Phase4PrototypeSlot> active_slots{
+        Shader::ActivePhase4PrototypeSlots()};
+    boost::container::small_vector<VkBool32, Shader::kMaxPhase4PrototypeSlots> phase4_spec_values;
+    boost::container::small_vector<VkSpecializationMapEntry, Shader::kMaxPhase4PrototypeSlots>
+        phase4_spec_map_entries;
+    for (size_t slot_id = 0; slot_id < active_slots.size(); ++slot_id) {
+        phase4_spec_values.push_back(
+            (key.phase4_prototype_needs_array_variant & (u64{1} << slot_id)) ? VK_TRUE
+                                                                              : VK_FALSE);
+        phase4_spec_map_entries.push_back(VkSpecializationMapEntry{
+            .constantID = static_cast<u32>(slot_id), // matches
+                                                       // TextureDescriptor::phase4_prototype_slot_id
+            .offset = static_cast<u32>(slot_id * sizeof(VkBool32)),
+            .size = sizeof(VkBool32),
+        });
+    }
     const VkSpecializationInfo phase4_spec_info{
-        .mapEntryCount = 1,
-        .pMapEntries = &phase4_spec_map_entry,
-        .dataSize = sizeof(phase4_spec_value),
-        .pData = &phase4_spec_value,
+        .mapEntryCount = static_cast<u32>(phase4_spec_map_entries.size()),
+        .pMapEntries = phase4_spec_map_entries.data(),
+        .dataSize = phase4_spec_values.size() * sizeof(VkBool32),
+        .pData = phase4_spec_values.data(),
     };
 
     for (size_t stage = 0; stage < Tegra::Engines::Maxwell3D::Regs::MaxShaderStage; ++stage) {

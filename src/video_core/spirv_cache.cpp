@@ -13,7 +13,28 @@
 
 namespace {
 constexpr std::array<char, 8> SPIRV_CACHE_MAGIC{'c', 'i', 't', 'r', 's', 'p', 'v', '\0'};
-constexpr u32 SPIRV_CACHE_VERSION = 8; // v8: texture_key now excludes the one Phase-4
+constexpr u32 SPIRV_CACHE_VERSION = 9; // v9: the Phase 4 slot table (which shaders get
+                                        // texture_key's handle-exclusion treatment) switched from a fixed, compile-time
+                                        // list to a runtime-published, adaptively-grown one
+                                        // (Shader::ActivePhase4PrototypeSlots(), environment.h) that starts EMPTY on a
+                                        // fresh profile or install now, rather than pre-loaded with the two
+                                        // hand-found coordinates v8 shipped with. Same category of change as v8 below:
+                                        // no on-disk format change, but which shaders get the exclusion treatment at
+                                        // all now depends on what THIS game's session(s) have actually discovered so
+                                        // far (persisted per-game, see phase4_prototype_slots_file.h) rather than a
+                                        // fixed compile-time set every game shared — an old entry computed under v8's
+                                        // fixed table isn't wrong, just silently unreachable if this session's
+                                        // discovered table doesn't (yet, or ever) match it exactly, same fail-safe
+                                        // story as every prior bump. Deliberately does NOT need its own bump for
+                                        // every future coordinate the adaptive mechanism goes on to discover after
+                                        // this point — texture_key already depends on IsPhase4PrototypeSlot, so a
+                                        // newly-active coordinate naturally produces a different texture_key on its
+                                        // own the moment it's learned, the same "old entry silently unreachable"
+                                        // story arrived at automatically instead of through an explicit version
+                                        // number — see ActivePhase4PrototypeSlots's own doc comment for the detailed
+                                        // argument. This bump covers only the one-time mechanism change, fixed table
+                                        // to adaptive table, not any particular slot or count of slots;
+                                        // (v8: texture_key now excludes the one Phase-4
                                         // -prototype-marked slot's resolved handle for shaders that
                                         // have it (ComputeTextureKeyExcludingHandles,
                                         // vk_pipeline_cache.cpp's CreateGraphicsPipeline/
@@ -80,7 +101,7 @@ constexpr u32 SPIRV_CACHE_VERSION = 8; // v8: texture_key now excludes the one P
                                         // (v4: single-bit ComputeBindingKey; v3: runtime_key
                                         // folds in viewport_transform_state [VertexB] and
                                         // starting Bindings state; v2: adds Bindings
-                                        // end_binding per entry)
+                                        // end_binding per entry)))
 } // anonymous namespace
 
 namespace VideoCommon {
