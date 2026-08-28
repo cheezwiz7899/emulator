@@ -655,9 +655,9 @@ if (WIN32 AND CITRON_USE_BUNDLED_QT)
     copy_citron_Qt6_deps(citron)
 endif()
 
-if (ENABLE_SDL2)
+if (ENABLE_SDL3)
     target_link_libraries(citron PRIVATE SDL3::SDL3)
-    target_compile_definitions(citron PRIVATE HAVE_SDL2)
+    target_compile_definitions(citron PRIVATE HAVE_SDL3)
 endif()
 
 if (MSVC)
@@ -668,13 +668,8 @@ elseif(MINGW)
     copy_mingw_deps(citron SEARCH_PATHS "${FFmpeg_PATH}/bin" "${QT_TARGET_PATH}/bin")
 endif()
 
-if (ENABLE_SDL2)
-    # copy_citron_sdl_runtime deploys SDL3.dll explicitly rather than relying on
-    # CopyMinGWDeps' import-table scan to find it. Kept running after
-    # CopyMinGWDeps for safety; unlike the old sdl2-compat setup, SDL3 is now a
-    # normal, directly-imported dependency of citron, so CopyMinGWDeps' own
-    # scan should see it too, but this hasn't been verified against a real
-    # MinGW build.
+if (ENABLE_SDL3)
+    # Run after CopyMinGWDeps so SDL3 is not removed as a stale DLL.
     copy_citron_sdl_runtime(citron)
 endif()
 

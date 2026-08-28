@@ -6,7 +6,7 @@
 #include <SDL3/SDL.h>
 
 #include "audio_core/common/common.h"
-#include "audio_core/sink/sdl2_sink.h"
+#include "audio_core/sink/sdl3_sink.h"
 #include "audio_core/sink/sink_stream.h"
 #include "common/logging.h"
 #include "common/scope_exit.h"
@@ -15,10 +15,7 @@
 namespace AudioCore::Sink {
 
 namespace {
-// SDL3 replaced SDL_GetNumAudioDevices()+index enumeration with an owned array of stable
-// SDL_AudioDeviceIDs, and device selection by name is no longer built into
-// SDL_OpenAudioDeviceStream (it takes a device ID, not a string). Resolve a requested device
-// name to an ID here; an empty name (or no match) falls back to the platform default device.
+// Resolve a selected device name to its SDL3 device ID.
 SDL_AudioDeviceID ResolveDeviceId(const std::string& device_name, bool capture) {
     const SDL_AudioDeviceID default_id =
         capture ? SDL_AUDIO_DEVICE_DEFAULT_RECORDING : SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK;
@@ -82,9 +79,7 @@ public:
         }
 
         const SDL_AudioDeviceID device_id = ResolveDeviceId(device_name, capture);
-        // SDL3 folds "open a device" and "create a stream bound to it" into one call. A NULL
-        // spec would let SDL pick the format; we still request one so channel count/rate match
-        // what the rest of the audio pipeline expects, same as the old SDL_OpenAudioDevice call.
+        // Request the format expected by the audio pipeline.
         stream = SDL_OpenAudioDeviceStream(device_id, &spec, &SDLSinkStream::DataCallback, this);
 
         if (stream == nullptr) {
@@ -119,7 +114,7 @@ public:
 
         Stop();
         SDL_ClearAudioStream(stream);
-        // Destroying the stream also closes the device it was opened against.
+        // The stream owns the device opened by SDL_OpenAudioDeviceStream.
         SDL_DestroyAudioStream(stream);
         stream = nullptr;
     }
@@ -151,16 +146,7 @@ public:
     }
 
 private:
-    /**
-     * Main callback from SDL. SDL3 replaced the old "here's a raw buffer, fill it" model with a
-     * notification callback: SDL tells us how much more data it wants, and we push/pull it
-     * through the stream ourselves via SDL_PutAudioStreamData/SDL_GetAudioStreamData.
-     *
-     * @param userdata           - Custom data pointer passed along, points to a SDLSinkStream.
-     * @param audio_stream       - The SDL audio stream requesting/offering data.
-     * @param additional_amount  - How many more bytes SDL wants right now.
-     * @param total_amount       - Total bytes SDL wants satisfied overall (unused here).
-     */
+    /// Supplies playback data or consumes captured data on demand.
     static void DataCallback(void* userdata, SDL_AudioStream* audio_stream, int additional_amount,
                              [[maybe_unused]] int total_amount) {
         auto* impl = static_cast<SDLSinkStream*>(userdata);
@@ -171,16 +157,21 @@ private:
 
         const std::size_t num_channels = impl->GetDeviceChannels();
         const std::size_t frame_size = num_channels * sizeof(s16);
-        const std::size_t num_frames = static_cast<std::size_t>(additional_amount) / frame_size;
-
-        if (num_frames == 0) {
-            return;
-        }
 
         if (impl->type == StreamType::In) {
-            std::vector<s16> input_buffer(num_frames * num_channels);
+            // Query the converted data actually available; callback sizes can be estimates.
+            const int available = SDL_GetAudioStreamAvailable(audio_stream);
+            if (available <= 0) {
+                return;
+            }
+            const std::size_t available_frames = static_cast<std::size_t>(available) / frame_size;
+            if (available_frames == 0) {
+                return;
+            }
+
+            std::vector<s16> input_buffer(available_frames * num_channels);
             const int received = SDL_GetAudioStreamData(
-                audio_stream, input_buffer.data(), static_cast<int>(num_frames * frame_size));
+                audio_stream, input_buffer.data(), static_cast<int>(available_frames * frame_size));
             if (received <= 0) {
                 return;
             }
@@ -188,6 +179,10 @@ private:
             impl->ProcessAudioIn({input_buffer.data(), received_frames * num_channels},
                                  received_frames);
         } else {
+            const std::size_t num_frames = static_cast<std::size_t>(additional_amount) / frame_size;
+            if (num_frames == 0) {
+                return;
+            }
             std::vector<s16> output_buffer(num_frames * num_channels);
             impl->ProcessAudioOutAndRender(output_buffer, num_frames);
             SDL_PutAudioStreamData(audio_stream, output_buffer.data(),
@@ -195,9 +190,7 @@ private:
         }
     }
 
-    /// SDL3 audio stream bound to the opened input/output device. Destroying it also closes
-    /// the underlying device (SDL_OpenAudioDeviceStream ties the device's lifetime to the
-    /// stream), so there is no separate device handle to track and close here.
+    /// Stream and its associated audio device.
     SDL_AudioStream* stream{};
 };
 
@@ -289,7 +282,7 @@ std::vector<std::string> ListSDLSinkDevices(bool capture) {
 }
 
 bool IsSDLSuitable() {
-#if !defined(HAVE_SDL2)
+#if !defined(HAVE_SDL3)
     return false;
 #else
     // Check SDL can init

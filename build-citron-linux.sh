@@ -497,38 +497,7 @@ _setup_apt() {
     #       pkg_check_modules(LIBVA-DRM libva-drm REQUIRED)
     #       pkg_check_modules(LIBVA-X11 libva-x11 REQUIRED)
     #
-    # Additionally, SDL3's cmake (also CPM-sourced) runs CheckX11() whenever
-    # libX11.so.6 is findable on the system. Unlike SDL2 2.x -- which
-    # unconditionally hard-failed via message_error() if Xext.h was absent --
-    # SDL3's CheckX11() has no hard-fail path for this at all: it gates the
-    # entire X11 video backend behind `if(X11_LIB AND HAVE_XEXT_H)` and simply
-    # leaves X11 support off if either is missing, no error, no warning.
-    # (Verified against SDL3's own cmake/sdlchecks.cmake: CheckX11() contains
-    # no message(FATAL_ERROR ...) or message_error() call anywhere.)
-    #
-    # That's a softer failure mode than SDL2 had, but not a safer one --
-    # installing libx11-dev without libxext-dev now produces a build that
-    # configures and links cleanly but silently ships with no X11 video
-    # driver, on a system where X11 is very likely still the primary or only
-    # display server available. Same shape of problem as the ALSA/PulseAudio
-    # case below (a working build with a quietly missing capability and no
-    # warning to catch it), so libxext-dev stays in the required, all-or-
-    # nothing group rather than the soft-fail optional block further down.
-    #
-    # This means libxext-dev MUST always be installed alongside libx11-dev.
-    # Installing libx11-dev without libxext-dev now means a silently
-    # X11-less SDL3 build rather than a hard failure -- worse to debug, not
-    # better, since there's nothing here to point at the missing package.
-    #
-    # libva-dev, libdrm-dev, and libx11-dev form a genuine hard-fail chain --
-    # FFmpeg's own cmake (unrelated to SDL) runs pkg_check_modules(...
-    # REQUIRED) and find_package(X11 REQUIRED) once libva is found, so a
-    # partial install among those three does hard-fail cmake configure.
-    # libxext-dev doesn't hard-fail anything itself (see above), but it rides
-    # along in the same atomic install for the same practical reason: nothing
-    # in this group should be allowed to produce a quietly-degraded build.
-    # APT's atomic install behaviour (the whole command either succeeds or is
-    # rolled back) is what keeps this safe.
+    # SDL3 silently disables X11 without Xext.h; install libxext-dev with libx11-dev.
     # DO NOT use --ignore-missing on this group, and DO NOT split it.
 
     # ── VAAPI + X11 core (all-or-nothing) ───────────────────────────────────
@@ -537,8 +506,7 @@ _setup_apt() {
     # libva-x11-2    → runtime libva-x11.so
     # libdrm-dev     → libdrm.pc (REQUIRED by FFmpeg cmake when LIBVA_FOUND)
     # libx11-dev     → X11 headers (REQUIRED by FFmpeg cmake when LIBVA_FOUND)
-    # libxext-dev    → Xext.h (REQUIRED by SDL2 cmake whenever libX11.so.6 is
-    #                  findable, regardless of VAAPI; must travel with libx11-dev)
+    # libxext-dev    → Xext.h (required for SDL3 X11 support)
     info "Installing VAAPI + X11 core packages (required together)..."
     sudo apt-get install -y \
         libva-dev libva-drm2 libva-x11-2 \
@@ -554,26 +522,7 @@ _setup_apt() {
         || warn "libvdpau-dev unavailable — FFmpeg will build with --disable-vdpau"
 
     # ── Linux audio output (ALSA + PulseAudio) — REQUIRED, not optional ─────
-    # SDL3's CheckALSA()/CheckPulseAudio() configure-time checks look for
-    # alsa/asoundlib.h and pulse/pulseaudio.h. If either header is missing,
-    # SDL2 silently disables that backend (SDL_ALSA / SDL_PULSEAUDIO → OFF)
-    # rather than hard-failing the build — the same "quiet fallback" pattern
-    # as the VAAPI/VDPAU checks above, except here the fallback is SDL2's
-    # SDL_DUMMYAUDIO/SDL_DISKAUDIO drivers, neither of which produces any
-    # actual sound. A machine missing both dev packages therefore still
-    # builds and packages successfully, but ships an AppImage with no
-    # functioning Linux audio output at all — a failure mode with no build
-    # warning to catch it, which is why this group is REQUIRED (unlike the
-    # --ignore-missing X11/XCB extras below).
-    #
-    # This also solves packaging determinism: package-citron-linux.sh finds
-    # libasound.so.2 and libpulse.so.0 to bundle into the AppImage via
-    # `ldconfig -p` against whatever happens to be installed on the machine
-    # running the packaging step (see comments there). Installing the -dev
-    # packages here pulls in their runtime libs (libasound2, libpulse0) as
-    # apt dependencies, so that probe now succeeds identically on every
-    # machine that runs this script — CI included — instead of depending on
-    # whether that machine happens to already have a desktop audio stack.
+    # SDL3 needs ALSA and PulseAudio headers for audio output.
     info "Installing ALSA + PulseAudio dev packages (required for audio output)..."
     sudo apt-get install -y libasound2-dev libpulse-dev \
         || error "ALSA/PulseAudio dev packages failed to install — Linux builds would have no audio output"
@@ -583,8 +532,7 @@ _setup_apt() {
     # extension headers.  All are optional — their cmake checks produce soft
     # warnings, not hard errors.  --ignore-missing lets a single unavailable
     # package name (which can vary across distro versions) skip cleanly.
-    # SDL3 requires these as hard configure-time dependencies.
-    # List mirrors wiki.libsdl.org/SDL3/README-linux (Ubuntu/apt section).
+    # SDL3 X11/XCB build dependencies.
     sudo apt-get install -y --ignore-missing \
         libxi-dev \
         libxkbcommon-x11-dev libxss-dev \
@@ -645,9 +593,7 @@ _setup_pacman() {
         || error "ALSA/PulseAudio packages failed to install — Linux builds would have no audio output"
 
     # ── X11 / XCB optional extras (SDL2 Xi/XSS/XCB, Qt XCB platform plugin) ─
-    # SDL3 requires the full set of X11 extension libraries as hard dependencies
-    # (it errors at configure time if any are missing).  List mirrors the
-    # official SDL3 Arch build-dependency list from wiki.libsdl.org/SDL3/README-linux
+    # SDL3 X11/XCB build dependencies.
     info "Installing optional X11/XCB extension packages..."
     $SUDO pacman -S --needed --noconfirm \
         libxi \
@@ -740,8 +686,7 @@ _setup_dnf() {
 
     # ── X11 / XCB optional extras (SDL2 Xi/XSS/XCB, Qt XCB platform plugin) ─
     info "Installing optional X11/XCB extension packages..."
-    # SDL3 requires these as hard configure-time dependencies.
-    # List mirrors wiki.libsdl.org/SDL3/README-linux (Fedora/dnf section).
+    # SDL3 X11/XCB build dependencies.
     sudo dnf install -y \
         libXi-devel \
         libxkbcommon-x11-devel libXScrnSaver-devel \
@@ -1471,12 +1416,7 @@ build_appimage_stage() {
         || error "citron binary not found at ${build_dir}/bin/citron"
     cp "${build_dir}/bin/citron" "${install_root}/usr/bin/citron"
 
-    # citron now links SDL3 directly (native, no sdl2-compat shim). The
-    # runtime manifest generated by dependencies.cmake lists the SDL3 shared
-    # library; nothing dlopens it, so in principle a well-behaved AppImage
-    # tool's own ELF scan should now find it like any other linked
-    # dependency, but it's copied here explicitly regardless since that's
-    # unverified against a real build.
+    # Bundle the SDL3 runtime listed by dependencies.cmake.
     local sdl_runtime_manifest sdl_runtime soname
     sdl_runtime_manifest="$(find "${build_dir}" -maxdepth 1 -type f -name 'citron-sdl-runtime-libs-*.txt' -print -quit)"
     [[ -n "${sdl_runtime_manifest}" ]] \

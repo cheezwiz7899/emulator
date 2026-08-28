@@ -67,10 +67,7 @@ bool IsMicrosoftGamepad(SDL_Gamepad* controller) {
     return s.find("xbox") != std::string::npos;
 }
 
-// SDL3 replaced SDL_GameControllerGetBindForButton/GetBindForAxis (one query per button/axis)
-// with SDL_GetGamepadBindings, which hands back every binding for the whole gamepad at once as
-// an array of owned pointers that must be freed with SDL_free. Fetch once per controller and
-// look up individual bindings against the local copy.
+// SDL3 returns all bindings as an SDL_free-owned array.
 std::vector<SDL_GamepadBinding> GetGamepadBindings(SDL_Gamepad* controller) {
     std::vector<SDL_GamepadBinding> result;
     if (controller == nullptr) {
@@ -318,8 +315,7 @@ public:
         case SDL_POWERSTATE_CHARGING:
             return Common::Input::BatteryLevel::Charging;
         case SDL_POWERSTATE_NO_BATTERY:
-            // Wired device with no battery of its own -- matches the old
-            // SDL_JOYSTICK_POWER_WIRED bucket.
+            // Wired device with no battery.
             return Common::Input::BatteryLevel::Charging;
         case SDL_POWERSTATE_CHARGED:
             return Common::Input::BatteryLevel::Full;
@@ -331,11 +327,7 @@ public:
             return Common::Input::BatteryLevel::None;
         }
 
-        // SDL3 replaced SDL2's coarse SDL_JoystickPowerLevel enum with a plain
-        // percentage; SDL2's own per-platform thresholds for EMPTY/LOW/MEDIUM/
-        // FULL aren't available to match exactly, so these are a best-effort
-        // bucketing devised for this migration. Critical is reachable now
-        // (SDL2's coarser data could never produce it).
+        // SDL3 reports a percentage; map it to Citron's battery levels.
         if (percent < 0) {
             return Common::Input::BatteryLevel::None;
         }
@@ -602,14 +594,8 @@ SDLDriver::SDLDriver(std::string input_engine_) : InputEngine(std::move(input_en
         SDL_SetHint(SDL_HINT_JOYSTICK_RAWINPUT, "0");
     }
 
-    // SDL3 has no equivalent of SDL_HINT_ACCELEROMETER_AS_JOYSTICK: sensors
-    // are exposed through their own dedicated API (SDL_SetGamepadSensorEnabled,
-    // used in EnableMotion() below) entirely separate from the axis list, so
-    // there's no more risk of accelerometer data mixing into axes for a hint
-    // to guard against.
 
     // Enable HIDAPI rumble. This prevents SDL from disabling motion on PS4 and PS5 controllers
-    SDL_SetHint(SDL_HINT_JOYSTICK_ENHANCED_REPORTS, "1");
     SDL_SetHint(SDL_HINT_JOYSTICK_ENHANCED_REPORTS, "1");
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
 
@@ -635,12 +621,6 @@ SDLDriver::SDLDriver(std::string input_engine_) : InputEngine(std::move(input_en
     }
 
     SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_SWITCH_PLAYER_LED, "1");
-    // SDL3 has no equivalent of SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS.
-    // SDL_GAMEPAD_BUTTON_SOUTH/EAST/WEST/NORTH etc. are unambiguously
-    // position-based now, regardless of controller brand -- there's no
-    // longer a label-based interpretation mode for this hint to disable.
-    // (Per-button display labels, if ever needed for UI, are now their own
-    // query: SDL_GetGamepadButtonLabel().)
 
     // Disable hidapi driver for xbox. Already default on Windows, this causes conflict with native
     // driver on Linux.
@@ -668,8 +648,7 @@ SDLDriver::SDLDriver(std::string input_engine_) : InputEngine(std::move(input_en
     }
     // Because the events for joystick connection happens before we have our event watcher added, we
     // can just open all the joysticks right here.
-    // SDL3 replaced SDL_NumJoysticks()+sequential-index enumeration with an array of real,
-    // stable instance IDs; InitJoystick takes one of those IDs directly now, not an index.
+    // SDL3 enumerates stable joystick IDs rather than positional indexes.
     int num_joysticks = 0;
     if (SDL_JoystickID* joysticks = SDL_GetJoysticks(&num_joysticks)) {
         for (int i = 0; i < num_joysticks; ++i) {

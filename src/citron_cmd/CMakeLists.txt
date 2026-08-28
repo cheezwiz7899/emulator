@@ -13,12 +13,12 @@ function(create_resource file output filename)
 endfunction()
 
 add_executable(citron-cmd
-    emu_window/emu_window_sdl2.cpp
-    emu_window/emu_window_sdl2.h
-    emu_window/emu_window_sdl2_null.cpp
-    emu_window/emu_window_sdl2_null.h
-    emu_window/emu_window_sdl2_vk.cpp
-    emu_window/emu_window_sdl2_vk.h
+    emu_window/emu_window_sdl3.cpp
+    emu_window/emu_window_sdl3.h
+    emu_window/emu_window_sdl3_null.cpp
+    emu_window/emu_window_sdl3_null.h
+    emu_window/emu_window_sdl3_vk.cpp
+    emu_window/emu_window_sdl3_vk.h
     precompiled_headers.h
     citron_sdl_config.cpp
     citron_sdl_config.h
@@ -109,7 +109,7 @@ if(MINGW)
     copy_mingw_deps(citron-cmd SEARCH_PATHS "${FFmpeg_PATH}/bin" "${QT_TARGET_PATH}/bin")
 endif()
 
-if (ENABLE_SDL2)
+if (ENABLE_SDL3)
     # Keep SDL3 after CopyMinGWDeps' import-table-only stale-DLL cleanup.
     copy_citron_sdl_runtime(citron-cmd)
 endif()

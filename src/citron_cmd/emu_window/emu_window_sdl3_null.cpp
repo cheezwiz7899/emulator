@@ -10,9 +10,9 @@
 #include "common/logging.h"
 #include "common/scm_rev.h"
 #include "video_core/renderer_null/renderer_null.h"
-#include "citron_cmd/emu_window/emu_window_sdl2_null.h"
+#include "citron_cmd/emu_window/emu_window_sdl3_null.h"
 
-#ifdef CITRON_USE_EXTERNAL_SDL2
+#ifdef CITRON_USE_EXTERNAL_SDL3
 // Include this before SDL.h to prevent the external from including a dummy
 #define USING_GENERATED_CONFIG_H
 #include <SDL3/SDL_config.h>
@@ -20,9 +20,9 @@
 
 #include <SDL3/SDL.h>
 
-EmuWindow_SDL2_Null::EmuWindow_SDL2_Null(InputCommon::InputSubsystem* input_subsystem_,
+EmuWindow_SDL3_Null::EmuWindow_SDL3_Null(InputCommon::InputSubsystem* input_subsystem_,
                                          Core::System& system_, bool fullscreen)
-    : EmuWindow_SDL2{input_subsystem_, system_} {
+    : EmuWindow_SDL3{input_subsystem_, system_} {
     const std::string window_title = fmt::format("citron {} | {}-{} (Vulkan)", Common::g_build_name,
                                                  Common::g_scm_branch, Common::g_scm_desc);
     render_window =
@@ -44,8 +44,8 @@ EmuWindow_SDL2_Null::EmuWindow_SDL2_Null(InputCommon::InputSubsystem* input_subs
              Common::g_scm_branch, Common::g_scm_desc);
 }
 
-EmuWindow_SDL2_Null::~EmuWindow_SDL2_Null() = default;
+EmuWindow_SDL3_Null::~EmuWindow_SDL3_Null() = default;
 
-std::unique_ptr<Core::Frontend::GraphicsContext> EmuWindow_SDL2_Null::CreateSharedContext() const {
+std::unique_ptr<Core::Frontend::GraphicsContext> EmuWindow_SDL3_Null::CreateSharedContext() const {
     return std::make_unique<DummyContext>();
 }

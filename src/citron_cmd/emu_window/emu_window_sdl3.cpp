@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: 2025 citron Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+// SDL_MAIN_HANDLED must be defined before including SDL.h/SDL_main.h
+#define SDL_MAIN_HANDLED
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
 
@@ -15,26 +17,26 @@
 #include "input_common/drivers/mouse.h"
 #include "input_common/drivers/touch_screen.h"
 #include "input_common/main.h"
-#include "citron_cmd/emu_window/emu_window_sdl2.h"
+#include "citron_cmd/emu_window/emu_window_sdl3.h"
 #include "citron_cmd/citron_icon.h"
 
-EmuWindow_SDL2::EmuWindow_SDL2(InputCommon::InputSubsystem* input_subsystem_, Core::System& system_)
+EmuWindow_SDL3::EmuWindow_SDL3(InputCommon::InputSubsystem* input_subsystem_, Core::System& system_)
     : input_subsystem{input_subsystem_}, system{system_} {
     input_subsystem->Initialize();
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD)) {
-        LOG_CRITICAL(Frontend, "Failed to initialize SDL2: {}, Exiting...", SDL_GetError());
+        LOG_CRITICAL(Frontend, "Failed to initialize SDL3: {}, Exiting...", SDL_GetError());
         exit(1);
     }
     SDL_SetMainReady();
 }
 
-EmuWindow_SDL2::~EmuWindow_SDL2() {
+EmuWindow_SDL3::~EmuWindow_SDL3() {
     system.HIDCore().UnloadInputDevices();
     input_subsystem->Shutdown();
     SDL_Quit();
 }
 
-InputCommon::MouseButton EmuWindow_SDL2::SDLButtonToMouseButton(u32 button) const {
+InputCommon::MouseButton EmuWindow_SDL3::SDLButtonToMouseButton(u32 button) const {
     switch (button) {
     case SDL_BUTTON_LEFT:
         return InputCommon::MouseButton::Left;
@@ -51,7 +53,7 @@ InputCommon::MouseButton EmuWindow_SDL2::SDLButtonToMouseButton(u32 button) cons
     }
 }
 
-std::pair<float, float> EmuWindow_SDL2::MouseToTouchPos(s32 touch_x, s32 touch_y) const {
+std::pair<float, float> EmuWindow_SDL3::MouseToTouchPos(s32 touch_x, s32 touch_y) const {
     int w, h;
     SDL_GetWindowSize(render_window, &w, &h);
     const float fx = static_cast<float>(touch_x) / w;
@@ -60,7 +62,7 @@ std::pair<float, float> EmuWindow_SDL2::MouseToTouchPos(s32 touch_x, s32 touch_y
     return {std::clamp<float>(fx, 0.0f, 1.0f), std::clamp<float>(fy, 0.0f, 1.0f)};
 }
 
-void EmuWindow_SDL2::OnMouseButton(u32 button, u8 state, s32 x, s32 y) {
+void EmuWindow_SDL3::OnMouseButton(u32 button, u8 state, s32 x, s32 y) {
     const auto mouse_button = SDLButtonToMouseButton(button);
     if (state != 0) {
         const auto [touch_x, touch_y] = MouseToTouchPos(x, y);
@@ -72,31 +74,31 @@ void EmuWindow_SDL2::OnMouseButton(u32 button, u8 state, s32 x, s32 y) {
     }
 }
 
-void EmuWindow_SDL2::OnMouseMotion(s32 x, s32 y) {
+void EmuWindow_SDL3::OnMouseMotion(s32 x, s32 y) {
     const auto [touch_x, touch_y] = MouseToTouchPos(x, y);
     input_subsystem->GetMouse()->Move(x, y, 0, 0);
     input_subsystem->GetMouse()->MouseMove(touch_x, touch_y);
     input_subsystem->GetMouse()->TouchMove(touch_x, touch_y);
 }
 
-void EmuWindow_SDL2::OnMouseWheel(s32 x, s32 y) {
+void EmuWindow_SDL3::OnMouseWheel(s32 x, s32 y) {
     input_subsystem->GetMouse()->MouseWheelChange(x, y);
-    LOG_DEBUG(Frontend, "SDL2 Mouse wheel event: x={}, y={}", x, y);
+    LOG_DEBUG(Frontend, "SDL3 Mouse wheel event: x={}, y={}", x, y);
 }
 
-void EmuWindow_SDL2::OnFingerDown(float x, float y, std::size_t id) {
+void EmuWindow_SDL3::OnFingerDown(float x, float y, std::size_t id) {
     input_subsystem->GetTouchScreen()->TouchPressed(x, y, id);
 }
 
-void EmuWindow_SDL2::OnFingerMotion(float x, float y, std::size_t id) {
+void EmuWindow_SDL3::OnFingerMotion(float x, float y, std::size_t id) {
     input_subsystem->GetTouchScreen()->TouchMoved(x, y, id);
 }
 
-void EmuWindow_SDL2::OnFingerUp() {
+void EmuWindow_SDL3::OnFingerUp() {
     input_subsystem->GetTouchScreen()->ReleaseAllTouch();
 }
 
-void EmuWindow_SDL2::OnKeyEvent(int key, u8 state) {
+void EmuWindow_SDL3::OnKeyEvent(int key, u8 state) {
     if (state != 0) {
         input_subsystem->GetKeyboard()->PressKey(static_cast<std::size_t>(key));
     } else {
@@ -104,21 +106,21 @@ void EmuWindow_SDL2::OnKeyEvent(int key, u8 state) {
     }
 }
 
-bool EmuWindow_SDL2::IsOpen() const {
+bool EmuWindow_SDL3::IsOpen() const {
     return is_open;
 }
 
-bool EmuWindow_SDL2::IsShown() const {
+bool EmuWindow_SDL3::IsShown() const {
     return is_shown;
 }
 
-void EmuWindow_SDL2::OnResize() {
+void EmuWindow_SDL3::OnResize() {
     int width, height;
     SDL_GetWindowSizeInPixels(render_window, &width, &height);
     UpdateCurrentFramebufferLayout(width, height);
 }
 
-void EmuWindow_SDL2::ShowCursor(bool show_cursor) {
+void EmuWindow_SDL3::ShowCursor(bool show_cursor) {
     if (show_cursor) {
         SDL_ShowCursor();
     } else {
@@ -126,13 +128,10 @@ void EmuWindow_SDL2::ShowCursor(bool show_cursor) {
     }
 }
 
-void EmuWindow_SDL2::Fullscreen() {
+void EmuWindow_SDL3::Fullscreen() {
     switch (Settings::values.fullscreen_mode.GetValue()) {
     case Settings::FullscreenMode::Exclusive: {
-        // Set window size to render size before entering fullscreen -- SDL does not resize
-        // window to display dimensions automatically in this mode.
-        // Note: matches the pre-SDL3 code's use of display index 0 rather than querying
-        // which display the window is actually on.
+        // Match the primary display before entering exclusive fullscreen.
         const SDL_DisplayMode* display_mode = SDL_GetDesktopDisplayMode(SDL_GetPrimaryDisplay());
         if (display_mode) {
             SDL_SetWindowSize(render_window, display_mode->w, display_mode->h);
@@ -140,10 +139,7 @@ void EmuWindow_SDL2::Fullscreen() {
             LOG_ERROR(Frontend, "SDL_GetDesktopDisplayMode failed: {}", SDL_GetError());
         }
 
-        // SDL3 folds SDL2's separate SDL_WINDOW_FULLSCREEN / SDL_WINDOW_FULLSCREEN_DESKTOP
-        // window flags into a single fullscreen on/off toggle. The exclusive-vs-desktop
-        // distinction is now made by what display mode is set beforehand: a specific mode
-        // here means exclusive fullscreen at that mode.
+        // A specific display mode requests exclusive fullscreen.
         if (display_mode && SDL_SetWindowFullscreenMode(render_window, display_mode) &&
             SDL_SetWindowFullscreen(render_window, true)) {
             return;
@@ -154,8 +150,7 @@ void EmuWindow_SDL2::Fullscreen() {
         [[fallthrough]];
     }
     case Settings::FullscreenMode::Borderless:
-        // A null display mode means "fullscreen at the current desktop resolution",
-        // i.e. SDL2's old SDL_WINDOW_FULLSCREEN_DESKTOP behavior.
+        // A null mode requests desktop-resolution fullscreen.
         if (SDL_SetWindowFullscreenMode(render_window, nullptr) &&
             SDL_SetWindowFullscreen(render_window, true)) {
             return;
@@ -172,7 +167,7 @@ void EmuWindow_SDL2::Fullscreen() {
     }
 }
 
-void EmuWindow_SDL2::WaitEvent() {
+void EmuWindow_SDL3::WaitEvent() {
     // Called on main thread
     SDL_Event event;
 
@@ -255,7 +250,7 @@ void EmuWindow_SDL2::WaitEvent() {
 }
 
 // Credits to Samantas5855 and others for this function.
-void EmuWindow_SDL2::SetWindowIcon() {
+void EmuWindow_SDL3::SetWindowIcon() {
     SDL_IOStream* const citron_icon_stream = SDL_IOFromConstMem((void*)citron_icon, citron_icon_size);
     if (citron_icon_stream == nullptr) {
         LOG_WARNING(Frontend, "Failed to create citron icon stream.");
@@ -271,6 +266,6 @@ void EmuWindow_SDL2::SetWindowIcon() {
     SDL_DestroySurface(window_icon);
 }
 
-void EmuWindow_SDL2::OnMinimalClientAreaChangeRequest(std::pair<u32, u32> minimal_size) {
+void EmuWindow_SDL3::OnMinimalClientAreaChangeRequest(std::pair<u32, u32> minimal_size) {
     SDL_SetWindowMinimumSize(render_window, minimal_size.first, minimal_size.second);
 }

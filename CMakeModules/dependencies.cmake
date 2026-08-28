@@ -349,15 +349,8 @@ if (ENABLE_CUBEB AND NOT TARGET cubeb::cubeb)
 endif()
 
 # ── SDL3 ──────────────────────────────────────────────────────────────────────
-if (CITRON_USE_EXTERNAL_SDL2 AND NOT TARGET SDL3::SDL3)
-    # SYSTEM YES: marks SDL3's include dirs as system headers so Citron's
-    # own strict warning flags inherited from CMAKE_C_FLAGS do not apply to
-    # SDL3's headers when included transitively by Citron code.
-    # SDL_WERROR OFF: prevents SDL3's SDL_AddCommonCompilerFlags from adding /WX.
-    # SDL_LIBC ON: SDL3 defaults this ON (SDL_LIBC_DEFAULT ON), but explicit
-    # here to avoid the MASM stdlib reimplementation — SDL3 guards its MASM
-    # source with `if(MSVC AND NOT SDL_LIBC)`, so no patch is needed here
-    # (unlike sdl2-compat previously, which lacked that guard).
+if (CITRON_USE_EXTERNAL_SDL3 AND NOT TARGET SDL3::SDL3)
+    # Treat SDL headers as system headers and keep SDL's warnings non-fatal.
     CPMAddPackage(
         NAME SDL3
         GITHUB_REPOSITORY libsdl-org/SDL
@@ -375,33 +368,17 @@ if (CITRON_USE_EXTERNAL_SDL2 AND NOT TARGET SDL3::SDL3)
             "SDL_LIBC ON"
     )
 
-    # Redirect SDL3's runtime DLL/so output to a staging directory separate
-    # from bin/. SDL3-shared inherits CMAKE_RUNTIME_OUTPUT_DIRECTORY (set to
-    # bin/) from the parent project, which means $<TARGET_FILE:SDL3::SDL3-shared>
-    # resolves to bin/SDL3.dll — the same location copy_citron_sdl_runtime
-    # would copy it to. cmake -E copy_if_different from a file to its own
-    # directory prints an error and ninja stops. A dedicated staging dir keeps
-    # $<TARGET_FILE:SDL3::SDL3-shared> distinct from $<TARGET_FILE_DIR:citron>.
+    # Keep the SDL runtime outside bin/ so deployment does not copy onto itself.
     if (TARGET SDL3-shared)
         set_target_properties(SDL3-shared PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/sdl-staging"
         )
     endif()
 
-    # Post-configure: strip any inherited -Werror / /WX from the SDL3 target.
-    # Citron's clang-cl build passes these flags through CMAKE_C_FLAGS /
-    # CMAKE_CXX_FLAGS, and CPM sub-projects inherit them. SDL_dynapi.c emits
-    # hundreds of -Wunsafe-buffer-usage, -Wmissing-prototypes, and related
-    # diagnostics that are harmless in third-party code but cause clang-cl to
-    # exit non-zero when -Werror is active. Suppressing on the target is the
-    # correct scope: we want these checks to remain active for Citron's own
-    # first-party code.
+    # SDL inherits Citron's strict warnings; disable them only for this target.
     if (TARGET SDL3-shared)
         if (MSVC)
-            # /W0 silences all MSVC-dialect warnings on this third-party target.
-            # /clang:-Wno-* flags suppress Clang front-end diagnostics and are only
-            # valid under clang-cl (CMAKE_C_COMPILER_ID == "Clang"). Plain cl.exe
-            # does not understand the /clang: prefix and would error.
+            # /clang: options are valid only under clang-cl.
             target_compile_options(SDL3-shared PRIVATE /W0)
             if (CMAKE_C_COMPILER_ID STREQUAL "Clang")
                 target_compile_options(SDL3-shared PRIVATE
@@ -465,14 +442,9 @@ endif()
 
 # copy_citron_sdl_runtime(<target>)
 # On Windows CPM builds: copies SDL3.dll next to <target> after build.
-# On Linux CPM builds: unlike the old statically-linked SDL2, SDL3-shared is
-# shared and citron links SDL3::SDL3 directly, but nothing puts the .so
-# anywhere citron's rpath ($ORIGIN/lib) can find it. Stage a SONAME-named
-# copy into <target>/lib to match.
-# On all other configurations this is a no-op so it is safe to call
-# unconditionally from src/citron/CMakeLists.txt and src/citron_cmd/CMakeLists.txt.
+# On Linux, place the shared library in the target's $ORIGIN/lib directory.
 function(copy_citron_sdl_runtime target)
-    if (WIN32 AND CITRON_USE_EXTERNAL_SDL2 AND TARGET SDL3-shared)
+    if (WIN32 AND CITRON_USE_EXTERNAL_SDL3 AND TARGET SDL3-shared)
         add_dependencies(${target} SDL3-shared)
         add_custom_command(TARGET ${target} POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -480,7 +452,7 @@ function(copy_citron_sdl_runtime target)
             COMMENT "Deploying SDL3 for ${target}"
             VERBATIM
         )
-    elseif (UNIX AND NOT APPLE AND CITRON_USE_EXTERNAL_SDL2 AND TARGET SDL3-shared)
+    elseif (UNIX AND NOT APPLE AND CITRON_USE_EXTERNAL_SDL3 AND TARGET SDL3-shared)
         add_dependencies(${target} SDL3-shared)
         add_custom_command(TARGET ${target} POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E make_directory

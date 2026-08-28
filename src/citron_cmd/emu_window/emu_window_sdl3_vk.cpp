@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
 
@@ -10,14 +11,14 @@
 #include "common/logging.h"
 #include "common/scm_rev.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
-#include "citron_cmd/emu_window/emu_window_sdl2_vk.h"
+#include "citron_cmd/emu_window/emu_window_sdl3_vk.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_metal.h>
 
-EmuWindow_SDL2_VK::EmuWindow_SDL2_VK(InputCommon::InputSubsystem* input_subsystem_,
+EmuWindow_SDL3_VK::EmuWindow_SDL3_VK(InputCommon::InputSubsystem* input_subsystem_,
                                      Core::System& system_, bool fullscreen)
-    : EmuWindow_SDL2{input_subsystem_, system_} {
+    : EmuWindow_SDL3{input_subsystem_, system_} {
     const std::string window_title = fmt::format("citron {} | {}-{} (Vulkan)", Common::g_build_name,
                                                  Common::g_scm_branch, Common::g_scm_desc);
     render_window =
@@ -25,11 +26,7 @@ EmuWindow_SDL2_VK::EmuWindow_SDL2_VK(InputCommon::InputSubsystem* input_subsyste
                          Layout::ScreenUndocked::Height,
                          SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
 
-    // SDL2's SDL_SysWMinfo/SDL_GetWindowWMInfo is gone in SDL3; the native handle is
-    // retrieved through the window-properties API instead. Which property is present
-    // depends on the platform (and, on Linux, on which video driver actually loaded),
-    // so this is a straight compile-time swap of the old #ifdef SDL_VIDEO_DRIVER_*
-    // ladder rather than a single portable call.
+    // SDL3 exposes native window handles through properties.
     const SDL_PropertiesID props = SDL_GetWindowProperties(render_window);
     if (props == 0) {
         LOG_CRITICAL(Frontend, "Failed to get window properties: {}", SDL_GetError());
@@ -51,9 +48,7 @@ EmuWindow_SDL2_VK::EmuWindow_SDL2_VK(InputCommon::InputSubsystem* input_subsyste
         wm_resolved = true;
     }
 #elif defined(SDL_PLATFORM_LINUX)
-    // SDL3 can be built with both X11 and Wayland support live at once, same as SDL2,
-    // so which one is actually driving this window is a runtime question, not a
-    // compile-time one.
+    // SDL3 can use either X11 or Wayland at runtime.
     const char* video_driver = SDL_GetCurrentVideoDriver();
     if (video_driver && std::strcmp(video_driver, "x11") == 0) {
         void* const display =
@@ -80,6 +75,7 @@ EmuWindow_SDL2_VK::EmuWindow_SDL2_VK(InputCommon::InputSubsystem* input_subsyste
     }
 #elif defined(SDL_PLATFORM_MACOS)
     if (SDL_MetalView view = SDL_Metal_CreateView(render_window)) {
+        metal_view = view;
         window_info.type = Core::Frontend::WindowSystemType::Cocoa;
         window_info.render_surface = view;
         wm_resolved = true;
@@ -104,8 +100,14 @@ EmuWindow_SDL2_VK::EmuWindow_SDL2_VK(InputCommon::InputSubsystem* input_subsyste
              Common::g_scm_branch, Common::g_scm_desc);
 }
 
-EmuWindow_SDL2_VK::~EmuWindow_SDL2_VK() = default;
+EmuWindow_SDL3_VK::~EmuWindow_SDL3_VK() {
+#if defined(SDL_PLATFORM_MACOS)
+    if (metal_view) {
+        SDL_Metal_DestroyView(static_cast<SDL_MetalView>(metal_view));
+    }
+#endif
+}
 
-std::unique_ptr<Core::Frontend::GraphicsContext> EmuWindow_SDL2_VK::CreateSharedContext() const {
+std::unique_ptr<Core::Frontend::GraphicsContext> EmuWindow_SDL3_VK::CreateSharedContext() const {
     return std::make_unique<DummyContext>();
 }

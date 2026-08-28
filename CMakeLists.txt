@@ -44,15 +44,11 @@ endif()
 
 
 # The SDL frontend (windowing, input, audio) is provided natively by SDL3.
-# ENABLE_SDL2/CITRON_USE_EXTERNAL_SDL2 keep their original names for this
-# release to avoid touching every #ifdef HAVE_SDL2 / if(ENABLE_SDL2) site and
-# every build-script invocation across the tree; they now gate the SDL3
-# frontend rather than the old sdl2-compat shim.
-option(ENABLE_SDL2 "Enable the SDL2 frontend" ON)
-# Must precede CITRON_USE_EXTERNAL_SDL2 so non-CPM builds retain the system
+option(ENABLE_SDL3 "Enable the SDL3 frontend" ON)
+# Must precede CITRON_USE_EXTERNAL_SDL3 so non-CPM builds retain the system
 # SDL3 find_package path.
 option(CITRON_USE_CPM "Use CPM.cmake to fetch dependencies" OFF)
-CMAKE_DEPENDENT_OPTION(CITRON_USE_EXTERNAL_SDL2 "Build SDL3 via CPM instead of the system/Homebrew copy" ON "ENABLE_SDL2;CITRON_USE_CPM" OFF)
+CMAKE_DEPENDENT_OPTION(CITRON_USE_EXTERNAL_SDL3 "Build SDL3 via CPM instead of the system/Homebrew copy" ON "ENABLE_SDL3;CITRON_USE_CPM" OFF)
 
 cmake_dependent_option(ENABLE_LIBUSB "Enable the use of LibUSB" ON "NOT ANDROID" OFF)
 
@@ -337,7 +333,7 @@ endif()
 # Set runtime library to MD/MDd for all configurations.
 # This MUST run before CPM dependencies are configured below: CMAKE_MSVC_RUNTIME_LIBRARY
 # is captured per-target at add_library()/add_executable() time (CMP0091), not
-# re-evaluated later. Some CPM packages (e.g. SDL2) have their own
+# re-evaluated later. Some CPM packages have their own
 # `if(NOT DEFINED CMAKE_MSVC_RUNTIME_LIBRARY)` fallback that bakes in a
 # different (static) default if this variable isn't already set by the time
 # their CMakeLists.txt runs -- so this has to be set before include(dependencies.cmake),
@@ -377,10 +373,7 @@ endif()
 
 # Enforce the search mode of non-required packages for better and shorter failure messages
 
-# copy_citron_sdl_runtime is defined in CMakeModules/dependencies.cmake for CPM
-# builds where the SDL2/SDL3 targets exist.  Define it here as a no-op so that
-# src/citron/CMakeLists.txt and src/citron_cmd/CMakeLists.txt can call it
-# unconditionally on all build configurations (macOS, native MSVC, etc.).
+# Non-CPM builds do not need SDL runtime staging.
 if (NOT COMMAND copy_citron_sdl_runtime)
     function(copy_citron_sdl_runtime target)
     endfunction()
@@ -679,8 +672,8 @@ list(APPEND CITRON_QT_COMPONENTS2 Multimedia)
     endfunction(set_citron_qt_components)
 
 # find SDL3 exports a bunch of variables that are needed, so its easier to do this outside of the citron_find_package
-if (ENABLE_SDL2)
-    if (CITRON_USE_EXTERNAL_SDL2)
+if (ENABLE_SDL3)
+    if (CITRON_USE_EXTERNAL_SDL3)
         message(STATUS "Using SDL3 from externals.")
     else()
         find_package(SDL3 3.2 REQUIRED)
@@ -874,8 +867,8 @@ if(CITRON_CLANGCL)
     endif()
 
     # PGO flags applied per-target to first-party targets only — never via global
-    # CMAKE_C/CXX_FLAGS, which SDL2 and other CPM sub-targets inherit. A PGO-instrumented
-    # citron.exe linked against plain SDL2 under the same LTO link fails with:
+    # CMAKE_C/CXX_FLAGS, which SDL3 and other CPM sub-targets inherit. A PGO-instrumented
+    # citron.exe linked against plain SDL3 under the same LTO link fails with:
     # "linking module flags 'ProfileSummary': IDs have conflicting values".
     # CITRON_CLANGCL_PGO_COMPILE_FLAGS/_LINK_FLAGS are empty by default;
     # only set by build-clangtron-windows.sh's clang-cl stage.
