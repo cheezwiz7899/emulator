@@ -78,10 +78,19 @@ option(CITRON_USE_LLVM_DEMANGLE "Search for and link against a system LLVM for C
 option(CITRON_USE_QT_MULTIMEDIA "Use QtMultimedia for Camera" OFF)
 
 option(CITRON_USE_QT_WEB_ENGINE "Use QtWebEngine for web applet implementation" OFF)
-# Platform-native alternatives to CITRON_USE_QT_WEB_ENGINE.
-# Both default OFF pending hardware validation -- see webkitgtk_web_browser.h for details.
-option(CITRON_USE_WEBKITGTK_WEB_ENGINE "Use WebKitGTK for web applet implementation (Linux)" OFF)
-option(CITRON_USE_WEBVIEW2_WEB_ENGINE "Use WebView2 for web applet implementation (Windows)" OFF)
+# Use the native web applet on the platform that supports it. QtWebEngine remains
+# opt-in because it substantially increases the packaged runtime size.
+set(CITRON_DEFAULT_WEBKITGTK_WEB_ENGINE OFF)
+set(CITRON_DEFAULT_WEBVIEW2_WEB_ENGINE OFF)
+if (UNIX AND NOT APPLE)
+    set(CITRON_DEFAULT_WEBKITGTK_WEB_ENGINE ON)
+elseif (WIN32)
+    set(CITRON_DEFAULT_WEBVIEW2_WEB_ENGINE ON)
+endif()
+option(CITRON_USE_WEBKITGTK_WEB_ENGINE "Use WebKitGTK for web applet implementation (Linux)"
+       ${CITRON_DEFAULT_WEBKITGTK_WEB_ENGINE})
+option(CITRON_USE_WEBVIEW2_WEB_ENGINE "Use WebView2 for web applet implementation (Windows)"
+       ${CITRON_DEFAULT_WEBVIEW2_WEB_ENGINE})
 
 # More than one backend ON at once would silently pick one in a fixed priority order;
 # fail loud at configure time instead.

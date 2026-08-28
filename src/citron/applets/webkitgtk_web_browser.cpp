@@ -135,21 +135,23 @@ WebKitGTKView::WebKitGTKView(GMainWindow& main_window_, Core::System& system_,
     webkit_user_content_manager_register_script_message_handler(ucm, "nxControl");
     g_signal_connect(ucm, "script-message-received::nxControl", G_CALLBACK(OnNxControl), this);
 
-    // Inject window_nx + gamepad scripts at document start, all frames -- mirrors qt_web_browser.cpp:62-81.
-    // Font/focus scripts are injected at load time via LoadExtractedFonts/FocusFirstLinkElement.
-    WebKitUserScript* window_nx_script = webkit_user_script_new(
-        WEBKITGTK_NX_SCRIPT, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
-        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, nullptr, nullptr);
+    // Inject window_nx + gamepad scripts at document start, all frames -- mirrors
+    // qt_web_browser.cpp:62-81. Font/focus scripts are injected at load time via
+    // LoadExtractedFonts/FocusFirstLinkElement.
+    WebKitUserScript* window_nx_script =
+        webkit_user_script_new(WEBKITGTK_NX_SCRIPT, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+                               WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, nullptr, nullptr);
     webkit_user_content_manager_add_script(ucm, window_nx_script);
     webkit_user_script_unref(window_nx_script);
 
-    WebKitUserScript* gamepad_script = webkit_user_script_new(
-        WEB_BROWSER_GAMEPAD_SCRIPT, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
-        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, nullptr, nullptr);
+    WebKitUserScript* gamepad_script =
+        webkit_user_script_new(WEB_BROWSER_GAMEPAD_SCRIPT, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+                               WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, nullptr, nullptr);
     webkit_user_content_manager_add_script(ucm, gamepad_script);
     webkit_user_script_unref(gamepad_script);
 
-    webview = WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW, "user-content-manager", ucm, nullptr));
+    webview =
+        WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW, "user-content-manager", ucm, nullptr));
     g_object_unref(ucm); // webview took its own ref via the property setter above;
                          // this releases the one webkit_user_content_manager_new()
                          // returned, which nothing was releasing before
@@ -266,30 +268,31 @@ void WebKitGTKView::LoadExtractedFonts() {
     std::replace(fonts_dir_str.begin(), fonts_dir_str.end(), '\\', '/');
     const QString fonts_dir = QString::fromStdString(fonts_dir_str);
 
-    const QString css_source = QString::fromUtf8(WEB_BROWSER_NX_FONT_CSS)
-                                   .arg(fonts_dir + QStringLiteral("FontStandard.ttf"))
-                                   .arg(fonts_dir + QStringLiteral("FontChineseSimplified.ttf"))
-                                   .arg(fonts_dir + QStringLiteral("FontExtendedChineseSimplified.ttf"))
-                                   .arg(fonts_dir + QStringLiteral("FontChineseTraditional.ttf"))
-                                   .arg(fonts_dir + QStringLiteral("FontKorean.ttf"))
-                                   .arg(fonts_dir + QStringLiteral("FontNintendoExtended.ttf"))
-                                   .arg(fonts_dir + QStringLiteral("FontNintendoExtended2.ttf"));
+    const QString css_source =
+        QString::fromUtf8(WEB_BROWSER_NX_FONT_CSS)
+            .arg(fonts_dir + QStringLiteral("FontStandard.ttf"))
+            .arg(fonts_dir + QStringLiteral("FontChineseSimplified.ttf"))
+            .arg(fonts_dir + QStringLiteral("FontExtendedChineseSimplified.ttf"))
+            .arg(fonts_dir + QStringLiteral("FontChineseTraditional.ttf"))
+            .arg(fonts_dir + QStringLiteral("FontKorean.ttf"))
+            .arg(fonts_dir + QStringLiteral("FontNintendoExtended.ttf"))
+            .arg(fonts_dir + QStringLiteral("FontNintendoExtended2.ttf"));
 
     WebKitUserContentManager* ucm = webkit_web_view_get_user_content_manager(webview);
 
     // WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_END approximates Qt's DocumentReady timing.
     QByteArray css_utf8 = css_source.toUtf8();
-    WebKitUserScript* css_script = webkit_user_script_new(
-        css_utf8.constData(), WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
-        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_END, nullptr, nullptr);
+    WebKitUserScript* css_script =
+        webkit_user_script_new(css_utf8.constData(), WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+                               WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_END, nullptr, nullptr);
     webkit_user_content_manager_add_script(ucm, css_script);
     webkit_user_script_unref(css_script);
 
     // DOCUMENT_END approximates Qt's Deferred timing; also re-run on every navigation
     // via decide-policy (50 ms debounce), mirroring qt_web_browser.cpp:380-386.
-    WebKitUserScript* font_script = webkit_user_script_new(
-        WEB_BROWSER_LOAD_NX_FONT, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
-        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_END, nullptr, nullptr);
+    WebKitUserScript* font_script =
+        webkit_user_script_new(WEB_BROWSER_LOAD_NX_FONT, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+                               WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_END, nullptr, nullptr);
     webkit_user_content_manager_add_script(ucm, font_script);
     webkit_user_script_unref(font_script);
 }
@@ -308,8 +311,10 @@ void WebKitGTKView::FocusFirstLinkElement() {
     webkit_user_script_unref(script);
 }
 
-void WebKitGTKView::LoadLocalWebPage(const std::string& main_url, const std::string& additional_args) {
-    if (init_failed) return; // already SetFinished(true) in the constructor
+void WebKitGTKView::LoadLocalWebPage(const std::string& main_url,
+                                     const std::string& additional_args) {
+    if (init_failed)
+        return; // already SetFinished(true) in the constructor
     is_local = true;
 
     LoadExtractedFonts();
@@ -334,8 +339,10 @@ void WebKitGTKView::LoadLocalWebPage(const std::string& main_url, const std::str
     }
 }
 
-void WebKitGTKView::LoadExternalWebPage(const std::string& main_url, const std::string& additional_args) {
-    if (init_failed) return;
+void WebKitGTKView::LoadExternalWebPage(const std::string& main_url,
+                                        const std::string& additional_args) {
+    if (init_failed)
+        return;
     is_local = false;
 
     FocusFirstLinkElement();
@@ -353,12 +360,15 @@ void WebKitGTKView::LoadExternalWebPage(const std::string& main_url, const std::
 }
 
 QString WebKitGTKView::GetCurrentURL() const {
-    if (init_failed || !webview) return QString();
+    if (init_failed || !webview)
+        return QString();
     return requested_url;
 }
 
-void WebKitGTKView::EvaluateJavaScript(const QString& script, std::function<void(const QVariant&)> callback) {
-    if (init_failed || !webview) return;
+void WebKitGTKView::EvaluateJavaScript(const QString& script,
+                                       std::function<void(const QVariant&)> callback) {
+    if (init_failed || !webview)
+        return;
     QByteArray utf8 = script.toUtf8();
     if (callback) {
         auto* ctx = new EvalCallbackContext{std::move(callback)};
@@ -371,7 +381,8 @@ void WebKitGTKView::EvaluateJavaScript(const QString& script, std::function<void
 }
 
 void WebKitGTKView::SetPageZoomFactor(qreal factor) {
-    if (init_failed || !webview) return;
+    if (init_failed || !webview)
+        return;
     webkit_web_view_set_zoom_level(webview, static_cast<gdouble>(factor));
 }
 
@@ -389,6 +400,9 @@ void WebKitGTKView::SendKeyEvent(const QString& key, const QString& code, int ke
 
 void WebKitGTKView::hideEvent(QHideEvent* event) {
     SetFinished(true);
+    if (gtk_window && !container) {
+        gtk_widget_hide(gtk_window);
+    }
     QWidget::hideEvent(event);
 }
 
@@ -474,20 +488,23 @@ void WebKitGTKView::InputThreadLoop() {
             // and invokeMethod(this, ...) auto-drops if `this` is destroyed first.
             const QString check_script =
                 QStringLiteral("citron_key_callbacks[%1] != null").arg(callback_index);
-            QMetaObject::invokeMethod(this, [this, check_script, callback_index, fallback_key,
-                                             fallback_code] {
-                EvaluateJavaScript(check_script, [this, callback_index, fallback_key,
-                                                  fallback_code](const QVariant& has_callback) {
-                    if (has_callback.toBool()) {
-                        EvaluateJavaScript(
-                            QStringLiteral("citron_key_callbacks[%1]();").arg(callback_index));
-                    } else if (fallback_key) {
-                        SendKeyEvent(QString::fromUtf8(fallback_key),
-                                    QStringLiteral("Key") + QString::fromUtf8(fallback_key).toUpper(),
-                                    fallback_code);
-                    }
-                });
-            }, Qt::QueuedConnection);
+            QMetaObject::invokeMethod(
+                this,
+                [this, check_script, callback_index, fallback_key, fallback_code] {
+                    EvaluateJavaScript(check_script, [this, callback_index, fallback_key,
+                                                      fallback_code](const QVariant& has_callback) {
+                        if (has_callback.toBool()) {
+                            EvaluateJavaScript(
+                                QStringLiteral("citron_key_callbacks[%1]();").arg(callback_index));
+                        } else if (fallback_key) {
+                            SendKeyEvent(QString::fromUtf8(fallback_key),
+                                         QStringLiteral("Key") +
+                                             QString::fromUtf8(fallback_key).toUpper(),
+                                         fallback_code);
+                        }
+                    });
+                },
+                Qt::QueuedConnection);
         }
 
         for (NpadButton button : {NpadButton::Left, NpadButton::Up, NpadButton::Right,
@@ -498,10 +515,13 @@ void WebKitGTKView::InputThreadLoop() {
             if (pressed_once || held) {
                 const DomKey dom_key = HIDButtonToDomKey(button);
                 if (dom_key.key_code != 0) {
-                    QMetaObject::invokeMethod(this, [this, dom_key] {
-                        SendKeyEvent(QString::fromUtf8(dom_key.key), QString::fromUtf8(dom_key.code),
-                                    dom_key.key_code);
-                    }, Qt::QueuedConnection);
+                    QMetaObject::invokeMethod(
+                        this,
+                        [this, dom_key] {
+                            SendKeyEvent(QString::fromUtf8(dom_key.key),
+                                         QString::fromUtf8(dom_key.code), dom_key.key_code);
+                        },
+                        Qt::QueuedConnection);
                 }
             }
         }
@@ -510,7 +530,8 @@ void WebKitGTKView::InputThreadLoop() {
     }
 }
 
-void WebKitGTKView::OnNxMessage(WebKitUserContentManager*, WebKitJavascriptResult* result, gpointer user_data) {
+void WebKitGTKView::OnNxMessage(WebKitUserContentManager*, WebKitJavascriptResult* result,
+                                gpointer user_data) {
     auto* self = static_cast<WebKitGTKView*>(user_data);
     JSCValue* value = webkit_javascript_result_get_js_value(result);
     char* str_value = jsc_value_to_string(value);
@@ -518,7 +539,8 @@ void WebKitGTKView::OnNxMessage(WebKitUserContentManager*, WebKitJavascriptResul
     g_free(str_value);
 }
 
-void WebKitGTKView::OnNxControl(WebKitUserContentManager*, WebKitJavascriptResult* result, gpointer user_data) {
+void WebKitGTKView::OnNxControl(WebKitUserContentManager*, WebKitJavascriptResult* result,
+                                gpointer user_data) {
     auto* self = static_cast<WebKitGTKView*>(user_data);
     JSCValue* value = webkit_javascript_result_get_js_value(result);
     char* str_value = jsc_value_to_string(value);
@@ -561,7 +583,9 @@ int WebKitGTKView::OnDecidePolicy(WebKitWebView*, WebKitPolicyDecision* decision
     // Re-run load_nx_font on every navigation, mirroring qt_web_browser.cpp:380-386
     // (50 ms debounce). Skipped above when finishing -- pointless if the view's
     // already closing.
-    QTimer::singleShot(50, self, [self] { self->EvaluateJavaScript(QString::fromUtf8(WEB_BROWSER_LOAD_NX_FONT)); });
+    QTimer::singleShot(50, self, [self] {
+        self->EvaluateJavaScript(QString::fromUtf8(WEB_BROWSER_LOAD_NX_FONT));
+    });
 
     webkit_policy_decision_use(decision);
     return TRUE;

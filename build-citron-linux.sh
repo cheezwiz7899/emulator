@@ -1053,9 +1053,7 @@ build_common_cmake_args() {
         "-DCITRON_CHECK_SUBMODULES=OFF"
         "-DCITRON_USE_LLVM_DEMANGLE=OFF"
         "-DCITRON_USE_QT_WEB_ENGINE=OFF"
-        # WebKitGTK backend: left OFF pending GPU/Wayland validation.
-        # Flip to ON for a validation build once confirmed on real hardware.
-        # "-DCITRON_USE_WEBKITGTK_WEB_ENGINE=ON"
+        "-DCITRON_USE_WEBKITGTK_WEB_ENGINE=ON"
         "-DCITRON_USE_QT_MULTIMEDIA=OFF"
         "-DQT_NO_PRIVATE_MODULE_WARNING=ON"
         "-DENABLE_QT_TRANSLATION=ON"

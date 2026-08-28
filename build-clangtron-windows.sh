@@ -1970,8 +1970,7 @@ build_common_cmake_args() {
         # setting lives entirely separately, in the generated .cmd heredoc
         # further down this file, untouched by this.
         "-DCITRON_USE_QT_WEB_ENGINE=OFF"
-        # WebView2: left OFF here too; never compiled against the real SDK.
-        # "-DCITRON_USE_WEBVIEW2_WEB_ENGINE=ON"
+        "-DCITRON_USE_WEBVIEW2_WEB_ENGINE=ON"
         "-Wno-dev"
     )
     [[ -n "${VULKAN_HEADERS_STUB_DIR}" ]] && _CMAKE_ARGS+=(
@@ -4797,6 +4796,7 @@ ${sccache_cmake_args}
   -DCPM_SOURCE_CACHE="${cpm_win}" ^
   -DCITRON_CLANGCL=ON -DCITRON_USE_BUNDLED_QT=ON -DCITRON_USE_BUNDLED_FFMPEG=ON ^
   -DCITRON_USE_QT_WEB_ENGINE=OFF ^
+  -DCITRON_USE_WEBVIEW2_WEB_ENGINE=ON ^
   -DBUILD_TESTING=OFF -DCITRON_TESTS=OFF -DCITRON_SHADER_TOOL=OFF ^
   -DCITRON_CRASH_DUMPS=OFF ^
   -DENABLE_UNITY_BUILD=${UNITY_BUILD} ^

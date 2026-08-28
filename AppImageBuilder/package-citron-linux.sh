@@ -22,7 +22,7 @@
 #   DEPLOY_OPENGL   Bundle Mesa OpenGL/EGL/GLX (default: 0)
 #   DEPLOY_PIPEWIRE Bundle PipeWire tree (default: 0)
 #   DEPLOY_GLIBC    Bundle glibc from Arch container (default: 1)
-#   DEPLOY_GTK      Bundle GTK modules (default: 0)
+#   DEPLOY_GTK      Bundle GTK/WebKitGTK libraries and modules (default: 1)
 #   CITRON_QT_PATH  CPM Qt6 prefix
 #   CITRON_XCB_PATH CPM XCB prefix
 #   CITRON_VULKAN_LOADER_PATH CPM Vulkan loader lib dir
@@ -79,9 +79,10 @@ export DEPLOY_OPENGL="${DEPLOY_OPENGL:-0}"
 export DEPLOY_PIPEWIRE="${DEPLOY_PIPEWIRE:-0}"
 # DEPLOY_GLIBC=1: Bundle glibc from Arch container (glibc 2.41+) for broad host compatibility.
 export DEPLOY_GLIBC="${DEPLOY_GLIBC:-1}"
-# DEPLOY_GTK=0: GTK3 is not bundled. libqgtk3.so is purged in cleanup below to force Qt
-# to use D-Bus libqxdgdesktopportal.so, avoiding host GTK module crashes on GTK distros.
-export DEPLOY_GTK="${DEPLOY_GTK:-0}"
+# WebKitGTK is the default web applet backend, so bundle its GTK stack rather than
+# relying on host packages. libqgtk3.so is still purged below: Qt then uses the
+# D-Bus XDG-desktop-portal theme path without affecting WebKitGTK itself.
+export DEPLOY_GTK="${DEPLOY_GTK:-1}"
 
 # ── CPM over system: steer dependency scan ──────────────────────────────────
 if [ -n "${CITRON_QT_PATH:-}" ] && [ -z "${QT_LOCATION:-}" ]; then

@@ -13,14 +13,14 @@
 #include <cwctype>
 #include <vector>
 
-#include <QResizeEvent>
-#include <QMoveEvent>
-#include <QMetaObject>
-#include <QThread>
-#include <QUrl>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
+#include <QMetaObject>
+#include <QMoveEvent>
+#include <QResizeEvent>
+#include <QThread>
+#include <QUrl>
 
 #include "citron/applets/webview2_web_browser_scripts.h"
 #include "citron/main.h"
@@ -68,7 +68,8 @@ constexpr DomKey HIDButtonToDomKey(Core::HID::NpadButton button) {
 // Single left-to-right pass -- never rescans inserted replacement text, so a
 // FontUrl() containing "%2F"/"%20" etc. can't be mistaken for a placeholder
 // or get substituted twice (finding #12).
-std::wstring SubstitutePlaceholders(const std::wstring& script, const std::vector<std::wstring>& args) {
+std::wstring SubstitutePlaceholders(const std::wstring& script,
+                                    const std::vector<std::wstring>& args) {
     std::wstring result;
     result.reserve(script.size());
     for (size_t i = 0; i < script.size();) {
@@ -124,7 +125,8 @@ void WebView2View::InitWebView2() {
         nullptr, user_data_folder.c_str(), nullptr,
         Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
             [this, life = alive](HRESULT result, ICoreWebView2Environment* env) -> HRESULT {
-                if (!*life) return S_OK; // `this` may already be destroyed
+                if (!*life)
+                    return S_OK; // `this` may already be destroyed
                 if (FAILED(result)) {
                     SetFinished(true);
                     SetExitReason(Service::AM::Frontend::WebExitReason::WindowClosed);
@@ -134,8 +136,10 @@ void WebView2View::InitWebView2() {
                 environment->CreateCoreWebView2Controller(
                     reinterpret_cast<HWND>(winId()),
                     Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-                        [this, life](HRESULT ctrl_result, ICoreWebView2Controller* ctrl) -> HRESULT {
-                            if (!*life) return S_OK;
+                        [this, life](HRESULT ctrl_result,
+                                     ICoreWebView2Controller* ctrl) -> HRESULT {
+                            if (!*life)
+                                return S_OK;
                             if (FAILED(ctrl_result)) {
                                 SetFinished(true);
                                 SetExitReason(Service::AM::Frontend::WebExitReason::WindowClosed);
@@ -156,46 +160,66 @@ void WebView2View::InitWebView2() {
 
                             webview->add_WebMessageReceived(
                                 Callback<ICoreWebView2WebMessageReceivedEventHandler>(
-                                    [this](ICoreWebView2* sender,
-                                          ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT {
+                                    [this, life = alive](
+                                        ICoreWebView2* sender,
+                                        ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT {
+                                        if (!*life)
+                                            return S_OK;
                                         return OnWebMessageReceived(sender, args);
-                                    }).Get(),
+                                    })
+                                    .Get(),
                                 nullptr);
 
                             webview->add_NavigationStarting(
                                 Callback<ICoreWebView2NavigationStartingEventHandler>(
-                                    [this](ICoreWebView2* sender,
-                                          ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT {
+                                    [this, life = alive](
+                                        ICoreWebView2* sender,
+                                        ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT {
+                                        if (!*life)
+                                            return S_OK;
                                         return OnNavigationStarting(sender, args);
-                                    }).Get(),
+                                    })
+                                    .Get(),
                                 nullptr);
 
                             // Mirrors qt_web_browser.cpp:94-102's windowCloseRequested.
                             webview->add_WindowCloseRequested(
                                 Callback<ICoreWebView2WindowCloseRequestedEventHandler>(
-                                    [this](ICoreWebView2* sender, IUnknown* args) -> HRESULT {
+                                    [this, life = alive](ICoreWebView2* sender,
+                                                         IUnknown* args) -> HRESULT {
+                                        if (!*life)
+                                            return S_OK;
                                         return OnWindowCloseRequested(sender, args);
-                                    }).Get(),
+                                    })
+                                    .Get(),
                                 nullptr);
 
                             // NavigationCompleted runs "after load" scripts and
                             // re-runs LOAD_NX_FONT on every navigation.
                             webview->add_NavigationCompleted(
                                 Callback<ICoreWebView2NavigationCompletedEventHandler>(
-                                    [this](ICoreWebView2*, ICoreWebView2NavigationCompletedEventArgs*) -> HRESULT {
-                                        EvaluateJavaScript(QString::fromUtf8(WEB_BROWSER_LOAD_NX_FONT));
+                                    [this, life = alive](
+                                        ICoreWebView2*,
+                                        ICoreWebView2NavigationCompletedEventArgs*) -> HRESULT {
+                                        if (!*life)
+                                            return S_OK;
+                                        EvaluateJavaScript(
+                                            QString::fromUtf8(WEB_BROWSER_LOAD_NX_FONT));
                                         FocusFirstLinkElement();
                                         return S_OK;
-                                    }).Get(),
+                                    })
+                                    .Get(),
                                 nullptr);
                             // Not called here -- InjectPersistentScripts's own
                             // completions call it once their counter hits 0
                             // (see below); calling it unconditionally here raced
                             // ahead of those registrations (finding #11).
                             return S_OK;
-                        }).Get());
+                        })
+                        .Get());
                 return S_OK;
-            }).Get());
+            })
+            .Get());
 
     if (FAILED(create_result)) {
         SetFinished(true);
@@ -212,37 +236,82 @@ void WebView2View::InjectPersistentScripts() {
     // Additive, not overwrite: FlushPendingNavigation (for is_local) queues
     // one more registration of its own on this same counter (finding #11).
     pending_script_registrations += 2;
-    webview->AddScriptToExecuteOnDocumentCreated(
+    const HRESULT nx_result = webview->AddScriptToExecuteOnDocumentCreated(
         WEBVIEW2_NX_SCRIPT,
         Callback<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler>(
-            [this](HRESULT, PCWSTR) -> HRESULT {
-                if (--pending_script_registrations == 0) FlushPendingNavigation();
+            [this, life = alive](HRESULT result, PCWSTR) -> HRESULT {
+                if (!*life)
+                    return S_OK;
+                if (FAILED(result)) {
+                    FailScriptRegistration();
+                    return result;
+                }
+                if (--pending_script_registrations == 0)
+                    FlushPendingNavigation();
                 return S_OK;
-            }).Get());
-    webview->AddScriptToExecuteOnDocumentCreated(
+            })
+            .Get());
+    if (FAILED(nx_result)) {
+        --pending_script_registrations;
+        FailScriptRegistration();
+        return;
+    }
+    const HRESULT gamepad_result = webview->AddScriptToExecuteOnDocumentCreated(
         Utf8ToWide(WEB_BROWSER_GAMEPAD_SCRIPT).c_str(),
         Callback<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler>(
-            [this](HRESULT, PCWSTR) -> HRESULT {
-                if (--pending_script_registrations == 0) FlushPendingNavigation();
+            [this, life = alive](HRESULT result, PCWSTR) -> HRESULT {
+                if (!*life)
+                    return S_OK;
+                if (FAILED(result)) {
+                    FailScriptRegistration();
+                    return result;
+                }
+                if (--pending_script_registrations == 0)
+                    FlushPendingNavigation();
                 return S_OK;
-            }).Get());
+            })
+            .Get());
+    if (FAILED(gamepad_result)) {
+        --pending_script_registrations;
+        FailScriptRegistration();
+    }
+}
+
+void WebView2View::FailScriptRegistration() {
+    script_registration_failed = true;
+    has_pending_navigation = false;
+    SetFinished(true);
+    SetExitReason(Service::AM::Frontend::WebExitReason::WindowClosed);
 }
 
 void WebView2View::SetUserAgent(UserAgent user_agent) {
     const wchar_t* user_agent_str = L"WebApplet";
     switch (user_agent) {
-    case UserAgent::WebApplet: user_agent_str = L"WebApplet"; break;
-    case UserAgent::ShopN: user_agent_str = L"ShopN"; break;
-    case UserAgent::LoginApplet: user_agent_str = L"LoginApplet"; break;
-    case UserAgent::ShareApplet: user_agent_str = L"ShareApplet"; break;
-    case UserAgent::LobbyApplet: user_agent_str = L"LobbyApplet"; break;
-    case UserAgent::WifiWebAuthApplet: user_agent_str = L"WifiWebAuthApplet"; break;
+    case UserAgent::WebApplet:
+        user_agent_str = L"WebApplet";
+        break;
+    case UserAgent::ShopN:
+        user_agent_str = L"ShopN";
+        break;
+    case UserAgent::LoginApplet:
+        user_agent_str = L"LoginApplet";
+        break;
+    case UserAgent::ShareApplet:
+        user_agent_str = L"ShareApplet";
+        break;
+    case UserAgent::LobbyApplet:
+        user_agent_str = L"LobbyApplet";
+        break;
+    case UserAgent::WifiWebAuthApplet:
+        user_agent_str = L"WifiWebAuthApplet";
+        break;
     }
     std::wstring full_ua = std::wstring(L"Mozilla/5.0 (Nintendo Switch; ") + user_agent_str +
                            L") AppleWebKit/606.4 (KHTML, like Gecko) NF/6.0.1.15.4 "
                            L"NintendoBrowser/5.1.0.20389";
 
-    if (!webview) return;
+    if (!webview)
+        return;
     wil::com_ptr<ICoreWebView2Settings> settings;
     webview->get_Settings(&settings);
     // put_UserAgent is on ICoreWebView2Settings2, not the base ICoreWebView2Settings.
@@ -275,24 +344,36 @@ void WebView2View::LoadExtractedFonts() {
     };
 
     std::wstring css_source = SubstitutePlaceholders(
-        Utf8ToWide(WEB_BROWSER_NX_FONT_CSS), {FontUrl(L"FontStandard.ttf"), FontUrl(L"FontChineseSimplified.ttf"),
-                               FontUrl(L"FontExtendedChineseSimplified.ttf"),
-                               FontUrl(L"FontChineseTraditional.ttf"), FontUrl(L"FontKorean.ttf"),
-                               FontUrl(L"FontNintendoExtended.ttf"), FontUrl(L"FontNintendoExtended2.ttf")});
+        Utf8ToWide(WEB_BROWSER_NX_FONT_CSS),
+        {FontUrl(L"FontStandard.ttf"), FontUrl(L"FontChineseSimplified.ttf"),
+         FontUrl(L"FontExtendedChineseSimplified.ttf"), FontUrl(L"FontChineseTraditional.ttf"),
+         FontUrl(L"FontKorean.ttf"), FontUrl(L"FontNintendoExtended.ttf"),
+         FontUrl(L"FontNintendoExtended2.ttf")});
 
     // WEB_BROWSER_NX_FONT_CSS is already a complete self-invoking script (builds its
     // own <style> tag via a JS template literal) -- inject as-is, no wrapping.
     // Registration is async; Navigate() is deferred to this completion (see
     // FlushPendingNavigation) so the first page load doesn't race ahead of it.
-    webview->AddScriptToExecuteOnDocumentCreated(
+    const HRESULT font_result = webview->AddScriptToExecuteOnDocumentCreated(
         css_source.c_str(),
         Callback<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler>(
-            [this](HRESULT, PCWSTR) -> HRESULT {
+            [this, life = alive](HRESULT result, PCWSTR) -> HRESULT {
+                if (!*life)
+                    return S_OK;
+                if (FAILED(result)) {
+                    FailScriptRegistration();
+                    return result;
+                }
                 if (--pending_script_registrations == 0) {
                     webview->Navigate(pending_url.c_str());
                 }
                 return S_OK;
-            }).Get());
+            })
+            .Get());
+    if (FAILED(font_result)) {
+        --pending_script_registrations;
+        FailScriptRegistration();
+    }
 
     // LOAD_NX_FONT / FocusFirstLinkElement run via NavigationCompleted (see InitWebView2).
 }
@@ -301,7 +382,8 @@ void WebView2View::FocusFirstLinkElement() {
     EvaluateJavaScript(QString::fromUtf8(WEB_BROWSER_FOCUS_LINK_ELEMENT_SCRIPT));
 }
 
-void WebView2View::LoadLocalWebPage(const std::string& main_url, const std::string& additional_args) {
+void WebView2View::LoadLocalWebPage(const std::string& main_url,
+                                    const std::string& additional_args) {
     is_local = true;
     pending_user_agent = UserAgent::WebApplet; // applied in FlushPendingNavigation --
                                                // SetUserAgent silently no-ops if
@@ -320,7 +402,8 @@ void WebView2View::LoadLocalWebPage(const std::string& main_url, const std::stri
     }
 }
 
-void WebView2View::LoadExternalWebPage(const std::string& main_url, const std::string& additional_args) {
+void WebView2View::LoadExternalWebPage(const std::string& main_url,
+                                       const std::string& additional_args) {
     is_local = false;
     pending_user_agent = UserAgent::WebApplet;
     SetFinished(false);
@@ -340,11 +423,15 @@ void WebView2View::LoadExternalWebPage(const std::string& main_url, const std::s
 // before the async WebView2 init finished (they'd otherwise be silently
 // dropped -- init is async, callers can't be expected to wait for it).
 void WebView2View::FlushPendingNavigation() {
-    if (!has_pending_navigation || !webview) return;
+    if (!has_pending_navigation || !webview)
+        return;
+    if (script_registration_failed)
+        return;
     // Persistent scripts (window_nx/gamepad) not registered yet -- their own
     // completion handlers call back in here once the counter hits 0
     // (finding #11).
-    if (pending_script_registrations > 0) return;
+    if (pending_script_registrations > 0)
+        return;
     has_pending_navigation = false;
     SetUserAgent(pending_user_agent);
     if (is_local) {
@@ -356,35 +443,42 @@ void WebView2View::FlushPendingNavigation() {
     }
 }
 
-void WebView2View::EvaluateJavaScript(const QString& script, std::function<void(const QVariant&)> callback) {
-    if (!webview) return;
+void WebView2View::EvaluateJavaScript(const QString& script,
+                                      std::function<void(const QVariant&)> callback) {
+    if (!webview)
+        return;
     std::wstring wscript = script.toStdWString();
-    webview->ExecuteScript(
-        wscript.c_str(),
-        Callback<ICoreWebView2ExecuteScriptCompletedHandler>(
-            // life guard: mirrors the environment/controller completion lambdas
-            // (finding #14/round 2) -- callback may itself capture `this`
-            // (finding #15).
-            [callback, life = alive](HRESULT, PCWSTR result_json) -> HRESULT {
-                if (!*life || !callback) return S_OK;
-        // result_json is JSON-encoded (ExecuteScript contract) -- handles the
-        // boolean/number/string cases the footer-callback check needs.
-        QString result = QString::fromWCharArray(result_json ? result_json : L"null");
-                QVariant qvariant;
-                if (result == QStringLiteral("true")) {
-                    qvariant = QVariant(true);
-                } else if (result == QStringLiteral("false")) {
-                    qvariant = QVariant(false);
-                } else if (result.startsWith(QStringLiteral("\"")) && result.endsWith(QStringLiteral("\""))) {
-                    qvariant = QVariant(result.mid(1, result.length() - 2));
-                } else {
-                    bool ok = false;
-                    double num = result.toDouble(&ok);
-                    if (ok) qvariant = QVariant(num);
-                }
-                callback(qvariant);
-                return S_OK;
-            }).Get());
+    webview->ExecuteScript(wscript.c_str(),
+                           Callback<ICoreWebView2ExecuteScriptCompletedHandler>(
+                               // life guard: mirrors the environment/controller completion lambdas
+                               // (finding #14/round 2) -- callback may itself capture `this`
+                               // (finding #15).
+                               [callback, life = alive](HRESULT, PCWSTR result_json) -> HRESULT {
+                                   if (!*life || !callback)
+                                       return S_OK;
+                                   // result_json is JSON-encoded (ExecuteScript contract) --
+                                   // handles the boolean/number/string cases the footer-callback
+                                   // check needs.
+                                   QString result =
+                                       QString::fromWCharArray(result_json ? result_json : L"null");
+                                   QVariant qvariant;
+                                   if (result == QStringLiteral("true")) {
+                                       qvariant = QVariant(true);
+                                   } else if (result == QStringLiteral("false")) {
+                                       qvariant = QVariant(false);
+                                   } else if (result.startsWith(QStringLiteral("\"")) &&
+                                              result.endsWith(QStringLiteral("\""))) {
+                                       qvariant = QVariant(result.mid(1, result.length() - 2));
+                                   } else {
+                                       bool ok = false;
+                                       double num = result.toDouble(&ok);
+                                       if (ok)
+                                           qvariant = QVariant(num);
+                                   }
+                                   callback(qvariant);
+                                   return S_OK;
+                               })
+                               .Get());
 }
 
 void WebView2View::SetPageZoomFactor(qreal factor) {
@@ -394,13 +488,13 @@ void WebView2View::SetPageZoomFactor(qreal factor) {
 }
 
 void WebView2View::SendKeyEvent(const std::wstring& key, const std::wstring& code, int key_code) {
-    std::wstring script =
-        L"(function() { var el = document.activeElement || document.body; "
-        L"var opts = { key: '" + key + L"', code: '" + code + L"', keyCode: " +
-        std::to_wstring(key_code) + L", which: " + std::to_wstring(key_code) +
-        L", bubbles: true, cancelable: true }; "
-        L"el.dispatchEvent(new KeyboardEvent('keydown', opts)); "
-        L"el.dispatchEvent(new KeyboardEvent('keyup', opts)); })();";
+    std::wstring script = L"(function() { var el = document.activeElement || document.body; "
+                          L"var opts = { key: '" +
+                          key + L"', code: '" + code + L"', keyCode: " + std::to_wstring(key_code) +
+                          L", which: " + std::to_wstring(key_code) +
+                          L", bubbles: true, cancelable: true }; "
+                          L"el.dispatchEvent(new KeyboardEvent('keydown', opts)); "
+                          L"el.dispatchEvent(new KeyboardEvent('keyup', opts)); })();";
     EvaluateJavaScript(QString::fromStdWString(script));
 }
 
@@ -410,13 +504,15 @@ void WebView2View::hideEvent(QHideEvent* event) {
 }
 
 void WebView2View::StartInputThread() {
-    if (input_thread_running) return;
+    if (input_thread_running)
+        return;
     input_thread_running = true;
     input_thread = std::thread(&WebView2View::InputThreadLoop, this);
 }
 
 void WebView2View::StopInputThread() {
-    if (!input_thread_running) return;
+    if (!input_thread_running)
+        return;
     input_thread_running = false;
     if (input_thread.joinable()) {
         input_thread.join();
@@ -433,37 +529,62 @@ void WebView2View::InputThreadLoop() {
         using Core::HID::NpadButton;
         for (NpadButton button : {NpadButton::A, NpadButton::B, NpadButton::X, NpadButton::Y,
                                   NpadButton::L, NpadButton::R}) {
-            if (!input_interpreter->IsButtonPressedOnce(button)) continue;
+            if (!input_interpreter->IsButtonPressedOnce(button))
+                continue;
 
             int callback_index = -1;
             const wchar_t* fallback_key = nullptr;
             int fallback_code = 0;
             switch (button) {
-            case NpadButton::A: callback_index = 0; fallback_key = L"a"; fallback_code = 65; break;
-            case NpadButton::B: callback_index = 1; fallback_key = L"b"; fallback_code = 66; break;
-            case NpadButton::X: callback_index = 2; fallback_key = L"x"; fallback_code = 88; break;
-            case NpadButton::Y: callback_index = 3; fallback_key = L"y"; fallback_code = 89; break;
-            case NpadButton::L: callback_index = 6; break;
-            case NpadButton::R: callback_index = 7; break;
-            default: break;
+            case NpadButton::A:
+                callback_index = 0;
+                fallback_key = L"a";
+                fallback_code = 65;
+                break;
+            case NpadButton::B:
+                callback_index = 1;
+                fallback_key = L"b";
+                fallback_code = 66;
+                break;
+            case NpadButton::X:
+                callback_index = 2;
+                fallback_key = L"x";
+                fallback_code = 88;
+                break;
+            case NpadButton::Y:
+                callback_index = 3;
+                fallback_key = L"y";
+                fallback_code = 89;
+                break;
+            case NpadButton::L:
+                callback_index = 6;
+                break;
+            case NpadButton::R:
+                callback_index = 7;
+                break;
+            default:
+                break;
             }
 
             const QString check_script =
                 QStringLiteral("citron_key_callbacks[%1] != null").arg(callback_index);
-            QMetaObject::invokeMethod(this, [this, check_script, callback_index, fallback_key,
-                                             fallback_code] {
-                EvaluateJavaScript(check_script, [this, callback_index, fallback_key,
-                                                  fallback_code](const QVariant& has_callback) {
-                    if (has_callback.toBool()) {
-                        EvaluateJavaScript(
-                            QStringLiteral("citron_key_callbacks[%1]();").arg(callback_index));
-                    } else if (fallback_key) {
-                        std::wstring upper_key(fallback_key);
-                        for (auto& c : upper_key) c = towupper(c);
-                        SendKeyEvent(fallback_key, L"Key" + upper_key, fallback_code);
-                    }
-                });
-            }, Qt::QueuedConnection);
+            QMetaObject::invokeMethod(
+                this,
+                [this, check_script, callback_index, fallback_key, fallback_code] {
+                    EvaluateJavaScript(check_script, [this, callback_index, fallback_key,
+                                                      fallback_code](const QVariant& has_callback) {
+                        if (has_callback.toBool()) {
+                            EvaluateJavaScript(
+                                QStringLiteral("citron_key_callbacks[%1]();").arg(callback_index));
+                        } else if (fallback_key) {
+                            std::wstring upper_key(fallback_key);
+                            for (auto& c : upper_key)
+                                c = towupper(c);
+                            SendKeyEvent(fallback_key, L"Key" + upper_key, fallback_code);
+                        }
+                    });
+                },
+                Qt::QueuedConnection);
         }
 
         for (NpadButton button : {NpadButton::Left, NpadButton::Up, NpadButton::Right,
@@ -474,9 +595,12 @@ void WebView2View::InputThreadLoop() {
             if (pressed_once || held) {
                 const DomKey dom_key = HIDButtonToDomKey(button);
                 if (dom_key.key_code != 0) {
-                    QMetaObject::invokeMethod(this, [this, dom_key] {
-                        SendKeyEvent(dom_key.key, dom_key.code, dom_key.key_code);
-                    }, Qt::QueuedConnection);
+                    QMetaObject::invokeMethod(
+                        this,
+                        [this, dom_key] {
+                            SendKeyEvent(dom_key.key, dom_key.code, dom_key.key_code);
+                        },
+                        Qt::QueuedConnection);
                 }
             }
         }
@@ -496,13 +620,15 @@ void WebView2View::moveEvent(QMoveEvent* event) {
 }
 
 void WebView2View::SyncBounds() {
-    if (!controller) return;
+    if (!controller)
+        return;
     const qreal dpr = devicePixelRatioF();
     RECT bounds{0, 0, static_cast<LONG>(width() * dpr), static_cast<LONG>(height() * dpr)};
     controller->put_Bounds(bounds);
 }
 
-HRESULT WebView2View::OnWebMessageReceived(ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* args) {
+HRESULT WebView2View::OnWebMessageReceived(ICoreWebView2*,
+                                           ICoreWebView2WebMessageReceivedEventArgs* args) {
     wil::unique_cotaskmem_string message_raw;
     if (FAILED(args->TryGetWebMessageAsString(&message_raw))) {
         // Control-envelope path for endApplet -- WebView2 has one JS->native channel,
@@ -532,9 +658,11 @@ HRESULT WebView2View::OnWebMessageReceived(ICoreWebView2*, ICoreWebView2WebMessa
     return S_OK;
 }
 
-HRESULT WebView2View::OnNavigationStarting(ICoreWebView2*, ICoreWebView2NavigationStartingEventArgs* args) {
+HRESULT WebView2View::OnNavigationStarting(ICoreWebView2*,
+                                           ICoreWebView2NavigationStartingEventArgs* args) {
     wil::unique_cotaskmem_string uri;
-    if (FAILED(args->get_Uri(&uri))) return E_FAIL;
+    if (FAILED(args->get_Uri(&uri)))
+        return E_FAIL;
     requested_url = QString::fromWCharArray(uri.get());
     if (QUrl(requested_url).host() == QStringLiteral("localhost")) {
         SetFinished(true);

@@ -13,9 +13,9 @@
 
 #ifdef CITRON_USE_WEBVIEW2_WEB_ENGINE
 #include <QWidget>
+#include <WebView2.h>
 #include <wil/com.h>
 #include <wrl.h>
-#include <WebView2.h>
 #endif
 
 #include "core/frontend/applets/web_browser.h"
@@ -48,24 +48,40 @@ public:
         WifiWebAuthApplet,
     };
 
-    explicit WebView2View(GMainWindow& main_window, Core::System& system, InputCommon::InputSubsystem* input_subsystem_);
+    explicit WebView2View(GMainWindow& main_window, Core::System& system,
+                          InputCommon::InputSubsystem* input_subsystem_);
     ~WebView2View() override;
 
     void LoadLocalWebPage(const std::string& main_url, const std::string& additional_args);
     void LoadExternalWebPage(const std::string& main_url, const std::string& additional_args);
 
-    [[nodiscard]] bool IsFinished() const { return finished; }
-    void SetFinished(bool finished_) { finished = finished_; }
+    [[nodiscard]] bool IsFinished() const {
+        return finished;
+    }
+    void SetFinished(bool finished_) {
+        finished = finished_;
+    }
 
-    [[nodiscard]] Service::AM::Frontend::WebExitReason GetExitReason() const { return exit_reason; }
-    void SetExitReason(Service::AM::Frontend::WebExitReason exit_reason_) { exit_reason = exit_reason_; }
+    [[nodiscard]] Service::AM::Frontend::WebExitReason GetExitReason() const {
+        return exit_reason;
+    }
+    void SetExitReason(Service::AM::Frontend::WebExitReason exit_reason_) {
+        exit_reason = exit_reason_;
+    }
 
-    [[nodiscard]] const std::string& GetLastURL() const { return last_url; }
-    void SetLastURL(std::string last_url_) { last_url = std::move(last_url_); }
+    [[nodiscard]] const std::string& GetLastURL() const {
+        return last_url;
+    }
+    void SetLastURL(std::string last_url_) {
+        last_url = std::move(last_url_);
+    }
 
-    [[nodiscard]] QString GetCurrentURL() const { return requested_url; }
+    [[nodiscard]] QString GetCurrentURL() const {
+        return requested_url;
+    }
 
-    void EvaluateJavaScript(const QString& script, std::function<void(const QVariant&)> callback = {});
+    void EvaluateJavaScript(const QString& script,
+                            std::function<void(const QVariant&)> callback = {});
     void SetPageZoomFactor(qreal factor);
 
 protected:
@@ -78,10 +94,12 @@ private:
     void FlushPendingNavigation(); // runs a Load*WebPage request queued before
                                    // webview finished initializing
     void SyncBounds();
+    void FailScriptRegistration();
     void SetUserAgent(UserAgent user_agent);
     void LoadExtractedFonts();
     void FocusFirstLinkElement();
-    void InjectPersistentScripts(); // window_nx + gamepad at document creation, mirrors qt_web_browser.cpp:62-81
+    void InjectPersistentScripts(); // window_nx + gamepad at document creation, mirrors
+                                    // qt_web_browser.cpp:62-81
 
     void StartInputThread();
     void StopInputThread();
@@ -109,6 +127,7 @@ private:
 
     bool is_local = false;
     bool fonts_injected = false;
+    bool script_registration_failed = false;
     int pending_script_registrations = 0;
     UserAgent pending_user_agent = UserAgent::WebApplet;
     std::shared_ptr<bool> alive = std::make_shared<bool>(true);
