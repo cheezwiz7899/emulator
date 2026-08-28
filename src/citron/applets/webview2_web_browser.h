@@ -13,6 +13,8 @@
 
 #ifdef CITRON_USE_WEBVIEW2_WEB_ENGINE
 #include <QWidget>
+#include <windows.h>
+#include <unknwn.h>
 #include <WebView2.h>
 #include <wil/com.h>
 #include <wrl.h>

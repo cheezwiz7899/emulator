@@ -30,7 +30,7 @@ if (WIN32 AND CITRON_USE_WEBVIEW2_WEB_ENGINE AND CITRON_USE_CPM)
         CPMAddPackage(
             NAME wil
             GITHUB_REPOSITORY microsoft/wil
-            GIT_TAG 6f37040e1a13f6c1104f6e4c30d5c50fdca75b26 # v1.0.240803.1
+            GIT_TAG f0c6a81c0c9a4b23b6801f40554b8bec425a83b4 # v1.0.240803.1
             OPTIONS "WIL_BUILD_TESTS OFF" "WIL_BUILD_PACKAGING OFF"
         )
     endif()
@@ -40,20 +40,17 @@ endif()
 # Distributed via NuGet (Microsoft.Web.WebView2). A .nupkg is a plain zip so
 # CPMAddPackage's URL form can fetch it directly without a NuGet client.
 #
-# NOTE: the URL/version/layout below has not been verified against a real extracted
-# package. Confirm before relying on it.
 if (WIN32 AND CITRON_USE_WEBVIEW2_WEB_ENGINE AND CITRON_USE_CPM)
     if (NOT TARGET WebView2::WebView2)
         CPMAddPackage(
             NAME WebView2
-            URL "https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/1.0.2957.106"
+            URL "https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/1.0.2957.106/microsoft.web.webview2.1.0.2957.106.nupkg"
             DOWNLOAD_ONLY YES # NuGet layout (build/native/...), not a CMake project
         )
         if (WebView2_ADDED)
             add_library(WebView2::WebView2 INTERFACE IMPORTED)
             target_include_directories(WebView2::WebView2 INTERFACE
                 "${WebView2_SOURCE_DIR}/build/native/include")
-            # NOTE: arch subdir and .lib name not confirmed against a real extracted package.
             target_link_libraries(WebView2::WebView2 INTERFACE
                 "${WebView2_SOURCE_DIR}/build/native/x64/WebView2LoaderStatic.lib")
         endif()
