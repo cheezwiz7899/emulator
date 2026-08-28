@@ -29,7 +29,13 @@ var citron_key_callbacks = [];
 (function() {
     class WindowNX {
         constructor() {
-            citron_key_callbacks[1] = function() { window.history.back(); };
+            citron_key_callbacks[1] = function() {
+                if (window.history.length > 1) {
+                    window.history.back();
+                } else {
+                    window.nx.endApplet();
+                }
+            };
             citron_key_callbacks[2] = function() { window.nx.endApplet(); };
         }
 

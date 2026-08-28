@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <system_error>
+
 #include "common/assert.h"
 #include "common/fs/file.h"
 #include "common/fs/fs.h"
@@ -373,6 +375,11 @@ void WebBrowser::ExtractOfflineRomFS() {
         Common::FS::PathToUTF8String(offline_cache_dir), FileSys::OpenMode::ReadWrite);
 
     FileSys::VfsRawCopyD(extracted_romfs_dir, temp_dir);
+
+    // The page is now served exclusively from offline_cache_dir. Keeping the layered RomFS alive
+    // would keep host handles open on its manual_html override files; ARCropolis rewrites those
+    // files before opening its next page, and Windows then rejects the truncate/write operation.
+    offline_romfs = nullptr;
 }
 
 void WebBrowser::WebBrowserExit(WebExitReason exit_reason, std::string last_url) {
@@ -461,14 +468,12 @@ void WebBrowser::InitializeOffline() {
     offline_document = Common::FS::ConcatPathSafe(
         offline_cache_dir, fmt::format("{}/{}", additional_paths, document_path));
 
-    // Mirror real hardware's LayeredFS behavior for the offline "manual" HtmlDocument page: SD
-    // mod frameworks such as ARCropolis (via skyline_web's OfflineWebSession) write their own
-    // content directly to sd:/atmosphere/contents/<title_id>/manual_html/html-document/... and
-    // rely on the OS transparently substituting it for the title's real HtmlDocument content -
-    // that's the whole trick that lets a mod manager UI hijack this applet in the first place.
-    // Previously nothing here ever looked at that SD location, only Citron's own NCA-extraction
-    // cache above, so pages like ARCropolis's mod-manager/workspace/config resolved to a path
-    // nothing had ever written to and silently failed to display anything.
+    // On hardware, manual_html is a LayeredFS overlay: files supplied by a mod replace matching
+    // files from the title's HtmlDocument, while all other files continue to come from the base
+    // document. ARCropolis intentionally supplies only its own files and relies on that fallback
+    // for the shared help/ and common/ resources. Refresh our extracted cache when such an
+    // overlay is present so ExecuteOffline extracts PatchManager's merged RomFS below instead of
+    // serving a stale, standalone copy of the override page.
     if (document_kind == DocumentKind::OfflineHtmlPage) {
         const auto sd_mod_root =
             system.GetFileSystemController().GetSDMCModificationLoadRoot(title_id);
@@ -479,7 +484,12 @@ void WebBrowser::InitializeOffline() {
                 fmt::format("manual_html/{}/{}", additional_paths, document_path));
 
             if (Common::FS::Exists(sd_override_document)) {
-                offline_document = sd_override_document;
+                std::error_code error;
+                std::filesystem::remove_all(offline_cache_dir, error);
+                if (error) {
+                    LOG_WARNING(Service_AM, "Failed to refresh offline web cache {}: {}",
+                                Common::FS::PathToUTF8String(offline_cache_dir), error.message());
+                }
             }
         }
     }
