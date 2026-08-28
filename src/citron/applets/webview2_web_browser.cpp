@@ -9,8 +9,18 @@
 
 #ifdef CITRON_USE_WEBVIEW2_WEB_ENGINE
 
+#include <chrono>
+#include <cwctype>
+#include <vector>
+
 #include <QResizeEvent>
 #include <QMoveEvent>
+#include <QMetaObject>
+#include <QThread>
+#include <QUrl>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonParseError>
 
 #include "citron/applets/webview2_web_browser_scripts.h"
 #include "citron/main.h"
@@ -27,6 +37,12 @@ struct DomKey {
     const wchar_t* code;
     int key_code;
 };
+
+// Byte-wise (begin(), end()) construction only works for ASCII; paths/URLs can
+// be non-ASCII UTF-8. QString::fromStdString is UTF-8-aware in Qt6.
+std::wstring Utf8ToWide(const std::string& utf8) {
+    return QString::fromStdString(utf8).toStdWString();
+}
 
 constexpr DomKey HIDButtonToDomKey(Core::HID::NpadButton button) {
     switch (button) {
@@ -49,15 +65,30 @@ constexpr DomKey HIDButtonToDomKey(Core::HID::NpadButton button) {
 
 // QString::arg()-style %N substitution for std::wstring -- handles the 7 positional
 // placeholders needed by NX_FONT_CSS.
-std::wstring SubstitutePlaceholders(std::wstring script, const std::vector<std::wstring>& args) {
-    for (size_t i = 0; i < args.size(); i++) {
-        std::wstring placeholder = L"%" + std::to_wstring(i + 1);
-        size_t pos;
-        while ((pos = script.find(placeholder)) != std::wstring::npos) {
-            script.replace(pos, placeholder.size(), args[i]);
+// Single left-to-right pass -- never rescans inserted replacement text, so a
+// FontUrl() containing "%2F"/"%20" etc. can't be mistaken for a placeholder
+// or get substituted twice (finding #12).
+std::wstring SubstitutePlaceholders(const std::wstring& script, const std::vector<std::wstring>& args) {
+    std::wstring result;
+    result.reserve(script.size());
+    for (size_t i = 0; i < script.size();) {
+        if (script[i] == L'%' && i + 1 < script.size() && iswdigit(script[i + 1])) {
+            size_t digits_end = i + 1;
+            while (digits_end < script.size() && iswdigit(script[digits_end])) {
+                ++digits_end;
+            }
+            size_t n = std::stoul(script.substr(i + 1, digits_end - i - 1));
+            if (n >= 1 && n <= args.size()) {
+                result += args[n - 1];
+                i = digits_end;
+                continue;
+            }
+            // No matching arg -- leave the placeholder text unchanged.
         }
+        result += script[i];
+        ++i;
     }
-    return script;
+    return result;
 }
 
 } // namespace
@@ -72,29 +103,53 @@ WebView2View::WebView2View(GMainWindow& main_window_, Core::System& system_,
 }
 
 WebView2View::~WebView2View() {
+    *alive = false; // first: any in-flight environment/controller completion
+                    // lambda bails immediately instead of touching `this`
     SetFinished(true);
-    StopInputThread();
+    StopInputThread(); // joins the thread; any invokeMethod(this, ...) still
+                       // queued is auto-dropped by Qt once `this` is gone
+    if (controller) {
+        controller->Close(); // documented clean-teardown call, before the
+                             // wil::com_ptr members release via RAII below
+    }
 }
 
 void WebView2View::InitWebView2() {
     // Store profile data in citron's cache dir, mirroring qt_web_browser.cpp:59-60.
     auto storage_dir = Common::FS::PathToUTF8String(
         Common::FS::GetCitronPath(Common::FS::CitronPath::CacheDir) / "webview2");
-    std::wstring user_data_folder(storage_dir.begin(), storage_dir.end()); // ASCII paths only
+    std::wstring user_data_folder = Utf8ToWide(storage_dir);
 
-    CreateCoreWebView2EnvironmentWithOptions(
+    HRESULT create_result = CreateCoreWebView2EnvironmentWithOptions(
         nullptr, user_data_folder.c_str(), nullptr,
         Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
-            [this](HRESULT result, ICoreWebView2Environment* env) -> HRESULT {
-                if (FAILED(result)) return result;
+            [this, life = alive](HRESULT result, ICoreWebView2Environment* env) -> HRESULT {
+                if (!*life) return S_OK; // `this` may already be destroyed
+                if (FAILED(result)) {
+                    SetFinished(true);
+                    SetExitReason(Service::AM::Frontend::WebExitReason::WindowClosed);
+                    return result;
+                }
                 environment = env;
                 environment->CreateCoreWebView2Controller(
                     reinterpret_cast<HWND>(winId()),
                     Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-                        [this](HRESULT ctrl_result, ICoreWebView2Controller* ctrl) -> HRESULT {
-                            if (FAILED(ctrl_result)) return ctrl_result;
+                        [this, life](HRESULT ctrl_result, ICoreWebView2Controller* ctrl) -> HRESULT {
+                            if (!*life) return S_OK;
+                            if (FAILED(ctrl_result)) {
+                                SetFinished(true);
+                                SetExitReason(Service::AM::Frontend::WebExitReason::WindowClosed);
+                                return ctrl_result;
+                            }
                             controller = ctrl;
-                            controller->get_CoreWebView2(&webview);
+                            // get_CoreWebView2 can fail; unchecked, webview stays
+                            // null and everything below dereferences it (finding #14).
+                            HRESULT webview_result = controller->get_CoreWebView2(&webview);
+                            if (FAILED(webview_result) || !webview) {
+                                SetFinished(true);
+                                SetExitReason(Service::AM::Frontend::WebExitReason::WindowClosed);
+                                return FAILED(webview_result) ? webview_result : E_FAIL;
+                            }
                             SyncBounds();
 
                             InjectPersistentScripts();
@@ -128,26 +183,49 @@ void WebView2View::InitWebView2() {
                             webview->add_NavigationCompleted(
                                 Callback<ICoreWebView2NavigationCompletedEventHandler>(
                                     [this](ICoreWebView2*, ICoreWebView2NavigationCompletedEventArgs*) -> HRESULT {
-                                        EvaluateJavaScript(QString::fromStdWString(WEBVIEW2_LOAD_NX_FONT));
+                                        EvaluateJavaScript(QString::fromUtf8(WEB_BROWSER_LOAD_NX_FONT));
+                                        FocusFirstLinkElement();
                                         return S_OK;
                                     }).Get(),
                                 nullptr);
+                            // Not called here -- InjectPersistentScripts's own
+                            // completions call it once their counter hits 0
+                            // (see below); calling it unconditionally here raced
+                            // ahead of those registrations (finding #11).
                             return S_OK;
                         }).Get());
                 return S_OK;
             }).Get());
+
+    if (FAILED(create_result)) {
+        SetFinished(true);
+        SetExitReason(Service::AM::Frontend::WebExitReason::WindowClosed);
+    }
 }
 
 void WebView2View::InjectPersistentScripts() {
     // window_nx + gamepad at document creation, mirrors qt_web_browser.cpp:62-81.
+    // Both registrations are async; Navigate() must not fire until WebView2 has
+    // actually confirmed both are registered, or the first page load could run
+    // with no nx bridge at all. FlushPendingNavigation is deferred here instead
+    // of being called unconditionally right after InitWebView2's setup.
+    // Additive, not overwrite: FlushPendingNavigation (for is_local) queues
+    // one more registration of its own on this same counter (finding #11).
+    pending_script_registrations += 2;
     webview->AddScriptToExecuteOnDocumentCreated(
         WEBVIEW2_NX_SCRIPT,
         Callback<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler>(
-            [](HRESULT, PCWSTR) -> HRESULT { return S_OK; }).Get());
+            [this](HRESULT, PCWSTR) -> HRESULT {
+                if (--pending_script_registrations == 0) FlushPendingNavigation();
+                return S_OK;
+            }).Get());
     webview->AddScriptToExecuteOnDocumentCreated(
-        WEBVIEW2_GAMEPAD_SCRIPT,
+        Utf8ToWide(WEB_BROWSER_GAMEPAD_SCRIPT).c_str(),
         Callback<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler>(
-            [](HRESULT, PCWSTR) -> HRESULT { return S_OK; }).Get());
+            [this](HRESULT, PCWSTR) -> HRESULT {
+                if (--pending_script_registrations == 0) FlushPendingNavigation();
+                return S_OK;
+            }).Get());
 }
 
 void WebView2View::SetUserAgent(UserAgent user_agent) {
@@ -175,62 +253,107 @@ void WebView2View::SetUserAgent(UserAgent user_agent) {
 }
 
 void WebView2View::LoadExtractedFonts() {
+    if (fonts_injected) {
+        // Already registered from an earlier call -- nothing new to wait on.
+        webview->Navigate(pending_url.c_str());
+        return;
+    }
+    fonts_injected = true;
+
     auto fonts_dir_str = Common::FS::PathToUTF8String(
         Common::FS::GetCitronPath(Common::FS::CitronPath::CacheDir) / "fonts/");
-    std::wstring fonts_dir(fonts_dir_str.begin(), fonts_dir_str.end());
+    std::wstring fonts_dir = Utf8ToWide(fonts_dir_str);
+
+    // QUrl::fromLocalFile produces a proper file:// URL (forward slashes,
+    // percent-encoded) instead of a raw Windows path. Windows paths have
+    // backslashes, which are meaningless in a CSS url() and -- since this gets
+    // substituted into a JS template literal below -- percent-encoding also
+    // protects against any backtick/${ in the path corrupting that literal.
+    auto FontUrl = [&](const wchar_t* filename) {
+        QString path = QString::fromStdWString(fonts_dir + filename);
+        return QUrl::fromLocalFile(path).toString().toStdWString();
+    };
 
     std::wstring css_source = SubstitutePlaceholders(
-        WEBVIEW2_NX_FONT_CSS, {fonts_dir + L"FontStandard.ttf", fonts_dir + L"FontChineseSimplified.ttf",
-                               fonts_dir + L"FontExtendedChineseSimplified.ttf",
-                               fonts_dir + L"FontChineseTraditional.ttf", fonts_dir + L"FontKorean.ttf",
-                               fonts_dir + L"FontNintendoExtended.ttf",
-                               fonts_dir + L"FontNintendoExtended2.ttf"});
+        Utf8ToWide(WEB_BROWSER_NX_FONT_CSS), {FontUrl(L"FontStandard.ttf"), FontUrl(L"FontChineseSimplified.ttf"),
+                               FontUrl(L"FontExtendedChineseSimplified.ttf"),
+                               FontUrl(L"FontChineseTraditional.ttf"), FontUrl(L"FontKorean.ttf"),
+                               FontUrl(L"FontNintendoExtended.ttf"), FontUrl(L"FontNintendoExtended2.ttf")});
 
-    // Wrap in a DOMContentLoaded listener to approximate Qt's DocumentReady timing,
-    // since AddScriptToExecuteOnDocumentCreated fires before the DOM exists.
-    std::wstring wrapped_css =
-        L"window.addEventListener('DOMContentLoaded', function() { "
-        L"var s = document.createElement('style'); s.textContent = \"" +
-        css_source + L"\"; document.head.appendChild(s); });";
+    // WEB_BROWSER_NX_FONT_CSS is already a complete self-invoking script (builds its
+    // own <style> tag via a JS template literal) -- inject as-is, no wrapping.
+    // Registration is async; Navigate() is deferred to this completion (see
+    // FlushPendingNavigation) so the first page load doesn't race ahead of it.
     webview->AddScriptToExecuteOnDocumentCreated(
-        wrapped_css.c_str(),
+        css_source.c_str(),
         Callback<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler>(
-            [](HRESULT, PCWSTR) -> HRESULT { return S_OK; }).Get());
+            [this](HRESULT, PCWSTR) -> HRESULT {
+                if (--pending_script_registrations == 0) {
+                    webview->Navigate(pending_url.c_str());
+                }
+                return S_OK;
+            }).Get());
 
-    // LOAD_NX_FONT runs via NavigationCompleted (see InitWebView2).
+    // LOAD_NX_FONT / FocusFirstLinkElement run via NavigationCompleted (see InitWebView2).
 }
 
 void WebView2View::FocusFirstLinkElement() {
-    EvaluateJavaScript(QString::fromStdWString(WEBVIEW2_FOCUS_LINK_ELEMENT_SCRIPT));
+    EvaluateJavaScript(QString::fromUtf8(WEB_BROWSER_FOCUS_LINK_ELEMENT_SCRIPT));
 }
 
 void WebView2View::LoadLocalWebPage(const std::string& main_url, const std::string& additional_args) {
     is_local = true;
-    LoadExtractedFonts();
-    SetUserAgent(UserAgent::WebApplet);
+    pending_user_agent = UserAgent::WebApplet; // applied in FlushPendingNavigation --
+                                               // SetUserAgent silently no-ops if
+                                               // called before webview exists
     SetFinished(false);
     SetExitReason(Service::AM::Frontend::WebExitReason::EndButtonPressed);
     SetLastURL("http://localhost/");
     StartInputThread();
 
-    if (!webview) return;
-    std::wstring wide_url(main_url.begin(), main_url.end());
-    std::wstring uri = L"file:///" + wide_url + std::wstring(additional_args.begin(), additional_args.end());
-    webview->Navigate(uri.c_str());
+    QString local_url = QUrl::fromLocalFile(QString::fromStdString(main_url)).toString() +
+                        QString::fromStdString(additional_args);
+    pending_url = local_url.toStdWString();
+    has_pending_navigation = true;
+    if (webview) {
+        FlushPendingNavigation();
+    }
 }
 
 void WebView2View::LoadExternalWebPage(const std::string& main_url, const std::string& additional_args) {
     is_local = false;
-    SetUserAgent(UserAgent::WebApplet);
+    pending_user_agent = UserAgent::WebApplet;
     SetFinished(false);
     SetExitReason(Service::AM::Frontend::WebExitReason::EndButtonPressed);
     SetLastURL("http://localhost/");
     StartInputThread();
 
-    if (!webview) return;
-    std::wstring uri(main_url.begin(), main_url.end());
-    uri += std::wstring(additional_args.begin(), additional_args.end());
-    webview->Navigate(uri.c_str());
+    pending_url = Utf8ToWide(main_url) + Utf8ToWide(additional_args);
+    has_pending_navigation = true;
+    if (webview) {
+        FlushPendingNavigation();
+    }
+}
+
+// Called immediately above if webview is already live, or from InitWebView2's
+// controller-creation handler if LoadLocalWebPage/LoadExternalWebPage ran
+// before the async WebView2 init finished (they'd otherwise be silently
+// dropped -- init is async, callers can't be expected to wait for it).
+void WebView2View::FlushPendingNavigation() {
+    if (!has_pending_navigation || !webview) return;
+    // Persistent scripts (window_nx/gamepad) not registered yet -- their own
+    // completion handlers call back in here once the counter hits 0
+    // (finding #11).
+    if (pending_script_registrations > 0) return;
+    has_pending_navigation = false;
+    SetUserAgent(pending_user_agent);
+    if (is_local) {
+        pending_script_registrations += 1;
+        LoadExtractedFonts(); // navigates from its own completion handler, or
+                              // immediately if the script was already registered
+    } else {
+        webview->Navigate(pending_url.c_str());
+    }
 }
 
 void WebView2View::EvaluateJavaScript(const QString& script, std::function<void(const QVariant&)> callback) {
@@ -239,8 +362,11 @@ void WebView2View::EvaluateJavaScript(const QString& script, std::function<void(
     webview->ExecuteScript(
         wscript.c_str(),
         Callback<ICoreWebView2ExecuteScriptCompletedHandler>(
-            [callback](HRESULT, PCWSTR result_json) -> HRESULT {
-                if (!callback) return S_OK;
+            // life guard: mirrors the environment/controller completion lambdas
+            // (finding #14/round 2) -- callback may itself capture `this`
+            // (finding #15).
+            [callback, life = alive](HRESULT, PCWSTR result_json) -> HRESULT {
+                if (!*life || !callback) return S_OK;
         // result_json is JSON-encoded (ExecuteScript contract) -- handles the
         // boolean/number/string cases the footer-callback check needs.
         QString result = QString::fromWCharArray(result_json ? result_json : L"null");
@@ -278,9 +404,9 @@ void WebView2View::SendKeyEvent(const std::wstring& key, const std::wstring& cod
     EvaluateJavaScript(QString::fromStdWString(script));
 }
 
-void WebView2View::hide() {
+void WebView2View::hideEvent(QHideEvent* event) {
     SetFinished(true);
-    QWidget::hide();
+    QWidget::hideEvent(event);
 }
 
 void WebView2View::StartInputThread() {
@@ -324,17 +450,20 @@ void WebView2View::InputThreadLoop() {
 
             const QString check_script =
                 QStringLiteral("citron_key_callbacks[%1] != null").arg(callback_index);
-            EvaluateJavaScript(check_script, [this, callback_index, fallback_key,
-                                              fallback_code](const QVariant& has_callback) {
-                if (has_callback.toBool()) {
-                    EvaluateJavaScript(
-                        QStringLiteral("citron_key_callbacks[%1]();").arg(callback_index));
-                } else if (fallback_key) {
-                    std::wstring upper_key(fallback_key);
-                    for (auto& c : upper_key) c = towupper(c);
-                    SendKeyEvent(fallback_key, upper_key, fallback_code);
-                }
-            });
+            QMetaObject::invokeMethod(this, [this, check_script, callback_index, fallback_key,
+                                             fallback_code] {
+                EvaluateJavaScript(check_script, [this, callback_index, fallback_key,
+                                                  fallback_code](const QVariant& has_callback) {
+                    if (has_callback.toBool()) {
+                        EvaluateJavaScript(
+                            QStringLiteral("citron_key_callbacks[%1]();").arg(callback_index));
+                    } else if (fallback_key) {
+                        std::wstring upper_key(fallback_key);
+                        for (auto& c : upper_key) c = towupper(c);
+                        SendKeyEvent(fallback_key, L"Key" + upper_key, fallback_code);
+                    }
+                });
+            }, Qt::QueuedConnection);
         }
 
         for (NpadButton button : {NpadButton::Left, NpadButton::Up, NpadButton::Right,
@@ -345,7 +474,9 @@ void WebView2View::InputThreadLoop() {
             if (pressed_once || held) {
                 const DomKey dom_key = HIDButtonToDomKey(button);
                 if (dom_key.key_code != 0) {
-                    SendKeyEvent(dom_key.key, dom_key.code, dom_key.key_code);
+                    QMetaObject::invokeMethod(this, [this, dom_key] {
+                        SendKeyEvent(dom_key.key, dom_key.code, dom_key.key_code);
+                    }, Qt::QueuedConnection);
                 }
             }
         }
@@ -366,7 +497,8 @@ void WebView2View::moveEvent(QMoveEvent* event) {
 
 void WebView2View::SyncBounds() {
     if (!controller) return;
-    RECT bounds{0, 0, width(), height()};
+    const qreal dpr = devicePixelRatioF();
+    RECT bounds{0, 0, static_cast<LONG>(width() * dpr), static_cast<LONG>(height() * dpr)};
     controller->put_Bounds(bounds);
 }
 
@@ -379,12 +511,19 @@ HRESULT WebView2View::OnWebMessageReceived(ICoreWebView2*, ICoreWebView2WebMessa
         if (FAILED(args->get_WebMessageAsJson(&json_raw))) {
             return S_OK;
         }
-        std::wstring json(json_raw.get());
-        // Check for the citron-owned control sentinel before treating as a page message.
-        if (json.find(L"__citron_control") != std::wstring::npos &&
-            json.find(L"endApplet") != std::wstring::npos) {
-            SetFinished(true);
-            SetExitReason(Service::AM::Frontend::WebExitReason::EndButtonPressed);
+        // Real JSON parse, not a substring check (finding #13) -- a page message
+        // could legitimately contain the literal text "__citron_control"/"endApplet"
+        // without being the control envelope.
+        QString json = QString::fromWCharArray(json_raw.get());
+        QJsonParseError parse_error;
+        QJsonDocument doc = QJsonDocument::fromJson(json.toUtf8(), &parse_error);
+        if (parse_error.error == QJsonParseError::NoError && doc.isObject()) {
+            QJsonObject obj = doc.object();
+            if (obj.value(QStringLiteral("__citron_control")).toString() ==
+                QStringLiteral("endApplet")) {
+                SetFinished(true);
+                SetExitReason(Service::AM::Frontend::WebExitReason::EndButtonPressed);
+            }
         }
         return S_OK;
     }
@@ -397,10 +536,13 @@ HRESULT WebView2View::OnNavigationStarting(ICoreWebView2*, ICoreWebView2Navigati
     wil::unique_cotaskmem_string uri;
     if (FAILED(args->get_Uri(&uri))) return E_FAIL;
     requested_url = QString::fromWCharArray(uri.get());
-    if (requested_url.contains(QStringLiteral("localhost"))) {
+    if (QUrl(requested_url).host() == QStringLiteral("localhost")) {
         SetFinished(true);
         SetExitReason(Service::AM::Frontend::WebExitReason::CallbackURL);
         SetLastURL(requested_url.toStdString());
+        // Citron-internal exit signal, not real content -- cancel rather than
+        // let WebView2 attempt a real connection right as the applet closes.
+        args->put_Cancel(TRUE);
     }
     return S_OK;
 }

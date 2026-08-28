@@ -62,8 +62,12 @@ class QtControllerSelectorDialog;
 class QtProfileSelectionDialog;
 class QtSoftwareKeyboardDialog;
 // web_applet's concrete type is chosen per build; the three backend defines are
-// mutually exclusive. Falls back to QtNXWebEngineView when none are set.
-#if defined(CITRON_USE_WEBKITGTK_WEB_ENGINE)
+// mutually exclusive. Order matches WebBrowserOpenWebPage's backend-selection
+// #if in main.cpp (finding #18) -- must resolve to the same concrete type.
+#if defined(CITRON_USE_QT_WEB_ENGINE)
+class QtNXWebEngineView;
+using ActiveWebEngineView = QtNXWebEngineView;
+#elif defined(CITRON_USE_WEBKITGTK_WEB_ENGINE)
 class WebKitGTKView;
 using ActiveWebEngineView = WebKitGTKView;
 #elif defined(CITRON_USE_WEBVIEW2_WEB_ENGINE)

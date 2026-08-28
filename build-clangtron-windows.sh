@@ -1960,10 +1960,17 @@ build_common_cmake_args() {
         "-DCITRON_USE_CPM=ON"
         "-DCITRON_CHECK_SUBMODULES=OFF"
         "-DCPM_SOURCE_CACHE=${CMAKE_CPM_CACHE}"
-        "-DCITRON_USE_QT_WEB_ENGINE=ON"
-        # WebView2 backend: left OFF; never compiled against the real SDK.
-        # Swap these two lines once that changes.
-        # "-DCITRON_USE_QT_WEB_ENGINE=OFF"
+        # This function is shared by every stage that calls it (see its own
+        # header comment), including the default llvm-mingw path -- QtWebEngine
+        # cannot build there at all (qt_download.cmake's own comment: "does not
+        # compile with MinGW"). Corrected from a 2-rounds-ago mistake: assumed
+        # this specific line was clang-cl-only without tracing whether the
+        # *function* itself was shared too. It is -- 6 call sites, and
+        # COMPILER_MODE defaults to llvm-mingw. The real clang-cl-only ON
+        # setting lives entirely separately, in the generated .cmd heredoc
+        # further down this file, untouched by this.
+        "-DCITRON_USE_QT_WEB_ENGINE=OFF"
+        # WebView2: left OFF here too; never compiled against the real SDK.
         # "-DCITRON_USE_WEBVIEW2_WEB_ENGINE=ON"
         "-Wno-dev"
     )
@@ -4767,10 +4774,11 @@ stage_clangcl() {
     local _clangcl_pgo_generate="OFF"
     local _clangcl_pgo_use="OFF"
 
-    # CITRON_USE_QT_WEB_ENGINE=ON below is unchanged. CITRON_USE_WEBVIEW2_WEB_ENGINE
-    # (see CMakeModules/webview_native_deps.cmake) is the replacement, left OFF here
-    # pending validation. To try it, edit the two flags in the heredoc below by hand
-    # (CITRON_USE_QT_WEB_ENGINE=OFF, CITRON_USE_WEBVIEW2_WEB_ENGINE=ON).
+    # All three build paths (Linux, llvm-mingw, clang-cl here) default
+    # CITRON_USE_QT_WEB_ENGINE off now -- no backend forced on by default
+    # anywhere until one of the replacements (WebKitGTK/WebView2) is actually
+    # validated. To try QtWebEngine here specifically (still the one backend
+    # that's genuinely known-working on this target), flip this one flag back.
     cat > "${build_dir}/build-clang-cl.cmd" <<CLANGCL_CMD_EOF
 @echo off
 setlocal
@@ -4788,7 +4796,7 @@ ${sccache_cmake_args}
   -DCITRON_USE_CPM=ON -DCITRON_USE_BUNDLED_VCPKG=OFF -DCITRON_CHECK_SUBMODULES=OFF ^
   -DCPM_SOURCE_CACHE="${cpm_win}" ^
   -DCITRON_CLANGCL=ON -DCITRON_USE_BUNDLED_QT=ON -DCITRON_USE_BUNDLED_FFMPEG=ON ^
-  -DCITRON_USE_QT_WEB_ENGINE=ON ^
+  -DCITRON_USE_QT_WEB_ENGINE=OFF ^
   -DBUILD_TESTING=OFF -DCITRON_TESTS=OFF -DCITRON_SHADER_TOOL=OFF ^
   -DCITRON_CRASH_DUMPS=OFF ^
   -DENABLE_UNITY_BUILD=${UNITY_BUILD} ^
@@ -4835,6 +4843,26 @@ if /I "${config}"=="RelWithDebInfo" (
 )
 if exist "${build_copy_win}\\bin\\${config}\\qt.conf" (
   copy /Y "${build_copy_win}\\bin\\${config}\\qt.conf" "${package_copy_win}\\qt.conf" >NUL
+  if errorlevel 1 exit /b 1
+)
+if exist "${build_copy_win}\\bin\\${config}\\QtWebEngineProcess.exe" (
+  copy /Y "${build_copy_win}\\bin\\${config}\\QtWebEngineProcess.exe" "${package_copy_win}\\QtWebEngineProcess.exe" >NUL
+  if errorlevel 1 exit /b 1
+)
+if exist "${build_copy_win}\\bin\\${config}\\icudtl.dat" (
+  copy /Y "${build_copy_win}\\bin\\${config}\\icudtl.dat" "${package_copy_win}\\icudtl.dat" >NUL
+  if errorlevel 1 exit /b 1
+)
+if exist "${build_copy_win}\\bin\\${config}\\*.pak" (
+  copy /Y "${build_copy_win}\\bin\\${config}\\*.pak" "${package_copy_win}\\" >NUL
+  if errorlevel 1 exit /b 1
+)
+if exist "${build_copy_win}\\bin\\${config}\\v8_context_snapshot*.bin" (
+  copy /Y "${build_copy_win}\\bin\\${config}\\v8_context_snapshot*.bin" "${package_copy_win}\\" >NUL
+  if errorlevel 1 exit /b 1
+)
+if exist "${build_copy_win}\\bin\\${config}\\qtwebengine_locales" (
+  xcopy /E /I /Y "${build_copy_win}\\bin\\${config}\\qtwebengine_locales" "${package_copy_win}\\qtwebengine_locales" >NUL
   if errorlevel 1 exit /b 1
 )
 for %%D in (iconengines imageformats platforms styles tls) do if exist "${build_copy_win}\\bin\\${config}\\%%D" (

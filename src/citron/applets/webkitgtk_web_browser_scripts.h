@@ -1,96 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2026 citron Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// All 5 scripts from qt_web_browser_scripts.h, byte-identical except for the two
-// mechanism changes in WEBKITGTK_NX_SCRIPT noted in that constant's comment below.
+// WEBKITGTK_NX_SCRIPT is the only backend-specific script here now -- the other
+// 4 (fonts, focus-link, gamepad) were byte-identical to the WebView2 copies and
+// live in web_browser_scripts_common.h instead.
 
 #pragma once
 
-constexpr char WEBKITGTK_NX_FONT_CSS[] = R"(
-(function() {
-    css = document.createElement('style');
-    css.type = 'text/css';
-    css.id = 'nx_font';
-    css.innerText = `
-/* FontStandard */
-@font-face {
-    font-family: 'FontStandard';
-    src: url('%1') format('truetype');
-}
-
-/* FontChineseSimplified */
-@font-face {
-    font-family: 'FontChineseSimplified';
-    src: url('%2') format('truetype');
-}
-
-/* FontExtendedChineseSimplified */
-@font-face {
-    font-family: 'FontExtendedChineseSimplified';
-    src: url('%3') format('truetype');
-}
-
-/* FontChineseTraditional */
-@font-face {
-    font-family: 'FontChineseTraditional';
-    src: url('%4') format('truetype');
-}
-
-/* FontKorean */
-@font-face {
-    font-family: 'FontKorean';
-    src: url('%5') format('truetype');
-}
-
-/* FontNintendoExtended */
-@font-face {
-    font-family: 'NintendoExt003';
-    src: url('%6') format('truetype');
-}
-
-/* FontNintendoExtended2 */
-@font-face {
-    font-family: 'NintendoExt003';
-    src: url('%7') format('truetype');
-}
-`;
-
-    document.head.appendChild(css);
-})();
-)";
-
-constexpr char WEBKITGTK_LOAD_NX_FONT[] = R"(
-(function() {
-    var elements = document.querySelectorAll("*");
-
-    for (var i = 0; i < elements.length; i++) {
-        var style = window.getComputedStyle(elements[i], null);
-        if (style.fontFamily.includes("Arial") || style.fontFamily.includes("Calibri") ||
-            style.fontFamily.includes("Century") || style.fontFamily.includes("Times New Roman")) {
-            elements[i].style.fontFamily = "FontStandard, FontChineseSimplified, FontExtendedChineseSimplified, FontChineseTraditional, FontKorean, NintendoExt003";
-        } else {
-            elements[i].style.fontFamily = style.fontFamily + ", FontStandard, FontChineseSimplified, FontExtendedChineseSimplified, FontChineseTraditional, FontKorean, NintendoExt003";
-        }
-    }
-})();
-)";
-
-constexpr char WEBKITGTK_FOCUS_LINK_ELEMENT_SCRIPT[] = R"(
-if (document.getElementsByTagName("a").length > 0) {
-    document.getElementsByTagName("a")[0].focus();
-}
-)";
-
-constexpr char WEBKITGTK_GAMEPAD_SCRIPT[] = R"(
-window.addEventListener("gamepadconnected", function(e) {
-    console.log("Gamepad connected at index %d: %s. %d buttons, %d axes.",
-        e.gamepad.index, e.gamepad.id, e.gamepad.buttons.length, e.gamepad.axes.length);
-});
-
-window.addEventListener("gamepaddisconnected", function(e) {
-    console.log("Gamepad disconnected from index %d: %s", e.gamepad.index, e.gamepad.id);
-});
-)";
+#include "citron/applets/web_browser_scripts_common.h"
 
 constexpr char WEBKITGTK_NX_SCRIPT[] = R"(
 // Ported from WINDOW_NX_SCRIPT (qt_web_browser_scripts.h). Two mechanism changes
@@ -122,7 +39,11 @@ var citron_key_callbacks = [];
         endApplet() {
             console.log("nx.endApplet called");
 
-            window.webkit.messageHandlers.nxControl.postMessage(JSON.stringify({event: "endApplet"}));
+            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.nxControl) {
+                window.webkit.messageHandlers.nxControl.postMessage(JSON.stringify({event: "endApplet"}));
+            } else {
+                console.log("nx.endApplet: nxControl message handler not registered, dropping");
+            }
         }
 
         playSystemSe(system_se) {
@@ -132,7 +53,11 @@ var citron_key_callbacks = [];
         sendMessage(message) {
             console.log("nx.sendMessage called, message=%s", message);
 
-            window.webkit.messageHandlers.nxMessage.postMessage(message);
+            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.nxMessage) {
+                window.webkit.messageHandlers.nxMessage.postMessage(typeof message === "string" ? message : JSON.stringify(message));
+            } else {
+                console.log("nx.sendMessage: nxMessage message handler not registered, dropping");
+            }
         }
 
         setCursorScrollSpeed(scroll_speed) {

@@ -170,9 +170,9 @@ _set_derived_paths() {
     BUILD_BOLT="${BUILD_ROOT}/bolt"
     PROFILE_DIR="${BUILD_ROOT}/pgo-profiles"
     BOLT_PROFILE_DIR="${BUILD_ROOT}/bolt-profiles"
-        # Build-local directory for tools this script installs (e.g. BOLT binaries).
-        # Never writes to /usr or /usr/local; safe to run without sudo.
-        BUILD_TOOLS_BIN="${BUILD_ROOT}/tools/bin"
+    # Build-local directory for tools this script installs (e.g. BOLT binaries).
+    # Never writes to /usr or /usr/local; safe to run without sudo.
+    BUILD_TOOLS_BIN="${BUILD_ROOT}/tools/bin"
     BUILD_TOOLS_LIB="${BUILD_ROOT}/tools/lib"
     PATH="${BUILD_TOOLS_BIN}:${PATH}"
 }

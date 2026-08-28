@@ -163,7 +163,7 @@ else()
         # Fresh install: request base and all additional modules in a single aqt
         # invocation. A separate modules-only follow-up call has been observed to
         # fail after a cache wipe even with correct argv.
-                message(STATUS "[Qt] Downloading Qt ${CITRON_QT_VERSION} ${_QT_ARCH} via aqt (modules: ${_QT_ADDL_MODULES})...")
+        message(STATUS "[Qt] Downloading Qt ${CITRON_QT_VERSION} ${_QT_ARCH} via aqt (modules: ${_QT_ADDL_MODULES})...")
         file(MAKE_DIRECTORY "${CITRON_QT_BASE_DIR}")
 
         execute_process(
@@ -181,25 +181,32 @@ else()
             # A WARNING leaves Qt6_DIR unset, allowing a later find_package to silently
             # pick up whatever Qt6 is on CMAKE_PREFIX_PATH (e.g. MSYS2's Qt), producing
             # a link failure hundreds of steps later instead of a clear configure error.
-                        message(FATAL_ERROR
+            message(FATAL_ERROR
                 "[Qt] aqt install failed (exit ${_qt_result}): ${_qt_error}\n"
                 "     Pass -DQt6_DIR=... manually or ensure aqt is installed.")
         endif()
         message(STATUS "[Qt] Qt ${CITRON_QT_VERSION} target and additional modules downloaded")
     else()
-        # Base already present (existing build dir, or Qt6_DIR pointed here
-        # from an earlier configure — see the aqt-managed check above).
-        # webengine is the only entry in _QT_ADDL_MODULES that's still a real
-        # addon module aqt can top up after the fact (svg/tools ship with the
-        # base install — see notes above, so there's nothing to top up there).
+        # Check each additional module independently -- gating this whole block on
+        # webengine's marker alone meant a missing qtimageformats (webengine already
+        # present, or CITRON_USE_QT_WEB_ENGINE off entirely) never got repaired.
+        set(_qt_missing_modules "")
+        file(GLOB _qt_imageformats_files "${_QT_TARGET_DIR}/plugins/imageformats/*")
+        if (NOT _qt_imageformats_files)
+            list(APPEND _qt_missing_modules qtimageformats)
+        endif()
         if (CITRON_USE_QT_WEB_ENGINE AND _QT_WEBENGINE_SUPPORTED AND NOT EXISTS "${_QT_WEBENGINE_CMAKE}")
-            message(STATUS "[Qt] Downloading Qt ${CITRON_QT_VERSION} additional modules (${_QT_ADDL_MODULES})...")
+            list(APPEND _qt_missing_modules qtwebengine qtpositioning qtwebchannel)
+        endif()
+
+        if (_qt_missing_modules)
+            message(STATUS "[Qt] Downloading Qt ${CITRON_QT_VERSION} additional modules (${_qt_missing_modules})...")
             execute_process(
                 COMMAND ${_AQT_EXECUTABLE} install-qt
                         ${_QT_OS} ${_QT_TARGET}
                         ${CITRON_QT_VERSION} ${_QT_ARCH}
                         --outputdir "${CITRON_QT_BASE_DIR}"
-                        --modules ${_QT_ADDL_MODULES}
+                        --modules ${_qt_missing_modules}
                 RESULT_VARIABLE _qt_addl_result
                 OUTPUT_VARIABLE _qt_addl_output
                 ERROR_VARIABLE  _qt_addl_error
@@ -207,7 +214,7 @@ else()
             if (NOT _qt_addl_result EQUAL 0)
                 message(WARNING
                     "[Qt] Additional module install failed (exit ${_qt_addl_result}) for "
-                    "(${_QT_ADDL_MODULES}): ${_qt_addl_error}\n"
+                    "(${_qt_missing_modules}): ${_qt_addl_error}\n"
                     "     Build may fail on missing Qt components.")
             endif()
         endif()

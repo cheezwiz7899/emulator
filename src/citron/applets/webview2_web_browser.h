@@ -68,14 +68,15 @@ public:
     void EvaluateJavaScript(const QString& script, std::function<void(const QVariant&)> callback = {});
     void SetPageZoomFactor(qreal factor);
 
-    void hide();
-
 protected:
+    void hideEvent(QHideEvent* event) override;
     void resizeEvent(QResizeEvent* event) override;
     void moveEvent(QMoveEvent* event) override;
 
 private:
     void InitWebView2();
+    void FlushPendingNavigation(); // runs a Load*WebPage request queued before
+                                   // webview finished initializing
     void SyncBounds();
     void SetUserAgent(UserAgent user_agent);
     void LoadExtractedFonts();
@@ -107,10 +108,16 @@ private:
     std::atomic<bool> input_thread_running{};
 
     bool is_local = false;
+    bool fonts_injected = false;
+    int pending_script_registrations = 0;
+    UserAgent pending_user_agent = UserAgent::WebApplet;
+    std::shared_ptr<bool> alive = std::make_shared<bool>(true);
     std::atomic<bool> finished{false};
     Service::AM::Frontend::WebExitReason exit_reason{};
     std::string last_url;
     QString requested_url;
+    std::wstring pending_url;
+    bool has_pending_navigation = false;
 };
 
 #endif // CITRON_USE_WEBVIEW2_WEB_ENGINE

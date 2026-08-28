@@ -971,6 +971,14 @@ void GMainWindow::WebBrowserOpenWebPage(const std::string& main_url,
 #if defined(CITRON_USE_QT_WEB_ENGINE)
     bool exit_check = false;
     bool interactive_poll_pending = false;
+    // runJavaScript callbacks are async and can fire after this function has
+    // already returned (e.g. loop exits mid-flight). The capture is [&,
+    // session_active]: exit_check/interactive_poll_pending are still captured
+    // by reference, but session_active is a shared_ptr copy (captured by
+    // value) that outlives this frame -- the `*session_active` guard inside
+    // each callback is what stops a late callback from touching the
+    // by-reference captures after this function has returned (finding #17).
+    auto session_active = std::make_shared<bool>(true);
 #endif
 
     // TODO (Morph): Remove this
@@ -995,7 +1003,8 @@ void GMainWindow::WebBrowserOpenWebPage(const std::string& main_url,
 #if defined(CITRON_USE_QT_WEB_ENGINE)
         if (!exit_check) {
             web_applet->page()->runJavaScript(
-                QStringLiteral("end_applet;"), [&](const QVariant& variant) {
+                QStringLiteral("end_applet;"), [&, session_active](const QVariant& variant) {
+                    if (!*session_active) return;
                     exit_check = false;
                     if (variant.toBool()) {
                         web_applet->SetFinished(true);
@@ -1015,7 +1024,8 @@ void GMainWindow::WebBrowserOpenWebPage(const std::string& main_url,
             web_applet->page()->runJavaScript(
                 QStringLiteral("(function() { var m = citron_outgoing_messages; "
                                "citron_outgoing_messages = []; return m; })();"),
-                [&](const QVariant& variant) {
+                [&, session_active](const QVariant& variant) {
+                    if (!*session_active) return;
                     interactive_poll_pending = false;
                     for (const auto& entry : variant.toList()) {
                         emit WebBrowserInteractiveDataReceived(entry.toString().toStdString());
@@ -1031,15 +1041,23 @@ void GMainWindow::WebBrowserOpenWebPage(const std::string& main_url,
 
             web_applet->SetLastURL(web_applet->GetCurrentURL().toStdString());
         }
+#elif defined(CITRON_USE_WEBKITGTK_WEB_ENGINE)
+        // GTK/WebKit signal callbacks (script-message-received, decide-policy,
+        // close) are only dispatched when the GLib main context is iterated --
+        // nothing else in this process does that. IsFinished()/GetExitReason()/
+        // GetLastURL() are otherwise already current, no polling needed beyond this.
+        WebKitGTKView::PumpGLibMainContext();
 #else
-        // WebKitGTK/WebView2: end_applet and citron_outgoing_messages are replaced
-        // by push-based handlers (OnNxControl/OnNxMessage, OnNavigationStarting).
-        // IsFinished()/GetExitReason()/GetLastURL() are already current; this loop
-        // only needs to pump the Qt event loop while modal-waiting.
+        // WebView2: push-based via native COM events, no extra pumping needed --
+        // IsFinished()/GetExitReason()/GetLastURL() are already current.
 #endif
 
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+
+#if defined(CITRON_USE_QT_WEB_ENGINE)
+    *session_active = false;
+#endif
 
     const auto exit_reason = web_applet->GetExitReason();
     const auto last_url = web_applet->GetLastURL();

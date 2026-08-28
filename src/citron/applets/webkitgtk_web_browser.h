@@ -23,6 +23,7 @@ typedef struct _WebKitWebView WebKitWebView;
 typedef struct _WebKitUserContentManager WebKitUserContentManager;
 typedef struct _WebKitJavascriptResult WebKitJavascriptResult;
 typedef struct _WebKitPolicyDecision WebKitPolicyDecision;
+typedef struct _GCancellable GCancellable;
 typedef void* gpointer;
 }
 #endif
@@ -81,7 +82,15 @@ public:
                             std::function<void(const QVariant&)> callback = {});
     void SetPageZoomFactor(qreal factor);
 
-    void hide();
+    // Pumps the default GLib main context so GTK/WebKit signal callbacks
+    // (script-message-received, decide-policy, close) actually get dispatched --
+    // called from GMainWindow's modal loop while a page is open. A plain function
+    // instead of exposing g_main_context_iteration directly, so main.cpp doesn't
+    // need glib.h (same signals/slots collision as gtk.h/webkit2.h).
+    static void PumpGLibMainContext();
+
+protected:
+    void hideEvent(QHideEvent* event) override;
 
 private:
     void SetUserAgent(UserAgent user_agent);
@@ -110,6 +119,7 @@ private:
     GMainWindow& main_window;
     GtkWidget* gtk_window = nullptr; // set by Embed() or FallbackToTopLevelWindow()
     WebKitWebView* webview = nullptr;
+    GCancellable* cancellable = nullptr;
     QWidget* container = nullptr; // createWindowContainer() result, X11 path only
 
     Core::System& system;
@@ -119,6 +129,9 @@ private:
     std::atomic<bool> input_thread_running{};
 
     bool is_local = false;
+    bool init_failed = false;
+    bool fonts_injected = false;
+    bool focus_script_injected = false;
     std::atomic<bool> finished{false};
     Service::AM::Frontend::WebExitReason exit_reason{};
     std::string last_url;

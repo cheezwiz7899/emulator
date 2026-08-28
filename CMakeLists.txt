@@ -93,6 +93,13 @@ if ((CITRON_USE_QT_WEB_ENGINE AND CITRON_USE_WEBKITGTK_WEB_ENGINE) OR
                         "one web-browser-applet backend can be compiled in per build.")
 endif()
 
+if (CITRON_USE_WEBKITGTK_WEB_ENGINE AND NOT (UNIX AND NOT APPLE))
+    message(FATAL_ERROR "CITRON_USE_WEBKITGTK_WEB_ENGINE is Linux-only.")
+endif()
+if (CITRON_USE_WEBVIEW2_WEB_ENGINE AND NOT WIN32)
+    message(FATAL_ERROR "CITRON_USE_WEBVIEW2_WEB_ENGINE is Windows-only.")
+endif()
+
 option(ENABLE_UNITY_BUILD "Enables the unity build" OFF)
 
 option(ENABLE_CUBEB "Enables the cubeb audio backend" ON)
@@ -388,6 +395,16 @@ if (CITRON_USE_CPM)
     option(CPM_USE_LOCAL_PACKAGES "Prefer system find_package over CPM fetch" OFF)
     include(${CMAKE_SOURCE_DIR}/CMakeModules/CPM.cmake)
     include(${CMAKE_SOURCE_DIR}/CMakeModules/dependencies.cmake)
+endif()
+
+# Not nested in the CITRON_USE_CPM block above: WebKitGTK's dependency is
+# pkg-config, a system-library lookup with no CPM involvement at all. Gating it
+# on CITRON_USE_CPM meant a plain native Linux build (no clangtron/CPM pipeline)
+# with CITRON_USE_WEBKITGTK_WEB_ENGINE=ON would never run the pkg_check_modules
+# call in this file, then fail later on an undefined PkgConfig::WEBKITGTK target.
+# wil/WebView2 (the two sections in this file that DO need CPM) still check
+# CITRON_USE_CPM themselves, individually, inside the file.
+if (CITRON_USE_WEBKITGTK_WEB_ENGINE OR CITRON_USE_WEBVIEW2_WEB_ENGINE)
     include(${CMAKE_SOURCE_DIR}/CMakeModules/webview_native_deps.cmake)
 endif()
 

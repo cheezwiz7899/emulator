@@ -4,19 +4,28 @@
 # CMakeModules/webview_native_deps.cmake — dependencies for the native web-browser
 # applet backends (WebKitGTK/Linux, WebView2/Windows).
 #
-# Called from CMakeModules/dependencies.cmake when CITRON_USE_CPM=ON.
+# Included from CMakeLists.txt whenever either backend option is on -- NOT
+# nested inside the CITRON_USE_CPM block. WebKitGTK's dependency (pkg-config)
+# has no CPM involvement at all; wil/WebView2 below check CITRON_USE_CPM
+# themselves, individually, since CPMAddPackage isn't defined without it.
 #
 # WebKitGTK is a deliberate exception to this project's CPM-first dependency
 # policy: it's a full browser engine with a large dependency graph and is not
 # reasonable to source-build as a CPM sub-project. It comes from the system
-# package manager via pkg-config. wil and WebView2 are fetched via CPM as normal.
+# package manager via pkg-config. wil and WebView2 are fetched via CPM.
+
+if (WIN32 AND CITRON_USE_WEBVIEW2_WEB_ENGINE AND NOT CITRON_USE_CPM)
+    message(FATAL_ERROR "CITRON_USE_WEBVIEW2_WEB_ENGINE needs wil + the WebView2 SDK, "
+                        "both fetched via CPM (CITRON_USE_CPM=ON) — no non-CPM path "
+                        "for these two is implemented.")
+endif()
 
 # ── wil (Windows Implementation Library) ───────────────────────────────────────
 # Needed by webview2_web_browser.cpp for wil::com_ptr / wil::unique_cotaskmem_string.
 # Checked before drafting that file: grepped the repo for existing wil::/WRL::
 # usage — zero hits, this is a genuinely new dependency, not already vendored
 # under a different name.
-if (WIN32 AND CITRON_USE_WEBVIEW2_WEB_ENGINE)
+if (WIN32 AND CITRON_USE_WEBVIEW2_WEB_ENGINE AND CITRON_USE_CPM)
     if (NOT TARGET WIL::WIL)
         CPMAddPackage(
             NAME wil
@@ -33,7 +42,7 @@ endif()
 #
 # NOTE: the URL/version/layout below has not been verified against a real extracted
 # package. Confirm before relying on it.
-if (WIN32 AND CITRON_USE_WEBVIEW2_WEB_ENGINE)
+if (WIN32 AND CITRON_USE_WEBVIEW2_WEB_ENGINE AND CITRON_USE_CPM)
     if (NOT TARGET WebView2::WebView2)
         CPMAddPackage(
             NAME WebView2

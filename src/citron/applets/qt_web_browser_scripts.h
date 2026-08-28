@@ -123,7 +123,7 @@ var citron_outgoing_messages = [];
         sendMessage(message) {
             console.log("nx.sendMessage called, message=%s", message);
 
-            citron_outgoing_messages.push(message);
+            citron_outgoing_messages.push(typeof message === "string" ? message : JSON.stringify(message));
         }
 
         setCursorScrollSpeed(scroll_speed) {
