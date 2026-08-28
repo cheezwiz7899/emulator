@@ -22,12 +22,12 @@
 
 EmuWindow_SDL3::EmuWindow_SDL3(InputCommon::InputSubsystem* input_subsystem_, Core::System& system_)
     : input_subsystem{input_subsystem_}, system{system_} {
+    SDL_SetMainReady();
     input_subsystem->Initialize();
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD)) {
         LOG_CRITICAL(Frontend, "Failed to initialize SDL3: {}, Exiting...", SDL_GetError());
         exit(1);
     }
-    SDL_SetMainReady();
 }
 
 EmuWindow_SDL3::~EmuWindow_SDL3() {

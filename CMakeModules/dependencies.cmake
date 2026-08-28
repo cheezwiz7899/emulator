@@ -434,9 +434,23 @@ if (CITRON_USE_EXTERNAL_SDL3 AND NOT TARGET SDL3::SDL3)
         endif()
     endif()
 
+endif()
+
+# SDL3 may have been created above or supplied by an earlier dependency.
+set(CITRON_SDL_RUNTIME_TARGET "")
+if (TARGET SDL3-shared)
+    set(CITRON_SDL_RUNTIME_TARGET SDL3-shared)
+elseif (TARGET SDL3::SDL3)
+    get_target_property(_citron_sdl3_type SDL3::SDL3 TYPE)
+    if (_citron_sdl3_type STREQUAL "SHARED_LIBRARY")
+        set(CITRON_SDL_RUNTIME_TARGET SDL3::SDL3)
+    endif()
+endif()
+
+if (CITRON_SDL_RUNTIME_TARGET)
     file(GENERATE
         OUTPUT "${CMAKE_BINARY_DIR}/citron-sdl-runtime-libs-$<CONFIG>.txt"
-        CONTENT "$<TARGET_FILE:SDL3::SDL3-shared>\n"
+        CONTENT "$<TARGET_FILE:${CITRON_SDL_RUNTIME_TARGET}>\n"
     )
 endif()
 
@@ -444,21 +458,25 @@ endif()
 # On Windows CPM builds: copies SDL3.dll next to <target> after build.
 # On Linux, place the shared library in the target's $ORIGIN/lib directory.
 function(copy_citron_sdl_runtime target)
-    if (WIN32 AND CITRON_USE_EXTERNAL_SDL3 AND TARGET SDL3-shared)
-        add_dependencies(${target} SDL3-shared)
+    if (WIN32 AND CITRON_USE_EXTERNAL_SDL3 AND CITRON_SDL_RUNTIME_TARGET)
+        if (TARGET SDL3-shared)
+            add_dependencies(${target} SDL3-shared)
+        endif()
         add_custom_command(TARGET ${target} POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "$<TARGET_FILE:SDL3::SDL3-shared>" "$<TARGET_FILE_DIR:${target}>"
+                "$<TARGET_FILE:${CITRON_SDL_RUNTIME_TARGET}>" "$<TARGET_FILE_DIR:${target}>"
             COMMENT "Deploying SDL3 for ${target}"
             VERBATIM
         )
-    elseif (UNIX AND NOT APPLE AND CITRON_USE_EXTERNAL_SDL3 AND TARGET SDL3-shared)
-        add_dependencies(${target} SDL3-shared)
+    elseif (UNIX AND NOT APPLE AND CITRON_USE_EXTERNAL_SDL3 AND CITRON_SDL_RUNTIME_TARGET)
+        if (TARGET SDL3-shared)
+            add_dependencies(${target} SDL3-shared)
+        endif()
         add_custom_command(TARGET ${target} POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E make_directory
                 "$<TARGET_FILE_DIR:${target}>/lib"
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "$<TARGET_SONAME_FILE:SDL3::SDL3-shared>" "$<TARGET_FILE_DIR:${target}>/lib"
+                "$<TARGET_SONAME_FILE:${CITRON_SDL_RUNTIME_TARGET}>" "$<TARGET_FILE_DIR:${target}>/lib"
             COMMENT "Deploying SDL3 for ${target} (\$ORIGIN/lib)"
             VERBATIM
         )

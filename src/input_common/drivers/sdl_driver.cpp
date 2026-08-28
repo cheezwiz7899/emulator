@@ -180,7 +180,7 @@ public:
         }
 
         motion_error_count = 0;
-        motion.delta_timestamp = time_difference * 1000;
+        motion.delta_timestamp = time_difference / 1000;
         return true;
     }
 

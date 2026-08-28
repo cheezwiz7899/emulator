@@ -25,6 +25,10 @@ EmuWindow_SDL3_VK::EmuWindow_SDL3_VK(InputCommon::InputSubsystem* input_subsyste
         SDL_CreateWindow(window_title.c_str(), Layout::ScreenUndocked::Width,
                          Layout::ScreenUndocked::Height,
                          SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    if (render_window == nullptr) {
+        LOG_CRITICAL(Frontend, "Failed to create SDL3 window: {}", SDL_GetError());
+        std::exit(EXIT_FAILURE);
+    }
 
     // SDL3 exposes native window handles through properties.
     const SDL_PropertiesID props = SDL_GetWindowProperties(render_window);
@@ -47,7 +51,8 @@ EmuWindow_SDL3_VK::EmuWindow_SDL3_VK(InputCommon::InputSubsystem* input_subsyste
         window_info.render_surface = hwnd;
         wm_resolved = true;
     }
-#elif defined(SDL_PLATFORM_LINUX)
+#elif defined(SDL_PLATFORM_LINUX) || defined(SDL_PLATFORM_FREEBSD) || \
+    defined(SDL_PLATFORM_NETBSD) || defined(SDL_PLATFORM_OPENBSD)
     // SDL3 can use either X11 or Wayland at runtime.
     const char* video_driver = SDL_GetCurrentVideoDriver();
     if (video_driver && std::strcmp(video_driver, "x11") == 0) {
