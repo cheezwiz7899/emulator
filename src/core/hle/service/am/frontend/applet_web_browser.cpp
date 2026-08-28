@@ -306,10 +306,6 @@ Result WebBrowser::GetStatus() const {
 }
 
 void WebBrowser::ExecuteInteractive() {
-    // The guest (e.g. ARCropolis's native code replying to a "GetModSize" request sent from its
-    // page's JS via window.nx.sendMessage) is pushing data into the still-open applet. Forward it
-    // to the frontend so it can be delivered into the page as a "message" event, mirroring the
-    // same window.nx.addEventListener("message", ...) bridge real hardware exposes.
     const auto storage = PopInteractiveInData();
 
     if (!storage) {
@@ -318,7 +314,60 @@ void WebBrowser::ExecuteInteractive() {
     }
 
     const auto& data = storage->GetData();
-    frontend.SendInteractiveData(std::string(data.begin(), data.end()));
+    if (!web_session_enabled) {
+        LOG_WARNING(Service_AM,
+                    "Ignoring interactive web data for an applet without WebSessionEnabled");
+        return;
+    }
+
+    if (data.size() < sizeof(WebSessionMessageHeader)) {
+        LOG_WARNING(Service_AM, "Ignoring undersized WebSession message ({} bytes)", data.size());
+        return;
+    }
+
+    WebSessionMessageHeader header;
+    std::memcpy(&header, data.data(), sizeof(header));
+    if (header.size + sizeof(header) != data.size()) {
+        LOG_WARNING(Service_AM,
+                    "Ignoring malformed WebSession message: kind={:#x}, payload_size={}, "
+                    "storage_size={}",
+                    header.kind, header.size, data.size());
+        return;
+    }
+
+    const auto send_ack = [this, storage_size = static_cast<u32>(data.size())](
+                              WebSessionReceiveMessageKind kind) {
+        std::vector<u8> ack_data(sizeof(WebSessionMessageHeader) + 0xC);
+        WebSessionMessageHeader ack_header;
+        ack_header.kind = static_cast<u32>(kind);
+        ack_header.size = 0xC;
+        std::memcpy(ack_data.data(), &ack_header, sizeof(ack_header));
+        std::memcpy(ack_data.data() + sizeof(ack_header), &storage_size, sizeof(storage_size));
+        PushInteractiveOutData(std::make_shared<IStorage>(system, std::move(ack_data)));
+    };
+
+    switch (static_cast<WebSessionSendMessageKind>(header.kind)) {
+    case WebSessionSendMessageKind::BrowserEngineContent: {
+        std::string payload(data.begin() + sizeof(header), data.end());
+        if (!payload.empty() && payload.back() == '\0') {
+            payload.pop_back();
+        }
+        frontend.SendInteractiveData(std::move(payload));
+        send_ack(WebSessionReceiveMessageKind::AckBrowserEngine);
+        break;
+    }
+    case WebSessionSendMessageKind::SystemMessageAppear:
+        // The frontend has already been opened by ExecuteOffline. Acknowledge the request so the
+        // guest can continue its session startup instead of waiting for the hardware web applet.
+        send_ack(WebSessionReceiveMessageKind::AckSystemMessage);
+        break;
+    case WebSessionSendMessageKind::Ack:
+        // This is an acknowledgement for a browser-to-guest message and needs no frontend work.
+        break;
+    default:
+        LOG_WARNING(Service_AM, "Ignoring unknown WebSession message kind {:#x}", header.kind);
+        break;
+    }
 }
 
 void WebBrowser::Execute() {
@@ -430,6 +479,11 @@ void WebBrowser::InitializeShop() {}
 void WebBrowser::InitializeLogin() {}
 
 void WebBrowser::InitializeOffline() {
+    if (const auto session_flag = GetInputTLVData(WebArgInputTLVType::WebSessionEnabled);
+        session_flag.has_value()) {
+        web_session_enabled = !session_flag->empty() && session_flag->front() != 0;
+    }
+
     const auto document_path =
         ParseStringValue(GetInputTLVData(WebArgInputTLVType::DocumentPath).value());
 
@@ -467,6 +521,8 @@ void WebBrowser::InitializeOffline() {
 
     offline_document = Common::FS::ConcatPathSafe(
         offline_cache_dir, fmt::format("{}/{}", additional_paths, document_path));
+
+    LOG_INFO(Service_AM, "Offline web session enabled: {}", web_session_enabled);
 
     // On hardware, manual_html is a LayeredFS overlay: files supplied by a mod replace matching
     // files from the title's HtmlDocument, while all other files continue to come from the base
@@ -554,7 +610,21 @@ void WebBrowser::ExecuteOffline() {
             WebBrowserExit(exit_reason, last_url);
         },
         [this](std::string data) {
-            std::vector<u8> out_data(data.begin(), data.end());
+            if (!web_session_enabled) {
+                LOG_WARNING(Service_AM,
+                            "Ignoring page message for an applet without WebSessionEnabled");
+                return;
+            }
+
+            // WebSession content must be framed and NUL-terminated. The NNSDK client replaces
+            // the last byte with a terminator when receiving it, so omitting it would truncate
+            // the page's final character.
+            WebSessionMessageHeader header;
+            header.kind = static_cast<u32>(WebSessionReceiveMessageKind::BrowserEngineContent);
+            header.size = static_cast<u32>(data.size() + 1);
+            std::vector<u8> out_data(sizeof(header) + header.size);
+            std::memcpy(out_data.data(), &header, sizeof(header));
+            std::memcpy(out_data.data() + sizeof(header), data.data(), data.size());
             PushInteractiveOutData(std::make_shared<IStorage>(system, std::move(out_data)));
         });
 }

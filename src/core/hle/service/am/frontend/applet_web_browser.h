@@ -78,6 +78,8 @@ private:
     std::filesystem::path offline_document;
     FileSys::VirtualFile offline_romfs;
 
+    bool web_session_enabled{};
+
     std::string external_url;
 };
 
