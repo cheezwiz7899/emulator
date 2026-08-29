@@ -992,7 +992,9 @@ void GMainWindow::WebBrowserOpenWebPage(const std::string& main_url,
             QMessageBox::Yes | QMessageBox::No);
         if (result == QMessageBox::Yes) {
             Settings::values.disable_web_applet = true;
-            web_applet->SetFinished(true);
+            if (web_applet) {
+                web_applet->SetFinished(true);
+            }
         }
     });
     ui->menubar->addAction(exit_action);
@@ -1022,7 +1024,8 @@ void GMainWindow::WebBrowserOpenWebPage(const std::string& main_url,
         if (!interactive_poll_pending) {
             interactive_poll_pending = true;
             web_applet->page()->runJavaScript(
-                QStringLiteral("(function() { var m = citron_outgoing_messages; "
+                QStringLiteral("(function() { var m = typeof citron_outgoing_messages === "
+                               "'undefined' ? [] : citron_outgoing_messages; "
                                "citron_outgoing_messages = []; return m; })();"),
                 [&, session_active](const QVariant& variant) {
                     if (!*session_active) return;

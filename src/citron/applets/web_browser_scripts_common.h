@@ -239,6 +239,9 @@ constexpr char WEB_BROWSER_FOCUS_LINK_ELEMENT_SCRIPT[] = R"(
                 ? configured.directions[event.keyCode] : undefined;
             var keyCode = mapped !== undefined ? mapped : event.keyCode;
             if (keyCode !== 37 && keyCode !== 38 && keyCode !== 39 && keyCode !== 40) return;
+            var target = event.target;
+            if (target && (target.isContentEditable ||
+                           /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))) return;
             event.preventDefault();
             event.stopImmediatePropagation();
             moveFocus(keyCode === 37 || keyCode === 38 ? -1 : 1);

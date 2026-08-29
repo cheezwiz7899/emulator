@@ -792,7 +792,7 @@ void WebView2View::InputThreadLoop() {
             if (!input_interpreter->IsButtonPressedOnce(button))
                 continue;
 
-            LOG_WARNING(Frontend, "[Web input diagnostic] WebView2 observed controller button {:#x}",
+            LOG_DEBUG(Frontend, "[Web input diagnostic] WebView2 observed controller button {:#x}",
                         static_cast<u64>(button));
 
             int callback_index = -1;
@@ -858,7 +858,7 @@ void WebView2View::InputThreadLoop() {
                 const DomKey dom_key = HIDButtonToDomKey(button);
                 if (dom_key.key_code != 0) {
                     if (pressed_once) {
-                        LOG_WARNING(Frontend,
+                        LOG_DEBUG(Frontend,
                                     "[Web input diagnostic] WebView2 observed direction {:#x}",
                                     static_cast<u64>(button));
                     }
@@ -903,10 +903,10 @@ void WebView2View::FocusWebView() {
 
 HRESULT WebView2View::OnWebMessageReceived(ICoreWebView2*,
                                            ICoreWebView2WebMessageReceivedEventArgs* args) {
-    LOG_WARNING(Frontend, "[WebSession diagnostic] WebView2 message event received");
+    LOG_DEBUG(Frontend, "[WebSession diagnostic] WebView2 message event received");
 
     const auto forward_message = [this](const QString& message) {
-        LOG_WARNING(Frontend,
+        LOG_DEBUG(Frontend,
                     "[WebSession diagnostic] WebView2 decoded nx.sendMessage ({} chars)",
                     message.size());
         main_window.ForwardWebBrowserInteractiveData(message.toStdString());

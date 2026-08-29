@@ -150,6 +150,10 @@ else()
                 "Use the MSVC/clang-cl toolchain instead if you need the web applet frontend; "
                 "the build will proceed without it and CITRON_USE_QT_WEB_ENGINE will have no "
                 "effect for this target.")
+            # Keep later component selection consistent with the modules available for this
+            # target, otherwise find_package still requests unavailable WebEngine components.
+            set(CITRON_USE_QT_WEB_ENGINE OFF CACHE BOOL
+                "Use QtWebEngine for web applet implementation" FORCE)
         endif()
     endif()
     # Svg/LinguistTools ship with the base install now (see note above), so

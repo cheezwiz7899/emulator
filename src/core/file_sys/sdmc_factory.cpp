@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <filesystem>
 #include <memory>
+#include <system_error>
 #include "common/fs/fs.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/sdmc_factory.h"
@@ -60,17 +62,16 @@ VirtualDir SDMCFactory::GetImageDirectory() const {
 }
 
 u64 SDMCFactory::GetSDMCFreeSpace() const {
-    const auto host_total_space = Common::FS::GetTotalSpaceSize(sd_dir->GetFullPath());
-    if (host_total_space == 0) {
-        // The real host query failed (returns 0 on failure) - most likely the backing path
-        // isn't available for some reason. Fall back to the old synthetic-capacity behavior
-        // rather than reporting 0 free space, which would make every subsequent write look
-        // like the SD card is full regardless of how much real disk space exists.
+    std::error_code error;
+    const auto space_info = std::filesystem::space(sd_dir->GetFullPath(), error);
+    if (error) {
+        // Unlike Common::FS::GetFreeSpaceSize(), the error code distinguishes a failed query
+        // from a legitimate zero-byte result on a full host filesystem.
         const auto used = sd_dir->GetSize();
         return used >= SDMC_TOTAL_SIZE ? 0 : SDMC_TOTAL_SIZE - used;
     }
 
-    return Common::FS::GetFreeSpaceSize(sd_dir->GetFullPath());
+    return space_info.free;
 }
 
 u64 SDMCFactory::GetSDMCTotalSpace() const {

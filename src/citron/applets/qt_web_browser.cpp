@@ -6,6 +6,7 @@
 
 #include <QApplication>
 #include <QKeyEvent>
+#include <QPointer>
 #include <QTimer>
 
 #include <QWebEngineProfile>
@@ -248,23 +249,26 @@ void QtNXWebEngineView::HandleWindowFooterButtonPressedOnce() {
                                        "if (typeof callback === 'function') { callback(); return true; } "
                                        "return false; })();")
                             .arg(button_index),
-                        [this, button](const QVariant& handled) {
+                        [view = QPointer<QtNXWebEngineView>{this}, button](const QVariant& handled) {
+                            if (!view) {
+                                return;
+                            }
                             if (handled.toBool()) {
                                 return;
                             }
                             switch (button) {
                             case Core::HID::NpadButton::A:
-                                SendMultipleKeyPressEvents<Qt::Key_A, Qt::Key_Space,
-                                                           Qt::Key_Return>();
+                                view->SendMultipleKeyPressEvents<Qt::Key_A, Qt::Key_Space,
+                                                                 Qt::Key_Return>();
                                 break;
                             case Core::HID::NpadButton::B:
-                                SendKeyPressEvent(Qt::Key_B);
+                                view->SendKeyPressEvent(Qt::Key_B);
                                 break;
                             case Core::HID::NpadButton::X:
-                                SendKeyPressEvent(Qt::Key_X);
+                                view->SendKeyPressEvent(Qt::Key_X);
                                 break;
                             case Core::HID::NpadButton::Y:
-                                SendKeyPressEvent(Qt::Key_Y);
+                                view->SendKeyPressEvent(Qt::Key_Y);
                                 break;
                             default:
                                 break;
@@ -444,7 +448,17 @@ QtWebBrowser::~QtWebBrowser() = default;
 void QtWebBrowser::Close() const {
     // Do not clear the active request here. Its completion callback is needed to complete the
     // guest applet before a queued foreground page is allowed to start.
-    emit MainWindowRequestExit();
+    bool request_visible_page_close = false;
+    {
+        std::scoped_lock lock{callback_mutex};
+        if (active_web_page && !close_requested) {
+            close_requested = true;
+            request_visible_page_close = true;
+        }
+    }
+    if (request_visible_page_close) {
+        emit MainWindowRequestExit();
+    }
 }
 
 void QtWebBrowser::OpenLocalWebPage(const std::string& local_url,
@@ -590,7 +604,7 @@ void QtWebBrowser::MainWindowInteractiveDataReceived(std::string data) {
             local_callback = active_web_page->interactive_data_callback;
         }
     }
-    LOG_WARNING(Frontend,
+    LOG_DEBUG(Frontend,
                 "[WebSession diagnostic] Native page message reached frontend ({} bytes, "
                 "callback={})",
                 data.size(), static_cast<bool>(local_callback));

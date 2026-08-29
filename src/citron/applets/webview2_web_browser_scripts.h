@@ -15,13 +15,10 @@ constexpr wchar_t WEBVIEW2_NX_SCRIPT[] = LR"(
 // Ported from WINDOW_NX_SCRIPT (qt_web_browser_scripts.h).
 //
 // The synthetic HTTPS host used by the backend supports WebView2's native message channel.
-// Keep the document-local state only as a fallback for runtimes where that API is unavailable.
 //
 // citron_key_callbacks and everything else are unchanged.
 
 var citron_key_callbacks = [];
-var citron_outgoing_messages = [];
-var end_applet = false;
 
 (function() {
     class WindowNX {
@@ -47,7 +44,7 @@ var end_applet = false;
             if (window.chrome && window.chrome.webview && window.chrome.webview.postMessage) {
                 window.chrome.webview.postMessage({ __citron_control: "endApplet" });
             } else {
-                end_applet = true;
+                console.error("WebView2 message bridge is unavailable");
             }
         }
 
@@ -61,7 +58,7 @@ var end_applet = false;
             if (window.chrome && window.chrome.webview && window.chrome.webview.postMessage) {
                 window.chrome.webview.postMessage(serialized);
             } else {
-                citron_outgoing_messages.push(serialized);
+                console.error("WebView2 message bridge is unavailable");
             }
         }
 

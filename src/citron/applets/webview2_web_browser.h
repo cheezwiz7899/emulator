@@ -118,8 +118,6 @@ private:
     HRESULT OnWindowCloseRequested(ICoreWebView2*, IUnknown*);
     HRESULT OnScriptDialogOpening(ICoreWebView2*, ICoreWebView2ScriptDialogOpeningEventArgs*);
 
-    static std::wstring JsonEscapeString(const std::wstring& input);
-
     GMainWindow& main_window;
     wil::com_ptr<ICoreWebView2Environment> environment;
     wil::com_ptr<ICoreWebView2Controller> controller;

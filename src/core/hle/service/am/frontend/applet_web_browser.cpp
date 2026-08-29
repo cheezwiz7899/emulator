@@ -41,6 +41,8 @@ namespace Service::AM::Frontend {
 
 namespace {
 
+constexpr std::string_view OFFLINE_CACHE_COMPLETION_TEXT{"complete"};
+
 template <typename T>
 void ParseRawValue(T& value, const std::vector<u8>& data) {
     static_assert(std::is_trivially_copyable_v<T>,
@@ -458,7 +460,8 @@ void WebBrowser::ExtractOfflineRomFS() {
         LOG_ERROR(Service_AM, "Failed to extract offline RomFS to {}",
                   Common::FS::PathToUTF8String(offline_cache_dir));
     } else if (Common::FS::WriteStringToFile(completion_marker, Common::FS::FileType::TextFile,
-                                              "complete") != 8) {
+                                              OFFLINE_CACHE_COMPLETION_TEXT) !=
+               OFFLINE_CACHE_COMPLETION_TEXT.size()) {
         LOG_WARNING(Service_AM, "Failed to mark offline RomFS cache complete at {}",
                     Common::FS::PathToUTF8String(completion_marker));
     }
@@ -565,9 +568,9 @@ void WebBrowser::InitializeOffline() {
     // On hardware, manual_html is a LayeredFS overlay: files supplied by a mod replace matching
     // files from the title's HtmlDocument, while all other files continue to come from the base
     // document. ARCropolis intentionally supplies only its own files and relies on that fallback
-    // for the shared help/ and common/ resources. Refresh our extracted cache when such an
-    // overlay is present so ExecuteOffline extracts PatchManager's merged RomFS below instead of
-    // serving a stale, standalone copy of the override page.
+    // for the shared help/ and common/ resources. Synchronize newer overlay files into the
+    // extracted cache while retaining its completion marker, so ExecuteOffline can reuse the
+    // merged base resources without a full re-extraction for each ARCropolis screen change.
     if (document_kind == DocumentKind::OfflineHtmlPage) {
         const auto sd_mod_root =
             system.GetFileSystemController().GetSDMCModificationLoadRoot(title_id);
@@ -674,7 +677,7 @@ void WebBrowser::ExecuteOffline() {
     const bool needs_extraction =
         !Common::FS::Exists(main_url) ||
         Common::FS::ReadStringFromFile(completion_marker, Common::FS::FileType::TextFile) !=
-            "complete";
+            OFFLINE_CACHE_COMPLETION_TEXT;
 
     if (needs_extraction) {
         offline_romfs = GetOfflineRomFS(system, title_id, nca_type);
@@ -720,7 +723,7 @@ void WebBrowser::ExecuteOffline() {
                 return;
             }
 
-            LOG_WARNING(Service_AM, "[WebSession diagnostic] Queueing page message ({} bytes)",
+            LOG_DEBUG(Service_AM, "[WebSession diagnostic] Queueing page message ({} bytes)",
                         data.size());
 
             // WebSession content must be framed and NUL-terminated. The NNSDK client replaces

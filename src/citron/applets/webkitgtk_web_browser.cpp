@@ -471,7 +471,10 @@ void WebKitGTKView::hideEvent(QHideEvent* event) {
 }
 
 void WebKitGTKView::PumpGLibMainContext() {
-    while (g_main_context_iteration(nullptr, FALSE)) {
+    constexpr int max_iterations = 64;
+    for (int iteration = 0; iteration < max_iterations &&
+                            g_main_context_iteration(nullptr, FALSE);
+         ++iteration) {
     }
 }
 
@@ -508,7 +511,7 @@ void WebKitGTKView::InputThreadLoop() {
             if (!input_interpreter->IsButtonPressedOnce(button)) {
                 continue;
             }
-            LOG_WARNING(Frontend,
+            LOG_DEBUG(Frontend,
                         "[Web input diagnostic] WebKitGTK observed controller button {:#x}",
                         static_cast<u64>(button));
             int callback_index = -1;
@@ -577,7 +580,7 @@ void WebKitGTKView::InputThreadLoop() {
                 const DomKey dom_key = HIDButtonToDomKey(button);
                 if (dom_key.key_code != 0) {
                     if (pressed_once) {
-                        LOG_WARNING(Frontend,
+                        LOG_DEBUG(Frontend,
                                     "[Web input diagnostic] WebKitGTK observed direction {:#x}",
                                     static_cast<u64>(button));
                     }
@@ -601,7 +604,7 @@ void WebKitGTKView::OnNxMessage(WebKitUserContentManager*, WebKitJavascriptResul
     auto* self = static_cast<WebKitGTKView*>(user_data);
     JSCValue* value = webkit_javascript_result_get_js_value(result);
     char* str_value = jsc_value_to_string(value);
-    LOG_WARNING(Frontend, "[WebSession diagnostic] WebKitGTK received nx.sendMessage ({} bytes)",
+    LOG_DEBUG(Frontend, "[WebSession diagnostic] WebKitGTK received nx.sendMessage ({} bytes)",
                 std::strlen(str_value));
     self->main_window.ForwardWebBrowserInteractiveData(std::string(str_value));
     g_free(str_value);

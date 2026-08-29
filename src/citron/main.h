@@ -249,7 +249,7 @@ public slots:
     /// Push-based path for WebKitGTK/WebView2 backends: called directly from their
     /// message-handler callbacks instead of being polled by the event loop.
     void ForwardWebBrowserInteractiveData(const std::string& data) {
-        emit WebBrowserInteractiveDataReceived(data);
+        Q_EMIT WebBrowserInteractiveDataReceived(data);
     }
     void OnAppFocusStateChanged(Qt::ApplicationState state);
     void OnTasStateChanged();

@@ -47,6 +47,14 @@ int QtKeyToDomKeyCode(int key) {
         return 33;
     case 0x01000017: // Qt::Key_PageDown
         return 34;
+    case ' ': // Qt::Key_Space
+        return 32;
+    case 0x01000020: // Qt::Key_Shift
+        return 16;
+    case 0x01000021: // Qt::Key_Control
+        return 17;
+    case 0x01000023: // Qt::Key_Alt
+        return 18;
     case ',': // Qt::Key_Comma
         return 188;
     case '.': // Qt::Key_Period
