@@ -266,6 +266,10 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QWidget* parent) {
            "EDS1: Enables basic Extended Dynamic State features only.\n"
            "Disabled: Disables all Extended Dynamic State features (may reduce compatibility)."));
     INSERT(
+        Settings, vertex_input_dynamic_state, tr("Vertex Input Dynamic State"),
+        tr("Uses dynamic vertex input when EDS3 is enabled. Disable this to troubleshoot "
+           "rendering issues on affected GPU drivers."));
+    INSERT(
         Settings, use_conditional_rendering, tr("Use conditional rendering"),
         tr("Enables conditional rendering based on query results.\n"
            "Disabling this can fix flickering objects in some games but may impact performance.\n"

@@ -762,11 +762,17 @@ void RoomMember::Unbind(CallbackHandle<T> handle) {
 
 void RoomMember::Leave() {
     room_member_impl->SetState(State::Idle);
-    room_member_impl->loop_thread->join();
-    room_member_impl->loop_thread.reset();
+    if (room_member_impl->loop_thread) {
+        if (room_member_impl->loop_thread->joinable()) {
+            room_member_impl->loop_thread->join();
+        }
+        room_member_impl->loop_thread.reset();
+    }
 
-    enet_host_destroy(room_member_impl->client);
-    room_member_impl->client = nullptr;
+    if (room_member_impl->client) {
+        enet_host_destroy(room_member_impl->client);
+        room_member_impl->client = nullptr;
+    }
 }
 
 template void RoomMember::Unbind(CallbackHandle<ProxyPacket>);

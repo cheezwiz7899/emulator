@@ -50,6 +50,11 @@
         android:label="SearchFragment" />
 
     <fragment
+        android:id="@+id/multiplayerFragment"
+        android:name="org.citron.citron_emu.features.multiplayer.ui.MultiplayerFragment"
+        android:label="MultiplayerFragment" />
+
+    <fragment
         android:id="@+id/aboutFragment"
         android:name="org.citron.citron_emu.fragments.AboutFragment"
         android:label="AboutFragment" >

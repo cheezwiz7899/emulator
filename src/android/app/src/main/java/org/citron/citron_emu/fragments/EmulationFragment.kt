@@ -63,6 +63,9 @@ import org.citron.citron_emu.features.settings.model.IntSetting
 import org.citron.citron_emu.features.settings.model.Settings
 import org.citron.citron_emu.features.settings.model.Settings.EmulationOrientation
 import org.citron.citron_emu.features.settings.model.Settings.EmulationVerticalAlignment
+import org.citron.citron_emu.features.multiplayer.model.MultiplayerSnapshot
+import org.citron.citron_emu.features.multiplayer.ui.MultiplayerViewModel
+import org.citron.citron_emu.features.multiplayer.ui.RoomDialogFragment
 import org.citron.citron_emu.features.settings.utils.SettingsFile
 import org.citron.citron_emu.model.DriverViewModel
 import org.citron.citron_emu.model.Game
@@ -92,6 +95,7 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
 
     private val emulationViewModel: EmulationViewModel by activityViewModels()
     private val driverViewModel: DriverViewModel by activityViewModels()
+    private val multiplayerViewModel: MultiplayerViewModel by activityViewModels()
     private val cheatToggleMutex = Mutex()
 
     private var isInFoldableLayout = false
@@ -249,6 +253,7 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
             override fun onDrawerOpened(drawerView: View) {
                 InputHandler.releaseAllInputs()
                 binding.drawerLayout.setDrawerLockMode(DrawerLayout.LOCK_MODE_UNLOCKED)
+                updateMultiplayerRoomMenuVisibility()
                 binding.inGameMenu.requestFocus()
                 emulationViewModel.setDrawerOpen(true)
             }
@@ -286,6 +291,7 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
                 requireContext().theme
             )
         }
+        updateMultiplayerRoomMenuVisibility()
 
         binding.inGameMenu.setNavigationItemSelectedListener {
             when (it.itemId) {
@@ -352,6 +358,14 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
 
                 R.id.menu_amiibo -> {
                     showAmiiboMenu()
+                    true
+                }
+
+                R.id.menu_multiplayer_room -> {
+                    binding.drawerLayout.close()
+                    if (parentFragmentManager.findFragmentByTag(RoomDialogFragment.TAG) == null) {
+                        RoomDialogFragment().show(parentFragmentManager, RoomDialogFragment.TAG)
+                    }
                     true
                 }
 
@@ -506,6 +520,9 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
         driverViewModel.isInteractionAllowed.collect(viewLifecycleOwner) {
             if (it) startEmulation()
         }
+        multiplayerViewModel.snapshot.collect(viewLifecycleOwner) {
+            updateMultiplayerRoomMenuVisibility(it)
+        }
     }
 
     private fun startEmulation(programIndex: Int = 0) {
@@ -518,6 +535,13 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
 
             emulationState.run(emulationActivity!!.isActivityRecreated, programIndex)
         }
+    }
+
+    private fun updateMultiplayerRoomMenuVisibility(
+        snapshot: MultiplayerSnapshot = multiplayerViewModel.snapshot.value
+    ) {
+        binding.inGameMenu.menu.findItem(R.id.menu_multiplayer_room).isVisible =
+            snapshot.isConnected || snapshot.isHosting
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {

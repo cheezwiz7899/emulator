@@ -147,15 +147,16 @@ class DriverViewModel : ViewModel() {
     fun onLaunchGame() {
         _isDriverReady.value = false
 
-        val selectedDriverFile = File(StringSetting.DRIVER_PATH.getString())
-        val selectedDriverMetadata = GpuDriverHelper.customDriverSettingData
-        if (GpuDriverHelper.installedCustomDriverData == selectedDriverMetadata) {
-            setDriverReady()
-            return
-        }
-
         viewModelScope.launch {
             withContext(Dispatchers.IO) {
+                val selectedDriverFile = GpuDriverHelper.resolveCustomDriverFile()
+                val selectedDriverMetadata =
+                    GpuDriverHelper.getMetadataFromZip(selectedDriverFile)
+                if (GpuDriverHelper.installedCustomDriverData == selectedDriverMetadata) {
+                    setDriverReady()
+                    return@withContext
+                }
+
                 if (selectedDriverMetadata.name == null) {
                     GpuDriverHelper.installDefaultDriver()
                     setDriverReady()

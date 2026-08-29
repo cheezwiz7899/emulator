@@ -20,8 +20,8 @@ namespace {
 
 // Convenience definitions.
 constexpr size_t MaxSessions = 0x3;
-constexpr size_t MaxNrrInfos = 0x40;
-constexpr size_t MaxNroInfos = 0x40;
+constexpr size_t MaxNrrInfos = 0x100;
+constexpr size_t MaxNroInfos = 0x100;
 
 constexpr u64 InvalidProcessId = 0xffffffffffffffffULL;
 constexpr u64 InvalidContextId = 0xffffffffffffffffULL;

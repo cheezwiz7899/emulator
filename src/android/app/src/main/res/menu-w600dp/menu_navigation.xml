@@ -7,6 +7,11 @@
         android:title="@string/home_settings" />
 
     <item
+        android:id="@+id/multiplayerFragment"
+        android:icon="@drawable/ic_share"
+        android:title="@string/home_multiplayer" />
+
+    <item
         android:id="@+id/searchFragment"
         android:icon="@drawable/ic_search"
         android:title="@string/home_search" />

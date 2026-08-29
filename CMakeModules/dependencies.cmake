@@ -237,21 +237,11 @@ endif()
 option(CITRON_USE_VULKAN_STUB "Use pre-generated Vulkan stub instead of fetching Vulkan-Headers" ON)
 
 if (CITRON_USE_EXTERNAL_VULKAN_HEADERS AND NOT TARGET Vulkan::Headers)
-    if (CITRON_USE_VULKAN_STUB AND
-        NOT CITRON_USE_EXTERNAL_VULKAN_UTILITY_LIBRARIES AND
-        EXISTS "${CMAKE_SOURCE_DIR}/externals/vulkan-stub/include")
-        add_library(Vulkan-Headers INTERFACE)
-        target_include_directories(Vulkan-Headers SYSTEM INTERFACE
-            "${CMAKE_SOURCE_DIR}/externals/vulkan-stub/include")
-        target_compile_definitions(Vulkan-Headers INTERFACE VK_ENABLE_BETA_EXTENSIONS)
-        add_library(Vulkan::Headers ALIAS Vulkan-Headers)
-    else()
-        CPMAddPackage(
-            NAME Vulkan-Headers
-            GITHUB_REPOSITORY KhronosGroup/Vulkan-Headers
-            GIT_TAG v1.4.337
-        )
-    endif()
+    CPMAddPackage(
+        NAME Vulkan-Headers
+        GITHUB_REPOSITORY KhronosGroup/Vulkan-Headers
+        GIT_TAG v1.4.337
+    )
 endif()
 
 # ── Vulkan-Utility-Libraries ──────────────────────────────────────────────────
@@ -369,6 +359,7 @@ if (CITRON_USE_EXTERNAL_SDL2 AND NOT TARGET SDL2::SDL2)
             "SDL_STATIC ON"
             "SDL_TEST OFF"
             "SDL_FORCE_STATIC_VCRT OFF"
+            "SDL_HIDAPI_LIBUSB ON"
     )
 endif()
 
@@ -439,7 +430,7 @@ if ((ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64) AND NOT (MSVC AND ARCHITECTURE_a
         CPMAddPackage(
             NAME dynarmic
             GITHUB_REPOSITORY xinitrcn1/dynarmic
-            GIT_TAG c08207ddec63447d625a382b56b04f68c17526c4
+            GIT_TAG 7bec834bcadbb8b7def7c552a08ad4ac189d4397
             OPTIONS
                 "DYNARMIC_USE_PRECOMPILED_HEADERS ${CITRON_USE_PRECOMPILED_HEADERS}"
                 "DYNARMIC_IGNORE_ASSERTS ON"
@@ -563,7 +554,6 @@ set(CITRON_XCB_KEYSYMS_VER "0.4.1" CACHE STRING "XCB keysyms version")
 set(CITRON_XCB_RENDERUTIL_VER "0.3.10" CACHE STRING "XCB renderutil version")
 set(CITRON_XCB_WM_VER "0.4.2" CACHE STRING "XCB wm version")
 
-set(CITRON_VULKAN_LOADER_TAG "vulkan-sdk-1.4.350.0" CACHE STRING "Vulkan-Loader/Vulkan-Headers git tag (packaging use only, not a compile-time dependency)")
 # ── Tracy (optional profiler) ─────────────────────────────────────────────────
 # Fetched only when CITRON_ENABLE_TRACY=ON.  TRACY_ENABLE must be set before
 # CPMAddPackage so the client library and application agree on configuration.
@@ -660,16 +650,6 @@ if (ENABLE_QT AND NOT USE_SYSTEM_QT)
     if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
         include(${CMAKE_SOURCE_DIR}/CMakeModules/xcb_build.cmake)
     endif()
-endif()
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Vulkan loader (packaging only — not a link-time dependency of anything)
-# ═══════════════════════════════════════════════════════════════════════════════
-# Deliberately not nested under the Qt block above: citron-cmd (SDL2, no Qt)
-# needs Vulkan too, and neither actually links the loader at compile time —
-# see vulkan_loader_build.cmake's own header comment for why this exists.
-if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    include(${CMAKE_SOURCE_DIR}/CMakeModules/vulkan_loader_build.cmake)
 endif()
 
 message(STATUS "[CPM] All dependency packages configured")

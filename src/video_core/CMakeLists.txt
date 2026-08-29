@@ -1,4 +1,4 @@
-﻿# SPDX-FileCopyrightText: 2018 yuzu Emulator Project
+# SPDX-FileCopyrightText: 2018 yuzu Emulator Project
 # SPDX-FileCopyrightText: 2025 citron Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -275,17 +275,21 @@ target_link_libraries(video_core PUBLIC common core)
 target_link_libraries(video_core PUBLIC glad shader_recompiler stb bc_decoder)
 
 if (CITRON_USE_BUNDLED_FFMPEG AND
-    (CITRON_CLANGCL OR NOT (WIN32 OR ANDROID)))
+    (CITRON_CLANGCL OR CITRON_CLANGTRON OR NOT (WIN32 OR ANDROID)))
     add_dependencies(video_core ffmpeg-build)
 endif()
 
-# clang-cl: add_dependencies only gates linking; compilation (incl. unity
+# clang-cl/clangtron: add_dependencies only gates linking; compilation (incl. unity
 # batches) can race ahead of ffmpeg-build.  Adding the stamp as a
 # HEADER_FILE_ONLY source blocks all compile rules until it exists.
 if (CITRON_CLANGCL AND DEFINED CLANGCL_FFMPEG_BUILD_STAMP)
     set_source_files_properties("${CLANGCL_FFMPEG_BUILD_STAMP}"
         PROPERTIES HEADER_FILE_ONLY ON GENERATED ON)
     target_sources(video_core PRIVATE "${CLANGCL_FFMPEG_BUILD_STAMP}")
+elseif (CITRON_CLANGTRON AND DEFINED CLANGTRON_FFMPEG_BUILD_STAMP)
+    set_source_files_properties("${CLANGTRON_FFMPEG_BUILD_STAMP}"
+        PROPERTIES HEADER_FILE_ONLY ON GENERATED ON)
+    target_sources(video_core PRIVATE "${CLANGTRON_FFMPEG_BUILD_STAMP}")
 endif()
 
 target_include_directories(video_core PRIVATE ${FFmpeg_INCLUDE_DIR})

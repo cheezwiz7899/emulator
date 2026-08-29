@@ -233,6 +233,8 @@
     <string name="renderer_reactive_flushing_description">牺牲性能，提高某些游戏的渲染精度。</string>
     <string name="android_arm64_register_guards">ARM64 驱动寄存器保护</string>
     <string name="android_arm64_register_guards_description">保护模拟器状态免受受影响 Android GPU 驱动的寄存器损坏。仅在诊断时关闭。</string>
+    <string name="vertex_input_dynamic_state">顶点输入动态状态（VIDS）</string>
+    <string name="vertex_input_dynamic_state_description">在启用 EDS3 时使用动态顶点输入。部分 GPU 驱动出现 3D 画面缺失、灰屏或花屏时，可关闭此项进行排查。</string>
     <string name="use_disk_shader_cache">磁盘着色器缓存</string>
     <string name="use_disk_shader_cache_description">将生成的着色器缓存于磁盘中并进行读取，以减少卡顿。</string>
     <string name="anisotropic_filtering">各向异性过滤</string>

@@ -1269,16 +1269,16 @@ COMSUPP_CPP_EOF
         cp "${stub_obj}" "${_safe_obj}" \
             || error "Failed to copy comsupp_stubs.o to space-free path ${_safe_obj}"
         if [[ "${_HOST_OS}" == "windows" ]]; then
-            _COMSUPP_TC_PATH="$(cygpath -m "${_safe_obj}")"
+            _COMSUPP_TC_PATH="$(cygpath -am "${_safe_obj}")"
         else
-            _COMSUPP_TC_PATH="${_safe_obj}"
+            _COMSUPP_TC_PATH="$(realpath -m "${_safe_obj}")"
         fi
         info "comsupp_stubs.o staged to space-free path: ${_COMSUPP_TC_PATH}"
     else
         if [[ "${_HOST_OS}" == "windows" ]]; then
-            _COMSUPP_TC_PATH="$(cygpath -m "${stub_obj}")"
+            _COMSUPP_TC_PATH="$(cygpath -am "${stub_obj}")"
         else
-            _COMSUPP_TC_PATH="${stub_obj}"
+            _COMSUPP_TC_PATH="$(realpath -m "${stub_obj}")"
         fi
     fi
 }
@@ -1363,49 +1363,6 @@ normalize_profraw_dirs() {
 }
 
 # =============================================================================
-# ensure_vulkan_import_lib — generate libvulkan-1.a from the vendored
-# Vulkan-Headers submodule so cmake's FindVulkan has an import lib at configure time.
-# Uses the checked-in vulkan-1.def; no network access or hardcoded version needed.
-# x86_64 uses cdecl for all exports, so --kill-at is not needed.
-# =============================================================================
-ensure_vulkan_import_lib() {
-    local out_dir="${BUILD_ROOT}/vulkan-stub"
-    local def_file="${out_dir}/vulkan-1.def"
-    local lib_file="${out_dir}/libvulkan-1.a"
-
-    if [[ -f "${lib_file}" ]]; then
-        info "Vulkan import lib already exists: ${lib_file}"
-        return 0
-    fi
-
-    mkdir -p "${out_dir}"
-    info "Building vulkan-1 MinGW import library from vendored headers..."
-
-    local stub_def="${SOURCE_DIR}/externals/vulkan-stub/vulkan-1.def"
-    if [[ -f "${stub_def}" ]]; then
-        cp -f "${stub_def}" "${def_file}"
-    else
-        error "vulkan-1.def stub not found at ${stub_def}"
-    fi
-
-    local dlltool="${LLVM_MINGW_DIR}/bin/llvm-dlltool"
-    if [[ ! -x "${dlltool}" ]]; then
-        warn "llvm-mingw dlltool not found at ${dlltool}, trying system fallback"
-        dlltool="x86_64-w64-mingw32-dlltool"
-        command -v "${dlltool}" &>/dev/null \
-            || error "No dlltool available. Run setup or ensure llvm-mingw is extracted."
-    fi
-
-    "${dlltool}" \
-        -m i386:x86-64 \
-        --input-def "${def_file}" \
-        --output-lib "${lib_file}" \
-        || error "dlltool failed to generate ${lib_file}"
-
-    local sym_count
-    sym_count=$(grep -c '^    vk' "${def_file}" 2>/dev/null || echo "?")
-    success "Vulkan import lib built: ${lib_file} (${sym_count} entry points)"
-}
 
 # =============================================================================
 # detect_ffmpeg_version — read FFmpeg version from the submodule RELEASE file
@@ -1472,301 +1429,6 @@ detect_ffmpeg_version() {
     info "[ffmpeg] Detected FFmpeg ${FFMPEG_VERSION} (avcodec-${FFMPEG_AVCODEC_VER}, avutil-${FFMPEG_AVUTIL_VER}, swscale-${FFMPEG_SWSCALE_VER})"
 }
 
-# rebuild_ffmpeg_pthread_free — build static FFmpeg with llvm-mingw before cmake configure.
-#
-# The citron WIN32 cmake path fetches FFmpeg from yuzu-mirror/ext-windows-bin, which
-# only carries FFmpeg ≤6.0 (newer versions 404). The pre-built GCC DLLs also import
-# libwinpthread-1.dll, whose TLS init races with llvm-mingw's libc++ at game boot
-# (interval_map.hpp assertion crash). This function runs first, placing the built
-# libs at externals/ffmpeg-VERSION-static/ so cmake skips the download entirely,
-# and builds with --disable-pthreads --enable-w32threads to drop the pthread dep.
-#
-# Prerequisites: detect_ffmpeg_version() and require_llvm_mingw() must be called first.
-# Args: $1 = build_dir (BUILD_GENERATE, BUILD_USE, etc.)
-# =============================================================================
-rebuild_ffmpeg_pthread_free() {
-    local build_dir="$1"
-
-    [[ -n "${FFMPEG_VERSION:-}" ]] \
-        || error "[ffmpeg-rebuild] FFMPEG_VERSION not set — call detect_ffmpeg_version() first"
-
-    local ffmpeg_ext_dir="${BUILD_ROOT}/externals/ffmpeg-${FFMPEG_VERSION}-static"
-    local ffmpeg_lib="${ffmpeg_ext_dir}/lib"
-    local ffmpeg_hdr="${ffmpeg_ext_dir}/include"
-    local ffmpeg_bld="${BUILD_ROOT}/externals/ffmpeg-${FFMPEG_VERSION}-llvm-bld"
-    local ffmpeg_src_dir="${CPM_SOURCE_CACHE}/ffmpeg-src/${FFMPEG_VERSION}"
-
-    # FFmpeg's configure does bare `cd` calls and breaks on spaces in paths.
-    # On Windows, usernames with spaces propagate into CPM_SOURCE_CACHE/BUILD_ROOT.
-    # Redirect src/build to /tmp (guaranteed space-free on MSYS2) if needed.
-    # ffmpeg_ext_dir (the installed .a + headers) stays under BUILD_ROOT.
-    if [[ "${ffmpeg_src_dir}" == *' '* || "${ffmpeg_bld}" == *' '* ]]; then
-        local _ffmpeg_safe_root="/tmp/citron-ffmpeg/${FFMPEG_VERSION}"
-        warn "[ffmpeg-rebuild] Path contains spaces — redirecting source/build to ${_ffmpeg_safe_root}"
-        ffmpeg_src_dir="${_ffmpeg_safe_root}/src"
-        ffmpeg_bld="${_ffmpeg_safe_root}/bld"
-        rm -rf "${ffmpeg_src_dir}" "${ffmpeg_bld}"
-    fi
-    local ffmpeg_global_cache="${CPM_SOURCE_CACHE}/citron-ffmpeg-static/${FFMPEG_VERSION}-llvm-mingw"
-
-    local sentinel="${ffmpeg_lib}/.llvm_static_built"
-
-    # 1. Check if it's already in the local build dir
-    if [[ -f "${sentinel}" ]]; then
-        info "[ffmpeg-rebuild] Static FFmpeg libs already in place locally — skipping"
-        return 0
-    fi
-
-    # 2. Check if it's in the global cache
-    if [[ -f "${ffmpeg_global_cache}/lib/.llvm_static_built" ]]; then
-        info "[ffmpeg-rebuild] Found pre-built FFmpeg in global cache: ${ffmpeg_global_cache}"
-        info "[ffmpeg-rebuild] Copying cached libs to ${ffmpeg_ext_dir}..."
-        mkdir -p "${ffmpeg_ext_dir}"
-        cp -r "${ffmpeg_global_cache}/." "${ffmpeg_ext_dir}/"
-        return 0
-    fi
-
-    # ── Locate FFmpeg source ─────────────────────────────────────────────────
-    #
-    # _ffmpeg_abi_matches: verify source sonames match detect_ffmpeg_version() vars.
-    # Uses awk — grep -oP lookbehinds not available in MSYS2/clang64.
-    _ffmpeg_abi_matches() {
-        local dir="$1"
-        [[ -f "${dir}/configure" ]] || return 1
-        [[ -f "${dir}/libavcodec/version_major.h" ]]    || return 1
-        [[ -f "${dir}/libavformat/version_major.h" ]]   || return 1
-        [[ -f "${dir}/libswscale/version_major.h" ]]    || return 1
-        [[ -f "${dir}/libswresample/version_major.h" ]] || return 1
-
-        # Use awk — grep -oP lookbehinds not available in MSYS2/clang64.
-        local _codec _fmt _scale _resample
-        _codec=$(awk '/^#define LIBAVCODEC_VERSION_MAJOR/{print $NF; exit}' \
-                     "${dir}/libavcodec/version_major.h")
-        _fmt=$(awk '/^#define LIBAVFORMAT_VERSION_MAJOR/{print $NF; exit}' \
-                   "${dir}/libavformat/version_major.h")
-        _scale=$(awk '/^#define LIBSWSCALE_VERSION_MAJOR/{print $NF; exit}' \
-                     "${dir}/libswscale/version_major.h")
-        _resample=$(awk '/^#define LIBSWRESAMPLE_VERSION_MAJOR/{print $NF; exit}' \
-                        "${dir}/libswresample/version_major.h")
-
-        [[ "${_codec}"    == "${FFMPEG_AVCODEC_VER}" ]] &&
-        [[ "${_fmt}"      == "${FFMPEG_AVFORMAT_VER}" ]] &&
-        [[ "${_scale}"    == "${FFMPEG_SWSCALE_VER}" ]] &&
-        [[ "${_resample}" == "${FFMPEG_SWRESAMPLE_VER}" ]]
-    }
-
-    local ffmpeg_src=""
-
-    # Priority 1: previously downloaded source (.ffmpeg_src_ready sentinel required;
-    # a dir without it means a partial extraction — skip and re-download).
-    if [[ -f "${ffmpeg_src_dir}/.ffmpeg_src_ready" && -f "${ffmpeg_src_dir}/configure" ]]; then
-        if _ffmpeg_abi_matches "${ffmpeg_src_dir}"; then
-            ffmpeg_src="${ffmpeg_src_dir}"
-            info "[ffmpeg-rebuild] Using cached FFmpeg ${FFMPEG_VERSION} source"
-        else
-            warn "[ffmpeg-rebuild] Cached source ABI does not match FFmpeg ${FFMPEG_VERSION} — ignoring"
-        fi
-    elif [[ -d "${ffmpeg_src_dir}" ]]; then
-        warn "[ffmpeg-rebuild] Cached source dir missing .ffmpeg_src_ready sentinel — partial extraction; wiping."
-        rm -rf "${ffmpeg_src_dir}"
-    fi
-
-    # Priority 2: vendored submodule (only if sonames match)
-    local submodule="${SOURCE_DIR}/externals/ffmpeg/ffmpeg"
-    if [[ -z "${ffmpeg_src}" && -f "${submodule}/configure" ]]; then
-        if _ffmpeg_abi_matches "${submodule}"; then
-            ffmpeg_src="${submodule}"
-            info "[ffmpeg-rebuild] Using vendored FFmpeg submodule (ABI matches ${FFMPEG_VERSION})"
-        else
-            warn "[ffmpeg-rebuild] Vendored submodule ABI does not match FFmpeg ${FFMPEG_VERSION} — ignoring"
-        fi
-    fi
-
-    # Priority 3: download tarball from ffmpeg.org
-    if [[ -z "${ffmpeg_src}" ]]; then
-        # Git snapshot versions (e.g. "8.0.git") have no release tarball on
-        # ffmpeg.org.  If the submodule ABI check failed for a git version it
-        # means the soname table in detect_ffmpeg_version() is out of date —
-        # not that we should construct a bogus URL.
-        if [[ "${FFMPEG_VERSION}" == *git* || "${FFMPEG_VERSION}" == *dev* ]]; then
-            error "[ffmpeg-rebuild] FFmpeg version '${FFMPEG_VERSION}' is a git snapshot with no release tarball.
-  The vendored submodule ABI check failed — the soname table in
-  detect_ffmpeg_version() may be wrong for this development version.
-  Check libavcodec/version_major.h in the submodule and update the
-  soname table, or check out a tagged FFmpeg release."
-        fi
-        local tarball="${BUILD_ROOT}/ffmpeg-${FFMPEG_VERSION}.tar.bz2"
-        local ffmpeg_url="https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.bz2"
-        info "[ffmpeg-rebuild] Downloading FFmpeg ${FFMPEG_VERSION} source from ffmpeg.org..."
-        mkdir -p "${BUILD_ROOT}"
-        download_with_retry "${ffmpeg_url}" "${tarball}" 3 \
-            || error "[ffmpeg-rebuild] Failed to download FFmpeg ${FFMPEG_VERSION} after 3 attempts.
-  URL: ${ffmpeg_url}
-  Check network connectivity or set CPM_SOURCE_CACHE to a pre-populated directory."
-        info "[ffmpeg-rebuild] Extracting FFmpeg ${FFMPEG_VERSION}..."
-        mkdir -p "${ffmpeg_src_dir}"
-        info "[ffmpeg-rebuild] Verifying tarball integrity..."
-        tar -tjf "${tarball}" > /dev/null 2>&1 \
-            || error "[ffmpeg-rebuild] Tarball integrity check failed — download is corrupt.
-  Delete ${tarball} and retry."
-        tar -xjf "${tarball}" -C "${ffmpeg_src_dir}" --strip-components=1 \
-            || error "[ffmpeg-rebuild] Extraction failed — tarball may be corrupt. Delete ${tarball} and retry."
-        touch "${ffmpeg_src_dir}/.ffmpeg_src_ready"
-        ffmpeg_src="${ffmpeg_src_dir}"
-        success "[ffmpeg-rebuild] FFmpeg ${FFMPEG_VERSION} source ready"
-    fi
-
-    # If source path has spaces (e.g. from vendored submodule), copy to /tmp.
-    if [[ "${ffmpeg_src}" == *' '* ]]; then
-        local safe_src="/tmp/citron-ffmpeg/${FFMPEG_VERSION}/src"
-        if [[ "${ffmpeg_src}" != "${safe_src}" ]]; then
-            mkdir -p "$(dirname "${safe_src}")"
-            rm -rf "${safe_src}"
-            cp -r "${ffmpeg_src}" "${safe_src}"
-            ffmpeg_src="${safe_src}"
-        fi
-    fi
-
-    info "[ffmpeg-rebuild] Building static FFmpeg ${FFMPEG_VERSION} with llvm-mingw..."
-    mkdir -p "${ffmpeg_bld}" "${ffmpeg_lib}" "${ffmpeg_hdr}"
-
-    local cross_prefix="${LLVM_MINGW_DIR}/bin/${MINGW_TRIPLE}-"
-    local cc="${LLVM_MINGW_DIR}/bin/${MINGW_TRIPLE}-clang"
-    local ar="${LLVM_MINGW_DIR}/bin/llvm-ar"
-    local nm_bin="${LLVM_MINGW_DIR}/bin/llvm-nm"
-    local strip_tool="${LLVM_MINGW_DIR}/bin/llvm-strip"
-    local ranlib="${LLVM_MINGW_DIR}/bin/llvm-ranlib"
-    local windres="${LLVM_MINGW_DIR}/bin/${MINGW_TRIPLE}-windres"
-
-    # On MSYS2/Windows host == target, so --enable-cross-compile must NOT be used.
-    local _ffmpeg_cross_flags=()
-    if [[ "${_HOST_OS}" == "linux" || "${_HOST_OS}" == "macos" ]]; then
-        _ffmpeg_cross_flags=(
-            --enable-cross-compile
-            "--cross-prefix=${cross_prefix}"
-        )
-    else
-        local _host_clang
-        _host_clang="$(command -v clang 2>/dev/null \
-                       || echo "${MSYS2_PREFIX}/bin/clang")"
-        _ffmpeg_cross_flags=("--host-cc=${_host_clang}")
-    fi
-
-    info "[ffmpeg-rebuild] Configuring FFmpeg (static, no pthreads, dxva2+d3d11va)..."
-    (
-        cd "${ffmpeg_bld}"
-        # Use relative path to configure to avoid Makefile absolute-path inclusion bugs.
-        local _rel_cfg="../src/configure"
-        if [[ ! -f "${_rel_cfg}" ]]; then
-            _rel_cfg="${ffmpeg_src}/configure"
-        fi
-
-        bash "${_rel_cfg}" \
-            --arch=x86_64 \
-            --target-os=mingw32 \
-            "${_ffmpeg_cross_flags[@]}" \
-            "--cc=${cc}" \
-            "--ar=${ar}" \
-            "--nm=${nm_bin}" \
-            "--strip=${strip_tool}" \
-            "--ranlib=${ranlib}" \
-            "--windres=${windres}" \
-            --disable-pthreads \
-            --enable-w32threads \
-            --enable-static \
-            --disable-shared \
-            --disable-doc \
-            --disable-programs \
-            --disable-avdevice \
-            --disable-network \
-            --disable-everything \
-            --disable-vaapi \
-            --disable-vdpau \
-            --enable-decoder=h264,vp8,vp9,aac,mp3,opus,flac \
-            --enable-demuxer=mp4,matroska,ogg \
-            --enable-filter=yadif,scale,aresample \
-            --enable-protocol=file \
-            --enable-dxva2 \
-            --enable-d3d11va
-    ) || {
-        error "[ffmpeg-rebuild] FFmpeg configure failed"
-    }
-
-    info "[ffmpeg-rebuild] Compiling (this takes a few minutes)..."
-    # Ensure no stale config.h exists in source if doing out-of-tree build
-    rm -f "${ffmpeg_src}/config.h"
-    make -C "${ffmpeg_bld}" -j"${JOBS}" || {
-        error "[ffmpeg-rebuild] FFmpeg make failed"
-    }
-
-    # ── Install static libraries (.a) ──────────────────────────────────────────
-    local installed=0
-
-    info "[ffmpeg-rebuild] Installing static libs to ${ffmpeg_lib}/..."
-    for lib in avutil avcodec avfilter swscale swresample avformat; do
-        local static_lib
-        static_lib="$(find "${ffmpeg_bld}" -maxdepth 2 -name "lib${lib}.a" 2>/dev/null | head -1)"
-        if [[ -n "${static_lib}" ]]; then
-            cp -f "${static_lib}" "${ffmpeg_lib}/lib${lib}.a"
-            info "  [ffmpeg-rebuild] lib${lib}.a"
-            (( installed++ )) || true
-        else
-            warn "  [ffmpeg-rebuild] lib${lib}.a NOT FOUND in build tree"
-        fi
-    done
-
-    # ── Install public headers (needed by cmake at configure time) ────────────
-    info "[ffmpeg-rebuild] Installing headers to ${ffmpeg_hdr}/..."
-    for lib in libavcodec libavfilter libavformat libavutil libswresample libswscale; do
-        local inc_dst="${ffmpeg_hdr}/${lib}"
-        mkdir -p "${inc_dst}"
-        # Source-tree public headers
-        if [[ -d "${ffmpeg_src}/${lib}" ]]; then
-            find "${ffmpeg_src}/${lib}" -maxdepth 1 -name "*.h" \
-                -exec cp -f {} "${inc_dst}/" \; 2>/dev/null || true
-        fi
-        # Build-generated headers (version.h, config.h, etc.)
-        if [[ -d "${ffmpeg_bld}/${lib}" ]]; then
-            find "${ffmpeg_bld}/${lib}" -maxdepth 1 -name "*.h" \
-                -exec cp -f {} "${inc_dst}/" \; 2>/dev/null || true
-        fi
-    done
-
-    if [[ "${installed}" -eq 0 ]]; then
-        error "[ffmpeg-rebuild] No static libs were installed after make — FFmpeg build silently produced nothing.
-  Check make output above for configuration errors.
-  Try removing ${ffmpeg_bld} and re-running."
-    fi
-
-    # ── Verify: static libs must NOT depend on libwinpthread ─────────────────
-    local nm_tool="${LLVM_MINGW_DIR}/bin/llvm-nm"
-    [[ -x "${nm_tool}" ]] || \
-        nm_tool="$(command -v llvm-nm 2>/dev/null || command -v nm 2>/dev/null || true)"
-
-    if [[ -n "${nm_tool}" ]]; then
-        local pthread_refs=0
-        for afile in "${ffmpeg_lib}"/lib*.a; do
-            if "${nm_tool}" "${afile}" 2>/dev/null | grep -qiE ' U .*pthread_'; then
-                warn "[ffmpeg-rebuild] ${afile##*/} imports external pthread symbols!"
-                pthread_refs=1
-            fi
-        done
-        if [[ "${pthread_refs}" -eq 0 ]]; then
-            success "[ffmpeg-rebuild] Verified: all static libs are pthread-free"
-        else
-            warn "[ffmpeg-rebuild] Some static libs reference pthread — check configure output"
-        fi
-    fi
-
-    touch "${sentinel}"
-    if [[ -n "${ffmpeg_global_cache}" ]]; then
-        info "[ffmpeg-rebuild] Populating global cache: ${ffmpeg_global_cache}..."
-        mkdir -p "$(dirname "${ffmpeg_global_cache}")"
-        rm -rf "${ffmpeg_global_cache}"
-        cp -r "${ffmpeg_ext_dir}" "${ffmpeg_global_cache}"
-    fi
-    success "[ffmpeg-rebuild] Static FFmpeg ${FFMPEG_VERSION} installed (${installed} libs)"
-}
 
 
 # =============================================================================
@@ -1928,12 +1590,6 @@ build_common_cmake_args() {
         CMAKE_CPM_CACHE="$(cygpath -m "${CMAKE_CPM_CACHE}")"
     fi
 
-    # Set Vulkan include dir using the checked-in stub (avoiding submodule/CPM download)
-    local VULKAN_HEADERS_STUB_DIR=""
-    if [[ -d "${SOURCE_DIR}/externals/vulkan-stub/include" ]]; then
-        VULKAN_HEADERS_STUB_DIR="${CMAKE_SOURCE_DIR}/externals/vulkan-stub/include"
-    fi
-
     # Populate the global array — one element per cmake arg (spaces in paths handled correctly).
     _CMAKE_ARGS=(
         "-G" "Ninja"
@@ -1944,6 +1600,7 @@ build_common_cmake_args() {
         "-DBUILD_TESTING=OFF"
         "-DCITRON_TESTS=OFF"
         "-DCITRON_USE_BUNDLED_FFMPEG=ON"
+        "-DCITRON_CLANGTRON=ON"
         "-DCITRON_USE_EXTERNAL_SDL2=ON"
         "-DCITRON_USE_EXTERNAL_VULKAN_HEADERS=ON"
         "-DCITRON_USE_EXTERNAL_VULKAN_UTILITY_LIBRARIES=ON"
@@ -1955,7 +1612,6 @@ build_common_cmake_args() {
         "-Dxbyak_FOUND=TRUE"
         "-Dcubeb_FOUND=TRUE"
         "-DENABLE_LIBUSB=ON"
-        "-DVulkan_LIBRARY=${CMAKE_BUILD_ROOT}/vulkan-stub/libvulkan-1.a"
         "-DCITRON_USE_PRECOMPILED_HEADERS=OFF"
         "-DCITRON_USE_CPM=ON"
         "-DCITRON_CHECK_SUBMODULES=OFF"
@@ -1973,31 +1629,10 @@ build_common_cmake_args() {
         "-DCITRON_USE_WEBVIEW2_WEB_ENGINE=ON"
         "-Wno-dev"
     )
-    [[ -n "${VULKAN_HEADERS_STUB_DIR}" ]] && _CMAKE_ARGS+=(
-        "-DVulkan_INCLUDE_DIR=${VULKAN_HEADERS_STUB_DIR}"
-        "-DVulkan_INCLUDE_DIRS=${VULKAN_HEADERS_STUB_DIR}"
-    )
     [[ -n "${GLSLC_PATH:-}" ]] && _CMAKE_ARGS+=(
         "-DVulkan_GLSLC_EXECUTABLE=${GLSLC_PATH}"
         "-DVulkan_GLSLANG_VALIDATOR_EXECUTABLE=${GLSLC_PATH}"
     )
-    # Only pass FFmpeg dir once rebuild_ffmpeg_pthread_free has completed (sentinel check).
-    # A missing dir causes CMake to fall through to the legacy download path and immediately fail.
-    if [[ -n "${FFMPEG_VERSION:-}" ]]; then
-        local _ffmpeg_ext_dir="${BUILD_ROOT}/externals/ffmpeg-${FFMPEG_VERSION}-static"
-        local _ffmpeg_sentinel="${_ffmpeg_ext_dir}/lib/.llvm_static_built"
-        if [[ -f "${_ffmpeg_sentinel}" ]]; then
-            local _ffmpeg_static="${_ffmpeg_ext_dir}"
-            if [[ "${_HOST_OS}" == "windows" ]]; then
-                _ffmpeg_static="$(cygpath -m "${_ffmpeg_ext_dir}")"
-            fi
-            _CMAKE_ARGS+=("-DCITRON_FFMPEG_STATIC_DIR=${_ffmpeg_static}")
-        else
-            error "FFmpeg static libs not ready — sentinel missing: ${_ffmpeg_sentinel}
-  rebuild_ffmpeg_pthread_free() must complete successfully before cmake is invoked.
-  If this is unexpected, delete ${_ffmpeg_ext_dir} and re-run."
-        fi
-    fi
     [[ -n "${CITRON_BUILD_TYPE:-}" ]] && _CMAKE_ARGS+=("-DCITRON_BUILD_TYPE=${CITRON_BUILD_TYPE}")
     [[ "${UNITY_BUILD}" == "ON" ]] && _CMAKE_ARGS+=("-DENABLE_UNITY_BUILD=ON")
     [[ -n "${MARCH_NATIVE:-}" ]] && _CMAKE_ARGS+=(
@@ -2108,8 +1743,6 @@ stage_generate() {
 
     ensure_profile_runtime_mingw
     compile_comsupp_stubs
-    rm -f "${BUILD_ROOT}/vulkan-stub/libvulkan-1.a" 2>/dev/null || true
-    ensure_vulkan_import_lib
     setup_case_fixup_headers
 
     GLSLC_PATH="$(command -v glslc 2>/dev/null || true)"
@@ -2125,7 +1758,6 @@ stage_generate() {
     # Pre-build FFmpeg before cmake configure so download_bundled_external() finds
     # it already present and skips the yuzu-mirror download (lacks FFmpeg >= 7.x).
     detect_ffmpeg_version
-    rebuild_ffmpeg_pthread_free "${BUILD_GENERATE}"
 
     info "Configuring CMake (instrumented build)..."
     cd "${BUILD_GENERATE}"
@@ -2344,7 +1976,6 @@ stage_csgenerate() {
     local extra_link_flags="-Wl,-u,__llvm_profile_write_file,-u,__llvm_profile_runtime"
 
     ensure_profile_runtime_mingw
-    ensure_vulkan_import_lib
     local qt_install_dir="${CPM_SOURCE_CACHE}/qt-bin/6.9.3/llvm-mingw_64"
     local qt_host_dir="${CPM_SOURCE_CACHE}/qt-bin-host/6.9.3/gcc_64"
     if [[ "${_HOST_OS}" == "windows" ]]; then
@@ -2357,7 +1988,6 @@ stage_csgenerate() {
 
     # Pre-build FFmpeg (fast no-op if already built via sentinel check).
     detect_ffmpeg_version
-    rebuild_ffmpeg_pthread_free "${BUILD_CSGENERATE}"
 
     info "Configuring CMake (CS-IRPGO instrumented build)..."
     cd "${BUILD_CSGENERATE}"
@@ -2485,8 +2115,6 @@ stage_use() {
 
         local nopgo_dir="${BUILD_ROOT}/use-nopgo"
         mkdir -p "${nopgo_dir}"
-
-            ensure_vulkan_import_lib
         compile_comsupp_stubs
         setup_case_fixup_headers
 
@@ -2614,7 +2242,6 @@ stage_use() {
 
         # Pre-build FFmpeg for this build directory
         detect_ffmpeg_version
-        rebuild_ffmpeg_pthread_free "${nopgo_dir}"
 
         info "Configuring CMake (no-PGO Windows PE, LTO=${LTO_MODE})..."
         cd "${nopgo_dir}"
@@ -2667,7 +2294,6 @@ stage_use() {
     require_llvm_mingw
     compile_comsupp_stubs
     setup_case_fixup_headers
-    ensure_vulkan_import_lib
 
     # ── Sentinel check: verify generate/use LTO and PGO modes match ─────────
     # PGO_MODE=="none" is exempt: a --pgo none use build consumes no
@@ -2768,12 +2394,9 @@ stage_use() {
     fi
     local lto_pgo_flag="${lto_flag:+${lto_flag} }${pgo_flag}"
 
-    ensure_vulkan_import_lib
-
     # ── 2a. Cross-compiled Windows PE ────────────────────────────────────────
     # Pre-build FFmpeg for this build directory
     detect_ffmpeg_version
-    rebuild_ffmpeg_pthread_free "${BUILD_USE}"
 
     info "Configuring CMake (PGO+LTO Windows PE)..."
     mkdir -p "${BUILD_USE}"; cd "${BUILD_USE}"
@@ -3273,8 +2896,6 @@ XBYAK_PATCH_EOF
         "-DQt6_DIR=${elf_qt_cmake_dir}"
         "-DSPIRV-Headers_DIR=${SPIRV_HEADERS_INSTALL}/share/cmake/SPIRV-Headers"
         "-DVulkanHeaders_DIR=${VULKAN_HEADERS_INSTALL}/share/cmake/VulkanHeaders"
-        "-DVulkan_INCLUDE_DIR=${SOURCE_DIR}/externals/vulkan-stub/include"
-        "-DVulkan_INCLUDE_DIRS=${SOURCE_DIR}/externals/vulkan-stub/include"
         "-DVulkanMemoryAllocator_FOUND=TRUE"
         -Wno-dev
         ${UNITY_BUILD:+"-DENABLE_UNITY_BUILD=${UNITY_BUILD}"}
@@ -3601,7 +3222,6 @@ BOLT_ORDER_EOF
 
     # Pre-build FFmpeg for this build directory
     detect_ffmpeg_version
-    rebuild_ffmpeg_pthread_free "${BUILD_BOLT}"
 
     # shellcheck disable=SC2034  # _CMAKE_ARGS used via array expansion below
     build_common_cmake_args
@@ -4027,7 +3647,6 @@ stage_propeller() {
     local qt6_cmake_dir="${qt_install_dir}/lib/cmake/Qt6"
 
     detect_ffmpeg_version
-    rebuild_ffmpeg_pthread_free "${BUILD_PROPELLER}"
 
     # shellcheck disable=SC2034  # _CMAKE_ARGS used via array expansion below
     build_common_cmake_args

@@ -12,6 +12,11 @@
         android:title="@string/home_search" />
 
     <item
+        android:id="@+id/multiplayerFragment"
+        android:icon="@drawable/ic_share"
+        android:title="@string/home_multiplayer" />
+
+    <item
         android:id="@+id/homeSettingsFragment"
         android:icon="@drawable/selector_settings"
         android:title="@string/home_settings" />

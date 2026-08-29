@@ -45,7 +45,7 @@ function(citron_build_clangcl_ffmpeg)
     get_filename_component(_ar_tool_dir "${CMAKE_AR}" DIRECTORY)
     execute_process(
         COMMAND "${CMAKE_COMMAND}" -E env "MSYS2_ARG_CONV_EXCL=*"
-            "${BASH_PROGRAM}" -lc "cygpath -am '${_source_dir}' && cygpath -am '${_build_dir}' && cygpath -am '${_install_dir}' && cygpath -au '${_clangcl_tool_dir}' && cygpath -au '${_linker_tool_dir}' && cygpath -au '${_ar_tool_dir}' && cygpath -au '${_install_dir}'"
+            "${BASH_PROGRAM}" -lc "(_winpath() { cygpath -dos \"$1\" 2>/dev/null || cygpath -am \"$1\"; }; _winpath '${_source_dir}' && _winpath '${_build_dir}' && _winpath '${_install_dir}' && cygpath -au '${_clangcl_tool_dir}' && cygpath -au '${_linker_tool_dir}' && cygpath -au '${_ar_tool_dir}' && cygpath -au '${_install_dir}' && cygpath -au '${_source_dir}' && cygpath -au '${_build_dir}')"
         OUTPUT_VARIABLE _clangcl_ffmpeg_paths
         OUTPUT_STRIP_TRAILING_WHITESPACE
         COMMAND_ERROR_IS_FATAL ANY
@@ -59,6 +59,8 @@ function(citron_build_clangcl_ffmpeg)
     list(GET _clangcl_ffmpeg_paths 5 _ar_tool_dir_msys)
     # MSYS paths for bash commands (cd, mv) — separate from Windows mixed paths
     list(GET _clangcl_ffmpeg_paths 6 _install_dir_msys)
+    list(GET _clangcl_ffmpeg_paths 7 _source_dir_msys)
+    list(GET _clangcl_ffmpeg_paths 8 _build_dir_msys)
     set(_build_stamp "${_install_dir}/.built")
     file(MAKE_DIRECTORY "${_build_dir}" "${_install_dir}")
 
@@ -68,19 +70,48 @@ function(citron_build_clangcl_ffmpeg)
         set(_ffmpeg_extra_cflags "${_ffmpeg_extra_cflags} ${CLANGCL_FFMPEG_EXTRA_CFLAGS}")
     endif()
 
-    # Flag sentinel: if cached build's flags differ from current, remove stamp so ninja rebuilds.
-    # CLANGCL_FFMPEG_CACHE_DIR path-keying is the primary protection; this is a fallback.
-    set(_ffmpeg_flags_sentinel "${_install_dir}/.citron-clangcl-extra-cflags")
-    set(_ffmpeg_flags_sentinel_content "")
-    if (EXISTS "${_ffmpeg_flags_sentinel}")
-        file(READ "${_ffmpeg_flags_sentinel}" _ffmpeg_flags_sentinel_content)
-        string(STRIP "${_ffmpeg_flags_sentinel_content}" _ffmpeg_flags_sentinel_content)
+    # ── Vulkan headers detection ───────────────────────────────────────────────
+    # Resolution order (most authoritative first):
+    #   1. CPM Vulkan-Headers_SOURCE_DIR (set by dependencies.cmake via CPMAddPackage)
+    #   2. MSYS2 system headers ($MSYSTEM_PREFIX/include)
+    # We intentionally do NOT use get_target_property(Vulkan::Headers ...) because
+    # INTERFACE_INCLUDE_DIRECTORIES may contain generator expressions that cannot
+    # be resolved at configure-time for an external shell command.
+    set(_vk_inc_dir "")
+    if (DEFINED Vulkan-Headers_SOURCE_DIR AND EXISTS "${Vulkan-Headers_SOURCE_DIR}/include/vulkan/vulkan.h")
+        set(_vk_inc_dir "${Vulkan-Headers_SOURCE_DIR}/include")
+    elseif (DEFINED Vulkan_Headers_SOURCE_DIR AND EXISTS "${Vulkan_Headers_SOURCE_DIR}/include/vulkan/vulkan.h")
+        # CPM normalises hyphens to underscores in some versions
+        set(_vk_inc_dir "${Vulkan_Headers_SOURCE_DIR}/include")
+    elseif (EXISTS "$ENV{MSYSTEM_PREFIX}/include/vulkan/vulkan.h")
+        set(_vk_inc_dir "$ENV{MSYSTEM_PREFIX}/include")
     endif()
-    if (EXISTS "${_build_stamp}" AND NOT _ffmpeg_flags_sentinel_content STREQUAL "${_ffmpeg_extra_cflags}")
-        message(STATUS "[FFmpeg/clang-cl] Cached build's recorded flags don't match the current build's; rebuilding")
-        file(REMOVE "${_build_stamp}")
+
+    set(_ffmpeg_vulkan_flags "")
+    if (_vk_inc_dir)
+        message(STATUS "[FFmpeg/clang-cl] Vulkan headers found at: ${_vk_inc_dir}")
+        # Convert to a Windows-compatible path that clang-cl and FFmpeg's configure can use.
+        execute_process(
+            COMMAND "${CMAKE_COMMAND}" -E env "MSYS2_ARG_CONV_EXCL=*"
+                "${BASH_PROGRAM}" -lc "cygpath -am '${_vk_inc_dir}'"
+            OUTPUT_VARIABLE _vk_inc_win
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        if (_vk_inc_win MATCHES "^[A-Za-z]:/")
+            set(_ffmpeg_extra_cflags "${_ffmpeg_extra_cflags} -I${_vk_inc_win}")
+            set(_ffmpeg_vulkan_flags
+                "--enable-vulkan"
+                "--enable-hwaccel=h264_vulkan"
+                "--enable-hwaccel=vp9_vulkan"
+            )
+        else()
+            message(STATUS "[FFmpeg/clang-cl] Vulkan include path conversion failed; disabling Vulkan hwaccel")
+            set(_ffmpeg_vulkan_flags "--disable-vulkan")
+        endif()
+    else()
+        message(STATUS "[FFmpeg/clang-cl] Vulkan headers not found; disabling Vulkan hwaccel")
+        set(_ffmpeg_vulkan_flags "--disable-vulkan")
     endif()
-    file(WRITE "${_ffmpeg_flags_sentinel}" "${_ffmpeg_extra_cflags}")
 
     set(_ffmpeg_configure_command
         "export PATH='${_clangcl_tool_dir_msys}:${_linker_tool_dir_msys}:${_ar_tool_dir_msys}':$PATH &&"
@@ -116,11 +147,26 @@ function(citron_build_clangcl_ffmpeg)
         "--enable-hwaccel=vp9_dxva2"
         "--enable-hwaccel=vp9_d3d11va"
         "--enable-hwaccel=vp9_d3d11va2"
+        ${_ffmpeg_vulkan_flags}
         "--enable-filter=yadif,scale"
         "--enable-dxva2"
         "--enable-d3d11va"
         "--extra-cflags='${_ffmpeg_extra_cflags}'")
     string(JOIN " " _ffmpeg_configure_command ${_ffmpeg_configure_command})
+
+    # Flag sentinel: if recorded configure flags/command differ from current, remove stamp so ninja rebuilds.
+    set(_ffmpeg_flags_sentinel "${_install_dir}/.citron-clangcl-extra-cflags")
+    set(_ffmpeg_flags_sentinel_content "")
+    set(_current_sentinel_hash "${_ffmpeg_configure_command} ${_ffmpeg_extra_cflags}")
+    if (EXISTS "${_ffmpeg_flags_sentinel}")
+        file(READ "${_ffmpeg_flags_sentinel}" _ffmpeg_flags_sentinel_content)
+        string(STRIP "${_ffmpeg_flags_sentinel_content}" _ffmpeg_flags_sentinel_content)
+    endif()
+    if (EXISTS "${_build_stamp}" AND NOT _ffmpeg_flags_sentinel_content STREQUAL "${_current_sentinel_hash}")
+        message(STATUS "[FFmpeg/clang-cl] Configure flags changed; invalidating cache and rebuilding FFmpeg")
+        file(REMOVE "${_build_stamp}")
+    endif()
+    file(WRITE "${_ffmpeg_flags_sentinel}" "${_current_sentinel_hash}")
 
     add_custom_command(
         OUTPUT "${_build_stamp}"
@@ -132,7 +178,7 @@ function(citron_build_clangcl_ffmpeg)
         COMMAND "${CMAKE_COMMAND}" -E env "MSYS2_ARG_CONV_EXCL=*"
             "${BASH_PROGRAM}" -lc "${_ffmpeg_configure_command}"
         COMMAND "${CMAKE_COMMAND}" -E env "MSYS2_ARG_CONV_EXCL=*"
-            "${BASH_PROGRAM}" -lc "perl -0pi -e 's{^SRC_PATH=.*$}{SRC_PATH=${_source_dir_win}}m; s{(?<![A-Za-z0-9_])/([A-Za-z])/}{uc($1).q{:/}}ge; s{^(AR|AR_CMD)=llvm-lib}{$1=llvm-ar}mg' '${_build_dir_win}/ffbuild/config.mak' '${_build_dir_win}/ffbuild/config.sh'"
+            "${BASH_PROGRAM}" -lc "FFMPEG_SOURCE_DIR_MSYS='${_source_dir_msys}' FFMPEG_SOURCE_DIR_WIN='${_source_dir_win}' FFMPEG_BUILD_DIR_MSYS='${_build_dir_msys}' FFMPEG_BUILD_DIR_WIN='${_build_dir_win}' perl -0pi -e 'my $source_dir_msys = \$ENV{FFMPEG_SOURCE_DIR_MSYS}; my $source_dir_win = \$ENV{FFMPEG_SOURCE_DIR_WIN}; my $build_dir_msys = \$ENV{FFMPEG_BUILD_DIR_MSYS}; my $build_dir_win = \$ENV{FFMPEG_BUILD_DIR_WIN}; if (\$ARGV =~ /config\\.mak$/) { (my $source_dir_make = $source_dir_win) =~ s{ }{\\\\ }g; (my $build_dir_make = $build_dir_win) =~ s{ }{\\\\ }g; s{\\Q$source_dir_msys\\E}{$source_dir_make}g; s{\\Q$build_dir_msys\\E}{$build_dir_make}g; s{^SRC_PATH\\s*:?=\\s*.*$}{SRC_PATH=$source_dir_make}mg; } else { (my $source_dir_sh = $source_dir_win) =~ s{\\x27}{\"\\x27\\\\\\x27\\x27\"}ge; (my $build_dir_sh = $build_dir_win) =~ s{\\x27}{\"\\x27\\\\\\x27\\x27\"}ge; s{\\Q$source_dir_msys\\E}{$source_dir_sh}g; s{\\Q$build_dir_msys\\E}{$build_dir_sh}g; s{^SRC_PATH\\s*:?=\\s*.*$}{\"SRC_PATH=\\x27$source_dir_sh\\x27\"}mge; } s{^(AR|AR_CMD)=llvm-lib}{$1=llvm-ar}mg' '${_build_dir_win}/ffbuild/config.mak' '${_build_dir_win}/ffbuild/config.sh'"
         COMMAND "${CMAKE_COMMAND}" -E env "MSYS2_ARG_CONV_EXCL=*"
             "${BASH_PROGRAM}" -lc "export PATH='${_clangcl_tool_dir_msys}:${_linker_tool_dir_msys}:${_ar_tool_dir_msys}':$PATH && '${MAKE_PROGRAM}' -j${_ffmpeg_jobs}"
         COMMAND "${CMAKE_COMMAND}" -E env "MSYS2_ARG_CONV_EXCL=*"

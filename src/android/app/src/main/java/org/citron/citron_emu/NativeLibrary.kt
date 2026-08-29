@@ -161,13 +161,53 @@ object NativeLibrary {
      * Connects to an existing multiplayer room. This can block while ENet performs its handshake,
      * so callers must invoke it off the main thread.
      */
-    external fun connectToRoom(nickname: String, host: String, port: Int): Boolean
+    external fun connectToRoom(
+        nickname: String,
+        host: String,
+        port: Int,
+        password: String
+    ): Boolean
+
+    /** Creates an unlisted room and joins it as the local host. */
+    external fun hostRoom(
+        nickname: String,
+        name: String,
+        description: String,
+        port: Int,
+        password: String,
+        maxPlayers: Int
+    ): Boolean
 
     /** Returns the current multiplayer room member state. */
     external fun getRoomConnectionState(): Int
 
+    /** Returns the most recent RoomMember.Error ordinal, or -1 when no error is pending. */
+    external fun getRoomLastError(): Int
+
+    /** Returns RoomMember.Error and Android-specific room error values in Kotlin enum order. */
+    external fun getMultiplayerErrorValues(): IntArray
+
+    /** Returns Network::MaxMessageSize. */
+    external fun getMaxRoomChatMessageBytes(): Int
+
+    /** Returns name, description, preferred game, member count, capacity, and port. */
+    external fun getRoomInfo(): Array<String>
+
+    /** Returns flattened nickname, username, game name, and game ID groups. */
+    external fun getRoomMembers(): Array<String>
+
+    /** Returns flattened event type, nickname, username, and payload groups. */
+    external fun drainRoomEvents(): Array<String>
+
+    external fun sendRoomChatMessage(message: String): Boolean
+
+    external fun isHostingRoom(): Boolean
+
     /** Disconnects from the current multiplayer room. */
     external fun leaveRoom()
+
+    /** Leaves the local membership and destroys a locally hosted room. */
+    external fun closeRoom()
 
     /**
      * Returns the performance stats for the current game

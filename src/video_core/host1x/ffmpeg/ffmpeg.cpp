@@ -19,51 +19,72 @@ namespace FFmpeg {
 
 namespace {
 
-constexpr AVPixelFormat PreferredGpuFormat = AV_PIX_FMT_NV12;
 constexpr AVPixelFormat PreferredCpuFormat = AV_PIX_FMT_YUV420P;
 constexpr std::array PreferredGpuDecoders = {
 #if defined(_WIN32)
     AV_HWDEVICE_TYPE_CUDA,
     AV_HWDEVICE_TYPE_D3D11VA,
     AV_HWDEVICE_TYPE_DXVA2,
+    // Vulkan Video decode is unreliable on Windows: NVIDIA produces artifacts,
+    // AMD lacks VK_KHR_video_decode_queue on most hardware. Use D3D11VA instead for now.
+    // https://forums.developer.nvidia.com/t/378828
+    // AV_HWDEVICE_TYPE_VULKAN,
 #elif defined(__FreeBSD__)
+    AV_HWDEVICE_TYPE_VULKAN,
+    AV_HWDEVICE_TYPE_VAAPI,
     AV_HWDEVICE_TYPE_VDPAU,
 #elif defined(__unix__)
     AV_HWDEVICE_TYPE_CUDA,
+    AV_HWDEVICE_TYPE_VULKAN,
     AV_HWDEVICE_TYPE_VAAPI,
     AV_HWDEVICE_TYPE_VDPAU,
-#endif
+#else
     AV_HWDEVICE_TYPE_VULKAN,
+#endif
 };
 
 AVPixelFormat GetGpuFormat(AVCodecContext* codec_context, const AVPixelFormat* pix_fmts) {
-    const auto desc = av_pix_fmt_desc_get(codec_context->pix_fmt);
-    if (desc && !(desc->flags & AV_PIX_FMT_FLAG_HWACCEL)) {
+    // codec_context->pix_fmt is AV_PIX_FMT_NONE when get_format is called, so we
+    // cannot rely on it to identify which hw type was selected. Instead, walk the
+    // codec's HW config table and match against the device type that was actually
+    // attached to hw_device_ctx, then verify the codec offers that pixel format.
+    if (codec_context->hw_device_ctx) {
+        const auto* hw_device_ctx =
+            reinterpret_cast<AVHWDeviceContext*>(codec_context->hw_device_ctx->data);
+        const AVHWDeviceType active_type = hw_device_ctx->type;
+
+        // Find the pixel format the codec uses for this device type.
         for (int i = 0;; i++) {
             const AVCodecHWConfig* config = avcodec_get_hw_config(codec_context->codec, i);
             if (!config) {
                 break;
             }
-
-            for (const auto type : PreferredGpuDecoders) {
-                if (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX &&
-                    config->device_type == type) {
-                    codec_context->pix_fmt = config->pix_fmt;
+            if (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX &&
+                config->device_type == active_type) {
+                // Confirm the codec is actually offering this format right now.
+                for (const AVPixelFormat* p = pix_fmts; *p != AV_PIX_FMT_NONE; ++p) {
+                    if (*p == config->pix_fmt) {
+                        return config->pix_fmt;
+                    }
                 }
+                break;
             }
         }
+
+        LOG_INFO(HW_GPU, "Could not find supported GPU pixel format for {}, falling back to CPU decoder",
+                 av_hwdevice_get_type_name(active_type));
+        av_buffer_unref(&codec_context->hw_device_ctx);
     }
 
+    // CPU fallback: pick the first software format on offer.
     for (const AVPixelFormat* p = pix_fmts; *p != AV_PIX_FMT_NONE; ++p) {
-        if (*p == codec_context->pix_fmt) {
-            return codec_context->pix_fmt;
+        const auto* desc = av_pix_fmt_desc_get(*p);
+        if (desc && !(desc->flags & AV_PIX_FMT_FLAG_HWACCEL)) {
+            return *p;
         }
     }
 
-    LOG_INFO(HW_GPU, "Could not find supported GPU pixel format, falling back to CPU decoder");
-    av_buffer_unref(&codec_context->hw_device_ctx);
-    codec_context->pix_fmt = PreferredCpuFormat;
-    return codec_context->pix_fmt;
+    return PreferredCpuFormat;
 }
 
 std::string AVError(int errnum) {
@@ -272,11 +293,26 @@ std::unique_ptr<Frame> DecoderContext::ReceiveFrame(bool* out_is_interlaced) {
             return {};
         }
 
-        dst_frame->SetFormat(PreferredGpuFormat);
+        // Do NOT pre-set dst_frame's format before calling av_hwframe_transfer_data.
+        // DXVA2/D3D11VA can transfer into a pre-formatted NV12 frame, but Vulkan
+        // requires FFmpeg to allocate the destination frame itself with the correct
+        // format and strides. Pre-setting AV_PIX_FMT_NV12 on an unallocated frame
+        // causes Vulkan transfers to write into uninitialised memory, producing the
+        // corrupted block artifacts seen on Windows. Let FFmpeg pick the sw format.
         if (const int ret =
                 av_hwframe_transfer_data(dst_frame->GetFrame(), intermediate_frame.GetFrame(), 0);
             ret < 0) {
             LOG_ERROR(HW_GPU, "av_hwframe_transfer_data error: {}", AVError(ret));
+            return {};
+        }
+
+        // After transfer, if the output came out as planar YUV (e.g. yuv420p from
+        // Vulkan) rather than NV12, copy the frame props so downstream code has
+        // correct width/height/pts regardless of which sw format was chosen.
+        if (const int ret =
+                av_frame_copy_props(dst_frame->GetFrame(), intermediate_frame.GetFrame());
+            ret < 0) {
+            LOG_ERROR(HW_GPU, "av_frame_copy_props error: {}", AVError(ret));
             return {};
         }
     } else {
