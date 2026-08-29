@@ -503,6 +503,12 @@ _setup_apt() {
 
     # Optional: bundled into the AppImage by package-citron-linux.sh if present.
     sudo apt-get install -y gamemode 2>/dev/null || true
+
+    # Required by the native Linux web-applet backend.  This supplies both
+    # WebKitGTK and the webkit2gtk-4.1 pkg-config module checked by CMake.
+    info "Installing WebKitGTK development package..."
+    sudo apt-get install -y libwebkit2gtk-4.1-dev \
+        || error "WebKitGTK development package failed to install — the native web applet backend requires webkit2gtk-4.1"
 }
 
 _setup_pacman() {
@@ -556,6 +562,12 @@ _setup_pacman() {
 
     # Optional: bundled into the AppImage by package-citron-linux.sh if present.
     $SUDO pacman -S --needed --noconfirm gamemode 2>/dev/null || true
+
+    # Required by the native Linux web-applet backend.  This supplies both
+    # WebKitGTK and the webkit2gtk-4.1 pkg-config module checked by CMake.
+    info "Installing WebKitGTK development package..."
+    $SUDO pacman -S --needed --noconfirm webkit2gtk-4.1 \
+        || error "WebKitGTK development package failed to install — the native web applet backend requires webkit2gtk-4.1"
 
     # Arch ships unversioned tools — symlink to versioned names
     for tool in clang clang++ lld llvm-profdata llvm-bolt merge-fdata; do
@@ -615,6 +627,11 @@ _setup_dnf() {
 
     # Optional: bundled into the AppImage by package-citron-linux.sh if present.
     sudo dnf install -y gamemode 2>/dev/null || true
+
+    # Provides pkgconfig(webkit2gtk-4.1), required by the native web applet.
+    info "Installing WebKitGTK development package..."
+    sudo dnf install -y webkit2gtk4.1-devel \
+        || error "WebKitGTK development package failed to install — the native web applet backend requires webkit2gtk-4.1"
 }
 
 _setup_yum() {
@@ -666,6 +683,11 @@ _setup_yum() {
     # Optional: bundled into the AppImage by package-citron-linux.sh if present.
     # May require EPEL or an RPM Fusion-style repo on RHEL-based distros.
     sudo yum install -y gamemode 2>/dev/null || true
+
+    # Provides pkgconfig(webkit2gtk-4.1), required by the native web applet.
+    info "Installing WebKitGTK development package..."
+    sudo yum install -y webkit2gtk4.1-devel \
+        || error "WebKitGTK development package failed to install — the native web applet backend requires webkit2gtk-4.1"
 }
 
 _setup_zypper() {
@@ -714,6 +736,11 @@ _setup_zypper() {
 
     # Optional: bundled into the AppImage by package-citron-linux.sh if present.
     sudo zypper install -y --no-recommends gamemode 2>/dev/null || true
+
+    # Provides pkgconfig(webkit2gtk-4.1), required by the native web applet.
+    info "Installing WebKitGTK development package..."
+    sudo zypper install -y --no-recommends webkitgtk3-devel \
+        || error "WebKitGTK development package failed to install — the native web applet backend requires webkit2gtk-4.1"
 }
 
 _setup_emerge() {
@@ -762,6 +789,11 @@ _setup_emerge() {
 
     # Optional: bundled into the AppImage by package-citron-linux.sh if present.
     sudo emerge --ask=n games-util/gamemode 2>/dev/null || true
+
+    # The GTK3-enabled package provides the webkit2gtk-4.1 pkg-config module.
+    info "Installing WebKitGTK development package..."
+    sudo emerge --ask=n net-libs/webkit-gtk \
+        || error "WebKitGTK development package failed to install — the native web applet backend requires webkit2gtk-4.1"
 }
 
 _install_llvm_clang() {

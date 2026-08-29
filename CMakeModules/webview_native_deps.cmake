@@ -58,7 +58,7 @@ if (WIN32 AND CITRON_USE_WEBVIEW2_WEB_ENGINE AND CITRON_USE_CPM)
 endif()
 
 # ── WebKitGTK (Linux) — system package, not CPM. See policy note above. ────────
-if (UNIX AND NOT APPLE AND CITRON_USE_WEBKITGTK_WEB_ENGINE)
+if (UNIX AND NOT APPLE AND NOT ANDROID AND CITRON_USE_WEBKITGTK_WEB_ENGINE)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(WEBKITGTK REQUIRED IMPORTED_TARGET webkit2gtk-4.1)
     pkg_check_modules(GTK3 REQUIRED IMPORTED_TARGET gtk+-3.0)
