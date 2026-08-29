@@ -327,6 +327,19 @@ void WebBrowser::ExecuteInteractive() {
 
     WebSessionMessageHeader header;
     std::memcpy(&header, data.data(), sizeof(header));
+
+    const auto message_kind = static_cast<WebSessionSendMessageKind>(header.kind);
+    if (message_kind == WebSessionSendMessageKind::Ack) {
+        // libnx uses a fixed 0x20-byte storage for ACK messages even though the header describes
+        // only 0xC bytes of payload. Do not apply the content-message size rule to ACKs.
+        if (header.size != 0xC || data.size() != 0x20) {
+            LOG_WARNING(Service_AM,
+                        "Ignoring malformed WebSession ACK: payload_size={}, storage_size={}",
+                        header.size, data.size());
+        }
+        return;
+    }
+
     if (header.size + sizeof(header) != data.size()) {
         LOG_WARNING(Service_AM,
                     "Ignoring malformed WebSession message: kind={:#x}, payload_size={}, "
@@ -337,7 +350,9 @@ void WebBrowser::ExecuteInteractive() {
 
     const auto send_ack = [this, storage_size = static_cast<u32>(data.size())](
                               WebSessionReceiveMessageKind kind) {
-        std::vector<u8> ack_data(sizeof(WebSessionMessageHeader) + 0xC);
+        // The protocol's ACK storage is 0x20 bytes. The trailing four bytes are padding and are
+        // deliberately not included in the header's 0xC-byte payload size.
+        std::vector<u8> ack_data(0x20);
         WebSessionMessageHeader ack_header;
         ack_header.kind = static_cast<u32>(kind);
         ack_header.size = 0xC;
@@ -346,7 +361,7 @@ void WebBrowser::ExecuteInteractive() {
         PushInteractiveOutData(std::make_shared<IStorage>(system, std::move(ack_data)));
     };
 
-    switch (static_cast<WebSessionSendMessageKind>(header.kind)) {
+    switch (message_kind) {
     case WebSessionSendMessageKind::BrowserEngineContent: {
         std::string payload(data.begin() + sizeof(header), data.end());
         if (!payload.empty() && payload.back() == '\0') {
@@ -362,7 +377,7 @@ void WebBrowser::ExecuteInteractive() {
         send_ack(WebSessionReceiveMessageKind::AckSystemMessage);
         break;
     case WebSessionSendMessageKind::Ack:
-        // This is an acknowledgement for a browser-to-guest message and needs no frontend work.
+        // Handled before the content-message size validation above.
         break;
     default:
         LOG_WARNING(Service_AM, "Ignoring unknown WebSession message kind {:#x}", header.kind);
@@ -371,6 +386,16 @@ void WebBrowser::ExecuteInteractive() {
 }
 
 void WebBrowser::Execute() {
+    // PushInteractiveInData calls ExecuteInteractive() and then Execute(). That continuation
+    // pattern is useful to some frontend applets, but a WebSession is already running inside a
+    // single long-lived browser view. In particular, the guest ACK for the page's initial
+    // `loaded` message used to reopen ExecuteOffline(), overwrite GMainWindow::web_applet, and
+    // leave a nested "Loading Web Applet" loop stuck at 66%.
+    if (complete || frontend_opened) {
+        return;
+    }
+    frontend_opened = true;
+
     // Checked here rather than per-frontend (e.g. previously only inside Qt's
     // GMainWindow::WebBrowserOpenWebPage, gated behind #ifdef CITRON_USE_QT_WEB_ENGINE) so the
     // behavior is identical for every frontend and independent of whether Qt WebEngine is even
@@ -418,12 +443,25 @@ void WebBrowser::ExtractOfflineRomFS() {
     LOG_DEBUG(Service_AM, "Extracting RomFS to {}",
               Common::FS::PathToUTF8String(offline_cache_dir));
 
+    // A previous extraction can have been interrupted after the document entry point was written,
+    // but before its stylesheets and images. Do not let that partial cache masquerade as complete
+    // on the next applet launch.
+    const auto completion_marker = offline_cache_dir / ".citron-romfs-complete";
+    Common::FS::RemoveFile(completion_marker);
+
     const auto extracted_romfs_dir = FileSys::ExtractRomFS(offline_romfs);
 
     const auto temp_dir = system.GetFilesystem()->CreateDirectory(
         Common::FS::PathToUTF8String(offline_cache_dir), FileSys::OpenMode::ReadWrite);
 
-    FileSys::VfsRawCopyD(extracted_romfs_dir, temp_dir);
+    if (!extracted_romfs_dir || !temp_dir || !FileSys::VfsRawCopyD(extracted_romfs_dir, temp_dir)) {
+        LOG_ERROR(Service_AM, "Failed to extract offline RomFS to {}",
+                  Common::FS::PathToUTF8String(offline_cache_dir));
+    } else if (Common::FS::WriteStringToFile(completion_marker, Common::FS::FileType::TextFile,
+                                              "complete") != 8) {
+        LOG_WARNING(Service_AM, "Failed to mark offline RomFS cache complete at {}",
+                    Common::FS::PathToUTF8String(completion_marker));
+    }
 
     // The page is now served exclusively from offline_cache_dir. Keeping the layered RomFS alive
     // would keep host handles open on its manual_html override files; ARCropolis rewrites those
@@ -540,11 +578,55 @@ void WebBrowser::InitializeOffline() {
                 fmt::format("manual_html/{}/{}", additional_paths, document_path));
 
             if (Common::FS::Exists(sd_override_document)) {
+                // ARCropolis rewrites parts of this overlay as the user changes screens.  Do not
+                // invalidate and re-extract the whole HtmlDocument for each change: retain the
+                // already-extracted base resources (help/, common/, fonts, etc.) and copy only
+                // the updated overlay files into that merged cache.
+                const auto sd_override_root = Common::FS::ConcatPathSafe(
+                    std::filesystem::path{sd_mod_root->GetFullPath()},
+                    std::filesystem::path{"manual_html"});
                 std::error_code error;
-                std::filesystem::remove_all(offline_cache_dir, error);
+                if (Common::FS::Exists(offline_cache_dir)) {
+                    std::filesystem::recursive_directory_iterator iterator{sd_override_root, error};
+                    const std::filesystem::recursive_directory_iterator end;
+                    for (; !error && iterator != end; iterator.increment(error)) {
+                        if (!iterator->is_regular_file(error)) {
+                            continue;
+                        }
+
+                        const auto relative_path =
+                            std::filesystem::relative(iterator->path(), sd_override_root, error);
+                        if (error) {
+                            break;
+                        }
+                        const auto destination = offline_cache_dir / relative_path;
+
+                        std::error_code cache_error;
+                        const auto source_time = iterator->last_write_time(error);
+                        const auto cache_time =
+                            std::filesystem::last_write_time(destination, cache_error);
+                        if (error) {
+                            break;
+                        }
+                        if (!cache_error && source_time <= cache_time) {
+                            continue;
+                        }
+
+                        std::filesystem::create_directories(destination.parent_path(), error);
+                        if (!error) {
+                            std::filesystem::copy_file(iterator->path(), destination,
+                                                       std::filesystem::copy_options::overwrite_existing,
+                                                       error);
+                        }
+                        if (error) {
+                            break;
+                        }
+                    }
+                }
+
                 if (error) {
-                    LOG_WARNING(Service_AM, "Failed to refresh offline web cache {}: {}",
-                                Common::FS::PathToUTF8String(offline_cache_dir), error.message());
+                    LOG_WARNING(Service_AM, "Failed to synchronize offline web overlay {}: {}",
+                                Common::FS::PathToUTF8String(sd_override_root), error.message());
                 }
             }
         }
@@ -588,8 +670,13 @@ void WebBrowser::ExecuteOffline() {
     // offline page was requested.
 
     const auto main_url = GetMainURL(Common::FS::PathToUTF8String(offline_document));
+    const auto completion_marker = offline_cache_dir / ".citron-romfs-complete";
+    const bool needs_extraction =
+        !Common::FS::Exists(main_url) ||
+        Common::FS::ReadStringFromFile(completion_marker, Common::FS::FileType::TextFile) !=
+            "complete";
 
-    if (!Common::FS::Exists(main_url)) {
+    if (needs_extraction) {
         offline_romfs = GetOfflineRomFS(system, title_id, nca_type);
 
         if (offline_romfs == nullptr) {
@@ -599,22 +686,42 @@ void WebBrowser::ExecuteOffline() {
             WebBrowserExit(WebExitReason::WindowClosed);
             return;
         }
+
+        // GMainWindow triggers the extraction callback only when the entry document is absent.
+        // Remove a stale entry only after obtaining the merged RomFS, so an interrupted prior
+        // extraction is repaired instead of being served as a superficially valid page.
+        Common::FS::RemoveFile(std::filesystem::path{main_url});
     }
 
     LOG_INFO(Service_AM, "Opening offline document at {}",
              Common::FS::PathToUTF8String(offline_document));
 
+    const std::weak_ptr<WebBrowser> weak_self = weak_from_this();
     frontend.OpenLocalWebPage(
-        Common::FS::PathToUTF8String(offline_document), [this] { ExtractOfflineRomFS(); },
-        [this](WebExitReason exit_reason, std::string last_url) {
-            WebBrowserExit(exit_reason, last_url);
+        Common::FS::PathToUTF8String(offline_document),
+        [weak_self] {
+            if (const auto self = weak_self.lock()) {
+                self->ExtractOfflineRomFS();
+            }
         },
-        [this](std::string data) {
-            if (!web_session_enabled) {
+        [weak_self](WebExitReason exit_reason, std::string last_url) {
+            if (const auto self = weak_self.lock()) {
+                self->WebBrowserExit(exit_reason, std::move(last_url));
+            }
+        },
+        [weak_self](std::string data) {
+            const auto self = weak_self.lock();
+            if (!self) {
+                return;
+            }
+            if (!self->web_session_enabled) {
                 LOG_WARNING(Service_AM,
                             "Ignoring page message for an applet without WebSessionEnabled");
                 return;
             }
+
+            LOG_WARNING(Service_AM, "[WebSession diagnostic] Queueing page message ({} bytes)",
+                        data.size());
 
             // WebSession content must be framed and NUL-terminated. The NNSDK client replaces
             // the last byte with a terminator when receiving it, so omitting it would truncate
@@ -625,7 +732,8 @@ void WebBrowser::ExecuteOffline() {
             std::vector<u8> out_data(sizeof(header) + header.size);
             std::memcpy(out_data.data(), &header, sizeof(header));
             std::memcpy(out_data.data() + sizeof(header), data.data(), data.size());
-            PushInteractiveOutData(std::make_shared<IStorage>(system, std::move(out_data)));
+            self->PushInteractiveOutData(
+                std::make_shared<IStorage>(self->system, std::move(out_data)));
         });
 }
 
@@ -637,10 +745,13 @@ void WebBrowser::ExecuteShare() {
 void WebBrowser::ExecuteWeb() {
     LOG_INFO(Service_AM, "Opening external URL at {}", external_url);
 
-    frontend.OpenExternalWebPage(external_url,
-                                 [this](WebExitReason exit_reason, std::string last_url) {
-                                     WebBrowserExit(exit_reason, last_url);
-                                 });
+    const std::weak_ptr<WebBrowser> weak_self = weak_from_this();
+    frontend.OpenExternalWebPage(
+        external_url, [weak_self](WebExitReason exit_reason, std::string last_url) {
+            if (const auto self = weak_self.lock()) {
+                self->WebBrowserExit(exit_reason, std::move(last_url));
+            }
+        });
 }
 
 void WebBrowser::ExecuteWifi() {

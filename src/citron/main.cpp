@@ -971,7 +971,7 @@ void GMainWindow::WebBrowserOpenWebPage(const std::string& main_url,
 #if defined(CITRON_USE_QT_WEB_ENGINE)
     bool exit_check = false;
     bool interactive_poll_pending = false;
-    // runJavaScript callbacks are async and can fire after this function has
+    // JavaScript callbacks are async and can fire after this function has
     // already returned (e.g. loop exits mid-flight). The capture is [&,
     // session_active]: exit_check/interactive_poll_pending are still captured
     // by reference, but session_active is a shared_ptr copy (captured by
@@ -1047,9 +1047,6 @@ void GMainWindow::WebBrowserOpenWebPage(const std::string& main_url,
         // nothing else in this process does that. IsFinished()/GetExitReason()/
         // GetLastURL() are otherwise already current, no polling needed beyond this.
         WebKitGTKView::PumpGLibMainContext();
-#else
-        // WebView2: push-based via native COM events, no extra pumping needed --
-        // IsFinished()/GetExitReason()/GetLastURL() are already current.
 #endif
 
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -1062,7 +1059,14 @@ void GMainWindow::WebBrowserOpenWebPage(const std::string& main_url,
     const auto exit_reason = web_applet->GetExitReason();
     const auto last_url = web_applet->GetLastURL();
 
-    web_applet->hide();
+    // A native web backend owns an external browser/controller and a polling thread. Hiding the
+    // widget is not sufficient: retaining it leaves those resources alive and the next applet
+    // can hang while creating another browser. Detach and destroy the completed instance before
+    // notifying the guest, which may immediately request the next web applet.
+    auto* completed_web_applet = web_applet;
+    web_applet = nullptr;
+    completed_web_applet->hide();
+    delete completed_web_applet;
 
     render_window->setFocus();
 

@@ -23,6 +23,7 @@ typedef struct _WebKitWebView WebKitWebView;
 typedef struct _WebKitUserContentManager WebKitUserContentManager;
 typedef struct _WebKitJavascriptResult WebKitJavascriptResult;
 typedef struct _WebKitPolicyDecision WebKitPolicyDecision;
+typedef struct _WebKitScriptDialog WebKitScriptDialog;
 typedef struct _GCancellable GCancellable;
 typedef void* gpointer;
 }
@@ -114,6 +115,9 @@ private:
     // the real typed signature is registered via G_CALLBACK in the .cpp where the
     // full header is visible. GTK dispatches by signal name string, not pointer type.
     static int OnDecidePolicy(WebKitWebView*, WebKitPolicyDecision*, int, gpointer);
+    // Return gboolean (erased to int here) so WebKitGTK does not show its own
+    // unparented script dialogs. The .cpp presents Qt dialogs parented to this view.
+    static int OnScriptDialog(WebKitWebView*, WebKitScriptDialog*, gpointer);
     static void OnClose(WebKitWebView*, gpointer);
 
     GMainWindow& main_window;

@@ -12,25 +12,22 @@
 #include "citron/applets/web_browser_scripts_common.h"
 
 constexpr wchar_t WEBVIEW2_NX_SCRIPT[] = LR"(
-// Ported from WINDOW_NX_SCRIPT (qt_web_browser_scripts.h). Two mechanism changes
-// vs the original, both to replace main.cpp's poll loop with push-based delivery:
+// Ported from WINDOW_NX_SCRIPT (qt_web_browser_scripts.h).
 //
-// 1. sendMessage(): posts directly via window.chrome.webview.postMessage.
-//
-// 2. endApplet(): WebView2 has one JS->native channel (window.chrome.webview),
-//    so this is envelope-tagged with __citron_control rather than using a
-//    separate named handler like the WebKitGTK port's nxControl. The native side
-//    checks for that key before treating the message as a regular page payload.
+// The synthetic HTTPS host used by the backend supports WebView2's native message channel.
+// Keep the document-local state only as a fallback for runtimes where that API is unavailable.
 //
 // citron_key_callbacks and everything else are unchanged.
 
 var citron_key_callbacks = [];
+var citron_outgoing_messages = [];
+var end_applet = false;
 
 (function() {
     class WindowNX {
         constructor() {
             citron_key_callbacks[1] = function() {
-                if (window.history.length > 1) {
+                if (window.history.length > 2) {
                     window.history.back();
                 } else {
                     window.nx.endApplet();
@@ -47,8 +44,11 @@ var citron_key_callbacks = [];
 
         endApplet() {
             console.log("nx.endApplet called");
-
-            window.chrome.webview.postMessage({ __citron_control: "endApplet" });
+            if (window.chrome && window.chrome.webview && window.chrome.webview.postMessage) {
+                window.chrome.webview.postMessage({ __citron_control: "endApplet" });
+            } else {
+                end_applet = true;
+            }
         }
 
         playSystemSe(system_se) {
@@ -57,8 +57,12 @@ var citron_key_callbacks = [];
 
         sendMessage(message) {
             console.log("nx.sendMessage called, message=%s", message);
-
-            window.chrome.webview.postMessage(typeof message === "string" ? message : JSON.stringify(message));
+            const serialized = typeof message === "string" ? message : JSON.stringify(message);
+            if (window.chrome && window.chrome.webview && window.chrome.webview.postMessage) {
+                window.chrome.webview.postMessage(serialized);
+            } else {
+                citron_outgoing_messages.push(serialized);
+            }
         }
 
         setCursorScrollSpeed(scroll_speed) {
@@ -135,5 +139,33 @@ var citron_key_callbacks = [];
     window.nx = new WindowNX();
     window.nx.footer = new WindowNXFooter();
     window.nx.playReport = new WindowNXPlayReport();
+
+    // WebView2 receives keyboard input in its native child window, bypassing QWidget's
+    // keyboard-to-NPad path. Translate only the configured host mappings; treating literal
+    // A/B/X/Y as Switch buttons conflicts with common mappings such as left-stick A/W/S/D.
+    // Synthetic events from the controller input thread are excluded to avoid double activation.
+    window.addEventListener("keydown", function(event) {
+        if (!event.isTrusted || event.repeat) {
+            return;
+        }
+
+        const configured = window.citron_host_key_bindings;
+        const mapped_index = configured && configured.buttons
+            ? configured.buttons[event.keyCode] : undefined;
+        const callback_index = mapped_index;
+        if (callback_index === undefined) {
+            return;
+        }
+
+        const callback = citron_key_callbacks[callback_index];
+        if (callback != null) {
+            event.preventDefault();
+            callback();
+        } else if (callback_index === 0 && document.activeElement &&
+                   typeof document.activeElement.click === "function") {
+            event.preventDefault();
+            document.activeElement.click();
+        }
+    }, true);
 })();
 )";

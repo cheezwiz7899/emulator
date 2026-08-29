@@ -5,13 +5,15 @@
 
 #ifdef CITRON_USE_WEBKITGTK_WEB_ENGINE
 
-#include <algorithm>
 #include <chrono>
 #include <cstring>
 
 #include <QGuiApplication>
+#include <QInputDialog>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QLineEdit>
+#include <QMessageBox>
 #include <QMetaObject>
 #include <QThread>
 #include <QTimer>
@@ -135,9 +137,17 @@ WebKitGTKView::WebKitGTKView(GMainWindow& main_window_, Core::System& system_,
     webkit_user_content_manager_register_script_message_handler(ucm, "nxControl");
     g_signal_connect(ucm, "script-message-received::nxControl", G_CALLBACK(OnNxControl), this);
 
-    // Inject window_nx + gamepad scripts at document start, all frames -- mirrors
+    // Inject configured keyboard mappings + window_nx + gamepad scripts at document start.
     // qt_web_browser.cpp:62-81. Font/focus scripts are injected at load time via
     // LoadExtractedFonts/FocusFirstLinkElement.
+    const QByteArray keyboard_mapping =
+        QByteArray::fromStdString(input_interpreter->GetKeyboardMappingScript());
+    WebKitUserScript* keyboard_mapping_script = webkit_user_script_new(
+        keyboard_mapping.constData(), WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, nullptr, nullptr);
+    webkit_user_content_manager_add_script(ucm, keyboard_mapping_script);
+    webkit_user_script_unref(keyboard_mapping_script);
+
     WebKitUserScript* window_nx_script =
         webkit_user_script_new(WEBKITGTK_NX_SCRIPT, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
                                WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, nullptr, nullptr);
@@ -150,18 +160,34 @@ WebKitGTKView::WebKitGTKView(GMainWindow& main_window_, Core::System& system_,
     webkit_user_content_manager_add_script(ucm, gamepad_script);
     webkit_user_script_unref(gamepad_script);
 
-    webview =
-        WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW, "user-content-manager", ucm, nullptr));
+    // Keep cookies, local storage, and other website data in Citron's cache just as WebView2
+    // uses CacheDir/webview2. The default WebKit context is ephemeral, which breaks applets
+    // that expect state to survive closing and reopening a web session.
+    const QString profile_dir = QString::fromStdString(Common::FS::PathToUTF8String(
+        Common::FS::GetCitronPath(Common::FS::CitronPath::CacheDir) / "webkitgtk"));
+    const QByteArray profile_dir_utf8 = profile_dir.toUtf8();
+    if (g_mkdir_with_parents(profile_dir_utf8.constData(), 0700) != 0) {
+        LOG_WARNING(Frontend, "WebKitGTK: failed to create persistent profile directory: {}",
+                    profile_dir.toStdString());
+    }
+    WebKitWebsiteDataManager* data_manager = webkit_website_data_manager_new(
+        "base-data-directory", profile_dir_utf8.constData(), "base-cache-directory",
+        profile_dir_utf8.constData(), nullptr);
+    WebKitWebContext* web_context =
+        webkit_web_context_new_with_website_data_manager(data_manager);
+    webview = WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW, "web-context", web_context,
+                                           "user-content-manager", ucm, nullptr));
+    g_object_unref(web_context);
+    g_object_unref(data_manager);
     g_object_unref(ucm); // webview took its own ref via the property setter above;
                          // this releases the one webkit_user_content_manager_new()
                          // returned, which nothing was releasing before
     g_signal_connect(webview, "decide-policy", G_CALLBACK(OnDecidePolicy), this);
+    // WebKit's default JavaScript dialogs are top-level GTK windows. In an embedded
+    // WebView they can land partly off-screen, so handle them as Qt dialogs parented
+    // to the applet instead.
+    g_signal_connect(webview, "script-dialog", G_CALLBACK(OnScriptDialog), this);
     g_signal_connect(webview, "close", G_CALLBACK(OnClose), this);
-
-    // TODO: wire persistent storage via webkit_website_data_manager_new -- WebKitGTK
-    // requires this at WebContext creation time, not settable after the WebView exists.
-    // auto storage_dir = Common::FS::PathToUTF8String(
-    //     Common::FS::GetCitronPath(Common::FS::CitronPath::CitronDir) / "webkitgtk");
 
     QWidget* view_widget = Embed(&main_window_);
     auto* layout = new QVBoxLayout(this);
@@ -263,10 +289,11 @@ void WebKitGTKView::LoadExtractedFonts() {
     }
     fonts_injected = true;
 
-    auto fonts_dir_str = Common::FS::PathToUTF8String(
-        Common::FS::GetCitronPath(Common::FS::CitronPath::CacheDir) / "fonts/");
-    std::replace(fonts_dir_str.begin(), fonts_dir_str.end(), '\\', '/');
-    const QString fonts_dir = QString::fromStdString(fonts_dir_str);
+    const QString fonts_dir =
+        QUrl::fromLocalFile(QString::fromStdString(Common::FS::PathToUTF8String(
+                                Common::FS::GetCitronPath(Common::FS::CitronPath::CacheDir) /
+                                "fonts/")))
+            .toString();
 
     const QString css_source =
         QString::fromUtf8(WEB_BROWSER_NX_FONT_CSS)
@@ -317,6 +344,13 @@ void WebKitGTKView::LoadLocalWebPage(const std::string& main_url,
         return; // already SetFinished(true) in the constructor
     is_local = true;
 
+    // ARCropolis loads generated state (mods.json/workspaces.json) with XMLHttpRequest. WebKit
+    // treats each file:// URL as an opaque origin unless this setting is enabled, so the HTML and
+    // scripts rendered while their JSON requests silently failed. Restrict the relaxation to
+    // local applet pages; external pages retain WebKit's normal origin policy.
+    WebKitSettings* settings = webkit_web_view_get_settings(webview);
+    webkit_settings_set_allow_file_access_from_file_urls(settings, TRUE);
+
     LoadExtractedFonts();
     FocusFirstLinkElement();
     SetUserAgent(UserAgent::WebApplet);
@@ -344,6 +378,11 @@ void WebKitGTKView::LoadExternalWebPage(const std::string& main_url,
     if (init_failed)
         return;
     is_local = false;
+
+    // LoadLocalWebPage relaxes file-to-file XMLHttpRequest for offline applets. Do not retain
+    // that relaxation after the same view is reused for an external page.
+    WebKitSettings* settings = webkit_web_view_get_settings(webview);
+    webkit_settings_set_allow_file_access_from_file_urls(settings, FALSE);
 
     FocusFirstLinkElement();
     SetUserAgent(UserAgent::WebApplet);
@@ -388,11 +427,35 @@ void WebKitGTKView::SetPageZoomFactor(qreal factor) {
 
 void WebKitGTKView::SendKeyEvent(const QString& key, const QString& code, int key_code) {
     const QString script =
-        QStringLiteral("(function() { var el = document.activeElement || document.body; "
-                       "var opts = { key: '%1', code: '%2', keyCode: %3, which: %3, "
-                       "bubbles: true, cancelable: true }; "
-                       "el.dispatchEvent(new KeyboardEvent('keydown', opts)); "
-                       "el.dispatchEvent(new KeyboardEvent('keyup', opts)); })();")
+        // keyCode and which are read-only legacy properties in WebKit. ARCropolis' pages use
+        // them for navigation, so define own values on each synthetic event. The fallback only
+        // acts when the page did not move focus itself.
+        QStringLiteral("(function() { var target = document.activeElement || document; "
+                       "var keyCode = %3; var before = document.activeElement; "
+                       "function send(type) { var event = new KeyboardEvent(type, "
+                       "{ key: '%1', code: '%2', bubbles: true, cancelable: true }); "
+                       "try { Object.defineProperty(event, 'keyCode', { value: keyCode }); "
+                       "Object.defineProperty(event, 'which', { value: keyCode }); } catch (_) {} "
+                       "target.dispatchEvent(event); } send('keydown'); send('keyup'); "
+                       "function visible(el) { var s = getComputedStyle(el); return s.display !== 'none' && "
+                       "s.visibility !== 'hidden' && el.getClientRects().length !== 0; } "
+                       "var buttons = Array.from(document.querySelectorAll('button:not([disabled]), "
+                       "input:not([disabled]), a[href]:not([tabindex=\"-1\"])')).filter(visible); "
+                       "if ((keyCode === 37 || keyCode === 38 || keyCode === 39 || keyCode === 40) && "
+                       "document.activeElement === before && buttons.length) { "
+                       "var current = document.querySelector('.is-focused') || before; "
+                       "var i = buttons.indexOf(current); "
+                       "if (i < 0) i = 0; else if (keyCode === 37 || keyCode === 38) "
+                       "i = Math.max(0, i - 1); else i = Math.min(buttons.length - 1, i + 1); "
+                       "document.querySelectorAll('.is-focused').forEach(function(el) { "
+                       "if (el !== buttons[i]) el.classList.remove('is-focused'); }); "
+                       "buttons[i].classList.add('is-focused'); buttons[i].focus(); } "
+                       "else if (keyCode === 65) { var active = document.activeElement; "
+                       "if (!active || active === document.body || active === document.documentElement) { "
+                       "active = document.querySelector('button:not([disabled]), a[href], input:not([disabled])'); "
+                       "if (active) active.focus(); } if (active && active.click) active.click(); } "
+                       "else if (keyCode === 66) { if (history.length > 2) history.back(); "
+                       "else window.location.href = 'http://localhost/'; } })();")
             .arg(key, code)
             .arg(key_code);
     EvaluateJavaScript(script);
@@ -400,6 +463,7 @@ void WebKitGTKView::SendKeyEvent(const QString& key, const QString& code, int ke
 
 void WebKitGTKView::hideEvent(QHideEvent* event) {
     SetFinished(true);
+    StopInputThread();
     if (gtk_window && !container) {
         gtk_widget_hide(gtk_window);
     }
@@ -435,11 +499,6 @@ void WebKitGTKView::InputThreadLoop() {
     // Key events are sent via JS eval (SendKeyEvent) rather than Qt postEvent.
     std::this_thread::sleep_for(std::chrono::seconds(1));
 
-    if (is_local) {
-        // grabKeyboard()/releaseKeyboard() have no equivalent for a
-        // createWindowContainer-embedded foreign window -- not ported.
-    }
-
     while (input_thread_running) {
         input_interpreter->PollInput();
 
@@ -449,6 +508,9 @@ void WebKitGTKView::InputThreadLoop() {
             if (!input_interpreter->IsButtonPressedOnce(button)) {
                 continue;
             }
+            LOG_WARNING(Frontend,
+                        "[Web input diagnostic] WebKitGTK observed controller button {:#x}",
+                        static_cast<u64>(button));
             int callback_index = -1;
             const char* fallback_key = nullptr;
             int fallback_code = 0;
@@ -486,17 +548,16 @@ void WebKitGTKView::InputThreadLoop() {
             // Check if a callback is registered; send fallback key only if not.
             // Marshaled onto the GUI thread -- WebKit calls aren't thread-safe,
             // and invokeMethod(this, ...) auto-drops if `this` is destroyed first.
-            const QString check_script =
-                QStringLiteral("citron_key_callbacks[%1] != null").arg(callback_index);
+            const QString invoke_script =
+                QStringLiteral("(function() { var callback = citron_key_callbacks[%1]; "
+                               "if (callback != null) { callback(); return true; } return false; })()")
+                    .arg(callback_index);
             QMetaObject::invokeMethod(
                 this,
-                [this, check_script, callback_index, fallback_key, fallback_code] {
-                    EvaluateJavaScript(check_script, [this, callback_index, fallback_key,
-                                                      fallback_code](const QVariant& has_callback) {
-                        if (has_callback.toBool()) {
-                            EvaluateJavaScript(
-                                QStringLiteral("citron_key_callbacks[%1]();").arg(callback_index));
-                        } else if (fallback_key) {
+                [this, invoke_script, fallback_key, fallback_code] {
+                    EvaluateJavaScript(invoke_script, [this, fallback_key,
+                                                       fallback_code](const QVariant& handled) {
+                        if (!handled.toBool() && fallback_key) {
                             SendKeyEvent(QString::fromUtf8(fallback_key),
                                          QStringLiteral("Key") +
                                              QString::fromUtf8(fallback_key).toUpper(),
@@ -515,6 +576,11 @@ void WebKitGTKView::InputThreadLoop() {
             if (pressed_once || held) {
                 const DomKey dom_key = HIDButtonToDomKey(button);
                 if (dom_key.key_code != 0) {
+                    if (pressed_once) {
+                        LOG_WARNING(Frontend,
+                                    "[Web input diagnostic] WebKitGTK observed direction {:#x}",
+                                    static_cast<u64>(button));
+                    }
                     QMetaObject::invokeMethod(
                         this,
                         [this, dom_key] {
@@ -535,6 +601,8 @@ void WebKitGTKView::OnNxMessage(WebKitUserContentManager*, WebKitJavascriptResul
     auto* self = static_cast<WebKitGTKView*>(user_data);
     JSCValue* value = webkit_javascript_result_get_js_value(result);
     char* str_value = jsc_value_to_string(value);
+    LOG_WARNING(Frontend, "[WebSession diagnostic] WebKitGTK received nx.sendMessage ({} bytes)",
+                std::strlen(str_value));
     self->main_window.ForwardWebBrowserInteractiveData(std::string(str_value));
     g_free(str_value);
 }
@@ -589,6 +657,44 @@ int WebKitGTKView::OnDecidePolicy(WebKitWebView*, WebKitPolicyDecision* decision
 
     webkit_policy_decision_use(decision);
     return TRUE;
+}
+
+int WebKitGTKView::OnScriptDialog(WebKitWebView*, WebKitScriptDialog* dialog,
+                                  gpointer user_data) {
+    auto* self = static_cast<WebKitGTKView*>(user_data);
+    const QString title = QStringLiteral("ARCropolis");
+    const char* raw_message = webkit_script_dialog_get_message(dialog);
+    const QString text = QString::fromUtf8(raw_message ? raw_message : "");
+
+    switch (webkit_script_dialog_get_dialog_type(dialog)) {
+    case WEBKIT_SCRIPT_DIALOG_ALERT:
+        QMessageBox::information(self, title, text);
+        return TRUE;
+
+    case WEBKIT_SCRIPT_DIALOG_CONFIRM:
+    case WEBKIT_SCRIPT_DIALOG_BEFORE_UNLOAD: {
+        const bool accepted =
+            QMessageBox::question(self, title, text, QMessageBox::Yes | QMessageBox::No,
+                                  QMessageBox::No) == QMessageBox::Yes;
+        webkit_script_dialog_confirm_set_confirmed(dialog, accepted);
+        return TRUE;
+    }
+
+    case WEBKIT_SCRIPT_DIALOG_PROMPT: {
+        bool accepted = false;
+        const char* default_text = webkit_script_dialog_prompt_get_default_text(dialog);
+        const QString result = QInputDialog::getText(
+            self, title, text, QLineEdit::Normal,
+            QString::fromUtf8(default_text ? default_text : ""), &accepted);
+        webkit_script_dialog_prompt_set_text(dialog,
+                                             accepted ? result.toUtf8().constData() : nullptr);
+        return TRUE;
+    }
+
+    default:
+        // Preserve WebKitGTK's native behavior for dialog types it may add later.
+        return FALSE;
+    }
 }
 
 void WebKitGTKView::OnClose(WebKitWebView*, gpointer user_data) {

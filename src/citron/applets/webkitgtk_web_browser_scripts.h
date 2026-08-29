@@ -27,7 +27,7 @@ var citron_key_callbacks = [];
     class WindowNX {
         constructor() {
             citron_key_callbacks[1] = function() {
-                if (window.history.length > 1) {
+                if (window.history.length > 2) {
                     window.history.back();
                 } else {
                     window.nx.endApplet();
@@ -140,5 +140,33 @@ var citron_key_callbacks = [];
     window.nx = new WindowNX();
     window.nx.footer = new WindowNXFooter();
     window.nx.playReport = new WindowNXPlayReport();
+
+    // The native web child receives keyboard input without passing it through QWidget's
+    // keyboard-to-NPad path. Translate only configured mappings so literal A/B/X/Y do not
+    // conflict with keyboard-backed controller mappings such as left-stick A/W/S/D.
+    // Synthetic events from the controller input thread are excluded to avoid double activation.
+    window.addEventListener("keydown", function(event) {
+        if (!event.isTrusted || event.repeat) {
+            return;
+        }
+
+        const configured = window.citron_host_key_bindings;
+        const mapped_index = configured && configured.buttons
+            ? configured.buttons[event.keyCode] : undefined;
+        const callback_index = mapped_index;
+        if (callback_index === undefined) {
+            return;
+        }
+
+        const callback = citron_key_callbacks[callback_index];
+        if (callback != null) {
+            event.preventDefault();
+            callback();
+        } else if (callback_index === 0 && document.activeElement &&
+                   typeof document.activeElement.click === "function") {
+            event.preventDefault();
+            document.activeElement.click();
+        }
+    }, true);
 })();
 )";

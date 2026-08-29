@@ -4,7 +4,10 @@
 #pragma once
 
 #include <atomic>
+#include <deque>
 #include <functional>
+#include <mutex>
+#include <optional>
 #include <thread>
 
 #include <QObject>
@@ -225,6 +228,19 @@ signals:
     void MainWindowSendInteractiveData(const std::string& data) const;
 
 private:
+    struct PendingWebPage {
+        std::string main_url;
+        std::string additional_args;
+        bool is_local{};
+        ExtractROMFSCallback extract_romfs_callback;
+        OpenWebPageCallback callback;
+        InteractiveDataCallback interactive_data_callback;
+    };
+
+    /// Starts a request only after it owns the frontend callback slot.  The web applet is a
+    /// single foreground surface, so requests must never create a second native browser while
+    /// the previous one is still running.
+    void StartWebPageRequest(const PendingWebPage& request) const;
     void MainWindowExtractOfflineRomFS();
 
     void MainWindowWebBrowserClosed(Service::AM::Frontend::WebExitReason exit_reason,
@@ -234,7 +250,13 @@ private:
     /// inside the applet sends an outgoing message via the injected window.nx.sendMessage bridge.
     void MainWindowInteractiveDataReceived(std::string data);
 
-    mutable ExtractROMFSCallback extract_romfs_callback;
-    mutable OpenWebPageCallback callback;
-    mutable InteractiveDataCallback interactive_data_callback;
+    /// The active request owns the callbacks used by the currently visible native browser.
+    /// Further foreground requests are queued until that page has been closed.  ARCropolis uses
+    /// this when switching from Workspaces to its Smash/mod-manager page.
+    mutable std::optional<PendingWebPage> active_web_page;
+    mutable std::deque<PendingWebPage> pending_web_pages;
+    // Only one exit is needed to replace the visible page. This is guarded with the request
+    // queue so a second deferred exit cannot close the page promoted by the first close.
+    mutable bool close_requested = false;
+    mutable std::mutex callback_mutex;
 };

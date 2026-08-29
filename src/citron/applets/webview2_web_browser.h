@@ -87,6 +87,7 @@ public:
     void SetPageZoomFactor(qreal factor);
 
 protected:
+    void showEvent(QShowEvent* event) override;
     void hideEvent(QHideEvent* event) override;
     void resizeEvent(QResizeEvent* event) override;
     void moveEvent(QMoveEvent* event) override;
@@ -96,10 +97,12 @@ private:
     void FlushPendingNavigation(); // runs a Load*WebPage request queued before
                                    // webview finished initializing
     void SyncBounds();
+    void FocusWebView();
     void FailScriptRegistration();
     void SetUserAgent(UserAgent user_agent);
     void LoadExtractedFonts();
     void FocusFirstLinkElement();
+    void ValidateInitialLocalResources();
     void InjectPersistentScripts(); // window_nx + gamepad at document creation, mirrors
                                     // qt_web_browser.cpp:62-81
 
@@ -113,6 +116,7 @@ private:
     HRESULT OnWebMessageReceived(ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs*);
     HRESULT OnNavigationStarting(ICoreWebView2*, ICoreWebView2NavigationStartingEventArgs*);
     HRESULT OnWindowCloseRequested(ICoreWebView2*, IUnknown*);
+    HRESULT OnScriptDialogOpening(ICoreWebView2*, ICoreWebView2ScriptDialogOpeningEventArgs*);
 
     static std::wstring JsonEscapeString(const std::wstring& input);
 
@@ -120,6 +124,17 @@ private:
     wil::com_ptr<ICoreWebView2Environment> environment;
     wil::com_ptr<ICoreWebView2Controller> controller;
     wil::com_ptr<ICoreWebView2> webview;
+
+    EventRegistrationToken web_message_received_token{};
+    EventRegistrationToken navigation_starting_token{};
+    EventRegistrationToken window_close_requested_token{};
+    EventRegistrationToken navigation_completed_token{};
+    EventRegistrationToken script_dialog_opening_token{};
+    bool web_message_received_registered = false;
+    bool navigation_starting_registered = false;
+    bool window_close_requested_registered = false;
+    bool navigation_completed_registered = false;
+    bool script_dialog_opening_registered = false;
 
     Core::System& system;
     InputCommon::InputSubsystem* input_subsystem;
@@ -129,6 +144,9 @@ private:
 
     bool is_local = false;
     bool fonts_injected = false;
+    bool local_resource_validation_pending = false;
+    bool local_resource_validation_complete = false;
+    bool local_resource_retry_used = false;
     bool script_registration_failed = false;
     int pending_script_registrations = 0;
     UserAgent pending_user_agent = UserAgent::WebApplet;
@@ -138,6 +156,7 @@ private:
     std::string last_url;
     QString requested_url;
     std::wstring pending_url;
+    std::wstring pending_local_folder;
     bool has_pending_navigation = false;
 };
 
