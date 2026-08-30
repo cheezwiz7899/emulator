@@ -31,6 +31,22 @@
 #include <gdk/gdkx.h>
 #endif
 
+// X11 exposes generic macros that collide with enum members in Citron and Qt.
+// Keep the GTK/WebKit includes above, then remove only the conflicting macros
+// before including application headers.
+#ifdef None
+#undef None
+#endif
+#ifdef True
+#undef True
+#endif
+#ifdef False
+#undef False
+#endif
+#ifdef Success
+#undef Success
+#endif
+
 #include "citron/applets/webkitgtk_web_browser_scripts.h"
 #include "citron/main.h"
 #include "common/fs/path_util.h"
