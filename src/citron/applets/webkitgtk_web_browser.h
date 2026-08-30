@@ -14,9 +14,9 @@
 #ifdef CITRON_USE_WEBKITGTK_WEB_ENGINE
 #include <QWidget>
 
-// GTK/WebKitGTK headers are included only in the .cpp (scoped with -DQT_NO_KEYWORDS)
-// to avoid the signals/slots name collision they cause when seen by main.cpp.
-// Forward declarations of the opaque GObject/GTK types are sufficient here.
+// GTK/WebKitGTK headers are included only in the .cpp. Forward declarations of
+// the opaque GObject/GTK types keep their signals/slots identifiers out of Qt
+// headers and are sufficient here.
 extern "C" {
 typedef struct _GtkWidget GtkWidget;
 typedef struct _WebKitWebView WebKitWebView;

@@ -21,8 +21,13 @@
 #include <QVBoxLayout>
 #include <QWindow>
 
-// GTK/WebKitGTK headers included here (not in the header) to avoid the
-// signals/slots name collision. See webkitgtk_web_browser.h for details.
+// GTK/WebKitGTK headers use fields named signals/slots. Temporarily hide Qt's
+// compatibility macros while parsing them, then restore the macros before
+// Citron headers which use the normal Qt signals: spelling.
+#pragma push_macro("signals")
+#pragma push_macro("slots")
+#undef signals
+#undef slots
 #include <gtk/gtk.h>
 #include <webkit2/webkit2.h>
 
@@ -30,6 +35,8 @@
 #if defined(GDK_WINDOWING_X11)
 #include <gdk/gdkx.h>
 #endif
+#pragma pop_macro("slots")
+#pragma pop_macro("signals")
 
 // X11 exposes generic macros that collide with enum members in Citron and Qt.
 // Keep the GTK/WebKit includes above, then remove only the conflicting macros
@@ -45,6 +52,12 @@
 #endif
 #ifdef Success
 #undef Success
+#endif
+#ifdef Always
+#undef Always
+#endif
+#ifdef Unsorted
+#undef Unsorted
 #endif
 
 #include "citron/applets/webkitgtk_web_browser_scripts.h"
