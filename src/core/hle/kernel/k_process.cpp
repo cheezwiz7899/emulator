@@ -1206,11 +1206,8 @@ Result KProcess::LoadFromMetadata(const FileSys::ProgramMetadata& metadata, std:
         // For 39-bit processes, the ASLR region starts at 0x800'0000 and is ~512GiB large.
         // However, some (buggy) programs/libraries like skyline incorrectly depend on the
         // existence of ASLR pages before the entry point, so we will adjust the load address
-        // to point to about 2GiB into the ASLR region. Ultimate S uses the exact Text address
-        // 0x80004000 as a Ryujinx fingerprint and intentionally disables its hardware WebApplet
-        // UI when it sees it. Keep that workaround title-scoped so the established address remains
-        // unchanged for all other 39-bit programs.
-        code_address = metadata.GetTitleID() == 0x01006A800016E000 ? 0x8001'0000 : 0x8000'0000;
+        // to point to about 2GiB into the ASLR region.
+        code_address = 0x8000'0000;
         break;
     case FileSys::ProgramAddressSpaceType::Is36Bit:
         flag |= Svc::CreateProcessFlag::AddressSpace64BitDeprecated;

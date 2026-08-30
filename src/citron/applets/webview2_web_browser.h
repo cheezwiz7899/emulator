@@ -155,6 +155,7 @@ private:
     QString requested_url;
     std::wstring pending_url;
     std::wstring pending_local_folder;
+    bool pending_local_uses_virtual_host = false;
     bool has_pending_navigation = false;
 };
 

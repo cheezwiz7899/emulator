@@ -229,11 +229,15 @@ constexpr char WEB_BROWSER_FOCUS_LINK_ELEMENT_SCRIPT[] = R"(
 
     // ARCropolis' page handlers omit preventDefault (and ARCadia only handles wraparound),
     // causing one key to move the browser scrollbar and sometimes the highlight in reverse.
-    // Own vertical navigation in the capture phase so keyboard and synthesized controller keys
-    // take exactly one deterministic step.
+    // Own vertical navigation in the capture phase only for those pages. Offline manuals have
+    // their own document-level arrow handling and must receive the original event.
     if (!window.__citronNavigationHandler) {
         window.__citronNavigationHandler = true;
         window.addEventListener('keydown', function(event) {
+            var isArcropolis = !!document.querySelector(
+                'script[src*="arcadia.js"], link[href*="arcadia.css"], #mods, #category_mover, ' +
+                'script[src*="menu.js"], script[src*="configurator.js"], script[src*="workspaces.js"]');
+            if (!isArcropolis) return;
             var configured = window.citron_host_key_bindings;
             var mapped = configured && configured.directions
                 ? configured.directions[event.keyCode] : undefined;

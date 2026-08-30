@@ -60,12 +60,12 @@ if (WIN32 AND CITRON_USE_WEBVIEW2_WEB_ENGINE AND CITRON_USE_CPM)
                     "${CMAKE_CURRENT_BINARY_DIR}/webview2_mingw_compat")
                 file(MAKE_DIRECTORY "${WEBVIEW2_MINGW_COMPAT_DIR}")
                 file(WRITE "${WEBVIEW2_MINGW_COMPAT_DIR}/EventToken.h"
-                     "#pragma once\n#include <eventtoken.h>\n")
+                     "#pragma once\n#include_next <eventtoken.h>\n")
                 # WIL includes the Windows SDK spelling WeakReference.h, while
                 # MinGW provides the same declarations as weakreference.h.
                 # This only affects case-sensitive cross-compilation hosts.
                 file(WRITE "${WEBVIEW2_MINGW_COMPAT_DIR}/WeakReference.h"
-                     "#pragma once\n#include <weakreference.h>\n")
+                     "#pragma once\n#include_next <weakreference.h>\n")
                 target_include_directories(WebView2::WebView2 INTERFACE
                     "${WEBVIEW2_MINGW_COMPAT_DIR}")
             endif()

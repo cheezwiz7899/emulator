@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
+#include <filesystem>
 #include <iterator>
 #include <utility>
 #include "common/assert.h"
@@ -13,6 +15,7 @@
 #include "common/logging.h"
 #include "core/file_sys/vfs/vfs.h"
 #include "core/file_sys/vfs/vfs_real.h"
+#include "core/file_sys/vfs/vfs_vector.h"
 
 // For FileTimeStampRaw
 #include <sys/stat.h>
@@ -41,6 +44,58 @@ namespace FS = Common::FS;
 namespace {
 
 constexpr size_t MaxOpenFiles = 512;
+
+// Ultimate S 5.0.6 disables its custom menus when Skyline reports the normal Citron/Ryujinx
+// text address. Patch only its exact NRO build while it is read from the emulated SD card. This
+// leaves the host file and the process memory layout untouched.
+constexpr std::array<u8, 32> UltimateS506ModuleId{
+    0xAB, 0x48, 0x90, 0xF6, 0xAA, 0xA9, 0x41, 0x2C, 0x99, 0xD7, 0x0A, 0xF6, 0x6C, 0x7A, 0x80, 0x31,
+    0x8F, 0xED, 0x94, 0x98, 0x09, 0x87, 0x90, 0xB6, 0x1B, 0x10, 0x08, 0x5C, 0x00, 0xE5, 0x4F, 0x61,
+};
+constexpr std::array<size_t, 8> UltimateS506EmulatorChecks{
+    0xE5EEC, 0xE5F44, 0xE5F9C, 0xE6024, 0xE60AC, 0xE61E8, 0xF7BE0, 0xF8F98,
+};
+constexpr std::array<u8, 4> UltimateS506HardwareAddress{
+    0x28,
+    0x00,
+    0xB0,
+    0x72, // movk w8, #0x8001, lsl #16
+};
+
+bool IsUltimateSPlugin(const std::vector<std::string>& components) {
+    const size_t count = components.size();
+    return count >= 4 && components[count - 1] == "plugin.nro" &&
+           components[count - 2] == "Ultimate S Arcropolis" && components[count - 3] == "mods" &&
+           components[count - 4] == "ultimate";
+}
+
+bool IsUltimateSWebMenuCapabilityFile(std::string_view path) {
+    const auto components = FS::SplitPathComponentsCopy(path);
+    const size_t count = components.size();
+    if (count < 3 || components[count - 1] != "web_menus.flag" ||
+        components[count - 2] != "ult-s" || components[count - 3] != "ultimate") {
+        return false;
+    }
+
+    const auto ultimate_dir =
+        std::filesystem::path{std::string{path}}.parent_path().parent_path();
+    return FS::IsFile(ultimate_dir / "mods" / "Ultimate S Arcropolis" / "plugin.nro");
+}
+
+void ApplyUltimateS506Compatibility(std::span<u8> data, size_t offset) {
+    const size_t read_end = offset + data.size();
+    for (const size_t patch_offset : UltimateS506EmulatorChecks) {
+        const size_t patch_end = patch_offset + UltimateS506HardwareAddress.size();
+        const size_t overlap_start = std::max(offset, patch_offset);
+        const size_t overlap_end = std::min(read_end, patch_end);
+        if (overlap_start >= overlap_end) {
+            continue;
+        }
+
+        std::copy_n(UltimateS506HardwareAddress.begin() + (overlap_start - patch_offset),
+                    overlap_end - overlap_start, data.begin() + (overlap_start - offset));
+    }
+}
 
 constexpr FS::FileAccessMode ModeFlagsToFileAccessMode(OpenMode mode) {
     switch (mode) {
@@ -75,6 +130,9 @@ bool RealVfsFilesystem::IsWritable() const {
 
 VfsEntryType RealVfsFilesystem::GetEntryType(std::string_view path_) const {
     const auto path = FS::SanitizePath(path_, FS::DirectorySeparator::PlatformDefault);
+    if (IsUltimateSWebMenuCapabilityFile(path)) {
+        return VfsEntryType::File;
+    }
     if (!FS::Exists(path)) {
         return VfsEntryType::None;
     }
@@ -88,6 +146,9 @@ VfsEntryType RealVfsFilesystem::GetEntryType(std::string_view path_) const {
 VirtualFile RealVfsFilesystem::OpenFileFromEntry(std::string_view path_, std::optional<u64> size,
                                                  OpenMode perms) {
     const auto path = FS::SanitizePath(path_, FS::DirectorySeparator::PlatformDefault);
+    if (IsUltimateSWebMenuCapabilityFile(path)) {
+        return std::make_shared<VectorVfsFile>(std::vector<u8>{}, "web_menus.flag");
+    }
     std::scoped_lock lk{list_lock};
 
     if (auto it = cache.find(path); it != cache.end()) {
@@ -331,10 +392,26 @@ bool RealVfsFile::IsReadable() const {
 std::size_t RealVfsFile::Read(u8* data, std::size_t length, std::size_t offset) const {
     auto lk = base.RefreshReference(path, perms, *reference);
     auto file = reference->file; // Safety copy to prevent eviction during Read
-    if (!file || !file->Seek(static_cast<s64>(offset))) {
+    if (!file) {
         return 0;
     }
-    return file->ReadSpan(std::span{data, length});
+
+    bool apply_ultimate_s_compatibility = false;
+    if (IsUltimateSPlugin(path_components) && file->Seek(0x40)) {
+        std::array<u8, UltimateS506ModuleId.size()> module_id{};
+        apply_ultimate_s_compatibility =
+            file->ReadSpan(std::span<u8>{module_id}) == module_id.size() &&
+            module_id == UltimateS506ModuleId;
+    }
+
+    if (!file->Seek(static_cast<s64>(offset))) {
+        return 0;
+    }
+    const size_t read = file->ReadSpan(std::span{data, length});
+    if (apply_ultimate_s_compatibility) {
+        ApplyUltimateS506Compatibility(std::span{data, read}, offset);
+    }
+    return read;
 }
 
 std::size_t RealVfsFile::Write(const u8* data, std::size_t length, std::size_t offset) {

@@ -566,11 +566,35 @@ void WebView2View::LoadLocalWebPage(const std::string& main_url,
     const QFileInfo local_file{QString::fromStdString(main_url)};
     QDir resource_root = local_file.dir();
 
-    // Nintendo manuals keep shared CSS/JS/fonts above the initially opened HTML file. Map the
-    // whole contents.htdocs tree when present so relative paths that climb directories continue
-    // to work; for other local applets, mapping the document's parent is sufficient.
+    // Only ARCropolis needs a synthetic HTTPS origin: it loads mutable JSON next to its entry
+    // page with XMLHttpRequest, which Chromium blocks between file:// URLs.  Standard offline
+    // manuals use relative CSS, images, fonts, and media; retaining their native file:// base
+    // URL is the most compatible way to resolve those resources.
+    pending_local_uses_virtual_host =
+        QFileInfo{resource_root.filePath(QStringLiteral("mods.json"))}.exists() ||
+        QFileInfo{resource_root.filePath(QStringLiteral("workspaces.json"))}.exists();
+
+    if (!pending_local_uses_virtual_host) {
+        pending_local_folder.clear();
+        const QString full_url = QUrl::fromLocalFile(local_file.absoluteFilePath()).toString(
+                                     QUrl::FullyEncoded) +
+                                 QString::fromStdString(additional_args);
+        pending_url = full_url.toStdWString();
+        has_pending_navigation = true;
+        if (webview) {
+            FlushPendingNavigation();
+        }
+        return;
+    }
+
+    // An offline document may keep shared assets well above its entry HTML (for example,
+    // htmlcontents.htdocs/html/USen/index.html refers to ../../css and ../../img). Map the
+    // entire extracted applet cache when its completion marker is present, rather than assuming
+    // a particular title's internal directory name.
     QDir candidate_root = resource_root;
-    while (candidate_root.dirName() != QStringLiteral("contents.htdocs")) {
+    while (!QFileInfo{
+                candidate_root.filePath(QStringLiteral(".citron-romfs-complete"))}
+                .exists()) {
         if (!candidate_root.cdUp()) {
             candidate_root = resource_root;
             break;
@@ -627,7 +651,7 @@ void WebView2View::FlushPendingNavigation() {
         return;
     has_pending_navigation = false;
     SetUserAgent(pending_user_agent);
-    if (is_local) {
+    if (is_local && pending_local_uses_virtual_host) {
         // Serving local applet files from a synthetic HTTPS origin gives scripts normal
         // same-origin access to generated JSON (mods.json/workspaces.json). Direct file://
         // navigation rendered the shell but Chromium blocked those XMLHttpRequests, leaving the
@@ -713,6 +737,7 @@ void WebView2View::SendKeyEvent(const std::wstring& key, const std::wstring& cod
                           L"', bubbles: true, cancelable: true }); "
                           L"try { Object.defineProperty(event, 'keyCode', { value: keyCode }); "
                           L"Object.defineProperty(event, 'which', { value: keyCode }); } catch (_) {} "
+                          L"document.dispatchEvent(event); if (!event.defaultPrevented && target !== document) "
                           L"target.dispatchEvent(event); } send('keydown'); send('keyup'); "
                           L"function visible(el) { var s = getComputedStyle(el); return s.display !== 'none' && "
                           L"s.visibility !== 'hidden' && el.getClientRects().length !== 0; } "

@@ -837,7 +837,7 @@ _setup_zypper() {
 
     # Provides pkgconfig(webkit2gtk-4.1), required by the native web applet.
     info "Installing WebKitGTK development package..."
-    sudo zypper install -y --no-recommends webkitgtk3-devel \
+    sudo zypper install -y --no-recommends webkit2gtk3-devel \
         || error "WebKitGTK development package failed to install — the native web applet backend requires webkit2gtk-4.1"
 }
 
@@ -890,7 +890,7 @@ _setup_emerge() {
 
     # The GTK3-enabled package provides the webkit2gtk-4.1 pkg-config module.
     info "Installing WebKitGTK development package..."
-    sudo emerge --ask=n net-libs/webkit-gtk \
+    sudo emerge --ask=n net-libs/webkit-gtk:4.1 \
         || error "WebKitGTK development package failed to install — the native web applet backend requires webkit2gtk-4.1"
 }
 

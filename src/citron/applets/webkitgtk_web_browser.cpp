@@ -465,6 +465,7 @@ void WebKitGTKView::SendKeyEvent(const QString& key, const QString& code, int ke
                        "{ key: '%1', code: '%2', bubbles: true, cancelable: true }); "
                        "try { Object.defineProperty(event, 'keyCode', { value: keyCode }); "
                        "Object.defineProperty(event, 'which', { value: keyCode }); } catch (_) {} "
+                       "document.dispatchEvent(event); if (!event.defaultPrevented && target !== document) "
                        "target.dispatchEvent(event); } send('keydown'); send('keyup'); "
                        "function visible(el) { var s = getComputedStyle(el); return s.display !== 'none' && "
                        "s.visibility !== 'hidden' && el.getClientRects().length !== 0; } "
