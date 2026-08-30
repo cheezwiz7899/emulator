@@ -216,8 +216,10 @@ RealVfsFilesystem::ListLockGuard RealVfsFilesystem::RefreshReference(const std::
     if (!reference.file) {
         this->EvictSingleReferenceLocked();
 
-        reference.file =
-            FS::FileOpen(path, ModeFlagsToFileAccessMode(perms), FS::FileType::BinaryFile);
+        // A guest may reopen an SD-card file with a broader access mode after it has already
+        // been read. Keep the host backing handle shareable so this does not fail on Windows.
+        reference.file = FS::FileOpen(path, ModeFlagsToFileAccessMode(perms),
+                                      FS::FileType::BinaryFile, FS::FileShareFlag::ShareReadWrite);
         if (reference.file) {
             num_open_files++;
         }
