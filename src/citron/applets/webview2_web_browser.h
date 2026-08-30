@@ -16,7 +16,6 @@
 #include <windows.h>
 #include <unknwn.h>
 #include <WebView2.h>
-#include <wil/com.h>
 #include <wrl.h>
 #endif
 
@@ -119,9 +118,9 @@ private:
     HRESULT OnScriptDialogOpening(ICoreWebView2*, ICoreWebView2ScriptDialogOpeningEventArgs*);
 
     GMainWindow& main_window;
-    wil::com_ptr<ICoreWebView2Environment> environment;
-    wil::com_ptr<ICoreWebView2Controller> controller;
-    wil::com_ptr<ICoreWebView2> webview;
+    Microsoft::WRL::ComPtr<ICoreWebView2Environment> environment;
+    Microsoft::WRL::ComPtr<ICoreWebView2Controller> controller;
+    Microsoft::WRL::ComPtr<ICoreWebView2> webview;
 
     EventRegistrationToken web_message_received_token{};
     EventRegistrationToken navigation_starting_token{};

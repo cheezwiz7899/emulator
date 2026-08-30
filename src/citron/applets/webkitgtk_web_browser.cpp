@@ -705,7 +705,7 @@ int WebKitGTKView::OnScriptDialog(WebKitWebView*, WebKitScriptDialog* dialog,
         return TRUE;
 
     case WEBKIT_SCRIPT_DIALOG_CONFIRM:
-    case WEBKIT_SCRIPT_DIALOG_BEFORE_UNLOAD: {
+    case WEBKIT_SCRIPT_DIALOG_BEFORE_UNLOAD_CONFIRM: {
         const bool accepted =
             QMessageBox::question(self, title, text, QMessageBox::Yes | QMessageBox::No,
                                   QMessageBox::No) == QMessageBox::Yes;

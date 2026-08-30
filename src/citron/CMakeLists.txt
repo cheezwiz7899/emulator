@@ -606,8 +606,8 @@ if (CITRON_USE_WEBKITGTK_WEB_ENGINE)
 endif ()
 
 if (CITRON_USE_WEBVIEW2_WEB_ENGINE)
-    # WIL::WIL / WebView2::WebView2 from CMakeModules/webview_native_deps.cmake.
-    target_link_libraries(citron PRIVATE WIL::WIL WebView2::WebView2)
+    # WebView2::WebView2 from CMakeModules/webview_native_deps.cmake.
+    target_link_libraries(citron PRIVATE WebView2::WebView2)
     target_compile_definitions(citron PRIVATE -DCITRON_USE_WEBVIEW2_WEB_ENGINE)
 endif ()
 

@@ -411,7 +411,7 @@ endif()
 # on CITRON_USE_CPM meant a plain native Linux build (no clangtron/CPM pipeline)
 # with CITRON_USE_WEBKITGTK_WEB_ENGINE=ON would never run the pkg_check_modules
 # call in this file, then fail later on an undefined PkgConfig::WEBKITGTK target.
-# wil/WebView2 (the two sections in this file that DO need CPM) still check
+# WebView2 (the only section in this file that needs CPM) still checks
 # CITRON_USE_CPM themselves, individually, inside the file.
 if (CITRON_USE_WEBKITGTK_WEB_ENGINE OR CITRON_USE_WEBVIEW2_WEB_ENGINE)
     include(${CMAKE_SOURCE_DIR}/CMakeModules/webview_native_deps.cmake)

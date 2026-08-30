@@ -38,8 +38,47 @@
 #include "hid_core/hid_types.h"
 
 using Microsoft::WRL::Callback;
+using Microsoft::WRL::ComPtr;
 
 namespace {
+
+class CoTaskMemString {
+public:
+    CoTaskMemString() = default;
+
+    ~CoTaskMemString() {
+        CoTaskMemFree(value);
+    }
+
+    CoTaskMemString(const CoTaskMemString&) = delete;
+    CoTaskMemString& operator=(const CoTaskMemString&) = delete;
+
+    [[nodiscard]] wchar_t** Put() {
+        CoTaskMemFree(value);
+        value = nullptr;
+        return &value;
+    }
+
+    [[nodiscard]] const wchar_t* Get() const {
+        return value;
+    }
+
+    explicit operator bool() const {
+        return value != nullptr;
+    }
+
+private:
+    wchar_t* value{};
+};
+
+template <typename To, typename From>
+ComPtr<To> QueryInterface(const ComPtr<From>& source) {
+    ComPtr<To> result;
+    if (source) {
+        source.As(&result);
+    }
+    return result;
+}
 
 struct DomKey {
     const wchar_t* key;
@@ -132,7 +171,7 @@ WebView2View::~WebView2View() {
     }
     if (controller) {
         controller->Close(); // documented clean-teardown call, before the
-                             // wil::com_ptr members release via RAII below
+                             // ComPtr members release via RAII below
     }
 }
 
@@ -169,7 +208,8 @@ void WebView2View::InitWebView2() {
                             controller = ctrl;
                             // get_CoreWebView2 can fail; unchecked, webview stays
                             // null and everything below dereferences it (finding #14).
-                            HRESULT webview_result = controller->get_CoreWebView2(&webview);
+                            HRESULT webview_result =
+                                controller->get_CoreWebView2(webview.GetAddressOf());
                             if (FAILED(webview_result) || !webview) {
                                 SetFinished(true);
                                 SetExitReason(Service::AM::Frontend::WebExitReason::WindowClosed);
@@ -191,8 +231,8 @@ void WebView2View::InitWebView2() {
                             // are disabled. Make the requirement explicit instead of relying on
                             // a runtime/profile default: WebSession pages use it for their initial
                             // "loaded" handshake and every subsequent option change.
-                            wil::com_ptr<ICoreWebView2Settings> settings;
-                            HRESULT settings_result = webview->get_Settings(&settings);
+                            ComPtr<ICoreWebView2Settings> settings;
+                            HRESULT settings_result = webview->get_Settings(settings.GetAddressOf());
                             if (FAILED(settings_result) || !settings) {
                                 SetFinished(true);
                                 SetExitReason(
@@ -428,10 +468,10 @@ void WebView2View::SetUserAgent(UserAgent user_agent) {
 
     if (!webview)
         return;
-    wil::com_ptr<ICoreWebView2Settings> settings;
-    webview->get_Settings(&settings);
+    ComPtr<ICoreWebView2Settings> settings;
+    webview->get_Settings(settings.GetAddressOf());
     // put_UserAgent is on ICoreWebView2Settings2, not the base ICoreWebView2Settings.
-    auto settings2 = settings.try_query<ICoreWebView2Settings2>();
+    auto settings2 = QueryInterface<ICoreWebView2Settings2>(settings);
     if (settings2) {
         settings2->put_UserAgent(full_ua.c_str());
     }
@@ -452,7 +492,7 @@ void WebView2View::LoadExtractedFonts() {
 
     // Use a WebView2 virtual host for fonts. A file:// document cannot reliably load another
     // file:// URL as a web font under Chromium's local-origin/CORS rules.
-    const auto webview3 = webview.try_query<ICoreWebView2_3>();
+    const auto webview3 = QueryInterface<ICoreWebView2_3>(webview);
     const bool mapped_fonts =
         webview3 &&
         SUCCEEDED(webview3->SetVirtualHostNameToFolderMapping(
@@ -656,7 +696,7 @@ void WebView2View::FlushPendingNavigation() {
         // same-origin access to generated JSON (mods.json/workspaces.json). Direct file://
         // navigation rendered the shell but Chromium blocked those XMLHttpRequests, leaving the
         // mod list empty.
-        const auto webview3 = webview.try_query<ICoreWebView2_3>();
+        const auto webview3 = QueryInterface<ICoreWebView2_3>(webview);
         if (!webview3 ||
             FAILED(webview3->SetVirtualHostNameToFolderMapping(
                 L"citron-applet.local", pending_local_folder.c_str(),
@@ -937,9 +977,9 @@ HRESULT WebView2View::OnWebMessageReceived(ICoreWebView2*,
         main_window.ForwardWebBrowserInteractiveData(message.toStdString());
     };
 
-    wil::unique_cotaskmem_string message_raw;
-    if (SUCCEEDED(args->TryGetWebMessageAsString(&message_raw)) && message_raw) {
-        forward_message(QString::fromWCharArray(message_raw.get()));
+    CoTaskMemString message_raw;
+    if (SUCCEEDED(args->TryGetWebMessageAsString(message_raw.Put())) && message_raw) {
+        forward_message(QString::fromWCharArray(message_raw.Get()));
         return S_OK;
     }
 
@@ -948,14 +988,14 @@ HRESULT WebView2View::OnWebMessageReceived(ICoreWebView2*,
         // so endApplet is tagged with __citron_control rather than a separate handler. Some
         // WebView2 runtimes also expose posted strings only through the JSON accessor; decode
         // that scalar-string form instead of silently discarding it.
-        wil::unique_cotaskmem_string json_raw;
-        if (FAILED(args->get_WebMessageAsJson(&json_raw))) {
+        CoTaskMemString json_raw;
+        if (FAILED(args->get_WebMessageAsJson(json_raw.Put()))) {
             return S_OK;
         }
         // Real JSON parse, not a substring check (finding #13) -- a page message
         // could legitimately contain the literal text "__citron_control"/"endApplet"
         // without being the control envelope.
-        QString json = QString::fromWCharArray(json_raw.get());
+        QString json = QString::fromWCharArray(json_raw.Get());
         QJsonParseError parse_error;
         QJsonDocument doc = QJsonDocument::fromJson(json.toUtf8(), &parse_error);
         if (parse_error.error == QJsonParseError::NoError && doc.isObject()) {
@@ -983,10 +1023,10 @@ HRESULT WebView2View::OnWebMessageReceived(ICoreWebView2*,
 
 HRESULT WebView2View::OnNavigationStarting(ICoreWebView2*,
                                            ICoreWebView2NavigationStartingEventArgs* args) {
-    wil::unique_cotaskmem_string uri;
-    if (FAILED(args->get_Uri(&uri)))
+    CoTaskMemString uri;
+    if (FAILED(args->get_Uri(uri.Put())))
         return E_FAIL;
-    requested_url = QString::fromWCharArray(uri.get());
+    requested_url = QString::fromWCharArray(uri.Get());
     if (QUrl(requested_url).host() == QStringLiteral("localhost")) {
         SetFinished(true);
         SetExitReason(Service::AM::Frontend::WebExitReason::CallbackURL);
@@ -1008,13 +1048,13 @@ HRESULT WebView2View::OnWindowCloseRequested(ICoreWebView2*, IUnknown*) {
 HRESULT WebView2View::OnScriptDialogOpening(
     ICoreWebView2*, ICoreWebView2ScriptDialogOpeningEventArgs* args) {
     COREWEBVIEW2_SCRIPT_DIALOG_KIND kind{};
-    wil::unique_cotaskmem_string message;
-    if (FAILED(args->get_Kind(&kind)) || FAILED(args->get_Message(&message))) {
+    CoTaskMemString message;
+    if (FAILED(args->get_Kind(&kind)) || FAILED(args->get_Message(message.Put()))) {
         return E_FAIL;
     }
 
     const QString title = QStringLiteral("ARCropolis");
-    const QString text = QString::fromWCharArray(message.get());
+    const QString text = QString::fromWCharArray(message.Get());
     switch (kind) {
     case COREWEBVIEW2_SCRIPT_DIALOG_KIND_ALERT:
         QMessageBox::information(this, title, text);
@@ -1027,13 +1067,13 @@ HRESULT WebView2View::OnScriptDialogOpening(
         }
         return S_OK;
     case COREWEBVIEW2_SCRIPT_DIALOG_KIND_PROMPT: {
-        wil::unique_cotaskmem_string default_text;
-        if (FAILED(args->get_DefaultText(&default_text))) {
+        CoTaskMemString default_text;
+        if (FAILED(args->get_DefaultText(default_text.Put()))) {
             return E_FAIL;
         }
         bool accepted = false;
         const QString result = QInputDialog::getText(
-            this, title, text, QLineEdit::Normal, QString::fromWCharArray(default_text.get()),
+            this, title, text, QLineEdit::Normal, QString::fromWCharArray(default_text.Get()),
             &accepted);
         if (!accepted) {
             return S_OK;

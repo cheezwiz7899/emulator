@@ -140,13 +140,39 @@ var citron_key_callbacks = [];
     // WebView2 receives keyboard input in its native child window, bypassing QWidget's
     // keyboard-to-NPad path. Translate only the configured host mappings; treating literal
     // A/B/X/Y as Switch buttons conflicts with common mappings such as left-stick A/W/S/D.
-    // Synthetic events from the controller input thread are excluded to avoid double activation.
+    // Direction mappings must be translated to arrow events for offline manuals, which handle
+    // their own document-level arrow keys rather than citron_key_callbacks. Synthetic events
+    // from the controller input thread are excluded to avoid double activation.
     window.addEventListener("keydown", function(event) {
         if (!event.isTrusted || event.repeat) {
             return;
         }
 
         const configured = window.citron_host_key_bindings;
+        const direction_key_code = configured && configured.directions
+            ? configured.directions[event.keyCode] : undefined;
+        if (direction_key_code !== undefined && direction_key_code !== event.keyCode) {
+            const direction = {
+                37: ["ArrowLeft", "ArrowLeft"],
+                38: ["ArrowUp", "ArrowUp"],
+                39: ["ArrowRight", "ArrowRight"],
+                40: ["ArrowDown", "ArrowDown"],
+            }[direction_key_code];
+            if (direction) {
+                event.preventDefault();
+                event.stopImmediatePropagation();
+                const mapped_event = new KeyboardEvent("keydown", {
+                    key: direction[0], code: direction[1], bubbles: true, cancelable: true,
+                });
+                try {
+                    Object.defineProperty(mapped_event, "keyCode", {value: direction_key_code});
+                    Object.defineProperty(mapped_event, "which", {value: direction_key_code});
+                } catch (_) {}
+                document.dispatchEvent(mapped_event);
+                return;
+            }
+        }
+
         const mapped_index = configured && configured.buttons
             ? configured.buttons[event.keyCode] : undefined;
         const callback_index = mapped_index;
