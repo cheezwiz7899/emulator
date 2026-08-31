@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 citron Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cstddef>
 #include <filesystem>
 #include <utility>
@@ -432,6 +433,9 @@ RealVfsDirectory::~RealVfsDirectory() = default;
 
 VirtualFile RealVfsDirectory::GetFileRelative(std::string_view relative_path) const {
     const auto full_path = FS::SanitizePath(path + '/' + std::string(relative_path));
+    if (IsUltimateSWebMenuCapabilityFile(full_path)) {
+        return base.OpenFile(full_path, perms);
+    }
     if (!FS::Exists(full_path) || FS::IsDir(full_path)) {
         return nullptr;
     }

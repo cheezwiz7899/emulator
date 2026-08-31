@@ -155,6 +155,11 @@ var citron_key_callbacks = [];
         const direction_key_code = configured && configured.directions
             ? configured.directions[event.keyCode] : undefined;
         if (direction_key_code !== undefined && direction_key_code !== event.keyCode) {
+            const target = event.target;
+            if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement ||
+                (target instanceof HTMLElement && target.isContentEditable)) {
+                return;
+            }
             const direction = {
                 37: ["ArrowLeft", "ArrowLeft"],
                 38: ["ArrowUp", "ArrowUp"],
@@ -171,7 +176,7 @@ var citron_key_callbacks = [];
                     Object.defineProperty(mapped_event, "keyCode", {value: direction_key_code});
                     Object.defineProperty(mapped_event, "which", {value: direction_key_code});
                 } catch (_) {}
-                document.dispatchEvent(mapped_event);
+                (target || document).dispatchEvent(mapped_event);
                 return;
             }
         }
