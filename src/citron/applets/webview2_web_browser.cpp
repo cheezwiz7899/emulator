@@ -11,6 +11,8 @@
 
 #include <chrono>
 #include <cwctype>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include <QDir>
@@ -37,7 +39,6 @@
 #include "hid_core/frontend/input_interpreter.h"
 #include "hid_core/hid_types.h"
 
-using Microsoft::WRL::Callback;
 using Microsoft::WRL::ComPtr;
 
 namespace {
@@ -71,13 +72,96 @@ private:
     wchar_t* value{};
 };
 
+template <typename Interface>
+const IID& InterfaceId();
+
+#define WEBVIEW2_INTERFACE_ID(Interface)                                                        \
+    template <>                                                                                  \
+    const IID& InterfaceId<Interface>() {                                                        \
+        return IID_##Interface;                                                                  \
+    }
+
+WEBVIEW2_INTERFACE_ID(ICoreWebView2Settings2)
+WEBVIEW2_INTERFACE_ID(ICoreWebView2_3)
+WEBVIEW2_INTERFACE_ID(ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler)
+WEBVIEW2_INTERFACE_ID(ICoreWebView2CreateCoreWebView2ControllerCompletedHandler)
+WEBVIEW2_INTERFACE_ID(ICoreWebView2ScriptDialogOpeningEventHandler)
+WEBVIEW2_INTERFACE_ID(ICoreWebView2WebMessageReceivedEventHandler)
+WEBVIEW2_INTERFACE_ID(ICoreWebView2NavigationStartingEventHandler)
+WEBVIEW2_INTERFACE_ID(ICoreWebView2WindowCloseRequestedEventHandler)
+WEBVIEW2_INTERFACE_ID(ICoreWebView2NavigationCompletedEventHandler)
+WEBVIEW2_INTERFACE_ID(ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler)
+WEBVIEW2_INTERFACE_ID(ICoreWebView2ExecuteScriptCompletedHandler)
+
+#undef WEBVIEW2_INTERFACE_ID
+
 template <typename To, typename From>
 ComPtr<To> QueryInterface(const ComPtr<From>& source) {
     ComPtr<To> result;
     if (source) {
-        source.As(&result);
+        source->QueryInterface(InterfaceId<To>(),
+                               reinterpret_cast<void**>(result.GetAddressOf()));
     }
     return result;
+}
+
+// llvm-mingw ships WRL's ComPtr but not its MSVC-only lambda Callback helper.
+// Keep callbacks portable by deriving the required COM handler interface from
+// its Invoke signature. This also avoids bringing WIL back just for callbacks.
+template <typename Method>
+struct ComCallbackTraits;
+
+template <typename Interface, typename Result, typename... Args>
+struct ComCallbackTraits<Result(STDMETHODCALLTYPE Interface::*)(Args...)> {
+    template <typename Function>
+    class Implementation final : public Interface {
+    public:
+        explicit Implementation(Function&& function_) : function{std::move(function_)} {}
+
+        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** object) override {
+            if (!object) {
+                return E_POINTER;
+            }
+            if (riid == IID_IUnknown || riid == InterfaceId<Interface>()) {
+                *object = static_cast<Interface*>(this);
+                AddRef();
+                return S_OK;
+            }
+            *object = nullptr;
+            return E_NOINTERFACE;
+        }
+
+        ULONG STDMETHODCALLTYPE AddRef() override {
+            return ++references;
+        }
+
+        ULONG STDMETHODCALLTYPE Release() override {
+            const ULONG remaining = --references;
+            if (!remaining) {
+                delete this;
+            }
+            return remaining;
+        }
+
+        Result STDMETHODCALLTYPE Invoke(Args... args) override {
+            return function(args...);
+        }
+
+    private:
+        std::atomic<ULONG> references{1};
+        Function function;
+    };
+};
+
+template <typename Interface, typename Function>
+ComPtr<Interface> Callback(Function&& function) {
+    using StoredFunction = std::decay_t<Function>;
+    using Implementation = typename ComCallbackTraits<decltype(&Interface::Invoke)>::template
+        Implementation<StoredFunction>;
+
+    ComPtr<Interface> callback;
+    callback.Attach(new Implementation(std::forward<Function>(function)));
+    return callback;
 }
 
 struct DomKey {
@@ -260,7 +344,7 @@ void WebView2View::InitWebView2() {
 
                             HRESULT event_result = webview->add_WebMessageReceived(
                                 Callback<ICoreWebView2WebMessageReceivedEventHandler>(
-                                    [this, life = alive](
+                                    [this, life](
                                         ICoreWebView2* sender,
                                         ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT {
                                         if (!*life)
@@ -278,7 +362,7 @@ void WebView2View::InitWebView2() {
 
                             event_result = webview->add_NavigationStarting(
                                 Callback<ICoreWebView2NavigationStartingEventHandler>(
-                                    [this, life = alive](
+                                    [this, life](
                                         ICoreWebView2* sender,
                                         ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT {
                                         if (!*life)
@@ -297,7 +381,7 @@ void WebView2View::InitWebView2() {
                             // Mirrors qt_web_browser.cpp:94-102's windowCloseRequested.
                             event_result = webview->add_WindowCloseRequested(
                                 Callback<ICoreWebView2WindowCloseRequestedEventHandler>(
-                                    [this, life = alive](ICoreWebView2* sender,
+                                    [this, life](ICoreWebView2* sender,
                                                          IUnknown* args) -> HRESULT {
                                         if (!*life)
                                             return S_OK;
@@ -316,7 +400,7 @@ void WebView2View::InitWebView2() {
                             // re-runs LOAD_NX_FONT on every navigation.
                             event_result = webview->add_NavigationCompleted(
                                 Callback<ICoreWebView2NavigationCompletedEventHandler>(
-                                    [this, life = alive](
+                                    [this, life](
                                         ICoreWebView2*,
                                         ICoreWebView2NavigationCompletedEventArgs*) -> HRESULT {
                                         if (!*life)

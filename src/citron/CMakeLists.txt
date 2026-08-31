@@ -687,7 +687,13 @@ if (MSVC)
     copy_citron_FFmpeg_deps(citron)
 elseif(MINGW)
     include(CopyMinGWDeps)
-    copy_mingw_deps(citron SEARCH_PATHS "${FFmpeg_PATH}/bin" "${QT_TARGET_PATH}/bin")
+    set(_webview2_loader_dir "")
+    if (WEBVIEW2_LOADER_RUNTIME_DLL)
+        get_filename_component(_webview2_loader_dir
+            "${WEBVIEW2_LOADER_RUNTIME_DLL}" DIRECTORY)
+    endif()
+    copy_mingw_deps(citron SEARCH_PATHS "${FFmpeg_PATH}/bin" "${QT_TARGET_PATH}/bin"
+                    "${_webview2_loader_dir}")
 endif()
 
 if (ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64)
