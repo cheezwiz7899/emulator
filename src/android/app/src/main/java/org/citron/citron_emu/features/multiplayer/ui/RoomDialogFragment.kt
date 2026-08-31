@@ -46,9 +46,7 @@ class RoomDialogFragment : DialogFragment() {
             .create()
             .also { dialog ->
                 dialog.setOnShowListener {
-                    dialog.window?.setSoftInputMode(
-                        WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
-                    )
+                    enableImeResize(dialog)
                     val disconnectButton = dialog.getButton(AlertDialog.BUTTON_NEGATIVE)
                     disconnectButton.setOnClickListener {
                         disconnectButton.isEnabled = false
@@ -73,6 +71,11 @@ class RoomDialogFragment : DialogFragment() {
                     observeRoomContent()
                 }
             }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun enableImeResize(dialog: AlertDialog) {
+        dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
     }
 
     override fun onDestroy() {

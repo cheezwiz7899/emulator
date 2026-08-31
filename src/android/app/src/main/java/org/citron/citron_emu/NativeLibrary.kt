@@ -153,6 +153,12 @@ object NativeLibrary {
     external fun isRunning(): Boolean
 
     /**
+     * Clears the native shader cache while holding the emulation session lock.
+     * @return 0 on success, 1 if emulation is active, or 2 on filesystem failure.
+     */
+    external fun clearShaderCache(): Int
+
+    /**
      * Returns true if emulation is paused.
      */
     external fun isPaused(): Boolean

@@ -581,6 +581,12 @@
     <string name="clear_shader_cache_description">Removes all shaders built while playing this game</string>
     <string name="clear_shader_cache_warning_description">You will experience more stuttering as the shader cache regenerates</string>
     <string name="cleared_shaders_successfully">Cleared shaders successfully</string>
+    <string name="clear_all_shader_caches">Clear all shader caches</string>
+    <string name="clear_all_shader_caches_description">Deletes shader caches for every game. Emulation must be stopped.</string>
+    <string name="clear_all_shader_caches_warning_description">All compiled shader and pipeline caches will be deleted. Games may stutter while the caches are rebuilt. Continue?</string>
+    <string name="cleared_all_shader_caches_successfully">Cleared all shader caches successfully</string>
+    <string name="clear_all_shader_caches_failed">Failed to clear all shader caches</string>
+    <string name="clear_all_shader_caches_emulation_active">Stop emulation before clearing shader caches</string>
     <string name="addons_game">Addons: %1$s</string>
     <string name="save_data">Save data</string>
     <string name="save_data_description">Manage save data specific to this game</string>

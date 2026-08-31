@@ -427,6 +427,12 @@
     <string name="clear_shader_cache_description">删除此游戏的所有着色器缓存</string>
     <string name="clear_shader_cache_warning_description">由于着色器缓存需要重新生成，您将遇到更多卡顿</string>
     <string name="cleared_shaders_successfully">着色器缓存清除成功</string>
+    <string name="clear_all_shader_caches">清除所有着色器缓存</string>
+    <string name="clear_all_shader_caches_description">删除所有游戏的着色器缓存，需要先停止模拟</string>
+    <string name="clear_all_shader_caches_warning_description">所有已编译的着色器和管线缓存都将被删除。缓存重新生成时游戏可能出现卡顿，是否继续？</string>
+    <string name="cleared_all_shader_caches_successfully">所有着色器缓存已清除</string>
+    <string name="clear_all_shader_caches_failed">无法清除所有着色器缓存</string>
+    <string name="clear_all_shader_caches_emulation_active">请先停止模拟再清除着色器缓存</string>
     <string name="addons_game">附加项: %1$s</string>
     <string name="save_data">保存数据</string>
     <string name="save_data_description">管理此游戏的保存数据</string>

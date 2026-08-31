@@ -54,6 +54,9 @@ class SettingsViewModel : ViewModel() {
     private val _shouldShowResetInputDialog = MutableStateFlow(false)
     val shouldShowResetInputDialog = _shouldShowResetInputDialog.asStateFlow()
 
+    private val _shouldShowClearShaderCacheDialog = MutableStateFlow(false)
+    val shouldShowClearShaderCacheDialog = _shouldShowClearShaderCacheDialog.asStateFlow()
+
     fun setShouldRecreate(value: Boolean) {
         _shouldRecreate.value = value
     }
@@ -101,6 +104,10 @@ class SettingsViewModel : ViewModel() {
 
     fun setShouldShowResetInputDialog(value: Boolean) {
         _shouldShowResetInputDialog.value = value
+    }
+
+    fun setShouldShowClearShaderCacheDialog(value: Boolean) {
+        _shouldShowClearShaderCacheDialog.value = value
     }
 
     fun getCurrentDeviceParams(defaultParams: ParamPackage): ParamPackage =
