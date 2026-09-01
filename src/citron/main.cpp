@@ -7489,6 +7489,10 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                                 // Accept all frag color output types conservatively.
                                 rt.frag_color_types.fill(Shader::FragmentOutputType::Float);
                             }
+                            // Phase 5 free wins (runtime_info.h) -- deliberate defaults for
+                            // the fields this speculative path has no real per-draw signal
+                            // for.
+                            rt.ApplySpeculativeDefaults(stage, prog.info);
                             Shader::Maxwell::ConvertLegacyToGeneric(prog, rt);
                             auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile,rt,prog,binding);
                             const u64 texture_key = VideoCommon::ComputeTextureKey(env.CapturedTextureTypes(), env.CapturedTexturePixelFormats());

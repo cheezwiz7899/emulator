@@ -14,6 +14,8 @@
 
 #include "common/cityhash.h"
 #include "common/common_types.h"
+#include "common/settings.h"
+#include "shader_recompiler/shader_info.h"
 #include "shader_recompiler/stage.h"
 #include "shader_recompiler/varying_state.h"
 
@@ -265,10 +267,17 @@ struct RuntimeInfo {
                                             frag_color_types.size() * sizeof(FragmentOutputType)));
         }
 
-        // y_negate: NOT stage-gated at its read site (EmitYDirection has no switch
-        // on ctx.stage) — fires whenever the shader's own IR contains a Y-direction
-        // query, which could in principle be any stage. Kept unconditional.
-        hash_combine(y_negate);
+        // y_negate: Phase 5 converted this to a real SPIR-V spec constant
+        // (Shader::kYNegateSpecId, spirv_emit_context.cpp's DefineRuntimeStateSpecConstants)
+        // instead of a value baked at translation time -- EmitYDirection
+        // (emit_spirv_context_get_set.cpp) no longer reads this field at all. The emitted
+        // SPIR-V is now identical regardless of the real y_negate value, so it must not stay
+        // in this hash: doing so would still fragment the cache on a field that no longer
+        // makes two entries' SPIR-V different from each other. This is exactly the "changes
+        // what the key means" category (SPIRV_CACHE_VERSION bump required, not just an
+        // ordinary edit) -- see the version history below. The real per-draw value is
+        // resolved separately, at pipeline-creation time (vk_graphics_pipeline.cpp), via a
+        // VkSpecializationMapEntry keyed on the same SpecId.
 
         // glasm_use_storage_buffers deliberately omitted: not read anywhere under
         // backend/spirv/ or frontend/maxwell/ at all (it's a GLASM-backend-only
@@ -277,6 +286,115 @@ struct RuntimeInfo {
         // so this is provably a no-op today either way.
 
         return hash;
+    }
+
+    // Phase 5 "free wins" (handoff_13/handoff_15): deliberate defaults for the fields
+    // speculative construction (scanner in citron/main.cpp, GPL live path in
+    // vk_pipeline_cache.cpp) has no real per-draw signal for. Both sites zero-init
+    // RuntimeInfo and only set what they can actually derive (previous_stage_stores,
+    // input_topology, frag_color_types) — everything else silently inherits C++
+    // zero-init, which is often *not* the real common-case value. Called once per
+    // speculative translation, after those site-specific fields are set and before
+    // ConvertLegacyToGeneric/EmitSPIRV.
+    //
+    // Zero architecture risk either way: a wrong guess here is exactly as harmless as
+    // today's accidental zero-init was — a non-matching real draw just falls through to
+    // an ordinary (non-speculative) translation, same as always. The only thing this
+    // changes is the odds of a speculative entry actually matching a real one.
+    //
+    // Confidence is graded per field below, not uniform — some of this is derived
+    // directly from the real MakeRuntimeInfo()/fixed_pipeline_state.cpp path, some is a
+    // documented best guess with no measurement behind it yet.
+    void ApplySpeculativeDefaults(Stage stage, const Info& info) {
+        // generic_input_types: Set by scanner? No / Set by GPL path? No (handoff_13's field
+        // audit) -- left at zero-init (every slot AttributeType::Disabled) until now. This
+        // isn't just a wrong-value guess the way the fields below are: DefineInputs
+        // (spirv_emit_context.cpp) skips declaring the Input variable ENTIRELY for a
+        // Disabled slot ("if (input_type == AttributeType::Disabled) continue;"), so any
+        // shader that actually loads a generic attribute got a speculatively-translated
+        // module MISSING that Input variable altogether -- not a different
+        // SpirvRelevantHash by chance, a guaranteed-different one, unconditionally, for
+        // every shader that loads any generic attribute at all. Real measurement (a real
+        // two-session gameplay log, RecordGenericInputTypesCardinalityDiagnostic) puts the
+        // field at 93.6%-95.9% single-observed-state per shader -- close to Phase 3's own
+        // 94.5% finding for the whole core-runtime-state -- so for the large majority of
+        // shaders, any correct-enough guess would match every real draw they ever see.
+        // AttributeType::Float for every slot this shader's own IR actually loads
+        // (info.loads.Generic(index)) is that guess: modern vertex/varying data is
+        // float-typed in the large majority of real cases (position/normal/UV/color-as-
+        // float all common; packed-integer formats like vertex colors as UNORM8x4 or bone
+        // indices as UInt are the minority this won't catch). Also gated on
+        // previous_stage_stores.Generic(index) -- already populated with real (or best-
+        // available) data by both speculative call sites before this runs -- matching
+        // DefineInputs' own two-part gate exactly (minus the Disabled check itself, which
+        // is what this sets): guessing Float for a slot the preceding stage doesn't even
+        // store would create a mismatch where zero-init's Disabled was actually correct.
+        // For VertexB, previous_stage_stores is always the all-ones "no restriction"
+        // sentinel (no previous program ever exists there), so this reduces to just the
+        // loads check, same as the real gate does.
+        //
+        // A wrong concrete type is still a real mismatch, not glossed over: GetAttributeType
+        // (spirv_emit_context.cpp) picks the actual SPIR-V type from this field, and unlike
+        // y_negate's plain value, a spec constant can't paper over a different
+        // OpTypePointer -- SPIR-V types are resolved at translation time, not
+        // pipeline-creation time, so generic_input_types isn't a spec-constant candidate
+        // the way y_negate was, cardinality result or not. This stops the *guaranteed* miss
+        // Disabled caused, which was strictly worse: a structural absence, not just a
+        // wrong-typed presence.
+        for (size_t index = 0; index < generic_input_types.size(); ++index) {
+            if (previous_stage_stores.Generic(index) && info.loads.Generic(index)) {
+                generic_input_types[index] = AttributeType::Float;
+            }
+        }
+
+        if (stage == Stage::VertexB || stage == Stage::Geometry) {
+            // gl_ndc = (regs.depth_mode == DepthMode::MinusOneToOne) in the real path
+            // (vk_pipeline_cache.cpp's MakeRuntimeInfo), and DepthMode::MinusOneToOne is
+            // enum value 0 (maxwell_3d.h) — the same "0 is the register's power-on-reset
+            // value" convention the rest of this codebase's fixed-function state already
+            // follows elsewhere. Reasoned from that convention, not from a real session
+            // measurement the way alpha_test_func below is — worth revisiting if that
+            // assumption about NVN's own depth_mode default ever turns out wrong.
+            convert_depth_mode = true;
+        }
+        if (stage == Stage::TessellationEval) {
+            // No reset-state or Settings-driven argument to lean on here the way
+            // convert_depth_mode/alpha_test_func have — a shader only reaches this stage
+            // at all when a game has actively opted into tessellation, so "what does an
+            // unused register default to" isn't the right question. Picked to match each
+            // enum's own value-0 entry for internal consistency, not because Triangles/
+            // Equal/counter-clockwise is known to be the common real choice. Lowest-
+            // confidence guesses in this pass — first candidates to revise if real
+            // tessellation measurement ever happens.
+            tess_primitive = TessPrimitive::Triangles;
+            tess_spacing = TessSpacing::Equal;
+            tess_clockwise = false;
+        }
+        if (stage == Stage::Fragment) {
+            // MakeRuntimeInfo sets alpha_test_func unconditionally — UNLESS
+            // Settings::IsGPULevelLow(), which skips it entirely as a deliberate
+            // accuracy/perf tradeoff — and even when alpha testing is disabled at the HW
+            // level, fixed_pipeline_state.cpp packs CompareFunction::Always for it, not an
+            // unset sentinel (alpha_test_enabled == 0 selects Always_GL, not "no value").
+            // Leaving this nullopt — C++ zero-init — is therefore the wrong default for
+            // the common (alpha test disabled) case under normal settings: it can never
+            // match a real draw's RuntimeInfo, which is populated in that exact common
+            // case. Mirrors the real path's own Settings check so this doesn't regress
+            // under Low GPU accuracy, where the real path also leaves it nullopt.
+            if (!Settings::IsGPULevelLow()) {
+                alpha_test_func = CompareFunction::Always;
+            }
+            // alpha_test_reference's zero-init (0.0f) is left as-is: its value is moot
+            // whenever func is Always or unset, and there's no real-state signal for what
+            // a non-Always reference value would even be.
+        }
+        // force_early_z, alpha_to_coverage_enabled, fixed_state_point_size, xfb_count:
+        // left at C++ zero-init deliberately, not by omission. Each reasoned as the real
+        // common case from its source in fixed_pipeline_state.cpp/MakeRuntimeInfo:
+        // mandated_early_z is an opt-in hint most shaders never set; alpha-to-coverage is
+        // an uncommon MSAA technique; most draws are neither point-primitive
+        // (fixed_state_point_size only applies when topology is Points, or a Geometry
+        // shader's output_topology is PointList) nor transform-feedback (xfb_count) draws.
     }
 };
 

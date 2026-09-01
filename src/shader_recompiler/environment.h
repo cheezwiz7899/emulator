@@ -276,6 +276,27 @@ inline constexpr size_t kMaxPhase4PrototypeSlots = 8;
 static_assert(kMaxPhase4PrototypeSlots <= 64,
               "GraphicsPipelineCacheKey::phase4_prototype_needs_array_variant is a u64 bitmask");
 
+// Phase 5 SpecId allocation (handoff_13 Lesson 1): Phase 4 already consumes SpecId
+// 0..kMaxPhase4PrototypeSlots-1 one-to-one with desc.phase4_prototype_slot_id
+// (shader_info.h) -- a real, enforced cap (the static_assert above), not a soft
+// convention. Phase 5's own spec constants (y_negate first) start immediately after it.
+// Deliberately derived from kMaxPhase4PrototypeSlots rather than an independent literal,
+// so the two can't silently drift apart if that cap is ever raised -- Phase 5 usage should
+// always go through this constant, never a hand-written SpecId number.
+inline constexpr u32 kPhase5SpecIdBase = static_cast<u32>(kMaxPhase4PrototypeSlots);
+static_assert(kPhase5SpecIdBase >= kMaxPhase4PrototypeSlots,
+              "Phase 5 SpecIds must start at or after Phase 4's own slot cap");
+
+// y_negate: the first Phase 5 field converted to a spec constant. Declared here (rather
+// than next to its emission site in spirv_emit_context.cpp) because, like
+// kMaxPhase4PrototypeSlots, it needs to be visible to both the emission side
+// (spirv_emit_context.cpp, declares the OpSpecConstant with this SpecId) and the
+// resolution side (vk_graphics_pipeline.cpp, supplies the real per-draw value through a
+// VkSpecializationMapEntry keyed on this same SpecId) -- two different library layers,
+// same requirement that put kMaxPhase4PrototypeSlots here instead of next to its own
+// single caller.
+inline constexpr u32 kYNegateSpecId = kPhase5SpecIdBase + 0;
+
 namespace detail {
 inline std::atomic<const std::vector<Phase4PrototypeSlot>*> g_active_phase4_prototype_slots{
     nullptr};
