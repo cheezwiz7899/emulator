@@ -337,6 +337,21 @@ fi
 HOOK_EOF
 chmod +x ./AppDir/bin/03-gnome-xcb.hook
 
+# WebKitGTK launches its network, GPU, and web-content helper processes from a
+# build-time libexec directory (normally /usr/lib/webkit2gtk-4.1).  Those
+# helpers are bundled under AppDir/lib/webkit2gtk-4.1, so make the relocated
+# directory explicit at runtime.  Without this, the host path can be selected
+# (or no helper found) after the HLE web applet opens.
+cat <<-'HOOK_EOF' > ./AppDir/bin/04-webkitgtk.hook
+#!/bin/sh
+if [ -z "${WEBKIT_EXEC_PATH:-}" ] \
+    && [ -n "${APPDIR:-}" ] \
+    && [ -d "${APPDIR}/lib/webkit2gtk-4.1" ]; then
+    export WEBKIT_EXEC_PATH="${APPDIR}/lib/webkit2gtk-4.1"
+fi
+HOOK_EOF
+chmod +x ./AppDir/bin/04-webkitgtk.hook
+
 # Build the AppImage
 ./quick-sharun --make-appimage
 
