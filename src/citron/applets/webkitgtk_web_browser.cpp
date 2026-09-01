@@ -148,6 +148,13 @@ WebKitGTKView::WebKitGTKView(GMainWindow& main_window_, Core::System& system_,
     : QWidget(&main_window_), main_window(main_window_), system(system_),
       input_subsystem(input_subsystem_),
       input_interpreter(std::make_unique<InputInterpreter>(system_)) {
+    // The X11 embedding path below needs GTK and Qt to use the same windowing
+    // system.  A Qt application running through Xwayland reports "xcb", while
+    // GTK may otherwise select Wayland and create a separate fallback window.
+    // This must happen before GTK is initialized.
+    if (QGuiApplication::platformName() == QStringLiteral("xcb")) {
+        g_setenv("GDK_BACKEND", "x11", TRUE);
+    }
     static bool gtk_initialized = gtk_init_check(nullptr, nullptr);
     if (!gtk_initialized) {
         LOG_ERROR(Frontend, "WebKitGTKView: gtk_init_check failed, GTK cannot be used");
@@ -258,7 +265,9 @@ QWidget* WebKitGTKView::Embed(QWidget* parent) {
     gtk_widget_show_all(gtk_window);
 
 #if defined(GDK_WINDOWING_X11)
-    GdkWindow* gdk_window = gtk_widget_get_window(GTK_WIDGET(webview));
+    // Embed the owning GTK toplevel, not the WebView's child window.  The
+    // latter leaves the parent GtkWindow behind as a blank, detached window.
+    GdkWindow* gdk_window = gtk_widget_get_window(gtk_window);
     if (gdk_window && GDK_IS_X11_WINDOW(gdk_window)) {
         Window xid = gdk_x11_window_get_xid(gdk_window);
         QWindow* foreign = QWindow::fromWinId(static_cast<WId>(xid));
