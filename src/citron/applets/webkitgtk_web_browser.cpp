@@ -112,6 +112,11 @@ void OnEvaluateJavaScriptFinished(GObject* source, GAsyncResult* result, gpointe
         // there before anything else) -- ctx->callback may capture `this`, don't
         // risk invoking it against a destroyed object.
         const bool was_cancelled = g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED);
+        if (!was_cancelled) {
+            LOG_WARNING(Frontend,
+                        "WebKitGTK JavaScript evaluation failed: domain={} code={} message={}",
+                        error->domain, error->code, error->message ? error->message : "(none)");
+        }
         g_error_free(error);
         if (was_cancelled) {
             delete ctx;
@@ -154,6 +159,14 @@ WebKitGTKView::WebKitGTKView(GMainWindow& main_window_, Core::System& system_,
     // This must happen before GTK is initialized.
     if (QGuiApplication::platformName() == QStringLiteral("xcb")) {
         g_setenv("GDK_BACKEND", "x11", TRUE);
+    }
+
+    // WebKitGTK's accelerated compositing can leave an embedded/reparented X11
+    // WebView completely white, particularly with NVIDIA drivers.  Web applets
+    // are lightweight 2D pages, so use WebKit's supported software-compositing
+    // fallback for reliable rendering.  Preserve an explicit user override.
+    if (!g_getenv("WEBKIT_DISABLE_COMPOSITING_MODE")) {
+        g_setenv("WEBKIT_DISABLE_COMPOSITING_MODE", "1", FALSE);
     }
     static bool gtk_initialized = gtk_init_check(nullptr, nullptr);
     if (!gtk_initialized) {
@@ -224,6 +237,9 @@ WebKitGTKView::WebKitGTKView(GMainWindow& main_window_, Core::System& system_,
     // to the applet instead.
     g_signal_connect(webview, "script-dialog", G_CALLBACK(OnScriptDialog), this);
     g_signal_connect(webview, "close", G_CALLBACK(OnClose), this);
+    g_signal_connect(webview, "load-changed", G_CALLBACK(OnLoadChanged), this);
+    g_signal_connect(webview, "load-failed", G_CALLBACK(OnLoadFailed), this);
+    g_signal_connect(webview, "web-process-terminated", G_CALLBACK(OnWebProcessTerminated), this);
 
     QWidget* view_widget = Embed(&main_window_);
     auto* layout = new QVBoxLayout(this);
@@ -404,6 +420,9 @@ void WebKitGTKView::LoadLocalWebPage(const std::string& main_url,
     }
     std::string uri = std::string(file_uri) + additional_args;
     g_free(file_uri);
+    load_committed = false;
+    load_failed = false;
+    LOG_INFO(Frontend, "WebKitGTK loading local URI: {}", uri);
     webkit_web_view_load_uri(webview, uri.c_str());
     StartInputThread();
     if (gtk_window) {
@@ -429,6 +448,9 @@ void WebKitGTKView::LoadExternalWebPage(const std::string& main_url,
     SetLastURL("http://localhost/");
 
     std::string uri = main_url + additional_args;
+    load_committed = false;
+    load_failed = false;
+    LOG_INFO(Frontend, "WebKitGTK loading external URI: {}", uri);
     webkit_web_view_load_uri(webview, uri.c_str());
     StartInputThread();
     if (gtk_window) {
@@ -584,6 +606,23 @@ void WebKitGTKView::InputThreadLoop() {
                 break;
             default:
                 break;
+            }
+
+            // Normal B handling belongs to the page because applets may use it to navigate
+            // within their own history. If WebKit has not produced a usable document, however,
+            // JavaScript cannot receive that input. Keep a native escape hatch so a failed or
+            // wedged page cannot trap the user in an inert white applet.
+            if (button == NpadButton::B && (!load_committed || load_failed)) {
+                LOG_WARNING(Frontend,
+                            "WebKitGTK closing uncommitted/failed page in response to B");
+                QMetaObject::invokeMethod(
+                    this,
+                    [this] {
+                        SetExitReason(Service::AM::Frontend::WebExitReason::WindowClosed);
+                        SetFinished(true);
+                    },
+                    Qt::QueuedConnection);
+                continue;
             }
 
             // Check if a callback is registered; send fallback key only if not.
@@ -745,6 +784,58 @@ void WebKitGTKView::OnClose(WebKitWebView*, gpointer user_data) {
     auto* self = static_cast<WebKitGTKView*>(user_data);
     self->SetFinished(true);
     self->SetExitReason(Service::AM::Frontend::WebExitReason::WindowClosed);
+}
+
+void WebKitGTKView::OnLoadChanged(WebKitWebView* view, int load_event_raw, gpointer user_data) {
+    auto* self = static_cast<WebKitGTKView*>(user_data);
+    const auto load_event = static_cast<WebKitLoadEvent>(load_event_raw);
+    const char* uri = webkit_web_view_get_uri(view);
+    const char* event_name = "unknown";
+    switch (load_event) {
+    case WEBKIT_LOAD_STARTED:
+        event_name = "started";
+        self->load_committed = false;
+        self->load_failed = false;
+        break;
+    case WEBKIT_LOAD_REDIRECTED:
+        event_name = "redirected";
+        break;
+    case WEBKIT_LOAD_COMMITTED:
+        event_name = "committed";
+        self->load_committed = true;
+        break;
+    case WEBKIT_LOAD_FINISHED:
+        event_name = "finished";
+        break;
+    }
+    LOG_INFO(Frontend, "WebKitGTK load {}: {}", event_name, uri ? uri : "(no URI)");
+}
+
+int WebKitGTKView::OnLoadFailed(WebKitWebView*, int load_event_raw, const char* failing_uri,
+                                GError* error, gpointer user_data) {
+    auto* self = static_cast<WebKitGTKView*>(user_data);
+    if (error && g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+        LOG_INFO(Frontend, "WebKitGTK load cancelled at event {}: {}", load_event_raw,
+                 failing_uri ? failing_uri : "(no URI)");
+        return FALSE;
+    }
+
+    self->load_failed = true;
+    LOG_ERROR(Frontend,
+              "WebKitGTK load failed at event {}: uri={} domain={} code={} message={}",
+              load_event_raw, failing_uri ? failing_uri : "(no URI)", error ? error->domain : 0,
+              error ? error->code : 0,
+              error && error->message ? error->message : "(no error detail)");
+    return FALSE;
+}
+
+void WebKitGTKView::OnWebProcessTerminated(WebKitWebView* view, int reason_raw,
+                                           gpointer user_data) {
+    auto* self = static_cast<WebKitGTKView*>(user_data);
+    self->load_failed = true;
+    const char* uri = webkit_web_view_get_uri(view);
+    LOG_ERROR(Frontend, "WebKitGTK web process terminated: reason={} uri={}", reason_raw,
+              uri ? uri : "(no URI)");
 }
 
 #endif // CITRON_USE_WEBKITGTK_WEB_ENGINE

@@ -25,6 +25,7 @@ typedef struct _WebKitJavascriptResult WebKitJavascriptResult;
 typedef struct _WebKitPolicyDecision WebKitPolicyDecision;
 typedef struct _WebKitScriptDialog WebKitScriptDialog;
 typedef struct _GCancellable GCancellable;
+typedef struct _GError GError;
 typedef void* gpointer;
 }
 #endif
@@ -119,6 +120,9 @@ private:
     // unparented script dialogs. The .cpp presents Qt dialogs parented to this view.
     static int OnScriptDialog(WebKitWebView*, WebKitScriptDialog*, gpointer);
     static void OnClose(WebKitWebView*, gpointer);
+    static void OnLoadChanged(WebKitWebView*, int, gpointer);
+    static int OnLoadFailed(WebKitWebView*, int, const char*, GError*, gpointer);
+    static void OnWebProcessTerminated(WebKitWebView*, int, gpointer);
 
     GMainWindow& main_window;
     GtkWidget* gtk_window = nullptr; // set by Embed() or FallbackToTopLevelWindow()
@@ -136,6 +140,8 @@ private:
     bool init_failed = false;
     bool fonts_injected = false;
     bool focus_script_injected = false;
+    std::atomic<bool> load_committed{false};
+    std::atomic<bool> load_failed{false};
     std::atomic<bool> finished{false};
     Service::AM::Frontend::WebExitReason exit_reason{};
     std::string last_url;
