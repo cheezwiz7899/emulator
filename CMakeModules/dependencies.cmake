@@ -537,6 +537,19 @@ elseif (CITRON_USE_BUNDLED_FFMPEG)
         set(FFMPEG_CPM_SOURCE_DIR "${ffmpeg_src_SOURCE_DIR}" CACHE INTERNAL
             "FFmpeg source location for the autotools bundled build")
     endif()
+
+    CPMAddPackage(
+        NAME ffnvcodec
+        GITHUB_REPOSITORY FFmpeg/nv-codec-headers
+        GIT_TAG n12.2.72.0
+        DOWNLOAD_ONLY YES
+    )
+    if (ffnvcodec_ADDED)
+        set(FFNVCODEC_FOUND YES)
+        set(FFNVCODEC_VERSION "12.2.72.0")
+        set(FFNVCODEC_INCLUDE_DIRS "${ffnvcodec_SOURCE_DIR}/include" CACHE INTERNAL
+            "ffnvcodec headers location for FFmpeg NVDEC/CUDA build")
+    endif()
 endif()
 
 # ── Dependency Versions (Qt, XCB) ─────────────────────────────────────────

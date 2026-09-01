@@ -113,6 +113,38 @@ function(citron_build_clangcl_ffmpeg)
         set(_ffmpeg_vulkan_flags "--disable-vulkan")
     endif()
 
+    # ── ffnvcodec (NVDEC / CUDA) detection ────────────────────────────────────
+    set(_ffnvcodec_inc_dir "")
+    if (DEFINED ffnvcodec_SOURCE_DIR AND EXISTS "${ffnvcodec_SOURCE_DIR}/include/ffnvcodec/nvEncodeAPI.h")
+        set(_ffnvcodec_inc_dir "${ffnvcodec_SOURCE_DIR}/include")
+    elseif (DEFINED FFNVCODEC_INCLUDE_DIRS AND EXISTS "${FFNVCODEC_INCLUDE_DIRS}/ffnvcodec/nvEncodeAPI.h")
+        set(_ffnvcodec_inc_dir "${FFNVCODEC_INCLUDE_DIRS}")
+    elseif (EXISTS "$ENV{MSYSTEM_PREFIX}/include/ffnvcodec/nvEncodeAPI.h")
+        set(_ffnvcodec_inc_dir "$ENV{MSYSTEM_PREFIX}/include")
+    endif()
+
+    set(_ffmpeg_nvdec_flags "")
+    if (_ffnvcodec_inc_dir)
+        message(STATUS "[FFmpeg/clang-cl] ffnvcodec headers found at: ${_ffnvcodec_inc_dir}")
+        execute_process(
+            COMMAND "${CMAKE_COMMAND}" -E env "MSYS2_ARG_CONV_EXCL=*"
+                "${BASH_PROGRAM}" -lc "cygpath -am '${_ffnvcodec_inc_dir}'"
+            OUTPUT_VARIABLE _ffnvcodec_inc_win
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        if (_ffnvcodec_inc_win MATCHES "^[A-Za-z]:/")
+            set(_ffmpeg_extra_cflags "${_ffmpeg_extra_cflags} -I${_ffnvcodec_inc_win}")
+            set(_ffmpeg_nvdec_flags
+                "--enable-ffnvcodec"
+                "--enable-cuvid"
+                "--enable-nvdec"
+                "--enable-hwaccel=h264_nvdec"
+                "--enable-hwaccel=vp8_nvdec"
+                "--enable-hwaccel=vp9_nvdec"
+            )
+        endif()
+    endif()
+
     set(_ffmpeg_configure_command
         "export PATH='${_clangcl_tool_dir_msys}:${_linker_tool_dir_msys}:${_ar_tool_dir_msys}':$PATH &&"
         "'${_source_dir_win}/configure'"
@@ -148,6 +180,7 @@ function(citron_build_clangcl_ffmpeg)
         "--enable-hwaccel=vp9_d3d11va"
         "--enable-hwaccel=vp9_d3d11va2"
         ${_ffmpeg_vulkan_flags}
+        ${_ffmpeg_nvdec_flags}
         "--enable-filter=yadif,scale"
         "--enable-dxva2"
         "--enable-d3d11va"

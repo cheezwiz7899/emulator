@@ -59,7 +59,9 @@ if (NOT WIN32 AND NOT ANDROID)
     if (NOT ANDROID)
         pkg_check_modules(LIBVA libva)
         pkg_check_modules(CUDA cuda)
-        pkg_check_modules(FFNVCODEC ffnvcodec)
+        if (NOT FFNVCODEC_FOUND)
+            pkg_check_modules(FFNVCODEC ffnvcodec)
+        endif()
         pkg_check_modules(VDPAU vdpau)
     endif()
 
@@ -105,20 +107,22 @@ if (NOT WIN32 AND NOT ANDROID)
             --enable-hwaccel=vp8_nvdec
             --enable-hwaccel=vp9_nvdec
         )
+        if (FFNVCODEC_INCLUDE_DIRS)
+            list(APPEND FFmpeg_HWACCEL_FLAGS --extra-cflags=-I${FFNVCODEC_INCLUDE_DIRS})
+        endif()
         list(APPEND FFmpeg_HWACCEL_LIBRARIES ${FFNVCODEC_LIBRARIES})
         list(APPEND FFmpeg_HWACCEL_INCLUDE_DIRS ${FFNVCODEC_INCLUDE_DIRS})
         list(APPEND FFmpeg_HWACCEL_LDFLAGS ${FFNVCODEC_LDFLAGS})
-        message(STATUS "ffnvcodec libraries version ${FFNVCODEC_VERSION} found")
-        # ffnvenc could load CUDA libraries at the runtime using dlopen/dlsym or LoadLibrary/GetProcAddress
-        # here we handle the hard-linking senario where CUDA is linked during compilation
+        message(STATUS "ffnvcodec headers/libraries found (version ${FFNVCODEC_VERSION})")
+        # ffnvenc could load CUDA libraries at runtime using dlopen/dlsym
         if (CUDA_FOUND)
-            # This line causes build error if CUDA_INCLUDE_DIRS is anything but a single non-empty value
-            #list(APPEND FFmpeg_HWACCEL_FLAGS --extra-cflags=-I${CUDA_INCLUDE_DIRS})
             list(APPEND FFmpeg_HWACCEL_LIBRARIES ${CUDA_LIBRARIES})
             list(APPEND FFmpeg_HWACCEL_INCLUDE_DIRS ${CUDA_INCLUDE_DIRS})
             list(APPEND FFmpeg_HWACCEL_LDFLAGS ${CUDA_LDFLAGS})
             message(STATUS "CUDA libraries found, hard-linking will be performed")
         endif(CUDA_FOUND)
+    else()
+        list(APPEND FFmpeg_HWACCEL_FLAGS --disable-ffnvcodec --disable-nvdec --disable-cuvid)
     endif()
 
     if (VDPAU_FOUND)
