@@ -549,6 +549,18 @@ elseif (CITRON_USE_BUNDLED_FFMPEG)
         set(FFNVCODEC_VERSION "12.2.72.0")
         set(FFNVCODEC_INCLUDE_DIRS "${ffnvcodec_SOURCE_DIR}/include" CACHE INTERNAL
             "ffnvcodec headers location for FFmpeg NVDEC/CUDA build")
+        set(FFNVCODEC_PKGCONFIG_DIR "${ffnvcodec_SOURCE_DIR}" CACHE INTERNAL
+            "ffnvcodec pkg-config directory")
+        # Generate ffnvcodec.pc so FFmpeg configure check_pkg_config succeeds on Linux and Windows MSYS2
+        file(WRITE "${ffnvcodec_SOURCE_DIR}/ffnvcodec.pc"
+"prefix=${ffnvcodec_SOURCE_DIR}
+includedir=\${prefix}/include
+
+Name: ffnvcodec
+Description: FFmpeg version of Nvidia Codec SDK headers
+Version: 12.2.72.0
+Cflags: -I\${includedir}
+")
     endif()
 endif()
 

@@ -115,16 +115,40 @@ function(citron_build_clangcl_ffmpeg)
 
     # ── ffnvcodec (NVDEC / CUDA) detection ────────────────────────────────────
     set(_ffnvcodec_inc_dir "")
+    set(_ffnvcodec_pc_dir "")
     if (DEFINED ffnvcodec_SOURCE_DIR AND EXISTS "${ffnvcodec_SOURCE_DIR}/include/ffnvcodec/nvEncodeAPI.h")
         set(_ffnvcodec_inc_dir "${ffnvcodec_SOURCE_DIR}/include")
+        set(_ffnvcodec_pc_dir "${ffnvcodec_SOURCE_DIR}")
     elseif (DEFINED FFNVCODEC_INCLUDE_DIRS AND EXISTS "${FFNVCODEC_INCLUDE_DIRS}/ffnvcodec/nvEncodeAPI.h")
         set(_ffnvcodec_inc_dir "${FFNVCODEC_INCLUDE_DIRS}")
+        if (DEFINED FFNVCODEC_PKGCONFIG_DIR)
+            set(_ffnvcodec_pc_dir "${FFNVCODEC_PKGCONFIG_DIR}")
+        endif()
     elseif (EXISTS "$ENV{MSYSTEM_PREFIX}/include/ffnvcodec/nvEncodeAPI.h")
         set(_ffnvcodec_inc_dir "$ENV{MSYSTEM_PREFIX}/include")
     endif()
 
-    set(_ffmpeg_nvdec_flags "")
-    if (_ffnvcodec_inc_dir)
+    set(_ffnvcodec_nvdec_flags "")
+    set(_ffnvcodec_export_pkgconfig "")
+    if (_ffnvcodec_pc_dir AND EXISTS "${_ffnvcodec_pc_dir}/ffnvcodec.pc")
+        execute_process(
+            COMMAND "${CMAKE_COMMAND}" -E env "MSYS2_ARG_CONV_EXCL=*"
+                "${BASH_PROGRAM}" -lc "cygpath -au '${_ffnvcodec_pc_dir}'"
+            OUTPUT_VARIABLE _ffnvcodec_pc_dir_msys
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        if (_ffnvcodec_pc_dir_msys)
+            set(_ffnvcodec_export_pkgconfig "export PKG_CONFIG_PATH='${_ffnvcodec_pc_dir_msys}':$PKG_CONFIG_PATH &&")
+            set(_ffnvcodec_nvdec_flags
+                "--enable-ffnvcodec"
+                "--enable-cuvid"
+                "--enable-nvdec"
+                "--enable-hwaccel=h264_nvdec"
+                "--enable-hwaccel=vp8_nvdec"
+                "--enable-hwaccel=vp9_nvdec"
+            )
+        endif()
+    elseif (_ffnvcodec_inc_dir)
         message(STATUS "[FFmpeg/clang-cl] ffnvcodec headers found at: ${_ffnvcodec_inc_dir}")
         execute_process(
             COMMAND "${CMAKE_COMMAND}" -E env "MSYS2_ARG_CONV_EXCL=*"
@@ -134,7 +158,7 @@ function(citron_build_clangcl_ffmpeg)
         )
         if (_ffnvcodec_inc_win MATCHES "^[A-Za-z]:/")
             set(_ffmpeg_extra_cflags "${_ffmpeg_extra_cflags} -I${_ffnvcodec_inc_win}")
-            set(_ffmpeg_nvdec_flags
+            set(_ffnvcodec_nvdec_flags
                 "--enable-ffnvcodec"
                 "--enable-cuvid"
                 "--enable-nvdec"
@@ -147,6 +171,7 @@ function(citron_build_clangcl_ffmpeg)
 
     set(_ffmpeg_configure_command
         "export PATH='${_clangcl_tool_dir_msys}:${_linker_tool_dir_msys}:${_ar_tool_dir_msys}':$PATH &&"
+        ${_ffnvcodec_export_pkgconfig}
         "'${_source_dir_win}/configure'"
         "--toolchain=msvc"
         "--cc=clang-cl"
@@ -180,7 +205,7 @@ function(citron_build_clangcl_ffmpeg)
         "--enable-hwaccel=vp9_d3d11va"
         "--enable-hwaccel=vp9_d3d11va2"
         ${_ffmpeg_vulkan_flags}
-        ${_ffmpeg_nvdec_flags}
+        ${_ffnvcodec_nvdec_flags}
         "--enable-filter=yadif,scale"
         "--enable-dxva2"
         "--enable-d3d11va"

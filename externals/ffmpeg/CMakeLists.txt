@@ -57,6 +57,9 @@ if (NOT WIN32 AND NOT ANDROID)
 
     find_package(PkgConfig REQUIRED)
     if (NOT ANDROID)
+        if (DEFINED FFNVCODEC_PKGCONFIG_DIR AND EXISTS "${FFNVCODEC_PKGCONFIG_DIR}/ffnvcodec.pc")
+            set(ENV{PKG_CONFIG_PATH} "${FFNVCODEC_PKGCONFIG_DIR}:$ENV{PKG_CONFIG_PATH}")
+        endif()
         pkg_check_modules(LIBVA libva)
         pkg_check_modules(CUDA cuda)
         if (NOT FFNVCODEC_FOUND)
@@ -213,10 +216,15 @@ if (NOT WIN32 AND NOT ANDROID)
     # sentinel unchanged, forcing re-invalidation on the next cmake --build).
     set(FFmpeg_SENTINEL_TMP "${FFmpeg_BUILD_DIR}/.citron_ffmpeg_configure_flags.tmp")
     file(WRITE "${FFmpeg_SENTINEL_TMP}" "${FFmpeg_CURRENT_FLAGS}")
+    set(_ffmpeg_configure_env "")
+    if (DEFINED FFNVCODEC_PKGCONFIG_DIR AND EXISTS "${FFNVCODEC_PKGCONFIG_DIR}/ffnvcodec.pc")
+        set(_ffmpeg_configure_env "${CMAKE_COMMAND}" -E env "PKG_CONFIG_PATH=${FFNVCODEC_PKGCONFIG_DIR}:$ENV{PKG_CONFIG_PATH}")
+    endif()
     add_custom_command(
         OUTPUT
             ${FFmpeg_MAKEFILE}
         COMMAND
+            ${_ffmpeg_configure_env}
             ${BASH_PROGRAM} ${FFmpeg_PREFIX}/configure
                 --disable-avdevice
                 --disable-avformat
