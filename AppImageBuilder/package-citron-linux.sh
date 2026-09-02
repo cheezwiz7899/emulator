@@ -320,19 +320,23 @@ chmod +x ./AppDir/bin/02-hwaccel.hook
 # GNOME 48 has a Mutter compositor bug where native Wayland Qt windows render
 # incorrectly (black/frozen, missing icons). XCB via Xwayland sidesteps this.
 # Only applied when GNOME is detected AND Xwayland is running ($DISPLAY set).
-# If X11 is unavailable (e.g. GNOME 50+ pure Wayland), falls back to native
-# Wayland. The user can override with QT_QPA_PLATFORM=wayland.
+# If X11 is unavailable (e.g. GNOME 50+ pure Wayland), explicitly select native
+# Wayland. The user can still override QT_QPA_PLATFORM.
 # See: https://codeberg.org/pkgforge-dev/Citron-AppImage/issues/50
 cat <<-'HOOK_EOF' > ./AppDir/bin/03-gnome-xcb.hook
 #!/bin/sh
 if [ -z "${QT_QPA_PLATFORM:-}" ]; then
-    case "${XDG_CURRENT_DESKTOP:-}" in
-        *GNOME*|*gnome*)
-            if [ -n "${DISPLAY:-}" ]; then
-                export QT_QPA_PLATFORM=xcb
-            fi
-            ;;
-    esac
+    if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -z "${DISPLAY:-}" ]; then
+        export QT_QPA_PLATFORM=wayland
+    else
+        case "${XDG_CURRENT_DESKTOP:-}" in
+            *GNOME*|*gnome*)
+                if [ -n "${DISPLAY:-}" ]; then
+                    export QT_QPA_PLATFORM=xcb
+                fi
+                ;;
+        esac
+    fi
 fi
 HOOK_EOF
 chmod +x ./AppDir/bin/03-gnome-xcb.hook

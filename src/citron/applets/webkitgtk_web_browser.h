@@ -140,6 +140,7 @@ private:
 
     bool is_local = false;
     bool is_x11 = false;
+    bool is_wayland = false;
     bool init_failed = false;
     bool fonts_injected = false;
     bool focus_script_injected = false;

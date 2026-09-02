@@ -155,12 +155,17 @@ WebKitGTKView::WebKitGTKView(GMainWindow& main_window_, Core::System& system_,
     : QWidget(&main_window_), main_window(main_window_), system(system_),
       input_subsystem(input_subsystem_),
       input_interpreter(std::make_unique<InputInterpreter>(system_)), is_local(is_local_) {
-    // The native X11 overlay needs GTK and Qt to use the same windowing system.
-    // A Qt application running through Xwayland reports "xcb", while GTK may
-    // otherwise select Wayland. This must happen before GTK is initialized.
-    is_x11 = QGuiApplication::platformName() == QStringLiteral("xcb");
+    // GTK and Qt must use the same display backend. A Qt application running
+    // through Xwayland reports "xcb", while a native Wayland application reports
+    // "wayland" or "wayland-egl". Select GTK's backend before gtk_init_check();
+    // otherwise GTK can choose X11 merely because DISPLAY is also present.
+    const QString qt_platform = QGuiApplication::platformName();
+    is_x11 = qt_platform == QStringLiteral("xcb");
+    is_wayland = qt_platform.startsWith(QStringLiteral("wayland"));
     if (is_x11) {
         g_setenv("GDK_BACKEND", "x11", TRUE);
+    } else if (is_wayland) {
+        g_setenv("GDK_BACKEND", "wayland", TRUE);
     }
 
     // WebKitGTK's DMA-BUF renderer can leave an embedded X11 WebView white with
@@ -587,7 +592,12 @@ void WebKitGTKView::showEvent(QShowEvent* event) {
             // compositor-managed maximized window is therefore the only
             // portable way to present the full applet without XWayland.
             gtk_window_maximize(GTK_WINDOW(gtk_window));
-            LOG_INFO(Frontend, "WebKitGTK: presenting applet in native Wayland window");
+            if (is_wayland) {
+                LOG_INFO(Frontend, "WebKitGTK: presenting applet in native Wayland window");
+            } else {
+                LOG_INFO(Frontend,
+                         "WebKitGTK: presenting applet in compositor-managed native window");
+            }
         }
         gtk_widget_show_all(gtk_window);
         gtk_window_present(GTK_WINDOW(gtk_window));
