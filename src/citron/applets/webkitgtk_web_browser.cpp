@@ -317,12 +317,14 @@ QWidget* WebKitGTKView::Embed(QWidget* parent) {
 void WebKitGTKView::FallbackToTopLevelWindow() {
     gtk_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_decorated(GTK_WINDOW(gtk_window), FALSE);
-    // X11 geometry is driven by the Qt placeholder. Native Wayland deliberately
-    // has no global positioning API, so let its compositor maximize a resizable
-    // applet window instead.
-    gtk_window_set_resizable(GTK_WINDOW(gtk_window), !is_x11);
+    // Keep the native window resizable even on X11. SyncTopLevelGeometry drives
+    // its size there, but some window managers retain GTK's 200-pixel natural
+    // width when a toplevel is made non-resizable before its first configure.
+    gtk_window_set_resizable(GTK_WINDOW(gtk_window), TRUE);
     gtk_window_set_skip_pager_hint(GTK_WINDOW(gtk_window), TRUE);
     gtk_window_set_skip_taskbar_hint(GTK_WINDOW(gtk_window), TRUE);
+    gtk_widget_set_hexpand(GTK_WIDGET(webview), TRUE);
+    gtk_widget_set_vexpand(GTK_WIDGET(webview), TRUE);
     gtk_container_add(GTK_CONTAINER(gtk_window), GTK_WIDGET(webview));
     gtk_widget_realize(gtk_window);
 
@@ -353,6 +355,11 @@ void WebKitGTKView::SyncTopLevelGeometry() {
         return;
     }
 
+    // Give WebKit an explicit allocation as well as resizing its GTK toplevel.
+    // Without this, GTK can configure the outer window correctly while leaving
+    // the WebView at its initial 200-pixel natural width.
+    gtk_widget_set_size_request(GTK_WIDGET(webview), view_size.width(), view_size.height());
+    gtk_window_set_default_size(GTK_WINDOW(gtk_window), view_size.width(), view_size.height());
     gtk_window_move(GTK_WINDOW(gtk_window), top_left.x(), top_left.y());
     gtk_window_resize(GTK_WINDOW(gtk_window), view_size.width(), view_size.height());
 }
@@ -586,6 +593,9 @@ void WebKitGTKView::showEvent(QShowEvent* event) {
     QWidget::showEvent(event);
     if (gtk_window) {
         if (is_x11) {
+            // Map the native window before the final geometry request so the
+            // window manager and WebKit child both receive a real allocation.
+            gtk_widget_show_all(gtk_window);
             SyncTopLevelGeometry();
         } else {
             // Wayland forbids clients from positioning toplevel surfaces. A
@@ -598,8 +608,8 @@ void WebKitGTKView::showEvent(QShowEvent* event) {
                 LOG_INFO(Frontend,
                          "WebKitGTK: presenting applet in compositor-managed native window");
             }
+            gtk_widget_show_all(gtk_window);
         }
-        gtk_widget_show_all(gtk_window);
         gtk_window_present(GTK_WINDOW(gtk_window));
     }
 }
@@ -885,6 +895,19 @@ void WebKitGTKView::OnLoadChanged(WebKitWebView* view, int load_event_raw, gpoin
         gtk_widget_queue_draw(GTK_WIDGET(view));
         if (GdkWindow* window = gtk_widget_get_window(GTK_WIDGET(view))) {
             gdk_window_invalidate_rect(window, nullptr, TRUE);
+        }
+        {
+            GtkAllocation allocation{};
+            gint window_width = 0;
+            gint window_height = 0;
+            gtk_widget_get_allocation(GTK_WIDGET(view), &allocation);
+            if (self->gtk_window) {
+                gtk_window_get_size(GTK_WINDOW(self->gtk_window), &window_width, &window_height);
+            }
+            LOG_INFO(Frontend,
+                     "WebKitGTK geometry: Qt={}x{}, window={}x{}, WebView={}x{}",
+                     self->width(), self->height(), window_width, window_height,
+                     allocation.width, allocation.height);
         }
         break;
     }
