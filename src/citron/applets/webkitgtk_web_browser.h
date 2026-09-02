@@ -93,6 +93,9 @@ public:
 
 protected:
     void hideEvent(QHideEvent* event) override;
+    void moveEvent(QMoveEvent* event) override;
+    void resizeEvent(QResizeEvent* event) override;
+    void showEvent(QShowEvent* event) override;
 
 private:
     void SetUserAgent(UserAgent user_agent);
@@ -103,12 +106,12 @@ private:
     void StopInputThread();
     void InputThreadLoop();
     // Sends a synthesized DOM KeyboardEvent via eval rather than Qt's postEvent,
-    // since a createWindowContainer-embedded foreign window's key events are handled
-    // by GTK's event loop, not Qt's.
+    // since the native GTK overlay's key events are handled by GTK, not Qt.
     void SendKeyEvent(const QString& key, const QString& code, int key_code);
 
     QWidget* Embed(QWidget* parent);
     void FallbackToTopLevelWindow();
+    void SyncTopLevelGeometry();
 
     static void OnNxMessage(WebKitUserContentManager*, WebKitJavascriptResult*, gpointer);
     static void OnNxControl(WebKitUserContentManager*, WebKitJavascriptResult*, gpointer);
@@ -125,10 +128,9 @@ private:
     static void OnWebProcessTerminated(WebKitWebView*, int, gpointer);
 
     GMainWindow& main_window;
-    GtkWidget* gtk_window = nullptr; // set by Embed() or FallbackToTopLevelWindow()
+    GtkWidget* gtk_window = nullptr; // native overlay positioned over this QWidget
     WebKitWebView* webview = nullptr;
     GCancellable* cancellable = nullptr;
-    QWidget* container = nullptr; // createWindowContainer() result, X11 path only
 
     Core::System& system;
     InputCommon::InputSubsystem* input_subsystem;
@@ -137,6 +139,7 @@ private:
     std::atomic<bool> input_thread_running{};
 
     bool is_local = false;
+    bool is_x11 = false;
     bool init_failed = false;
     bool fonts_injected = false;
     bool focus_script_injected = false;

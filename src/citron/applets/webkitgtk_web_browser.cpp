@@ -15,11 +15,13 @@
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QMetaObject>
+#include <QMoveEvent>
+#include <QResizeEvent>
+#include <QShowEvent>
 #include <QThread>
 #include <QTimer>
 #include <QUrl>
 #include <QVBoxLayout>
-#include <QWindow>
 
 // GTK/WebKitGTK headers use fields named signals/slots. Temporarily hide Qt's
 // compatibility macros while parsing them, then restore the macros before
@@ -153,12 +155,11 @@ WebKitGTKView::WebKitGTKView(GMainWindow& main_window_, Core::System& system_,
     : QWidget(&main_window_), main_window(main_window_), system(system_),
       input_subsystem(input_subsystem_),
       input_interpreter(std::make_unique<InputInterpreter>(system_)), is_local(is_local_) {
-    // The X11 embedding path below needs GTK and Qt to use the same windowing
-    // system.  A Qt application running through Xwayland reports "xcb", while
-    // GTK may otherwise select Wayland and create a separate fallback window.
-    // This must happen before GTK is initialized.
-    const bool embedded_x11 = QGuiApplication::platformName() == QStringLiteral("xcb");
-    if (embedded_x11) {
+    // The native X11 overlay needs GTK and Qt to use the same windowing system.
+    // A Qt application running through Xwayland reports "xcb", while GTK may
+    // otherwise select Wayland. This must happen before GTK is initialized.
+    is_x11 = QGuiApplication::platformName() == QStringLiteral("xcb");
+    if (is_x11) {
         g_setenv("GDK_BACKEND", "x11", TRUE);
     }
 
@@ -242,15 +243,14 @@ WebKitGTKView::WebKitGTKView(GMainWindow& main_window_, Core::System& system_,
                     "WebKitGTK: disabled nested web-process sandbox for local portable content");
     }
     WebKitSettings* web_settings = webkit_settings_new();
-    if (embedded_x11) {
-        // Accelerated WebKitGTK frames can remain attached to the original X11
-        // toplevel after Qt embeds/reparents it: the DOM, context menu, and input
-        // work, but the imported frame is never visible. NEVER selects WebKit's
-        // supported shared-memory painting path, which survives foreign-window
-        // embedding and is sufficient for these 2D applet pages.
+    if (is_x11) {
+        // NVIDIA/X11 can leave WebKitGTK's imported accelerated frame invisible
+        // even though the DOM, context menu, and input work. NEVER selects
+        // WebKit's supported shared-memory painting path, which is sufficient
+        // for these 2D applet pages.
         webkit_settings_set_hardware_acceleration_policy(
             web_settings, WEBKIT_HARDWARE_ACCELERATION_POLICY_NEVER);
-        LOG_INFO(Frontend, "WebKitGTK: using software rendering for embedded X11 applet");
+        LOG_INFO(Frontend, "WebKitGTK: using software rendering for native X11 applet overlay");
     }
     webview = WEBKIT_WEB_VIEW(g_object_new(
         WEBKIT_TYPE_WEB_VIEW, "web-context", web_context, "user-content-manager", ucm,
@@ -276,6 +276,12 @@ WebKitGTKView::WebKitGTKView(GMainWindow& main_window_, Core::System& system_,
     layout->setContentsMargins(0, 0, 0, 0);
     layout->addWidget(view_widget);
     setLayout(layout);
+
+    // Moving the Qt toplevel does not generate a move event for this child, so
+    // periodically keep the separate GTK window aligned with its placeholder.
+    auto* geometry_timer = new QTimer(this);
+    connect(geometry_timer, &QTimer::timeout, this, &WebKitGTKView::SyncTopLevelGeometry);
+    geometry_timer->start(33);
 }
 
 WebKitGTKView::~WebKitGTKView() {
@@ -295,48 +301,55 @@ WebKitGTKView::~WebKitGTKView() {
 }
 
 QWidget* WebKitGTKView::Embed(QWidget* parent) {
-    const QString platform = QGuiApplication::platformName();
-    if (platform != QStringLiteral("xcb")) {
-        FallbackToTopLevelWindow();
-        return new QWidget(parent);
-    }
-
-    // Real (not offscreen) top-level window, used only to get webview a normal,
-    // realized, mapped X11 native window whose XID we hand to Qt.
-    // gtk_offscreen_window_new() was wrong here -- offscreen windows don't behave
-    // like a normal embeddable mapped X11 window.
-    gtk_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_container_add(GTK_CONTAINER(gtk_window), GTK_WIDGET(webview));
-    gtk_widget_realize(gtk_window);
-    gtk_widget_show_all(gtk_window);
-
-#if defined(GDK_WINDOWING_X11)
-    // Embed the owning GTK toplevel, not the WebView's child window.  The
-    // latter leaves the parent GtkWindow behind as a blank, detached window.
-    GdkWindow* gdk_window = gtk_widget_get_window(gtk_window);
-    if (gdk_window && GDK_IS_X11_WINDOW(gdk_window)) {
-        Window xid = gdk_x11_window_get_xid(gdk_window);
-        QWindow* foreign = QWindow::fromWinId(static_cast<WId>(xid));
-        container = QWidget::createWindowContainer(foreign, parent);
-        return container;
-    }
-#endif
-
-    // X11 extraction failed despite platformName() == xcb -- fall back. webview
-    // is already parented to gtk_window from above; must detach it before
-    // FallbackToTopLevelWindow() re-parents it (gtk_container_add on an
-    // already-parented widget is a GTK critical, not a re-parent), and destroy
-    // the now-empty window instead of leaking it.
-    gtk_container_remove(GTK_CONTAINER(gtk_window), GTK_WIDGET(webview));
-    gtk_widget_destroy(gtk_window);
-    gtk_window = nullptr;
+    // Reparenting a realized GtkWindow through QWindow::fromWinId leaves
+    // WebKitGTK interactive but unable to present either accelerated or software
+    // frames. Keep WebKit in its supported native toplevel and use this child as
+    // its geometry placeholder inside Citron instead.
     FallbackToTopLevelWindow();
     return new QWidget(parent);
 }
 
 void WebKitGTKView::FallbackToTopLevelWindow() {
     gtk_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_decorated(GTK_WINDOW(gtk_window), FALSE);
+    // X11 geometry is driven by the Qt placeholder. Native Wayland deliberately
+    // has no global positioning API, so let its compositor maximize a resizable
+    // applet window instead.
+    gtk_window_set_resizable(GTK_WINDOW(gtk_window), !is_x11);
+    gtk_window_set_skip_pager_hint(GTK_WINDOW(gtk_window), TRUE);
+    gtk_window_set_skip_taskbar_hint(GTK_WINDOW(gtk_window), TRUE);
     gtk_container_add(GTK_CONTAINER(gtk_window), GTK_WIDGET(webview));
+    gtk_widget_realize(gtk_window);
+
+#if defined(GDK_WINDOWING_X11)
+    // Make the overlay a transient child of Citron so the window manager keeps
+    // it above, minimizes it with Citron, and does not expose it as another app.
+    if (GdkWindow* window = gtk_widget_get_window(gtk_window);
+        window && GDK_IS_X11_WINDOW(window)) {
+        GdkDisplay* display = gdk_window_get_display(window);
+        GdkWindow* parent_window = gdk_x11_window_foreign_new_for_display(
+            display, static_cast<Window>(main_window.winId()));
+        if (parent_window) {
+            gdk_window_set_transient_for(window, parent_window);
+            g_object_unref(parent_window);
+        }
+    }
+#endif
+}
+
+void WebKitGTKView::SyncTopLevelGeometry() {
+    if (!gtk_window || !isVisible() || !is_x11) {
+        return;
+    }
+
+    const QPoint top_left = mapToGlobal(QPoint(0, 0));
+    const QSize view_size = size();
+    if (view_size.isEmpty()) {
+        return;
+    }
+
+    gtk_window_move(GTK_WINDOW(gtk_window), top_left.x(), top_left.y());
+    gtk_window_resize(GTK_WINDOW(gtk_window), view_size.width(), view_size.height());
 }
 
 void WebKitGTKView::SetUserAgent(UserAgent user_agent) {
@@ -455,9 +468,6 @@ void WebKitGTKView::LoadLocalWebPage(const std::string& main_url,
     LOG_INFO(Frontend, "WebKitGTK loading local URI: {}", uri);
     webkit_web_view_load_uri(webview, uri.c_str());
     StartInputThread();
-    if (gtk_window) {
-        gtk_widget_show_all(gtk_window);
-    }
 }
 
 void WebKitGTKView::LoadExternalWebPage(const std::string& main_url,
@@ -483,9 +493,6 @@ void WebKitGTKView::LoadExternalWebPage(const std::string& main_url,
     LOG_INFO(Frontend, "WebKitGTK loading external URI: {}", uri);
     webkit_web_view_load_uri(webview, uri.c_str());
     StartInputThread();
-    if (gtk_window) {
-        gtk_widget_show_all(gtk_window);
-    }
 }
 
 QString WebKitGTKView::GetCurrentURL() const {
@@ -554,10 +561,37 @@ void WebKitGTKView::SendKeyEvent(const QString& key, const QString& code, int ke
 void WebKitGTKView::hideEvent(QHideEvent* event) {
     SetFinished(true);
     StopInputThread();
-    if (gtk_window && !container) {
+    if (gtk_window) {
         gtk_widget_hide(gtk_window);
     }
     QWidget::hideEvent(event);
+}
+
+void WebKitGTKView::moveEvent(QMoveEvent* event) {
+    QWidget::moveEvent(event);
+    SyncTopLevelGeometry();
+}
+
+void WebKitGTKView::resizeEvent(QResizeEvent* event) {
+    QWidget::resizeEvent(event);
+    SyncTopLevelGeometry();
+}
+
+void WebKitGTKView::showEvent(QShowEvent* event) {
+    QWidget::showEvent(event);
+    if (gtk_window) {
+        if (is_x11) {
+            SyncTopLevelGeometry();
+        } else {
+            // Wayland forbids clients from positioning toplevel surfaces. A
+            // compositor-managed maximized window is therefore the only
+            // portable way to present the full applet without XWayland.
+            gtk_window_maximize(GTK_WINDOW(gtk_window));
+            LOG_INFO(Frontend, "WebKitGTK: presenting applet in native Wayland window");
+        }
+        gtk_widget_show_all(gtk_window);
+        gtk_window_present(GTK_WINDOW(gtk_window));
+    }
 }
 
 void WebKitGTKView::PumpGLibMainContext() {
@@ -836,9 +870,8 @@ void WebKitGTKView::OnLoadChanged(WebKitWebView* view, int load_event_raw, gpoin
         break;
     case WEBKIT_LOAD_FINISHED:
         event_name = "finished";
-        // The foreign X11 window may not receive a fresh expose after WebKit
-        // swaps in the first software-rendered frame. Explicitly invalidate it
-        // so GTK paints that completed frame into Qt's window container.
+        // Ensure the first completed software-rendered frame is exposed after
+        // the native overlay has been mapped and resized.
         gtk_widget_queue_draw(GTK_WIDGET(view));
         if (GdkWindow* window = gtk_widget_get_window(GTK_WIDGET(view))) {
             gdk_window_invalidate_rect(window, nullptr, TRUE);
