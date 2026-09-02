@@ -155,28 +155,8 @@ function(citron_build_clangtron_ffmpeg)
 
     set(_ffnvcodec_nvdec_flags "")
     set(_ffnvcodec_export_pkgconfig "")
-    if (_ffnvcodec_pc_dir AND EXISTS "${_ffnvcodec_pc_dir}/ffnvcodec.pc")
-        if(CMAKE_HOST_WIN32)
-            execute_process(
-                COMMAND "${BASH_PROGRAM}" -lc "cygpath -au '${_ffnvcodec_pc_dir}'"
-                OUTPUT_VARIABLE _ffnvcodec_pc_dir_msys
-                OUTPUT_STRIP_TRAILING_WHITESPACE
-            )
-        else()
-            set(_ffnvcodec_pc_dir_msys "${_ffnvcodec_pc_dir}")
-        endif()
-        if (_ffnvcodec_pc_dir_msys)
-            set(_ffnvcodec_export_pkgconfig "export PKG_CONFIG_PATH='${_ffnvcodec_pc_dir_msys}':$PKG_CONFIG_PATH &&")
-            set(_ffnvcodec_nvdec_flags
-                "--enable-ffnvcodec"
-                "--enable-cuvid"
-                "--enable-nvdec"
-                "--enable-hwaccel=h264_nvdec"
-                "--enable-hwaccel=vp8_nvdec"
-                "--enable-hwaccel=vp9_nvdec"
-            )
-        endif()
-    elseif (_ffnvcodec_inc_dir)
+    set(_ffnvcodec_pkg_config_opt "")
+    if (_ffnvcodec_inc_dir)
         if(CMAKE_HOST_WIN32)
             execute_process(
                 COMMAND "${CMAKE_COMMAND}" -E env "MSYS2_ARG_CONV_EXCL=*"
@@ -185,10 +165,70 @@ function(citron_build_clangtron_ffmpeg)
                 OUTPUT_STRIP_TRAILING_WHITESPACE
                 COMMAND_ERROR_IS_FATAL ANY
             )
+            if (_ffnvcodec_pc_dir)
+                execute_process(
+                    COMMAND "${BASH_PROGRAM}" -lc "cygpath -au '${_ffnvcodec_pc_dir}'"
+                    OUTPUT_VARIABLE _ffnvcodec_pc_dir_msys
+                    OUTPUT_STRIP_TRAILING_WHITESPACE
+                )
+            endif()
         else()
             set(_ffnvcodec_inc_win "${_ffnvcodec_inc_dir}")
+            set(_ffnvcodec_pc_dir_msys "${_ffnvcodec_pc_dir}")
         endif()
-        set(_ffmpeg_extra_cflags "${_ffmpeg_extra_cflags} -I${_ffnvcodec_inc_win}")
+
+        if (_ffnvcodec_pc_dir_msys)
+            set(_ffnvcodec_export_pkgconfig "export PKG_CONFIG_PATH='${_ffnvcodec_pc_dir_msys}':$PKG_CONFIG_PATH &&")
+        endif()
+
+        # Provide a pkg-config wrapper in build dir to guarantee configure check_pkg_config succeeds
+        # even when cross-compiling (where FFmpeg's --cross-prefix defaults pkg-config to
+        # <cross-prefix>pkg-config which doesn't exist) or when pkgconf is missing.
+        file(WRITE "${_build_dir_win}/pkg-config"
+"#!/bin/sh
+for arg in \"\$@\"; do
+    case \"\$arg\" in
+        --exists)
+            exit 0
+            ;;
+        --cflags*)
+            echo \"-I${_ffnvcodec_inc_win}\"
+            exit 0
+            ;;
+        --libs*)
+            echo \"\"
+            exit 0
+            ;;
+        --variable=includedir)
+            echo \"${_ffnvcodec_inc_win}\"
+            exit 0
+            ;;
+        --modversion)
+            echo \"12.2.72.0\"
+            exit 0
+            ;;
+    esac
+done
+if command -v /usr/bin/pkg-config >/dev/null 2>&1; then
+    exec /usr/bin/pkg-config \"\$@\"
+elif command -v /usr/bin/pkgconf >/dev/null 2>&1; then
+    exec /usr/bin/pkgconf \"\$@\"
+elif command -v /clang64/bin/pkg-config >/dev/null 2>&1; then
+    exec /clang64/bin/pkg-config \"\$@\"
+fi
+exit 0
+")
+        if (CMAKE_HOST_WIN32)
+            execute_process(
+                COMMAND "${BASH_PROGRAM}" -lc "chmod +x '${_build_dir_msys}/pkg-config'"
+            )
+        else()
+            execute_process(
+                COMMAND chmod +x "${_build_dir_win}/pkg-config"
+            )
+        endif()
+        set(_ffnvcodec_pkg_config_opt "--pkg-config='${_build_dir_msys}/pkg-config'")
+
         set(_ffnvcodec_nvdec_flags
             "--enable-ffnvcodec"
             "--enable-cuvid"
@@ -204,9 +244,10 @@ function(citron_build_clangtron_ffmpeg)
     endif()
 
     set(_ffmpeg_configure_command
-        "export PATH='${_clangtron_tool_dir_msys}':$PATH &&"
+        "export PATH='${_build_dir_msys}:${_clangtron_tool_dir_msys}':$PATH &&"
         ${_ffnvcodec_export_pkgconfig}
         "'${_source_dir_win}/configure'"
+        ${_ffnvcodec_pkg_config_opt}
         "--arch=x86_64"
         "--target-os=mingw32"
         "--cc='${_c_compiler_ffmpeg}'"

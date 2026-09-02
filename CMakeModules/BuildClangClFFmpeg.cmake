@@ -130,25 +130,8 @@ function(citron_build_clangcl_ffmpeg)
 
     set(_ffnvcodec_nvdec_flags "")
     set(_ffnvcodec_export_pkgconfig "")
-    if (_ffnvcodec_pc_dir AND EXISTS "${_ffnvcodec_pc_dir}/ffnvcodec.pc")
-        execute_process(
-            COMMAND "${CMAKE_COMMAND}" -E env "MSYS2_ARG_CONV_EXCL=*"
-                "${BASH_PROGRAM}" -lc "cygpath -au '${_ffnvcodec_pc_dir}'"
-            OUTPUT_VARIABLE _ffnvcodec_pc_dir_msys
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-        )
-        if (_ffnvcodec_pc_dir_msys)
-            set(_ffnvcodec_export_pkgconfig "export PKG_CONFIG_PATH='${_ffnvcodec_pc_dir_msys}':$PKG_CONFIG_PATH &&")
-            set(_ffnvcodec_nvdec_flags
-                "--enable-ffnvcodec"
-                "--enable-cuvid"
-                "--enable-nvdec"
-                "--enable-hwaccel=h264_nvdec"
-                "--enable-hwaccel=vp8_nvdec"
-                "--enable-hwaccel=vp9_nvdec"
-            )
-        endif()
-    elseif (_ffnvcodec_inc_dir)
+    set(_ffnvcodec_pkg_config_opt "")
+    if (_ffnvcodec_inc_dir)
         message(STATUS "[FFmpeg/clang-cl] ffnvcodec headers found at: ${_ffnvcodec_inc_dir}")
         execute_process(
             COMMAND "${CMAKE_COMMAND}" -E env "MSYS2_ARG_CONV_EXCL=*"
@@ -156,23 +139,75 @@ function(citron_build_clangcl_ffmpeg)
             OUTPUT_VARIABLE _ffnvcodec_inc_win
             OUTPUT_STRIP_TRAILING_WHITESPACE
         )
-        if (_ffnvcodec_inc_win MATCHES "^[A-Za-z]:/")
-            set(_ffmpeg_extra_cflags "${_ffmpeg_extra_cflags} -I${_ffnvcodec_inc_win}")
-            set(_ffnvcodec_nvdec_flags
-                "--enable-ffnvcodec"
-                "--enable-cuvid"
-                "--enable-nvdec"
-                "--enable-hwaccel=h264_nvdec"
-                "--enable-hwaccel=vp8_nvdec"
-                "--enable-hwaccel=vp9_nvdec"
+        if (_ffnvcodec_pc_dir)
+            execute_process(
+                COMMAND "${CMAKE_COMMAND}" -E env "MSYS2_ARG_CONV_EXCL=*"
+                    "${BASH_PROGRAM}" -lc "cygpath -au '${_ffnvcodec_pc_dir}'"
+                OUTPUT_VARIABLE _ffnvcodec_pc_dir_msys
+                OUTPUT_STRIP_TRAILING_WHITESPACE
             )
+            if (_ffnvcodec_pc_dir_msys)
+                set(_ffnvcodec_export_pkgconfig "export PKG_CONFIG_PATH='${_ffnvcodec_pc_dir_msys}':$PKG_CONFIG_PATH &&")
+            endif()
         endif()
+
+        # Provide a pkg-config wrapper in build dir to guarantee configure check_pkg_config succeeds
+        # even if pkgconf is not installed in the MSYS2 environment.
+        file(WRITE "${_build_dir_win}/pkg-config"
+"#!/bin/sh
+for arg in \"\$@\"; do
+    case \"\$arg\" in
+        --exists)
+            exit 0
+            ;;
+        --cflags*)
+            echo \"-I${_ffnvcodec_inc_win}\"
+            exit 0
+            ;;
+        --libs*)
+            echo \"\"
+            exit 0
+            ;;
+        --variable=includedir)
+            echo \"${_ffnvcodec_inc_win}\"
+            exit 0
+            ;;
+        --modversion)
+            echo \"12.2.72.0\"
+            exit 0
+            ;;
+    esac
+done
+if command -v /usr/bin/pkgconf >/dev/null 2>&1; then
+    exec /usr/bin/pkgconf \"\$@\"
+elif command -v /usr/bin/pkg-config >/dev/null 2>&1; then
+    exec /usr/bin/pkg-config \"\$@\"
+elif command -v /clang64/bin/pkg-config >/dev/null 2>&1; then
+    exec /clang64/bin/pkg-config \"\$@\"
+fi
+exit 0
+")
+        execute_process(
+            COMMAND "${CMAKE_COMMAND}" -E env "MSYS2_ARG_CONV_EXCL=*"
+                "${BASH_PROGRAM}" -lc "chmod +x '${_build_dir_msys}/pkg-config'"
+        )
+        set(_ffnvcodec_pkg_config_opt "--pkg-config='${_build_dir_msys}/pkg-config'")
+
+        set(_ffnvcodec_nvdec_flags
+            "--enable-ffnvcodec"
+            "--enable-cuvid"
+            "--enable-nvdec"
+            "--enable-hwaccel=h264_nvdec"
+            "--enable-hwaccel=vp8_nvdec"
+            "--enable-hwaccel=vp9_nvdec"
+        )
     endif()
 
     set(_ffmpeg_configure_command
-        "export PATH='${_clangcl_tool_dir_msys}:${_linker_tool_dir_msys}:${_ar_tool_dir_msys}':$PATH &&"
+        "export PATH='${_build_dir_msys}:${_clangcl_tool_dir_msys}:${_linker_tool_dir_msys}:${_ar_tool_dir_msys}':$PATH &&"
         ${_ffnvcodec_export_pkgconfig}
         "'${_source_dir_win}/configure'"
+        ${_ffnvcodec_pkg_config_opt}
         "--toolchain=msvc"
         "--cc=clang-cl"
         "--cxx=clang-cl"

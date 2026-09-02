@@ -573,6 +573,7 @@ stage_setup_clangcl() {
         mingw-w64-clang-x86_64-nasm mingw-w64-clang-x86_64-yasm \
         mingw-w64-clang-x86_64-glslang mingw-w64-clang-x86_64-ninja \
         mingw-w64-clang-x86_64-sccache mingw-w64-clang-x86_64-jom \
+        pkgconf mingw-w64-clang-x86_64-pkgconf \
         2>/dev/null || error "Failed to install required MSYS2 packages."
 
     # Locate Python 3.12 — pre-installed on CI runners, installed via winget on dev machines.
@@ -697,7 +698,8 @@ stage_setup() {
         fi
         info "Installing toolchain and build tools via pacman..."
         pacman -S --needed --noconfirm \
-            base-devel git curl wget \
+            base-devel git curl wget pkgconf \
+            mingw-w64-clang-x86_64-pkgconf \
             mingw-w64-clang-x86_64-python-pip \
             mingw-w64-clang-x86_64-python-psutil \
             mingw-w64-clang-x86_64-toolchain \
