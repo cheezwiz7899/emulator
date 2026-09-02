@@ -149,10 +149,10 @@ void OnEvaluateJavaScriptFinished(GObject* source, GAsyncResult* result, gpointe
 } // namespace
 
 WebKitGTKView::WebKitGTKView(GMainWindow& main_window_, Core::System& system_,
-                             InputCommon::InputSubsystem* input_subsystem_)
+                             InputCommon::InputSubsystem* input_subsystem_, bool is_local_)
     : QWidget(&main_window_), main_window(main_window_), system(system_),
       input_subsystem(input_subsystem_),
-      input_interpreter(std::make_unique<InputInterpreter>(system_)) {
+      input_interpreter(std::make_unique<InputInterpreter>(system_)), is_local(is_local_) {
     // The X11 embedding path below needs GTK and Qt to use the same windowing
     // system.  A Qt application running through Xwayland reports "xcb", while
     // GTK may otherwise select Wayland and create a separate fallback window.
@@ -161,12 +161,15 @@ WebKitGTKView::WebKitGTKView(GMainWindow& main_window_, Core::System& system_,
         g_setenv("GDK_BACKEND", "x11", TRUE);
     }
 
-    // WebKitGTK's accelerated compositing can leave an embedded/reparented X11
-    // WebView completely white, particularly with NVIDIA drivers.  Web applets
-    // are lightweight 2D pages, so use WebKit's supported software-compositing
-    // fallback for reliable rendering.  Preserve an explicit user override.
-    if (!g_getenv("WEBKIT_DISABLE_COMPOSITING_MODE")) {
-        g_setenv("WEBKIT_DISABLE_COMPOSITING_MODE", "1", FALSE);
+    // WebKitGTK's DMA-BUF renderer can leave an embedded X11 WebView white with
+    // the proprietary NVIDIA driver. Avoid disabling compositing altogether:
+    // newer WebKitGTK versions can terminate their web process on that broader
+    // fallback. Preserve an explicit user choice in either direction.
+    const bool proprietary_nvidia =
+        g_file_test("/proc/driver/nvidia/version", G_FILE_TEST_EXISTS) != FALSE;
+    if (proprietary_nvidia && !g_getenv("WEBKIT_DISABLE_DMABUF_RENDERER")) {
+        g_setenv("WEBKIT_DISABLE_DMABUF_RENDERER", "1", FALSE);
+        LOG_INFO(Frontend, "WebKitGTK: disabled DMA-BUF rendering for proprietary NVIDIA");
     }
     static bool gtk_initialized = gtk_init_check(nullptr, nullptr);
     if (!gtk_initialized) {
@@ -224,6 +227,19 @@ WebKitGTKView::WebKitGTKView(GMainWindow& main_window_, Core::System& system_,
         profile_dir_utf8.constData(), nullptr);
     WebKitWebContext* web_context =
         webkit_web_context_new_with_website_data_manager(data_manager);
+
+    // WebKitGTK launches its own bubblewrap sandbox. Portable builds route that
+    // launch through sharun's compatibility wrapper, but on the tested AppImage
+    // the helper never reaches load-started and eventually terminates. Limit this
+    // fallback to extracted local applet content in a portable bundle. External
+    // pages and native distro builds remain sandboxed.
+    const bool portable_bundle =
+        g_getenv("APPIMAGE") != nullptr || g_getenv("APPDIR") != nullptr;
+    if (is_local && portable_bundle) {
+        webkit_web_context_set_sandbox_enabled(web_context, FALSE);
+        LOG_WARNING(Frontend,
+                    "WebKitGTK: disabled nested web-process sandbox for local portable content");
+    }
     webview = WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW, "web-context", web_context,
                                            "user-content-manager", ucm, nullptr));
     g_object_unref(web_context);
@@ -836,6 +852,10 @@ void WebKitGTKView::OnWebProcessTerminated(WebKitWebView* view, int reason_raw,
     const char* uri = webkit_web_view_get_uri(view);
     LOG_ERROR(Frontend, "WebKitGTK web process terminated: reason={} uri={}", reason_raw,
               uri ? uri : "(no URI)");
+    // A terminated WebKit process cannot recover or receive the native B-button
+    // fallback. Close the applet rather than trapping the user in a blank view.
+    self->SetExitReason(Service::AM::Frontend::WebExitReason::WindowClosed);
+    self->SetFinished(true);
 }
 
 #endif // CITRON_USE_WEBKITGTK_WEB_ENGINE

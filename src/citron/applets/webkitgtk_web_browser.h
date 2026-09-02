@@ -63,7 +63,7 @@ public:
     };
 
     explicit WebKitGTKView(GMainWindow& main_window, Core::System& system,
-                           InputCommon::InputSubsystem* input_subsystem_);
+                           InputCommon::InputSubsystem* input_subsystem_, bool is_local_);
     ~WebKitGTKView() override;
 
     void LoadLocalWebPage(const std::string& main_url, const std::string& additional_args);

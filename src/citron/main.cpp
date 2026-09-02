@@ -913,7 +913,7 @@ void GMainWindow::WebBrowserOpenWebPage(const std::string& main_url,
 #if defined(CITRON_USE_QT_WEB_ENGINE)
     web_applet = new QtNXWebEngineView(this, *system, input_subsystem.get());
 #elif defined(CITRON_USE_WEBKITGTK_WEB_ENGINE)
-    web_applet = new WebKitGTKView(*this, *system, input_subsystem.get());
+    web_applet = new WebKitGTKView(*this, *system, input_subsystem.get(), is_local);
 #elif defined(CITRON_USE_WEBVIEW2_WEB_ENGINE)
     web_applet = new WebView2View(*this, *system, input_subsystem.get());
 #endif

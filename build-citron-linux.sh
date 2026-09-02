@@ -576,9 +576,9 @@ _setup_apt() {
 
     # Required by the native Linux web-applet backend.  This supplies both
     # WebKitGTK and the webkit2gtk-4.1 pkg-config module checked by CMake.
-    info "Installing WebKitGTK development package..."
-    sudo apt-get install -y libwebkit2gtk-4.1-dev \
-        || error "WebKitGTK development package failed to install — the native web applet backend requires webkit2gtk-4.1"
+    info "Installing WebKitGTK and sandbox helper packages..."
+    sudo apt-get install -y libwebkit2gtk-4.1-dev bubblewrap xdg-dbus-proxy \
+        || error "WebKitGTK dependencies failed to install — the native web applet backend requires webkit2gtk-4.1, bubblewrap, and xdg-dbus-proxy"
 }
 
 _setup_pacman() {
@@ -636,9 +636,9 @@ _setup_pacman() {
 
     # Required by the native Linux web-applet backend.  This supplies both
     # WebKitGTK and the webkit2gtk-4.1 pkg-config module checked by CMake.
-    info "Installing WebKitGTK development package..."
-    $SUDO pacman -S --needed --noconfirm webkit2gtk-4.1 \
-        || error "WebKitGTK development package failed to install — the native web applet backend requires webkit2gtk-4.1"
+    info "Installing WebKitGTK and sandbox helper packages..."
+    $SUDO pacman -S --needed --noconfirm webkit2gtk-4.1 bubblewrap xdg-dbus-proxy \
+        || error "WebKitGTK dependencies failed to install — the native web applet backend requires webkit2gtk-4.1, bubblewrap, and xdg-dbus-proxy"
     # If in an arch container, use pkgforge's debloated packages
     if [[ "${CITRON_IN_ARCH_CONTAINER:-0}" = 1 && -f /etc/arch-release ]]; then
         local debloated_helper debloated_helper_sha256
@@ -725,9 +725,9 @@ _setup_dnf() {
     sudo dnf install -y gamemode 2>/dev/null || true
 
     # Provides pkgconfig(webkit2gtk-4.1), required by the native web applet.
-    info "Installing WebKitGTK development package..."
-    sudo dnf install -y webkit2gtk4.1-devel \
-        || error "WebKitGTK development package failed to install — the native web applet backend requires webkit2gtk-4.1"
+    info "Installing WebKitGTK and sandbox helper packages..."
+    sudo dnf install -y webkit2gtk4.1-devel bubblewrap xdg-dbus-proxy \
+        || error "WebKitGTK dependencies failed to install — the native web applet backend requires webkit2gtk-4.1, bubblewrap, and xdg-dbus-proxy"
 }
 
 _setup_yum() {
@@ -782,9 +782,9 @@ _setup_yum() {
     sudo yum install -y gamemode 2>/dev/null || true
 
     # Provides pkgconfig(webkit2gtk-4.1), required by the native web applet.
-    info "Installing WebKitGTK development package..."
-    sudo yum install -y webkit2gtk4.1-devel \
-        || error "WebKitGTK development package failed to install — the native web applet backend requires webkit2gtk-4.1"
+    info "Installing WebKitGTK and sandbox helper packages..."
+    sudo yum install -y webkit2gtk4.1-devel bubblewrap xdg-dbus-proxy \
+        || error "WebKitGTK dependencies failed to install — the native web applet backend requires webkit2gtk-4.1, bubblewrap, and xdg-dbus-proxy"
 }
 
 _setup_zypper() {
@@ -836,9 +836,9 @@ _setup_zypper() {
     sudo zypper install -y --no-recommends gamemode 2>/dev/null || true
 
     # Provides pkgconfig(webkit2gtk-4.1), required by the native web applet.
-    info "Installing WebKitGTK development package..."
-    sudo zypper install -y --no-recommends webkit2gtk3-devel \
-        || error "WebKitGTK development package failed to install — the native web applet backend requires webkit2gtk-4.1"
+    info "Installing WebKitGTK and sandbox helper packages..."
+    sudo zypper install -y --no-recommends webkit2gtk3-devel bubblewrap xdg-dbus-proxy \
+        || error "WebKitGTK dependencies failed to install — the native web applet backend requires webkit2gtk-4.1, bubblewrap, and xdg-dbus-proxy"
 }
 
 _setup_emerge() {
@@ -889,9 +889,9 @@ _setup_emerge() {
     sudo emerge --ask=n games-util/gamemode 2>/dev/null || true
 
     # The GTK3-enabled package provides the webkit2gtk-4.1 pkg-config module.
-    info "Installing WebKitGTK development package..."
-    sudo emerge --ask=n net-libs/webkit-gtk:4.1 \
-        || error "WebKitGTK development package failed to install — the native web applet backend requires webkit2gtk-4.1"
+    info "Installing WebKitGTK and sandbox helper packages..."
+    sudo emerge --ask=n net-libs/webkit-gtk:4.1 sys-apps/bubblewrap sys-apps/xdg-dbus-proxy \
+        || error "WebKitGTK dependencies failed to install — the native web applet backend requires webkit2gtk-4.1, bubblewrap, and xdg-dbus-proxy"
 }
 
 _install_llvm_clang() {
