@@ -157,7 +157,8 @@ WebKitGTKView::WebKitGTKView(GMainWindow& main_window_, Core::System& system_,
     // system.  A Qt application running through Xwayland reports "xcb", while
     // GTK may otherwise select Wayland and create a separate fallback window.
     // This must happen before GTK is initialized.
-    if (QGuiApplication::platformName() == QStringLiteral("xcb")) {
+    const bool embedded_x11 = QGuiApplication::platformName() == QStringLiteral("xcb");
+    if (embedded_x11) {
         g_setenv("GDK_BACKEND", "x11", TRUE);
     }
 
@@ -240,8 +241,21 @@ WebKitGTKView::WebKitGTKView(GMainWindow& main_window_, Core::System& system_,
         LOG_WARNING(Frontend,
                     "WebKitGTK: disabled nested web-process sandbox for local portable content");
     }
-    webview = WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW, "web-context", web_context,
-                                           "user-content-manager", ucm, nullptr));
+    WebKitSettings* web_settings = webkit_settings_new();
+    if (embedded_x11) {
+        // Accelerated WebKitGTK frames can remain attached to the original X11
+        // toplevel after Qt embeds/reparents it: the DOM, context menu, and input
+        // work, but the imported frame is never visible. NEVER selects WebKit's
+        // supported shared-memory painting path, which survives foreign-window
+        // embedding and is sufficient for these 2D applet pages.
+        webkit_settings_set_hardware_acceleration_policy(
+            web_settings, WEBKIT_HARDWARE_ACCELERATION_POLICY_NEVER);
+        LOG_INFO(Frontend, "WebKitGTK: using software rendering for embedded X11 applet");
+    }
+    webview = WEBKIT_WEB_VIEW(g_object_new(
+        WEBKIT_TYPE_WEB_VIEW, "web-context", web_context, "user-content-manager", ucm,
+        "settings", web_settings, nullptr));
+    g_object_unref(web_settings);
     g_object_unref(web_context);
     g_object_unref(data_manager);
     g_object_unref(ucm); // webview took its own ref via the property setter above;
@@ -822,6 +836,13 @@ void WebKitGTKView::OnLoadChanged(WebKitWebView* view, int load_event_raw, gpoin
         break;
     case WEBKIT_LOAD_FINISHED:
         event_name = "finished";
+        // The foreign X11 window may not receive a fresh expose after WebKit
+        // swaps in the first software-rendered frame. Explicitly invalidate it
+        // so GTK paints that completed frame into Qt's window container.
+        gtk_widget_queue_draw(GTK_WIDGET(view));
+        if (GdkWindow* window = gtk_widget_get_window(GTK_WIDGET(view))) {
+            gdk_window_invalidate_rect(window, nullptr, TRUE);
+        }
         break;
     }
     LOG_INFO(Frontend, "WebKitGTK load {}: {}", event_name, uri ? uri : "(no URI)");
