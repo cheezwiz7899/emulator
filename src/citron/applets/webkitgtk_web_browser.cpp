@@ -321,8 +321,11 @@ void WebKitGTKView::FallbackToTopLevelWindow() {
     // its size there, but some window managers retain GTK's 200-pixel natural
     // width when a toplevel is made non-resizable before its first configure.
     gtk_window_set_resizable(GTK_WINDOW(gtk_window), TRUE);
+    gtk_window_set_accept_focus(GTK_WINDOW(gtk_window), TRUE);
+    gtk_window_set_focus_on_map(GTK_WINDOW(gtk_window), TRUE);
     gtk_window_set_skip_pager_hint(GTK_WINDOW(gtk_window), TRUE);
     gtk_window_set_skip_taskbar_hint(GTK_WINDOW(gtk_window), TRUE);
+    gtk_widget_set_can_focus(GTK_WIDGET(webview), TRUE);
     gtk_widget_set_hexpand(GTK_WIDGET(webview), TRUE);
     gtk_widget_set_vexpand(GTK_WIDGET(webview), TRUE);
     gtk_container_add(GTK_CONTAINER(gtk_window), GTK_WIDGET(webview));
@@ -362,6 +365,37 @@ void WebKitGTKView::SyncTopLevelGeometry() {
     gtk_window_set_default_size(GTK_WINDOW(gtk_window), view_size.width(), view_size.height());
     gtk_window_move(GTK_WINDOW(gtk_window), top_left.x(), top_left.y());
     gtk_window_resize(GTK_WINDOW(gtk_window), view_size.width(), view_size.height());
+}
+
+void WebKitGTKView::FocusNativeWindow() {
+    if (!gtk_window || !webview) {
+        return;
+    }
+
+    GtkWidget* web_widget = GTK_WIDGET(webview);
+    gtk_window_set_focus(GTK_WINDOW(gtk_window), web_widget);
+    gtk_widget_grab_focus(web_widget);
+
+#if defined(GDK_WINDOWING_X11)
+    if (is_x11) {
+        if (GdkWindow* window = gtk_widget_get_window(gtk_window);
+            window && GDK_IS_X11_WINDOW(window)) {
+            // GDK_CURRENT_TIME is commonly rejected for a second transient
+            // window by focus-stealing prevention. Query a current X server
+            // timestamp so every newly-created applet can become active.
+            gdk_window_set_events(window, static_cast<GdkEventMask>(gdk_window_get_events(window) |
+                                                                    GDK_PROPERTY_CHANGE_MASK));
+            const guint32 timestamp = gdk_x11_get_server_time(window);
+            gtk_window_present_with_time(GTK_WINDOW(gtk_window), timestamp);
+            return;
+        }
+    }
+#endif
+
+    // Native Wayland has no client-side focus API. Presenting the mapped
+    // toplevel and assigning its GTK focus widget lets the compositor activate
+    // it according to the normal Wayland policy.
+    gtk_window_present(GTK_WINDOW(gtk_window));
 }
 
 void WebKitGTKView::SetUserAgent(UserAgent user_agent) {
@@ -610,7 +644,7 @@ void WebKitGTKView::showEvent(QShowEvent* event) {
             }
             gtk_widget_show_all(gtk_window);
         }
-        gtk_window_present(GTK_WINDOW(gtk_window));
+        FocusNativeWindow();
     }
 }
 
@@ -645,6 +679,7 @@ void WebKitGTKView::InputThreadLoop() {
     // continuous poll with same button mapping and pressed-once vs held logic.
     // Key events are sent via JS eval (SendKeyEvent) rather than Qt postEvent.
     std::this_thread::sleep_for(std::chrono::seconds(1));
+    bool logged_controller_input = false;
 
     while (input_thread_running) {
         input_interpreter->PollInput();
@@ -654,6 +689,10 @@ void WebKitGTKView::InputThreadLoop() {
                                   NpadButton::L, NpadButton::R}) {
             if (!input_interpreter->IsButtonPressedOnce(button)) {
                 continue;
+            }
+            if (!logged_controller_input) {
+                LOG_INFO(Frontend, "WebKitGTK controller input became active");
+                logged_controller_input = true;
             }
             LOG_DEBUG(Frontend,
                         "[Web input diagnostic] WebKitGTK observed controller button {:#x}",
@@ -741,6 +780,10 @@ void WebKitGTKView::InputThreadLoop() {
                 const DomKey dom_key = HIDButtonToDomKey(button);
                 if (dom_key.key_code != 0) {
                     if (pressed_once) {
+                        if (!logged_controller_input) {
+                            LOG_INFO(Frontend, "WebKitGTK controller input became active");
+                            logged_controller_input = true;
+                        }
                         LOG_DEBUG(Frontend,
                                     "[Web input diagnostic] WebKitGTK observed direction {:#x}",
                                     static_cast<u64>(button));
@@ -909,6 +952,10 @@ void WebKitGTKView::OnLoadChanged(WebKitWebView* view, int load_event_raw, gpoin
                      self->width(), self->height(), window_width, window_height,
                      allocation.width, allocation.height);
         }
+        // Navigating between ARCropolis screens creates successive native GTK
+        // toplevels. Reassert focus once the new document is ready so keyboard-
+        // backed controller mappings do not require a mouse click.
+        self->FocusNativeWindow();
         break;
     }
     LOG_INFO(Frontend, "WebKitGTK load {}: {}", event_name, uri ? uri : "(no URI)");

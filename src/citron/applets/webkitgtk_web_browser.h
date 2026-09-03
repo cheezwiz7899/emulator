@@ -112,6 +112,7 @@ private:
     QWidget* Embed(QWidget* parent);
     void FallbackToTopLevelWindow();
     void SyncTopLevelGeometry();
+    void FocusNativeWindow();
 
     static void OnNxMessage(WebKitUserContentManager*, WebKitJavascriptResult*, gpointer);
     static void OnNxControl(WebKitUserContentManager*, WebKitJavascriptResult*, gpointer);
