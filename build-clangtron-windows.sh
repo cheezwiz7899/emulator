@@ -4277,6 +4277,7 @@ stage_clangcl() {
         full)
             flags="${flags} /clang:-flto=full"
             pgo_flags_dash="${pgo_flags_dash} -flto=full"
+            config_link_flags="${config_link_flags} /opt:lldltopartitions=${JOBS:-16} /opt:lldltojobs=all"
             ;;
     esac
 
@@ -4439,6 +4440,8 @@ ${qt_cmake_line}
   -DCITRON_ENABLE_PGO_GENERATE=${_clangcl_pgo_generate} -DCITRON_ENABLE_PGO_USE=${_clangcl_pgo_use} ^
   -DCMAKE_C_FLAGS_${config^^}="${config_compile_flags} ${flags_batch}" -DCMAKE_CXX_FLAGS_${config^^}="${config_compile_flags} ${flags_batch}" ^
   -DCMAKE_EXE_LINKER_FLAGS_${config^^}="${config_link_flags}" ^
+  -DCMAKE_SHARED_LINKER_FLAGS_${config^^}="${config_link_flags}" ^
+  -DCMAKE_MODULE_LINKER_FLAGS_${config^^}="${config_link_flags}" ^
   -DCITRON_CLANGCL_PGO_COMPILE_FLAGS="${pgo_flags_batch}" -DCITRON_CLANGCL_PGO_LINK_FLAGS="${pgo_link_flags_batch}" ^
   -DCMAKE_RC_FLAGS="" -DCMAKE_RC_FLAGS_DEBUG="" -DCMAKE_RC_FLAGS_RELEASE="" -DCMAKE_RC_FLAGS_RELWITHDEBINFO=""
 if errorlevel 1 exit /b %errorlevel%
