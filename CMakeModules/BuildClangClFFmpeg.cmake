@@ -155,37 +155,46 @@ function(citron_build_clangcl_ffmpeg)
         # even if pkgconf is not installed in the MSYS2 environment.
         file(WRITE "${_build_dir_win}/pkg-config"
 "#!/bin/sh
-for arg in \"\$@\"; do
-    case \"\$arg\" in
-        --exists)
-            exit 0
-            ;;
-        --cflags*)
-            echo \"-I${_ffnvcodec_inc_win}\"
-            exit 0
-            ;;
-        --libs*)
-            echo \"\"
-            exit 0
-            ;;
-        --variable=includedir)
-            echo \"${_ffnvcodec_inc_win}\"
-            exit 0
-            ;;
-        --modversion)
-            echo \"12.2.72.0\"
-            exit 0
-            ;;
-    esac
-done
-if command -v /usr/bin/pkgconf >/dev/null 2>&1; then
+case \" \$* \" in
+    *ffnvcodec*)
+        for arg in \"\$@\"; do
+            case \"\$arg\" in
+                --exists)
+                    exit 0
+                    ;;
+                --cflags*)
+                    echo \"-I${_ffnvcodec_inc_win}\"
+                    exit 0
+                    ;;
+                --libs*)
+                    echo \"\"
+                    exit 0
+                    ;;
+                --variable=includedir)
+                    echo \"${_ffnvcodec_inc_win}\"
+                    exit 0
+                    ;;
+                --modversion)
+                    echo \"12.2.72.0\"
+                    exit 0
+                    ;;
+            esac
+        done
+        exit 0
+        ;;
+esac
+if command -v pkgconf >/dev/null 2>&1; then
+    exec pkgconf \"\$@\"
+elif command -v pkg-config >/dev/null 2>&1; then
+    exec pkg-config \"\$@\"
+elif command -v /usr/bin/pkgconf >/dev/null 2>&1; then
     exec /usr/bin/pkgconf \"\$@\"
 elif command -v /usr/bin/pkg-config >/dev/null 2>&1; then
     exec /usr/bin/pkg-config \"\$@\"
 elif command -v /clang64/bin/pkg-config >/dev/null 2>&1; then
     exec /clang64/bin/pkg-config \"\$@\"
 fi
-exit 0
+exit 1
 ")
         execute_process(
             COMMAND "${CMAKE_COMMAND}" -E env "MSYS2_ARG_CONV_EXCL=*"
