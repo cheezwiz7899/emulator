@@ -38,6 +38,8 @@ add_library(common STATIC
     common_types.h
     concepts.h
     container_hash.h
+    crilayla_compression.cpp
+    crilayla_compression.h
     demangle.cpp
     demangle.h
     detached_tasks.cpp
@@ -141,8 +143,14 @@ add_library(common STATIC
     virtual_buffer.h
     wall_clock.cpp
     wall_clock.h
+    xbc1_compression.cpp
+    xbc1_compression.h
     xci_trimmer.cpp
     xci_trimmer.h
+    yaz0_compression.cpp
+    yaz0_compression.h
+    zlib_compression.cpp
+    zlib_compression.h
     zstd_compression.cpp
     zstd_compression.h
 )
@@ -240,7 +248,7 @@ endif()
 
 target_link_libraries(common PUBLIC Boost::context Boost::headers fmt::fmt stb::headers Threads::Threads unordered_dense::unordered_dense)
 target_include_directories(common INTERFACE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(common PRIVATE lz4::lz4 zstd::zstd LLVM::Demangle)
+target_link_libraries(common PRIVATE lz4::lz4 zstd::zstd ZLIB::ZLIB LLVM::Demangle)
 
 if (ANDROID)
     # For ASharedMemory_create

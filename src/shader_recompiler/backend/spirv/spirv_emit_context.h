@@ -321,6 +321,12 @@ public:
     Id render_area_push_constant{};
     u32 render_are_member_index{};
 
+    // Phase 5: y_negate as a spec constant (SpecId Shader::kYNegateSpecId, environment.h).
+    // Declared once by DefineRuntimeStateSpecConstants when info.uses_y_direction, then
+    // just referenced by EmitYDirection -- avoids redeclaring/re-decorating the same
+    // SpecId if a shader's IR queries Y-direction more than once.
+    Id y_negate_spec_const{};
+
     Id local_memory{};
 
     Id shared_memory_u8{};
@@ -401,6 +407,7 @@ private:
     void DefineRescalingInputPushConstant();
     void DefineRescalingInputUniformConstant();
     void DefineRenderArea(const Info& info);
+    void DefineRuntimeStateSpecConstants(const Info& info);
 
     void DefineInputs(const IR::Program& program);
     void DefineOutputs(const IR::Program& program);

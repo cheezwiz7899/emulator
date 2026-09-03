@@ -757,6 +757,148 @@ void PipelineCache::RecordPhase3RuntimeVariantDiagnostic(u64 unique_hash,
              total_hashes, buckets[0], buckets[1], buckets[2], buckets[3]);
 }
 
+// Phase 5 groundwork — see this method's doc comment in vk_pipeline_cache.h for what it's
+// measuring and why. Diagnostic only, same as its Phase 3 counterpart just above: nothing
+// here changes what gets cached, guessed, or served.
+void PipelineCache::RecordGenericInputTypesCardinalityDiagnostic(u64 unique_hash,
+                                                                   u64 generic_input_types_hash) const {
+    constexpr size_t kMaxTrackedVariantsForDiagnostics = 8;
+    bool should_log = false;
+    {
+        std::unique_lock lock{phase5_diag_generic_input_types_mutex};
+        auto& variants = phase5_diag_generic_input_types_variants_by_hash[unique_hash];
+        if (std::find(variants.begin(), variants.end(), generic_input_types_hash) ==
+                variants.end() &&
+            variants.size() < kMaxTrackedVariantsForDiagnostics) {
+            variants.push_back(generic_input_types_hash);
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - phase5_diag_generic_input_types_last_log_time >= std::chrono::seconds{30}) {
+            phase5_diag_generic_input_types_last_log_time = now;
+            should_log = true;
+        }
+    }
+    if (!should_log) {
+        return;
+    }
+    std::array<size_t, 4> buckets{}; // [0]=1 variant, [1]=2-3, [2]=4-7, [3]=8+ (capped)
+    size_t total_hashes = 0;
+    {
+        std::shared_lock lock{phase5_diag_generic_input_types_mutex};
+        for (const auto& [hash, variants] : phase5_diag_generic_input_types_variants_by_hash) {
+            ++total_hashes;
+            const size_t n = variants.size();
+            if (n <= 1) {
+                ++buckets[0];
+            } else if (n <= 3) {
+                ++buckets[1];
+            } else if (n <= 7) {
+                ++buckets[2];
+            } else {
+                ++buckets[3];
+            }
+        }
+    }
+    LOG_INFO(Render_Vulkan,
+             "Phase 5 groundwork: of {} graphics shaders seen with a real draw so far, {} "
+             "showed exactly 1 distinct generic_input_types state, {} showed 2-3, {} showed "
+             "4-7, {} showed 8+ (capped — true count may be higher). Diagnostic only, nothing "
+             "currently acts on this. Low cardinality across most hashes would say "
+             "generic_input_types is realistically chaseable the way y_negate was; a lot of "
+             "8+ hashes would say it isn't -- more real attribute-format combinations than a "
+             "small guess or spec-constant set could plausibly cover.",
+             total_hashes, buckets[0], buckets[1], buckets[2], buckets[3]);
+}
+
+// Phase 5 groundwork — confirms or corrects the reasoned-not-measured convert_depth_mode
+// default (runtime_info.h's ApplySpeculativeDefaults). Diagnostic only.
+void PipelineCache::RecordConvertDepthModeDiagnostic(bool convert_depth_mode) const {
+    bool should_log = false;
+    u64 true_count = 0;
+    u64 total_count = 0;
+    {
+        std::unique_lock lock{phase5_diag_convert_depth_mode_mutex};
+        ++phase5_diag_convert_depth_mode_total_count;
+        if (convert_depth_mode) {
+            ++phase5_diag_convert_depth_mode_true_count;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - phase5_diag_convert_depth_mode_last_log_time >= std::chrono::seconds{30}) {
+            phase5_diag_convert_depth_mode_last_log_time = now;
+            should_log = true;
+            true_count = phase5_diag_convert_depth_mode_true_count;
+            total_count = phase5_diag_convert_depth_mode_total_count;
+        }
+    }
+    if (!should_log) {
+        return;
+    }
+    LOG_INFO(Render_Vulkan,
+             "Phase 5 groundwork: of {} real VertexB/Geometry translations so far, "
+             "convert_depth_mode was true (DepthMode::MinusOneToOne) for {} ({:.1f}%). The "
+             "speculative default guesses true, reasoned from that enum's HW value of 0, not "
+             "measured -- a real majority true confirms it, a real majority false means it "
+             "should flip.",
+             total_count, true_count,
+             total_count > 0 ? 100.0 * static_cast<double>(true_count) /
+                                   static_cast<double>(total_count)
+                             : 0.0);
+}
+
+// Phase 5 groundwork — confirms or corrects the tess_primitive/spacing/clockwise
+// defaults, the lowest-confidence guesses in that pass (runtime_info.h's
+// ApplySpeculativeDefaults). Diagnostic only.
+void PipelineCache::RecordTessellationStateDiagnostic(Shader::TessPrimitive primitive,
+                                                        Shader::TessSpacing spacing,
+                                                        bool clockwise) const {
+    bool should_log = false;
+    decltype(phase5_diag_tess_primitive_counts) primitive_counts;
+    decltype(phase5_diag_tess_spacing_counts) spacing_counts;
+    u64 clockwise_true_count = 0;
+    u64 total_count = 0;
+    {
+        std::unique_lock lock{phase5_diag_tess_state_mutex};
+        ++phase5_diag_tess_primitive_counts[primitive];
+        ++phase5_diag_tess_spacing_counts[spacing];
+        ++phase5_diag_tess_total_count;
+        if (clockwise) {
+            ++phase5_diag_tess_clockwise_true_count;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - phase5_diag_tess_state_last_log_time >= std::chrono::seconds{30}) {
+            phase5_diag_tess_state_last_log_time = now;
+            should_log = true;
+            primitive_counts = phase5_diag_tess_primitive_counts;
+            spacing_counts = phase5_diag_tess_spacing_counts;
+            clockwise_true_count = phase5_diag_tess_clockwise_true_count;
+            total_count = phase5_diag_tess_total_count;
+        }
+    }
+    if (!should_log) {
+        return;
+    }
+    const auto get = [](const auto& counts, auto key) {
+        const auto it = counts.find(key);
+        return it != counts.end() ? it->second : u64{0};
+    };
+    LOG_INFO(Render_Vulkan,
+             "Phase 5 groundwork: of {} real TessellationEval translations so far -- "
+             "tess_primitive: {} Isolines, {} Triangles, {} Quads (default guess: "
+             "Triangles); tess_spacing: {} Equal, {} FractionalOdd, {} FractionalEven "
+             "(default guess: Equal); tess_clockwise: {} true, {} false (default guess: "
+             "false). All three defaults were picked for internal consistency (each enum's "
+             "own value-0 entry), not measured -- the lowest confidence of any Phase 5 "
+             "preset. Real gameplay data on any of these should replace the guess it "
+             "disagrees with.",
+             total_count, get(primitive_counts, Shader::TessPrimitive::Isolines),
+             get(primitive_counts, Shader::TessPrimitive::Triangles),
+             get(primitive_counts, Shader::TessPrimitive::Quads),
+             get(spacing_counts, Shader::TessSpacing::Equal),
+             get(spacing_counts, Shader::TessSpacing::FractionalOdd),
+             get(spacing_counts, Shader::TessSpacing::FractionalEven), clockwise_true_count,
+             total_count - clockwise_true_count);
+}
+
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     if (!RefreshStages(graphics_key.unique_hashes)) {
         current_pipeline = nullptr;
@@ -1169,6 +1311,18 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
 
         const auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage)};
         ConvertLegacyToGeneric(program, runtime_info);
+        // Phase 5 groundwork -- must live here, not inside MakeRuntimeInfo itself:
+        // MakeRuntimeInfo is a free function (no implicit `this`), these diagnostics are
+        // PipelineCache members. Reading back from the just-returned runtime_info instead
+        // of threading extra parameters into MakeRuntimeInfo.
+        if (program.stage == Shader::Stage::VertexB || program.stage == Shader::Stage::Geometry) {
+            RecordConvertDepthModeDiagnostic(runtime_info.convert_depth_mode);
+        }
+        if (program.stage == Shader::Stage::TessellationEval) {
+            RecordTessellationStateDiagnostic(runtime_info.tess_primitive,
+                                               runtime_info.tess_spacing,
+                                               runtime_info.tess_clockwise);
+        }
         // SPIR-V cache check
         // AsGenericEnvironment() returns nullptr for FileEnvironment (disk-load path)
         // and this* for GraphicsEnvironment (live path). Avoids dynamic_cast/-frtti.
@@ -1337,6 +1491,18 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                     RecordPhase3RuntimeVariantDiagnostic(key.unique_hashes[index],
                                                           diag_base_runtime_hash);
                 }
+                // Phase 5 groundwork — see RecordGenericInputTypesCardinalityDiagnostic's
+                // doc comment (vk_pipeline_cache.h) for what this measures. No cbuf_key
+                // gate (see that same doc comment for why not) -- every real insert reaching
+                // here is in scope. CityHash64 over the raw array, matching exactly how
+                // SpirvRelevantHash/Hash (runtime_info.h) fold this field in, so the values
+                // tracked here are the real cache-key-relevant ones, not a different
+                // measure that happens to also vary with attribute formats.
+                RecordGenericInputTypesCardinalityDiagnostic(
+                    key.unique_hashes[index],
+                    Common::CityHash64(
+                        reinterpret_cast<const char*>(runtime_info.generic_input_types.data()),
+                        runtime_info.generic_input_types.size() * sizeof(Shader::AttributeType)));
                 if (!spirv_cache_filename.empty()) {
                     serialization_thread.QueueWork([this] { spirv_cache.SaveThrottled(spirv_cache_filename); });
                 }
@@ -1737,6 +1903,9 @@ void PipelineCache::SubmitSpeculativeShader(
             if (stage == Shader::Stage::Fragment) {
                 rt.input_topology = Shader::InputTopology::Triangles;
             }
+            // Phase 5 free wins (runtime_info.h) -- deliberate defaults for the fields
+            // this speculative path has no real per-draw signal for.
+            rt.ApplySpeculativeDefaults(stage, program.info);
             if (stage != Shader::Stage::Compute) {
                 Shader::Maxwell::ConvertLegacyToGeneric(program, rt);
             }

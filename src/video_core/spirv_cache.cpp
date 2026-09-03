@@ -13,7 +13,26 @@
 
 namespace {
 constexpr std::array<char, 8> SPIRV_CACHE_MAGIC{'c', 'i', 't', 'r', 's', 'p', 'v', '\0'};
-constexpr u32 SPIRV_CACHE_VERSION = 9; // v9: the Phase 4 slot table (which shaders get
+constexpr u32 SPIRV_CACHE_VERSION = 10; // v10: y_negate (Shader::kYNegateSpecId,
+                                        // spirv_emit_context.cpp) converted from a value baked
+                                        // into the SPIR-V at translation time to a real spec
+                                        // constant, resolved separately at pipeline-creation
+                                        // time instead (VkSpecializationMapEntry,
+                                        // vk_graphics_pipeline.cpp) — see SpirvRelevantHash's
+                                        // own comment (runtime_info.h) on why it's no longer
+                                        // folded into this hash at all. Old entries computed
+                                        // under v9 aren't wrong, just keyed on a field that no
+                                        // longer distinguishes anything about the emitted
+                                        // SPIR-V (every real y_negate value now produces
+                                        // identical SPIR-V); a stale cross-version entry simply
+                                        // fails to match, same as any other cache miss. One-time
+                                        // bump for this one field's mechanism change, same
+                                        // category as v9/v8 below — does not need re-bumping
+                                        // for any other Phase 5 field converted the same way
+                                        // later (each such field's own conversion is its own,
+                                        // separate bump when it happens, not covered in advance
+                                        // by this one);
+                                        // (v9: the Phase 4 slot table (which shaders get
                                         // texture_key's handle-exclusion treatment) switched from a fixed, compile-time
                                         // list to a runtime-published, adaptively-grown one
                                         // (Shader::ActivePhase4PrototypeSlots(), environment.h) that starts EMPTY on a
@@ -101,7 +120,7 @@ constexpr u32 SPIRV_CACHE_VERSION = 9; // v9: the Phase 4 slot table (which shad
                                         // (v4: single-bit ComputeBindingKey; v3: runtime_key
                                         // folds in viewport_transform_state [VertexB] and
                                         // starting Bindings state; v2: adds Bindings
-                                        // end_binding per entry)))
+                                        // end_binding per entry))))
 } // anonymous namespace
 
 namespace VideoCommon {

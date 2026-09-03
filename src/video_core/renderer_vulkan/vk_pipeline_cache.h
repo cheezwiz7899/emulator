@@ -27,6 +27,7 @@
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/object_pool.h"
 #include "shader_recompiler/profile.h"
+#include "shader_recompiler/runtime_info.h"
 #include "shader_recompiler/varying_state.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -334,6 +335,79 @@ public:
     // cbuf_key == 0 — see that call site for why those two gates are what make the data
     // meaningful. Safe to call from any worker thread.
     void RecordPhase3RuntimeVariantDiagnostic(u64 unique_hash, u64 diag_base_runtime_hash) const;
+
+    // ---- Phase 5 groundwork (diagnostic only — same "nothing below reads these back or
+    // changes caching/guessing behavior" as the Phase 3 block above) ----
+    //
+    // Tracks, per graphics unique_hash, the distinct generic_input_types values observed
+    // among REAL, non-speculative graphics inserts -- generic_input_types_hash is
+    // CityHash64 over the raw 32-entry AttributeType array, the exact same hash
+    // SpirvRelevantHash folds in unconditionally for every stage (runtime_info.h), so a
+    // value tracked here is directly comparable to what actually distinguishes cache
+    // entries. Answers handoff_13's own open question for this field empirically instead
+    // of by argument: low cardinality per hash would mean this attribute-format state is
+    // realistically worth chasing the way y_negate was (a small, enumerable set of real
+    // values a spec constant or scan-time guess could plausibly cover); high cardinality
+    // would mean it isn't.
+    //
+    // Deliberately no cbuf_key==0 gate at the call site, unlike RecordPhase3RuntimeVariantDiagnostic
+    // above: that gate exists there because InsertSpeculative() hardcodes cbuf_key=0, so
+    // cbuf_key!=0 real inserts are structurally unreachable by any speculative entry
+    // regardless of Phase 3's own outcome. generic_input_types' speculative-matching
+    // potential isn't tied to cbuf narrowing at all, so restricting to that same subset
+    // here would just throw away real, relevant data for no reason -- the full real
+    // population is the right one for this specific question.
+    //
+    // Own dedicated mutex, same reasoning as phase3_diag_runtime_variants_mutex above:
+    // unrelated data, written from the same worker-thread context, shouldn't share a lock
+    // with something unrelated.
+    mutable std::shared_mutex phase5_diag_generic_input_types_mutex;
+    mutable ankerl::unordered_dense::map<u64, std::vector<u64>> phase5_diag_generic_input_types_variants_by_hash;
+    mutable std::chrono::steady_clock::time_point phase5_diag_generic_input_types_last_log_time{};
+
+    // Same shape as RecordPhase3RuntimeVariantDiagnostic (capped at 8 distinct values per
+    // hash, throttled to at most once per 30 seconds) -- see that method's own doc comment
+    // just above for why both those choices are made the way they are; identical reasoning
+    // applies here. Safe to call from any worker thread.
+    void RecordGenericInputTypesCardinalityDiagnostic(u64 unique_hash,
+                                                        u64 generic_input_types_hash) const;
+
+    // ---- Phase 5 groundwork: confirming (or correcting) the two speculative-default
+    // guesses runtime_info.h's ApplySpeculativeDefaults flags as REASONED rather than
+    // MEASURED -- convert_depth_mode (argued from DepthMode::MinusOneToOne's HW enum
+    // value of 0, not from data) and tess_primitive/spacing/clockwise (argued from
+    // nothing stronger than "match each enum's own value-0 entry for consistency",
+    // explicitly called the lowest-confidence guesses in that pass). Same diagnostic-only
+    // contract as everything else in this section: nothing below reads these back. ----
+    //
+    // Simple true/false frequency, not a cardinality-by-hash table like the two diagnostics
+    // above: the open question here isn't "does this vary per shader" (it doesn't --
+    // convert_depth_mode is one pipeline-wide GPU register, not a per-draw guess target the
+    // way generic_input_types is), it's "which value is actually common", so a plain global
+    // count answers it directly and more cheaply.
+    mutable std::mutex phase5_diag_convert_depth_mode_mutex;
+    mutable u64 phase5_diag_convert_depth_mode_true_count{0};
+    mutable u64 phase5_diag_convert_depth_mode_total_count{0};
+    mutable std::chrono::steady_clock::time_point phase5_diag_convert_depth_mode_last_log_time{};
+    // Called from both real MakeRuntimeInfo assignment sites (VertexB and Geometry) --
+    // see runtime_info.h's ApplySpeculativeDefaults for why this guess is the same for
+    // both. Throttled the same 30s way as the diagnostics above.
+    void RecordConvertDepthModeDiagnostic(bool convert_depth_mode) const;
+
+    // Real distribution across a game's actual TessellationEval-stage draws, not per-hash
+    // (tessellation is opt-in per shader, not a "does this shader see multiple states"
+    // question the way generic_input_types was) -- three small frequency maps, one per
+    // field, logged together. Expect little to no data most sessions: TessellationEval is
+    // relatively rare across the real game library, which is exactly why this trio had
+    // nothing stronger than an internal-consistency argument to lean on in the first place.
+    mutable std::mutex phase5_diag_tess_state_mutex;
+    mutable ankerl::unordered_dense::map<Shader::TessPrimitive, u64> phase5_diag_tess_primitive_counts;
+    mutable ankerl::unordered_dense::map<Shader::TessSpacing, u64> phase5_diag_tess_spacing_counts;
+    mutable u64 phase5_diag_tess_clockwise_true_count{0};
+    mutable u64 phase5_diag_tess_total_count{0};
+    mutable std::chrono::steady_clock::time_point phase5_diag_tess_state_last_log_time{};
+    void RecordTessellationStateDiagnostic(Shader::TessPrimitive primitive,
+                                            Shader::TessSpacing spacing, bool clockwise) const;
 
     GraphicsPipelineCacheKey graphics_key{};
     GraphicsPipeline* current_pipeline{};

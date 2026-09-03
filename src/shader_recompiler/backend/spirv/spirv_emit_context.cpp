@@ -522,6 +522,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     DefineGlobalMemoryFunctions(program.info);
     DefineRescalingInput(program.info);
     DefineRenderArea(program.info);
+    DefineRuntimeStateSpecConstants(program.info);
 }
 
 EmitContext::~EmitContext() = default;
@@ -1143,6 +1144,24 @@ void EmitContext::DefineRenderArea(const Info& info) {
             interfaces.push_back(render_area_push_constant);
         }
     }
+}
+
+void EmitContext::DefineRuntimeStateSpecConstants(const Info& info) {
+    if (!info.uses_y_direction) {
+        return;
+    }
+    // Same shape as Phase 4's own SpecConstantFalse+Decorate(SpecId)+Name block for texture-
+    // type resolution (see DefineImages below) -- SpecId is Shader::kYNegateSpecId
+    // (environment.h), fixed rather than table-indexed like Phase 4's own SpecIds, since
+    // there's exactly one y_negate per shader, not one per descriptor. Default -1.0f matches
+    // EmitYDirection's old baked "negated" branch; the real per-draw value (+1.0f or -1.0f,
+    // from key.state.y_negate) is supplied at pipeline-creation time via
+    // VkSpecializationMapEntry (vk_graphics_pipeline.cpp) and never affects this cached SPIR-V
+    // module or its cache key -- see SpirvRelevantHash's own comment on why y_negate is no
+    // longer hashed there.
+    y_negate_spec_const = SpecConstant(F32[1], -1.0f);
+    Decorate(y_negate_spec_const, spv::Decoration::SpecId, Shader::kYNegateSpecId);
+    Name(y_negate_spec_const, "y_negate");
 }
 
 void EmitContext::DefineConstantBuffers(const Info& info, u32& binding) {

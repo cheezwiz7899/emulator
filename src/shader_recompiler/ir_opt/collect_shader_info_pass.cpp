@@ -482,6 +482,9 @@ void VisitUsages(Info& info, IR::Inst& inst) {
     case IR::Opcode::IsHelperInvocation:
         info.uses_is_helper_invocation = true;
         break;
+    case IR::Opcode::YDirection:
+        info.uses_y_direction = true;
+        break;
     case IR::Opcode::ResolutionDownFactor:
     case IR::Opcode::IsTextureScaled:
     case IR::Opcode::IsImageScaled:

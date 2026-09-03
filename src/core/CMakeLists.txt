@@ -47,10 +47,18 @@ add_library(core STATIC
     file_sys/card_image.cpp
     file_sys/card_image.h
     file_sys/common_funcs.h
+    file_sys/arc_archive.cpp
+    file_sys/arc_archive.h
     file_sys/content_archive.cpp
     file_sys/content_archive.h
+    file_sys/cpk_archive.cpp
+    file_sys/cpk_archive.h
+    file_sys/mpr_material_archive.cpp
+    file_sys/mpr_material_archive.h
     file_sys/sarc_archive.cpp
     file_sys/sarc_archive.h
+    file_sys/xc2_arh_archive.cpp
+    file_sys/xc2_arh_archive.h
     file_sys/control_metadata.cpp
     file_sys/control_metadata.h
     file_sys/errors.h
@@ -1262,6 +1270,7 @@ target_link_libraries(core
         RenderDoc::API
         stb::headers
         ZLIB::ZLIB
+        zstd::zstd
     )
 
 # Conditionally link against Boost::process ONLY if it was found by the main CMakeLists.txt.

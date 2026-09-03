@@ -260,6 +260,7 @@ add_executable(citron
     multiplayer/validation.h
     play_time_manager.cpp
     play_time_manager.h
+    precache_scanner.cpp
     precompiled_headers.h
     qt_common.cpp
     qt_common.h
