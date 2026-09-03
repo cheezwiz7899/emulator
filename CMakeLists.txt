@@ -42,6 +42,18 @@ if (MSVC)
     add_compile_options(/wd4267)  # Suppress size_t conversion warnings
 endif()
 
+# Emulator code extensively type-puns memory (reinterpret_cast across unrelated
+# types, union-based access, etc.).  Strict aliasing lets the optimizer assume
+# pointers of different types never alias, which is wrong for this codebase.
+# With full LTO the resulting alias-analysis scope covers the entire merged
+# module and can stall the optimiser for hours.  Disable it globally.
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND MSVC)
+    # clang-cl: Clang flags must be forwarded through /clang:
+    add_compile_options(/clang:-fno-strict-aliasing)
+elseif (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    add_compile_options(-fno-strict-aliasing)
+endif()
+
 # Check if SDL2::SDL2 target exists; if not, create an alias
 if (TARGET SDL2::SDL2-static)
     add_library(SDL2::SDL2 ALIAS SDL2::SDL2-static)

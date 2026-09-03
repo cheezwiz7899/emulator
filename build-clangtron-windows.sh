@@ -3950,11 +3950,11 @@ stage_clangcl() {
     local config="${BUILD_TYPE}" stage_name flags="" pgo_flags="" pgo_link_flags="" pgo_flags_dash="" config_compile_flags config_link_flags
     case "${config}" in
         Release)
-            config_compile_flags="/O2 /DNDEBUG"
+            config_compile_flags="/O2 /DNDEBUG /clang:-fno-strict-aliasing"
             config_link_flags="/OPT:REF /OPT:ICF"
             ;;
         RelWithDebInfo)
-            config_compile_flags="/O2 /Z7 /DNDEBUG"
+            config_compile_flags="/O2 /Z7 /DNDEBUG /clang:-fno-strict-aliasing"
             config_link_flags="/DEBUG /OPT:REF /OPT:ICF"
             ;;
         Debug)
@@ -4272,6 +4272,7 @@ stage_clangcl() {
         thin)
             flags="${flags} /clang:-flto=thin"
             pgo_flags_dash="${pgo_flags_dash} -flto=thin"
+            config_link_flags="${config_link_flags} /opt:lldltojobs=all"
             ;;
         full)
             flags="${flags} /clang:-flto=full"
