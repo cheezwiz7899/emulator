@@ -42,6 +42,15 @@ if (MSVC)
     add_compile_options(/wd4267)  # Suppress size_t conversion warnings
 endif()
 
+# Limit concurrent link jobs to 1 when using Ninja generators.
+# Linking with Full LTO on large executables (citron, citron-cmd) consumes 8-14 GB RAM
+# per process. Running multiple links in parallel exceeds physical RAM on CI (7-14 GB)
+# and triggers catastrophic swap thrashing. Sequential linking keeps RAM within limits.
+if (CMAKE_GENERATOR MATCHES "Ninja")
+    set_property(GLOBAL PROPERTY JOB_POOLS link_jobs=1)
+    set(CMAKE_JOB_POOL_LINK link_jobs)
+endif()
+
 # Emulator code extensively type-puns memory (reinterpret_cast across unrelated
 # types, union-based access, etc.).  Strict aliasing lets the optimizer assume
 # pointers of different types never alias, which is wrong for this codebase.
@@ -50,6 +59,10 @@ endif()
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND MSVC)
     # clang-cl: Clang flags must be forwarded through /clang:
     add_compile_options(/clang:-fno-strict-aliasing)
+    # Parallelize lld-link Full LTO code generation across all CPU cores.
+    # Without these, lld-link defaults to 1 partition / 1 thread for the entire
+    # monolithic module, taking dozens of minutes sequentially.
+    add_link_options(/opt:lldltopartitions=16 /opt:lldltojobs=all)
 elseif (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     add_compile_options(-fno-strict-aliasing)
 endif()
