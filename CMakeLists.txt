@@ -42,14 +42,6 @@ if (MSVC)
     add_compile_options(/wd4267)  # Suppress size_t conversion warnings
 endif()
 
-# Limit concurrent link jobs to 1 when using Ninja generators.
-# Linking with Full LTO on large executables (citron, citron-cmd) consumes 8-14 GB RAM
-# per process. Running multiple links in parallel exceeds physical RAM on CI (7-14 GB)
-# and triggers catastrophic swap thrashing. Sequential linking keeps RAM within limits.
-if (CMAKE_GENERATOR MATCHES "Ninja")
-    set_property(GLOBAL PROPERTY JOB_POOLS link_jobs=1)
-    set(CMAKE_JOB_POOL_LINK link_jobs)
-endif()
 
 # Emulator code extensively type-puns memory (reinterpret_cast across unrelated
 # types, union-based access, etc.).  Strict aliasing lets the optimizer assume

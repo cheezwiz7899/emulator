@@ -4445,6 +4445,12 @@ ${qt_cmake_line}
   -DCITRON_CLANGCL_PGO_COMPILE_FLAGS="${pgo_flags_batch}" -DCITRON_CLANGCL_PGO_LINK_FLAGS="${pgo_link_flags_batch}" ^
   -DCMAKE_RC_FLAGS="" -DCMAKE_RC_FLAGS_DEBUG="" -DCMAKE_RC_FLAGS_RELEASE="" -DCMAKE_RC_FLAGS_RELWITHDEBINFO=""
 if errorlevel 1 exit /b %errorlevel%
+cmake --build "${build_win}" --config ${config} --parallel ${JOBS} --target citron-room
+if not %errorlevel%==0 exit /b 1
+cmake --build "${build_win}" --config ${config} --parallel ${JOBS} --target citron-cmd
+if not %errorlevel%==0 exit /b 1
+cmake --build "${build_win}" --config ${config} --parallel ${JOBS} --target citron
+if not %errorlevel%==0 exit /b 1
 cmake --build "${build_win}" --config ${config} --parallel ${JOBS} --target citron-runtime
 if not %errorlevel%==0 exit /b 1
 ${sccache_stats_cmd}
