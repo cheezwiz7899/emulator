@@ -1246,7 +1246,6 @@ target_link_libraries(core
     PUBLIC
         common
         Boost::headers
-        unordered_dense::unordered_dense
     PRIVATE
         audio_core
         hid_core

@@ -381,7 +381,7 @@ endif()
 # Find Boost and its components.
 # 'process' is optional. The build will continue if it's not found.
 if (NOT TARGET Boost::context)
-    find_package(Boost 1.79.0 REQUIRED COMPONENTS context OPTIONAL_COMPONENTS process)
+    find_package(Boost 1.83.0 REQUIRED COMPONENTS context OPTIONAL_COMPONENTS process)
 elseif (TARGET Boost::process)
     set(Boost_PROCESS_FOUND TRUE)
 else()
@@ -400,7 +400,7 @@ endif()
 
 # Find the Boost package with our dynamically built list of required components.
 if (NOT TARGET Boost::context)
-    find_package(Boost 1.79.0 REQUIRED ${BOOST_COMPONENTS})
+    find_package(Boost 1.83.0 REQUIRED ${BOOST_COMPONENTS})
 endif()
 if (NOT TARGET enet::enet)
     find_package(enet 1.3 MODULE)

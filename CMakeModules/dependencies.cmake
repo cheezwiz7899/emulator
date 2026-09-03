@@ -60,7 +60,7 @@ if(CITRON_CLANGCL)
 endif()
 
 if (NOT TARGET Boost::headers)
-    set(BOOST_INCLUDE_LIBRARIES "algorithm;asio;container;context;crc;heap;icl;intrusive;process;range;spirit;test;timer;variant" CACHE STRING "Boost components to build")
+    set(BOOST_INCLUDE_LIBRARIES "algorithm;asio;container;context;crc;heap;icl;intrusive;process;range;spirit;test;timer;unordered;variant" CACHE STRING "Boost components to build")
     set(BOOST_ENABLE_CMAKE ON CACHE BOOL "Enable Boost CMake")
     set(BUILD_TESTING OFF CACHE BOOL "Disable testing")
     set(BUILD_SHARED_LIBS OFF CACHE BOOL "Disable shared libs")
@@ -179,13 +179,9 @@ endif()
 # Header-only / trivial packages
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# ── unordered_dense ───────────────────────────────────────────────────────────
-CPMAddPackage(
-    NAME unordered_dense
-    GITHUB_REPOSITORY martinus/unordered_dense
-    GIT_TAG 7b55cab8418da1603496462ce3ccdb4cb1dc3368
-    OPTIONS "BUILD_TESTING OFF"
-)
+# ── unordered_dense: dropped (2026) ──────────────────────────────────────────
+# Replaced by boost::unordered_flat_map/flat_set ("unordered" added to
+# BOOST_INCLUDE_LIBRARIES above). Boost is already fetched for this build.
 
 # ── simpleini ─────────────────────────────────────────────────────────────────
 if (NOT TARGET SimpleIni::SimpleIni)

@@ -238,7 +238,7 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
   )
 endif()
 
-target_link_libraries(common PUBLIC Boost::context Boost::headers fmt::fmt stb::headers Threads::Threads unordered_dense::unordered_dense)
+target_link_libraries(common PUBLIC Boost::context Boost::headers fmt::fmt stb::headers Threads::Threads)
 target_include_directories(common INTERFACE ${CMAKE_SOURCE_DIR}/src)
 # Propagates to every target that links common, including dynarmic (which
 # already does, for this same target) -- see xbyak_abi.h for what it does.

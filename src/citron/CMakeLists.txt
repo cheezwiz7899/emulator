@@ -325,7 +325,6 @@ if (CITRON_CRASH_DUMPS)
 
     target_link_libraries(citron PRIVATE
         libbreakpad_client
-        unordered_dense::unordered_dense
     )
     target_compile_definitions(citron PRIVATE CITRON_CRASH_DUMPS)
 endif()

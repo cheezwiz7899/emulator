@@ -10,7 +10,7 @@
 #include <span>
 #include <variant>
 #include <vector>
-#include <ankerl/unordered_dense.h>
+#include <boost/unordered/unordered_flat_map.hpp>
 #include "common/bit_field.h"
 #include "common/common_types.h"
 
@@ -237,8 +237,8 @@ struct MacroEngine {
         AnyCachedMacro program;
         u64 hash{};
     };
-    ankerl::unordered_dense::map<u32, CacheInfo> macro_cache;
-    ankerl::unordered_dense::map<u32, std::vector<u32>> uploaded_macro_code;
+    boost::unordered_flat_map<u32, CacheInfo> macro_cache;
+    boost::unordered_flat_map<u32, std::vector<u32>> uploaded_macro_code;
     bool is_interpreted;
 };
 

@@ -7,10 +7,8 @@
 set(CMAKE_UNITY_BUILD OFF)
 
 
-# Needed for ankerls map implementation used in various places
-if (NOT TARGET unordered_dense::unordered_dense)
-    add_subdirectory(unordered_dense)
-endif()
+# unordered_dense dropped (2026): replaced by boost::unordered_flat_map/flat_set,
+# see migration notes. Boost is already a required dependency.
 
 # Dynarmic has cmake_minimum_required(3.12) and we may want to override
 # some of its variables, which is only possible in 3.13+

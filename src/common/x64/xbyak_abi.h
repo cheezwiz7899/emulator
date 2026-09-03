@@ -21,10 +21,11 @@
 // Note: dynarmic's common/x64/xbyak.h also defines CMP_*, IsWithin2G, CallFarFunction --
 // don't add them here, equivalents already exist in xbyak_util.h.
 #ifdef DYNARMIC_XBYAK_CUSTOM_CONTAINERS
-#include <ankerl/unordered_dense.h>
+#include <boost/unordered/unordered_flat_map.hpp>
+#include <boost/unordered/unordered_flat_set.hpp>
 #include <boost/unordered_map.hpp>
-#define XBYAK_STD_UNORDERED_SET ankerl::unordered_dense::set
-#define XBYAK_STD_UNORDERED_MAP ankerl::unordered_dense::map
+#define XBYAK_STD_UNORDERED_SET boost::unordered_flat_set
+#define XBYAK_STD_UNORDERED_MAP boost::unordered_flat_map
 #define XBYAK_STD_UNORDERED_MULTIMAP boost::unordered_multimap
 #endif
 
