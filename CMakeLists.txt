@@ -51,10 +51,9 @@ endif()
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND MSVC)
     # clang-cl: Clang flags must be forwarded through /clang:
     add_compile_options(/clang:-fno-strict-aliasing)
-    # Parallelize lld-link Full LTO code generation across all CPU cores.
-    # Without these, lld-link defaults to 1 partition / 1 thread for the entire
-    # monolithic module, taking dozens of minutes sequentially.
-    add_link_options(/opt:lldltopartitions=16 /opt:lldltojobs=all)
+    # Parallelize lld-link Full LTO code generation across all CPU cores, and allow
+    # duplicate symbols from SDK/dependency import libraries (e.g. CM_Get_Child in SetupAPI/libusb).
+    add_link_options(/opt:lldltopartitions=16 /opt:lldltojobs=all /force:multiple)
 elseif (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     add_compile_options(-fno-strict-aliasing)
 endif()

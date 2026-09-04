@@ -3951,15 +3951,15 @@ stage_clangcl() {
     case "${config}" in
         Release)
             config_compile_flags="/O2 /DNDEBUG /clang:-fno-strict-aliasing"
-            config_link_flags="/OPT:REF /OPT:ICF"
+            config_link_flags="/OPT:REF /OPT:ICF /force:multiple"
             ;;
         RelWithDebInfo)
             config_compile_flags="/O2 /Z7 /DNDEBUG /clang:-fno-strict-aliasing"
-            config_link_flags="/DEBUG /OPT:REF /OPT:ICF"
+            config_link_flags="/DEBUG /OPT:REF /OPT:ICF /force:multiple"
             ;;
         Debug)
             config_compile_flags="/Od /Z7"
-            config_link_flags="/DEBUG"
+            config_link_flags="/DEBUG /force:multiple"
             ;;
         *) error "Unsupported clang-cl build type: ${config}" ;;
     esac
