@@ -183,17 +183,18 @@ case \" \$* \" in
         exit 0
         ;;
 esac
-if command -v pkgconf >/dev/null 2>&1; then
-    exec pkgconf \"\$@\"
-elif command -v pkg-config >/dev/null 2>&1; then
-    exec pkg-config \"\$@\"
-elif command -v /usr/bin/pkgconf >/dev/null 2>&1; then
-    exec /usr/bin/pkgconf \"\$@\"
-elif command -v /usr/bin/pkg-config >/dev/null 2>&1; then
-    exec /usr/bin/pkg-config \"\$@\"
-elif command -v /clang64/bin/pkg-config >/dev/null 2>&1; then
-    exec /clang64/bin/pkg-config \"\$@\"
-fi
+_pkg_config_wrapper=\"\$(cd -P \"\$(dirname \"\$0\")\" && pwd -P)/\$(basename \"\$0\")\"
+for _pkg_config_candidate in pkgconf pkg-config /usr/bin/pkgconf /usr/bin/pkg-config /clang64/bin/pkg-config; do
+    case \"\$_pkg_config_candidate\" in
+        /*) _pkg_config_delegate=\"\$_pkg_config_candidate\" ;;
+        *) _pkg_config_delegate=\"\$(command -v \"\$_pkg_config_candidate\" 2>/dev/null)\" || continue ;;
+    esac
+    [ -n \"\$_pkg_config_delegate\" ] || continue
+    [ -x \"\$_pkg_config_delegate\" ] || continue
+    _pkg_config_delegate=\"\$(cd -P \"\$(dirname \"\$_pkg_config_delegate\")\" && pwd -P)/\$(basename \"\$_pkg_config_delegate\")\" || continue
+    [ \"\$_pkg_config_delegate\" = \"\$_pkg_config_wrapper\" ] && continue
+    exec \"\$_pkg_config_delegate\" \"\$@\"
+done
 exit 1
 ")
         execute_process(
