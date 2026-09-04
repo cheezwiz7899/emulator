@@ -4271,12 +4271,10 @@ stage_clangcl() {
         none) ;;
         thin)
             flags="${flags} /clang:-flto=thin"
-            pgo_flags_dash="${pgo_flags_dash} -flto=thin"
             config_link_flags="${config_link_flags} /opt:lldltojobs=all"
             ;;
         full)
             flags="${flags} /clang:-flto=full"
-            pgo_flags_dash="${pgo_flags_dash} -flto=full"
             config_link_flags="${config_link_flags} /opt:lldltopartitions=${JOBS:-16} /opt:lldltojobs=all"
             ;;
     esac
@@ -4342,7 +4340,12 @@ stage_clangcl() {
     # Each distinct (LTO, PGO, stage, profile) combination gets its own dir —
     # prevents execute_process-based builds (OpenSSL, FFmpeg) from silently reusing
     # a cache built with different flags.
-    local _pgo_lto_cache_key="lto-${LTO_MODE}_pgo-${PGO_MODE}_${STAGE}"
+    # OpenSSL and FFmpeg deliberately stay native COFF even when the application
+    # uses LTO. lld-link can then resolve members from these lazy archives after
+    # its LTO phase; LLVM-bitcode archive members cannot be loaded at that point.
+    # Include the dependency object format in the key so old bitcode archives are
+    # never reused.
+    local _pgo_lto_cache_key="deps-coff_lto-${LTO_MODE}_pgo-${PGO_MODE}_${STAGE}"
     if [[ -n "${_pd_hash:-}" ]]; then
         _pgo_lto_cache_key="${_pgo_lto_cache_key}_${_pd_hash}"
     fi
