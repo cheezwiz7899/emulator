@@ -196,6 +196,17 @@ if (CITRON_USE_PRECOMPILED_HEADERS)
         set(CITRON_USE_PRECOMPILED_HEADERS OFF CACHE BOOL "" FORCE)
     endif()
 endif()
+# Snapshot the fully-resolved value now, once, into a plain (non-cache) variable.
+# CPM hashes this literal string as part of dynarmic's cache key (see CPM.cmake's
+# origin_parameters/SHA1 logic) -- if dependencies.cmake read the live cache
+# variable instead, a later reconfigure that flips CITRON_USE_PRECOMPILED_HEADERS
+# (e.g. a compiler-version check re-evaluating differently) changes the hash
+# string mid-build and CPM ends up fetching dynarmic into two different cache
+# directories in the same build. Reference this snapshot from dependencies.cmake,
+# never the cache variable directly, so the OPTIONS string is fixed for the
+# lifetime of this CMake process.
+set(CITRON_USE_PRECOMPILED_HEADERS_RESOLVED ${CITRON_USE_PRECOMPILED_HEADERS})
+
 if (CITRON_USE_PRECOMPILED_HEADERS)
     message(STATUS "Using Precompiled Headers.")
     set(CMAKE_PCH_INSTANTIATE_TEMPLATES ON)

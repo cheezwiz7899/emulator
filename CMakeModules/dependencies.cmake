@@ -428,7 +428,10 @@ if ((ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64) AND NOT (MSVC AND ARCHITECTURE_a
             GITHUB_REPOSITORY xinitrcn1/dynarmic
             GIT_TAG e40fa8ba6d739807b0965c5e3a60e69f2353f209
             OPTIONS
-                "DYNARMIC_USE_PRECOMPILED_HEADERS ${CITRON_USE_PRECOMPILED_HEADERS}"
+                # Use the snapshot taken in the root CMakeLists.txt, not the live
+                # CITRON_USE_PRECOMPILED_HEADERS cache variable -- see the comment
+                # there for why (this string feeds CPM's cache-key hash).
+                "DYNARMIC_USE_PRECOMPILED_HEADERS ${CITRON_USE_PRECOMPILED_HEADERS_RESOLVED}"
                 "DYNARMIC_IGNORE_ASSERTS ON"
                 "DYNARMIC_TESTS OFF"
         )
