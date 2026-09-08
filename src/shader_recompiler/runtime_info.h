@@ -184,21 +184,11 @@ struct RuntimeInfo {
             hash ^= val + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
         };
 
-        // generic_input_types: real per-pipeline attribute-format state for every
-        // stage that has inputs at all — VertexB reads it for actual vertex-buffer
-        // attribute types, every other graphics stage reads it (alongside
-        // previous_stage_stores below) to wire up inputs matching whatever the
-        // preceding stage declared. (spirv_emit_context.cpp DefineInputs)
+        // These values define the SPIR-V input interface. Keep the full representation in
+        // the key: narrowing it to apparently-used inputs caused distinct interfaces to
+        // alias a cached module, producing severe rendering corruption.
         hash_combine(Common::CityHash64(reinterpret_cast<const char*>(generic_input_types.data()),
                                         generic_input_types.size() * sizeof(AttributeType)));
-
-        // previous_stage_stores / previous_stage_legacy_stores_mapping: also read by
-        // DefineInputs, but skipped for VertexB specifically — MakeRuntimeInfo sets
-        // previous_stage_stores.mask to an all-ones sentinel ("no restriction")
-        // whenever there's no previous program, which is always true for VertexB, so
-        // it's a fixed constant there and contributes nothing. For every other stage
-        // it reflects the ACTUAL preceding program's output layout and genuinely
-        // varies per real pipeline.
         if (stage != Stage::VertexB) {
             hash_combine(std::hash<std::bitset<512>>{}(previous_stage_stores.mask));
             for (const auto& [key, value] : previous_stage_legacy_stores_mapping) {
@@ -286,6 +276,49 @@ struct RuntimeInfo {
         // so this is provably a no-op today either way.
 
         return hash;
+    }
+
+    // Diagnostic-only decomposition of SpirvRelevantHash(). The eight slots are
+    // stable and intentionally persisted beside speculative cache entries so a
+    // later real miss can name the state family that differs after a restart.
+    [[nodiscard]] std::array<u64, 8> SpirvRelevantFieldHashes(Stage stage) const noexcept {
+        std::array<u64, 8> fields{};
+        fields[0] = Common::CityHash64(reinterpret_cast<const char*>(generic_input_types.data()),
+                                        generic_input_types.size() * sizeof(AttributeType));
+        if (stage != Stage::VertexB) {
+            fields[1] = std::hash<std::bitset<512>>{}(previous_stage_stores.mask);
+            for (const auto& [key, value] : previous_stage_legacy_stores_mapping) {
+                fields[2] ^= (static_cast<u64>(key) << 32) | static_cast<u64>(value);
+            }
+        }
+        if (stage == Stage::VertexB || stage == Stage::Geometry) {
+            fields[3] = convert_depth_mode | (static_cast<u64>(xfb_count) << 1);
+            if (fixed_state_point_size) {
+                u32 value;
+                std::memcpy(&value, &*fixed_state_point_size, sizeof(value));
+                fields[3] ^= static_cast<u64>(value) << 32;
+            }
+            if (xfb_count > 0) fields[3] ^= Common::CityHash64(
+                reinterpret_cast<const char*>(xfb_varyings.data()),
+                xfb_count * sizeof(TransformFeedbackVarying));
+        }
+        if (stage == Stage::TessellationEval) {
+            fields[4] = static_cast<u64>(tess_primitive) |
+                        (static_cast<u64>(tess_spacing) << 8) |
+                        (static_cast<u64>(tess_clockwise) << 16);
+        }
+        if (stage == Stage::Geometry) fields[5] = static_cast<u64>(input_topology);
+        if (stage == Stage::Fragment) {
+            fields[6] = force_early_z;
+            fields[7] = alpha_to_coverage_enabled;
+            if (alpha_test_func) fields[7] ^= static_cast<u64>(*alpha_test_func) + 1;
+            u32 alpha_ref;
+            std::memcpy(&alpha_ref, &alpha_test_reference, sizeof(alpha_ref));
+            fields[7] ^= static_cast<u64>(alpha_ref) << 32;
+            fields[7] ^= Common::CityHash64(reinterpret_cast<const char*>(frag_color_types.data()),
+                                              frag_color_types.size() * sizeof(FragmentOutputType));
+        }
+        return fields;
     }
 
     // Phase 5 "free wins" (handoff_13/handoff_15): deliberate defaults for the fields

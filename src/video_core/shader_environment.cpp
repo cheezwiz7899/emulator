@@ -706,7 +706,9 @@ u32 GraphicsEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
     if (cbuf_offset < cbuf.size) {
         value = gpu_memory->Read<u32>(cbuf.address + cbuf_offset);
     }
-    cbuf_values.emplace(MakeCbufKey(cbuf_index, cbuf_offset), value);
+    const u64 key = MakeCbufKey(cbuf_index, cbuf_offset);
+    cbuf_values.emplace(key, value);
+    RecordCbufRead(key);
     return value;
 }
 
@@ -801,7 +803,9 @@ u32 ComputeEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
     if (cbuf_offset < cbuf.size) {
         value = gpu_memory->Read<u32>(cbuf.Address() + cbuf_offset);
     }
-    cbuf_values.emplace(MakeCbufKey(cbuf_index, cbuf_offset), value);
+    const u64 key = MakeCbufKey(cbuf_index, cbuf_offset);
+    cbuf_values.emplace(key, value);
+    RecordCbufRead(key);
     return value;
 }
 

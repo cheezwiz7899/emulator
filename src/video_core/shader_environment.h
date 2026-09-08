@@ -118,8 +118,17 @@ public:
     /// ReadCbufValue() override is active, which happens automatically via the
     /// (still-virtual, separately overridden per subclass) call below.
     u32 ReadCbufValueForTextureHandle(u32 cbuf_index, u32 cbuf_offset) override final {
+        struct RestoreFlag {
+            bool& flag;
+            bool old_value;
+            ~RestoreFlag() { flag = old_value; }
+        } restore{reading_texture_handle_cbuf_, reading_texture_handle_cbuf_};
+        reading_texture_handle_cbuf_ = true;
         const u32 value = ReadCbufValue(cbuf_index, cbuf_offset);
-        texture_handle_cbuf_keys.insert(MakeCbufKey(cbuf_index, cbuf_offset));
+        const u64 key = MakeCbufKey(cbuf_index, cbuf_offset);
+        if (!non_texture_handle_cbuf_keys.contains(key)) {
+            texture_handle_cbuf_keys.insert(key);
+        }
         return value;
     }
 
@@ -183,6 +192,17 @@ public:
     }
 
 protected:
+    // Called by concrete ReadCbufValue implementations for ordinary reads. A word may
+    // appear at both a texture-handle resolver and another constant-folding site; only
+    // words observed exclusively through ReadCbufValueForTextureHandle may be removed
+    // from the cbuf cache key.
+    void RecordCbufRead(u64 key) {
+        if (!reading_texture_handle_cbuf_) {
+            non_texture_handle_cbuf_keys.insert(key);
+            texture_handle_cbuf_keys.erase(key);
+        }
+    }
+
     std::optional<u64> TryFindSize();
 
     Tegra::Texture::TICEntry ReadTextureInfo(GPUVAddr tic_addr, u32 tic_limit,
@@ -197,6 +217,8 @@ protected:
     std::unordered_map<u64, u32> cbuf_values;
     // See ReadCbufValueForTextureHandle() and CapturedTextureHandleCbufKeys() above.
     std::unordered_set<u64> texture_handle_cbuf_keys;
+    std::unordered_set<u64> non_texture_handle_cbuf_keys;
+    bool reading_texture_handle_cbuf_{};
     // See CapturedPhase4PrototypeHandles() above.
     std::unordered_set<u32> phase4_prototype_handles;
     // Memoized CalculateHash() for RecordResolvedTextureType()/RecordResolvedTexturePixelFormat()

@@ -23,6 +23,8 @@
 // with no captures, so hoisting them is behavior-preserving, and each is
 // substantial and independently meaningful enough to read on its own.
 
+#include <bitset>
+
 #include <QMessageBox>
 #include <QProgressDialog>
 #include <QTimer>
@@ -107,6 +109,14 @@ struct PreviousStageStoresSnapshot {
     std::map<Shader::IR::Attribute, Shader::IR::Attribute> legacy_stores_mapping{};
     Shader::VaryingState passthrough{};
     bool is_geometry_passthrough{};
+};
+
+// A successful speculative translation is reusable only when its complete
+// pipeline context matches. Keeping the resulting successor state alongside the
+// dedup key is essential: callers chain this state into the next BNSH stage.
+struct PrecacheStageResult {
+    PreviousStageStoresSnapshot stage_snapshot{};
+    Shader::Backend::Bindings end_binding{};
 };
 
 // One already-unwrapped region of bytes ready for the BNSH/GRSC/SPH scan below —
@@ -453,13 +463,11 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
         host_info.support_conditional_barrier=false;
 
         std::mutex seen_mutex;
-        // Checked/inserted while holding seen_mutex, on every shader blob
-        // candidate found across the scan (potentially many thousands between
-        // BNSH sub-blocks and raw-matched files) — unordered_dense's better
-        // cache locality reduces time spent inside the lock, which matters
-        // more here than usual since it's contended across every worker
-        // thread, not just a single-thread hot path.
-        ankerl::unordered_dense::set<u64> seen_hashes;
+        // Maps a raw blob PLUS its predecessor-output and descriptor context to
+        // the state that a successful translation left for the next stage. A
+        // blob-only set is unsound for BNSH: the same stage under a different
+        // predecessor has different input declarations and descriptor numbers.
+        ankerl::unordered_dense::map<u64, PrecacheStageResult> seen_contexts;
 
         const size_t nthreads = std::max(1u, std::thread::hardware_concurrency()-1u);
         Common::ThreadWorker workers{nthreads, "PreCacheShader"};
@@ -757,7 +765,9 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
 
                 const auto process_blob = [&](const std::vector<u8>& blob, bool is_bnsh_derived,
                                               const PreviousStageStoresSnapshot* previous_stage,
-                                              PreviousStageStoresSnapshot* out_stage_snapshot) -> bool {
+                                              PreviousStageStoresSnapshot* out_stage_snapshot,
+                                              Shader::Backend::Bindings starting_binding,
+                                              Shader::Backend::Bindings* out_end_binding) -> bool {
                     // Claim one of a limited number of diagnostic-logging slots
                     // (thread-safe across the worker pool). diag_slot >= 0 means
                     // this call should log; this is temporary instrumentation to
@@ -857,14 +867,43 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
 
                     const u32 t = shader_type;
 
-                    // Quick same-session dedup using a blob fingerprint.
-                    // This prevents re-translating identical blobs found in multiple
-                    // RomFS files within a single scan. It is NOT the authoritative
-                    // shader hash — that comes from env.CalculateHash() below.
-                    const u64 blob_fingerprint = Common::CityHash64(
+                    // Deduplicate only equal complete contexts. This permits a
+                    // repeated BNSH stage after a different predecessor to make a
+                    // distinct speculative entry, while avoiding repeated work for
+                    // truly identical BNSH variations and raw standalone sources.
+                    u64 context_key = Common::CityHash64(
                         reinterpret_cast<const char*>(blob.data()), blob.size());
-                    { std::lock_guard g{seen_mutex};
-                      if (!seen_hashes.insert(blob_fingerprint).second) return true; }
+                    const auto combine_context = [&context_key](u64 value) {
+                        context_key ^= value + 0x9e3779b97f4a7c15ULL +
+                            (context_key << 6) + (context_key >> 2);
+                    };
+                    combine_context(VideoCommon::ComputeBindingKey(starting_binding));
+                    if (previous_stage) {
+                        combine_context(std::hash<std::bitset<512>>{}(
+                            previous_stage->stores.mask));
+                        combine_context(std::hash<std::bitset<512>>{}(
+                            previous_stage->passthrough.mask));
+                        combine_context(previous_stage->is_geometry_passthrough);
+                        for (const auto& [from, to] : previous_stage->legacy_stores_mapping) {
+                            combine_context((static_cast<u64>(from) << 32) |
+                                            static_cast<u64>(to));
+                        }
+                    } else {
+                        combine_context(~0ULL);
+                    }
+                    {
+                        std::lock_guard g{seen_mutex};
+                        const auto it = seen_contexts.find(context_key);
+                        if (it != seen_contexts.end()) {
+                            if (out_stage_snapshot) {
+                                *out_stage_snapshot = it->second.stage_snapshot;
+                            }
+                            if (out_end_binding) {
+                                *out_end_binding = it->second.end_binding;
+                            }
+                            return true;
+                        }
+                    }
 
                     const Shader::Stage stage = [t]()->Shader::Stage {
                         switch(t){case 1:return Shader::Stage::VertexB;
@@ -903,6 +942,12 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                     // to satisfy all of that by chance. code is passed by value
                     // (copied, not moved) so it can be reused across multiple
                     // attempts at different offsets.
+                    // A brute-force scan can make up to ~1,000 deliberately-invalid
+                    // attempts per candidate.  Log the first failures for diagnosis, but
+                    // never every rejected offset: that grew a normal scan past 100 MB
+                    // before it could reach its completion summary.
+                    constexpr size_t kMaxLoggedCandidateFailures = 2;
+                    size_t logged_candidate_failures{};
                     const auto try_translate_at = [&](u32 entry_offset_in_payload) -> bool {
                         try {
                             VideoCommon::SpeculativeShaderEnvironment env{code, stage, lm, bsph};
@@ -921,10 +966,9 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                             // This must match GenericEnvironment::CalculateHash() used by the live path.
                             const u64 unique_hash = env.CalculateHash();
                             if (diag_slot >= 0) {
-                                LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: unique_hash={:016x} already_cached={}",
-                                         diag_slot, unique_hash, cache.ContainsByUniqueHash(unique_hash));
+                                LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: unique_hash={:016x}",
+                                         diag_slot, unique_hash);
                             }
-                            if (cache.ContainsByUniqueHash(unique_hash)) return true;
                             ++state->shaders_found;
 
                             auto prog = Shader::Maxwell::TranslateProgram(ip,bp,env,cfg,host_info);
@@ -932,7 +976,7 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                                 LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: TranslateProgram OK at entry +{}",
                                          diag_slot, entry_offset_in_payload);
                             }
-                            Shader::Backend::Bindings binding{};
+                            Shader::Backend::Bindings binding = starting_binding;
                             Shader::RuntimeInfo rt{};
                             // Phase 3 guess refinement: for every stage except VertexB,
                             // previous_stage_stores is a real, IS-read field of
@@ -997,7 +1041,10 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                             // real Fragment/VertexB draws using Lines/Points no longer need to
                             // coincidentally match a guess that was never going to affect their
                             // actual SPIR-V in the first place.
-                            u64 runtime_key = rt.SpirvRelevantHash(stage);
+                            u64 runtime_key = stage == Shader::Stage::Compute
+                                                  ? VideoCommon::ComputeWorkgroupKey(
+                                                        /*shared_memory_size=*/0, {1u, 1u, 1u})
+                                                  : rt.SpirvRelevantHash(stage);
                             if (stage == Shader::Stage::VertexB) {
                                 runtime_key = VideoCommon::FoldViewportTransformState(
                                     runtime_key, env.ReadViewportTransformState());
@@ -1010,11 +1057,19 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                             // an opaque "runtime differs" on the folded key. See
                             // spirv_cache.h's Insert()/InsertSpeculative() doc comments.
                             const u64 diag_base_runtime_hash = runtime_key;
-                            const u64 diag_binding_key =
-                                VideoCommon::ComputeBindingKey(Shader::Backend::Bindings{});
-                            runtime_key = VideoCommon::FoldBindingKey(runtime_key, diag_binding_key);
+                            const auto diag_runtime_fields = rt.SpirvRelevantFieldHashes(stage);
+                            const u64 diag_binding_key = stage == Shader::Stage::Compute
+                                                             ? 0
+                                                             : VideoCommon::ComputeBindingKey(starting_binding);
+                            if (stage != Shader::Stage::Compute) {
+                                runtime_key = VideoCommon::FoldBindingKey(runtime_key,
+                                                                          diag_binding_key);
+                            }
                             cache.InsertSpeculative(unique_hash, runtime_key, texture_key, std::move(spirv),
-                                                    diag_base_runtime_hash, diag_binding_key);
+                                                    binding, diag_base_runtime_hash, diag_binding_key,
+                                                    diag_runtime_fields,
+                                                    VideoCommon::SpirvCacheEntrySource::PrecacheScanner);
+
                             ++state->shaders_translated;
                             if (diag_slot >= 0) {
                                 LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: fully translated OK at entry +{}",
@@ -1025,10 +1080,18 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                             // TranslateProgram above, so a later failure/exception in
                             // this same attempt can never leave the caller thinking this
                             // stage succeeded when process_blob is about to return false.
+                            const PrecacheStageResult result{
+                                {prog.info.stores, prog.info.legacy_stores_mapping,
+                                 prog.info.passthrough, prog.is_geometry_passthrough}, binding};
+                            {
+                                std::lock_guard g{seen_mutex};
+                                seen_contexts.insert_or_assign(context_key, result);
+                            }
                             if (out_stage_snapshot) {
-                                *out_stage_snapshot = PreviousStageStoresSnapshot{
-                                    prog.info.stores, prog.info.legacy_stores_mapping,
-                                    prog.info.passthrough, prog.is_geometry_passthrough};
+                                *out_stage_snapshot = result.stage_snapshot;
+                            }
+                            if (out_end_binding) {
+                                *out_end_binding = result.end_binding;
                             }
                             // A second VertexB translate guessing viewport_transform_state=0
                             // used to run here (mirroring PipelineCache::SubmitSpeculativeShader).
@@ -1044,13 +1107,15 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                             // SubmitSpeculativeShader for the matching removal on the live path.
                             return true;
                         } catch (const std::exception& e) {
-                            if (diag_slot >= 0) {
+                            if (diag_slot >= 0 &&
+                                logged_candidate_failures++ < kMaxLoggedCandidateFailures) {
                                 LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: entry +{} threw std::exception: {}",
                                          diag_slot, entry_offset_in_payload, e.what());
                             }
                             return false;
                         } catch (...) {
-                            if (diag_slot >= 0) {
+                            if (diag_slot >= 0 &&
+                                logged_candidate_failures++ < kMaxLoggedCandidateFailures) {
                                 LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: entry +{} threw unknown exception",
                                          diag_slot, entry_offset_in_payload);
                             }
@@ -1244,7 +1309,9 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
 
                 const auto process_stage_offset = [&](size_t base, u64 stage_offset,
                                                        const PreviousStageStoresSnapshot* previous_stage,
-                                                       PreviousStageStoresSnapshot* out_stage_snapshot) -> bool {
+                                                       PreviousStageStoresSnapshot* out_stage_snapshot,
+                                                       Shader::Backend::Bindings starting_binding,
+                                                       Shader::Backend::Bindings* out_end_binding) -> bool {
                     if (stage_offset == 0) return false;
                     const size_t code_hdr = base + static_cast<size_t>(stage_offset);
                     u64 control_code_offset{};
@@ -1262,7 +1329,8 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                         const size_t blob_size = byte_code_size - kByteCodePreambleSize;
                         if (blob_start + blob_size <= sz) {
                             succeeded = process_blob(std::vector<u8>(data + blob_start, data + blob_start + blob_size),
-                                                      /*is_bnsh_derived=*/true, previous_stage, out_stage_snapshot);
+                                                      /*is_bnsh_derived=*/true, previous_stage, out_stage_snapshot,
+                                                      starting_binding, out_end_binding);
                         }
                     }
                     if (succeeded) return true;
@@ -1287,7 +1355,8 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                         const size_t blob_size = control_code_size - kByteCodePreambleSize;
                         if (blob_start + blob_size <= sz) {
                             succeeded = process_blob(std::vector<u8>(data + blob_start, data + blob_start + blob_size),
-                                                      /*is_bnsh_derived=*/true, previous_stage, out_stage_snapshot);
+                                                      /*is_bnsh_derived=*/true, previous_stage, out_stage_snapshot,
+                                                      starting_binding, out_end_binding);
                         }
                     }
                     return succeeded;
@@ -1342,16 +1411,19 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                         // loop, deliberately excluded from the chain in both directions.
                         static constexpr size_t kGraphicsStageOffsetFields[5] = {0x08, 0x10, 0x18, 0x20, 0x28};
                         std::optional<PreviousStageStoresSnapshot> previous_stage_snapshot;
+                        Shader::Backend::Bindings binding{};
                         for (const size_t field : kGraphicsStageOffsetFields) {
                             u64 stage_offset{};
                             if (!read_u64(prog_hdr + field, stage_offset)) continue;
                             PreviousStageStoresSnapshot this_stage_snapshot{};
+                            Shader::Backend::Bindings end_binding{};
                             const bool succeeded = process_stage_offset(
                                 base, stage_offset,
                                 previous_stage_snapshot ? &*previous_stage_snapshot : nullptr,
-                                &this_stage_snapshot);
+                                &this_stage_snapshot, binding, &end_binding);
                             if (succeeded) {
                                 previous_stage_snapshot = this_stage_snapshot;
+                                binding = end_binding;
                             }
                             // An absent stage (stage_offset==0, already skipped by the
                             // `continue` above) or one that failed to translate leaves
@@ -1364,7 +1436,8 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                         u64 compute_offset{};
                         if (read_u64(prog_hdr + 0x30, compute_offset) && compute_offset != 0) {
                             process_stage_offset(base, compute_offset, /*previous_stage=*/nullptr,
-                                                 /*out_stage_snapshot=*/nullptr);
+                                                 /*out_stage_snapshot=*/nullptr,
+                                                 Shader::Backend::Bindings{}, nullptr);
                         }
                     }
                 };
@@ -1425,7 +1498,8 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                             // both new params.
                             process_blob(std::vector<u8>(data + sph_off, data + sz),
                                          /*is_bnsh_derived=*/false,
-                                         /*previous_stage=*/nullptr, /*out_stage_snapshot=*/nullptr);
+                                         /*previous_stage=*/nullptr, /*out_stage_snapshot=*/nullptr,
+                                         Shader::Backend::Bindings{}, nullptr);
                         }
                     }
                 }
@@ -1458,7 +1532,8 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                             // sibling-stage data for a pairtable-derived scan unit.
                             process_blob(std::vector<u8>(data + off, data + sz),
                                          /*is_bnsh_derived=*/false,
-                                         /*previous_stage=*/nullptr, /*out_stage_snapshot=*/nullptr);
+                                         /*previous_stage=*/nullptr, /*out_stage_snapshot=*/nullptr,
+                                         Shader::Backend::Bindings{}, nullptr);
                         }
                     }
                     if (any_raw_matched) {
@@ -1476,7 +1551,8 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                         // both falls back to exactly the previous (pre-Phase-3) sentinel
                         // behavior for this path, unchanged.
                         process_blob(std::vector<u8>(data, data+sz), /*is_bnsh_derived=*/false,
-                                     /*previous_stage=*/nullptr, /*out_stage_snapshot=*/nullptr);
+                                     /*previous_stage=*/nullptr, /*out_stage_snapshot=*/nullptr,
+                                     Shader::Backend::Bindings{}, nullptr);
                     } else {
                         ++state->unrecognized;
                         log_unrecognized_sample();

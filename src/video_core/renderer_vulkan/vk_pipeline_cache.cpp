@@ -1244,22 +1244,6 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             layer_source_program = &programs[index];
         }
 
-        // Phase 3 guess refinement, GPL live-speculative path: record this stage's
-        // REAL translated data (same four fields MakeRuntimeInfo() below reads from a
-        // real previous_program) keyed by its own unique_hash, so a LATER draw's
-        // speculative guess for whichever stage follows this one (see
-        // OnNewShaderSeen()/ResolveRealStageStoresSnapshot()) can use real data
-        // instead of an invented sentinel. Overwrites any prior entry for this hash
-        // with the most recent real observation — per Phase 3's own cardinality data
-        // most shaders only ever show one real state anyway, so this is usually also
-        // the only one, and even when it isn't, "most recent real state" is a better
-        // starting guess than a sentinel that was never observed at all.
-        {
-            std::unique_lock real_stage_stores_lock{real_stage_stores_mutex};
-            real_stage_stores_by_hash[key.unique_hashes[index]] = RealStageStoresSnapshot{
-                programs[index].info.stores, programs[index].info.legacy_stores_mapping,
-                programs[index].info.passthrough, programs[index].is_geometry_passthrough};
-        }
     }
     std::array<const Shader::Info*, Tegra::Engines::Maxwell3D::Regs::MaxShaderStage> infos{};
     std::array<vk::ShaderModule, Tegra::Engines::Maxwell3D::Regs::MaxShaderStage> modules;
@@ -1409,6 +1393,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         // Fragment codegen, over-invalidating cache entries for reasons that could
         // never have produced different SPIR-V bytes in the first place.
         const Shader::Stage current_stage = stage_envs[index]->ShaderStage();
+        const auto diag_runtime_fields = runtime_info.SpirvRelevantFieldHashes(current_stage);
         u64 runtime_key = runtime_info.SpirvRelevantHash(current_stage);
         if (current_stage == Shader::Stage::VertexB) {
             // env.ReadViewportTransformState() is not stored in RuntimeInfo, but
@@ -1445,7 +1430,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         if (!is_merged_vertex) {
             if (auto cached = spirv_cache.Lookup(spirv_key, has_real_specialization_context,
                                                  diag_base_runtime_hash, binding_key,
-                                                 diag_cbuf_key_excl_texture_handles)) {
+                                                 diag_cbuf_key_excl_texture_handles,
+                                                 diag_runtime_fields)) {
                 code = *cached->spirv;
                 if (cached->is_speculative) {
                     // Capped like the field-mismatch diagnostic in spirv_cache.cpp — this
@@ -1456,8 +1442,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                     static std::atomic<size_t> speculative_hit_logs{0};
                     if (size_t expected = speculative_hit_logs.load(); expected < 50 &&
                         speculative_hit_logs.compare_exchange_strong(expected, expected + 1)) {
-                        LOG_INFO(Render_Vulkan, "0x{:016x} stage[{}] served from SPECULATIVE entry (unique_hash=0x{:016x})",
-                                 hash, index, key.unique_hashes[index]);
+                        const char* source = cached->source == VideoCommon::SpirvCacheEntrySource::PrecacheScanner
+                                                 ? "scanner"
+                                                 : "live";
+                        LOG_INFO(Render_Vulkan,
+                                 "0x{:016x} stage[{}] served from {} SPECULATIVE entry "
+                                 "(unique_hash=0x{:016x})",
+                                 hash, index, source, key.unique_hashes[index]);
                     }
                 }
                 // Restore the binding counter to where EmitSPIRV left it when this
@@ -1478,7 +1469,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             if (!is_merged_vertex && has_real_specialization_context) {
                 spirv_cache.Insert(spirv_key, code, binding, /*is_speculative=*/false,
                                   diag_base_runtime_hash, binding_key,
-                                  diag_cbuf_key_excl_texture_handles);
+                                  diag_cbuf_key_excl_texture_handles, diag_runtime_fields);
                 // Phase 3 groundwork — see RecordPhase3RuntimeVariantDiagnostic's doc
                 // comment (vk_pipeline_cache.h) for what this measures. Gated on cbuf_key
                 // == 0 specifically (not just has_real_specialization_context, which the
@@ -1512,6 +1503,15 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 VideoCommon::GenericEnvironment::LogTextureSlotVarianceReportThrottled();
             }
             code.reserve(std::max<size_t>(code.size(), 16 * 1024 / sizeof(u32)));
+        }
+        // Keep the state after this stage, not merely its IR output layout. A
+        // later speculative translation begins after this stage in the real
+        // pipeline and therefore must allocate descriptors from this exact state.
+        {
+            std::unique_lock real_stage_stores_lock{real_stage_stores_mutex};
+            real_stage_stores_by_hash[key.unique_hashes[index]] = RealStageStoresSnapshot{
+                program.info.stores, program.info.legacy_stores_mapping,
+                program.info.passthrough, program.is_geometry_passthrough, binding};
         }
         device.SaveShader(code);
         modules[stage_index] = BuildShader(device, code);
@@ -1677,8 +1677,12 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
             static std::atomic<size_t> speculative_hit_logs_compute{0};
             if (size_t expected = speculative_hit_logs_compute.load(); expected < 50 &&
                 speculative_hit_logs_compute.compare_exchange_strong(expected, expected + 1)) {
-                LOG_INFO(Render_Vulkan, "0x{:016x} served from SPECULATIVE entry (unique_hash=0x{:016x})",
-                         hash, compute_unique_hash);
+                const char* source = cached->source == VideoCommon::SpirvCacheEntrySource::PrecacheScanner
+                                         ? "scanner"
+                                         : "live";
+                LOG_INFO(Render_Vulkan,
+                         "0x{:016x} served from {} SPECULATIVE entry (unique_hash=0x{:016x})",
+                         hash, source, compute_unique_hash);
             }
         }
         // Compute pipelines are self-contained (no preceding stage to misalign),
@@ -1836,8 +1840,6 @@ void PipelineCache::SubmitSpeculativeShader(
         u32 start_address, u32 texture_bound,
         Shader::ProgramHeader sph,
         std::optional<RealStageStoresSnapshot> previous_stage_snapshot) {
-    if (spirv_cache.ContainsByUniqueHash(unique_hash)) return;
-
     speculative_worker.QueueWork(
         [this, unique_hash, code = std::move(maxwell_code),
          stage, local_memory_size, shared_memory_size,
@@ -1873,7 +1875,9 @@ void PipelineCache::SubmitSpeculativeShader(
             auto program = Shader::Maxwell::TranslateProgram(
                 spec_pools.inst, spec_pools.block, env, cfg, host_info);
 
-            Shader::Backend::Bindings binding{};
+            const Shader::Backend::Bindings starting_binding = previous_stage_snapshot
+                ? previous_stage_snapshot->end_binding : Shader::Backend::Bindings{};
+            Shader::Backend::Bindings binding = starting_binding;
             Shader::RuntimeInfo rt{};
             // Phase 3 guess refinement, GPL live-speculative path. Real previous-stage
             // data when we have it (previous_stage_snapshot — resolved in
@@ -1909,7 +1913,6 @@ void PipelineCache::SubmitSpeculativeShader(
             if (stage != Shader::Stage::Compute) {
                 Shader::Maxwell::ConvertLegacyToGeneric(program, rt);
             }
-            auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, rt, program, binding);
             const u64 texture_key = ComputeTextureKey(env.CapturedTextureTypes(),
                                                        env.CapturedTexturePixelFormats());
             // Phase 4 narrow prototype's texture_key fix is NOT applied here -- confirmed by
@@ -1925,7 +1928,9 @@ void PipelineCache::SubmitSpeculativeShader(
             // (rt is used for both), so restricting to stage-relevant fields also
             // means a wider set of real pipeline states can validly reuse this exact
             // guess, not just a wider match against the folded key.
-            u64 runtime_key = rt.SpirvRelevantHash(stage);
+            u64 runtime_key = stage == Shader::Stage::Compute
+                                  ? ComputeWorkgroupKey(shared_memory_size, workgroup_size)
+                                  : rt.SpirvRelevantHash(stage);
             if (stage == Shader::Stage::VertexB) {
                 // Must match the fold CreateGraphicsPipeline() applies on the real
                 // path — otherwise this entry's runtime_key is in a different
@@ -1939,17 +1944,26 @@ void PipelineCache::SubmitSpeculativeShader(
             // below, purely so a later stale miss against this entry can be attributed to
             // "core RuntimeInfo state never matched" vs "binding offset never matched".
             const u64 diag_base_runtime_hash = runtime_key;
-            // Must match the fold applied on the live path in CreateGraphicsPipeline().
-            // Speculative compiles always start from an all-zero Bindings
-            // accumulator (see `binding{}` above) — NOT the post-EmitSPIRV
-            // `binding`, which has since been advanced past this stage's slots.
-            // Using a fresh zero value here is what actually matches what was
-            // baked into `spirv`, and what lets a genuinely-leading-stage real
-            // draw hit this entry.
-            const u64 binding_key = ComputeBindingKey(Shader::Backend::Bindings{});
-            runtime_key = FoldBindingKey(runtime_key, binding_key);
+            const auto diag_runtime_fields = rt.SpirvRelevantFieldHashes(stage);
+            // `binding` is now the post-emit state; the cache key needs the
+            // starting state that was baked into this module's descriptor numbers.
+            const u64 binding_key = stage == Shader::Stage::Compute
+                                        ? 0
+                                        : ComputeBindingKey(starting_binding);
+            if (stage != Shader::Stage::Compute) {
+                runtime_key = FoldBindingKey(runtime_key, binding_key);
+            }
+            // A cache entry is only interchangeable when every component of
+            // SpirvKey matches. Do not suppress this translation merely because
+            // another context for the same raw shader was seen first.
+            const SpirvKey speculative_key{unique_hash, 0, runtime_key, texture_key};
+            if (spirv_cache.Contains(speculative_key)) {
+                return;
+            }
+            auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, rt, program, binding);
             spirv_cache.InsertSpeculative(unique_hash, runtime_key, texture_key, std::move(spirv),
-                                          diag_base_runtime_hash, binding_key);
+                                          binding, diag_base_runtime_hash, binding_key,
+                                          diag_runtime_fields);
             if (!spirv_cache_filename.empty()) {
                 serialization_thread.QueueWork([this] {
                     spirv_cache.SaveThrottled(spirv_cache_filename);
@@ -1979,8 +1993,6 @@ void PipelineCache::OnNewShaderSeen(VideoCommon::GenericEnvironment& env,
                                     u64 unique_hash, u64 previous_stage_unique_hash) {
     if (!Settings::values.use_gpl_speculative_shaders.GetValue()) return;
     if (env.ShaderStage() == Shader::Stage::VertexA) return;
-    if (spirv_cache.ContainsByUniqueHash(unique_hash)) return;
-
     // Use CopyCode() rather than CachedSizeBytes() to obtain the shader binary.
     // When GenericEnvironment::Analyze() fails (TryFindSize returns nullopt), the
     // slow CFG path is taken and cached_lowest/cached_highest are left at their

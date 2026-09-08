@@ -141,6 +141,7 @@ private:
         std::map<Shader::IR::Attribute, Shader::IR::Attribute> legacy_stores_mapping{};
         Shader::VaryingState passthrough{};
         bool is_geometry_passthrough{};
+        Shader::Backend::Bindings end_binding{};
     };
     mutable std::shared_mutex real_stage_stores_mutex;
     mutable ankerl::unordered_dense::map<u64, RealStageStoresSnapshot> real_stage_stores_by_hash;

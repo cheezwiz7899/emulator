@@ -22,6 +22,12 @@
 
 namespace VideoCommon {
 
+enum class SpirvCacheEntrySource : u8 {
+    Real,
+    LiveSpeculative,
+    PrecacheScanner,
+};
+
 // ---------------------------------------------------------------------------
 // SpirvKey — identifies a pre-translated SPIR-V program.
 //   unique_hash : CityHash64 of the raw Maxwell bytecode (matches GenericEnvironment::Analyze).
@@ -193,6 +199,7 @@ public:
         Shader::Backend::Bindings end_binding;
         // See Entry::is_speculative — carried through so the caller can log/act on it.
         bool is_speculative = false;
+        SpirvCacheEntrySource source = SpirvCacheEntrySource::Real;
     };
 
     // Look up a pre-translated SPIR-V program.
@@ -224,7 +231,8 @@ public:
                                                        bool has_real_specialization_context,
                                                        u64 diag_base_runtime_hash = 0,
                                                        u64 diag_binding_key = 0,
-                                                       u64 diag_cbuf_key_excl_texture_handles = 0) const;
+                                                       u64 diag_cbuf_key_excl_texture_handles = 0,
+                                                       std::array<u64, 8> diag_runtime_fields = {}) const;
 
     // Returns true if the cache already contains an entry for @p key.
     // Faster than Lookup() when the SPIR-V itself is not needed — avoids the vector copy.
@@ -333,7 +341,8 @@ public:
     void Insert(const SpirvKey& key, std::vector<u32> spirv,
                 const Shader::Backend::Bindings& end_binding, bool is_speculative = false,
                 u64 diag_base_runtime_hash = 0, u64 diag_binding_key = 0,
-                u64 diag_cbuf_key_excl_texture_handles = 0);
+                u64 diag_cbuf_key_excl_texture_handles = 0,
+                std::array<u64, 8> diag_runtime_fields = {});
     void Insert(u64 unique_hash, const std::unordered_map<u64, u32>& cbuf_values,
                 u64 runtime_key, u64 texture_key, std::vector<u32> spirv,
                 const Shader::Backend::Bindings& end_binding,
@@ -341,20 +350,22 @@ public:
                 u64 diag_cbuf_key_excl_texture_handles = 0);
 
     // Insert a speculative/AOT entry (cbuf_key = 0).
-    // Speculative entries store a zero end_binding — they are only valid for the prewarmer
-    // path which accumulates bindings correctly across all stages itself.
+    // Speculative hits use the normal graphics-pipeline path, so they need the
+    // post-EmitSPIRV binding state just like real cache entries do.
     // diag_base_runtime_hash / diag_binding_key: see the matching Insert() doc comment
     // above — the same pre-fold components, but for the GUESSED values a speculative
-    // translation used (diag_binding_key is always ComputeBindingKey(Bindings{}) — a
-    // fresh, all-zero starting state — since speculative translation has no real
-    // pipeline context to know a non-zero starting offset; see FoldBindingKey's doc
-    // comment in this file for why that's only ever correct for a leading stage).
+    // translation used. When the immediately preceding real stage is known, the
+    // speculative path uses its post-emit Bindings state; otherwise it starts at zero.
     // diag_cbuf_key_excl_texture_handles is not threaded through here: speculative
     // entries already use cbuf_key=0 (empty cbuf_values) unconditionally, so the
     // counterfactual is always 0 too — nothing to narrow on the guessed side.
     void InsertSpeculative(u64 unique_hash, u64 runtime_key, u64 texture_key,
-                           std::vector<u32> spirv, u64 diag_base_runtime_hash = 0,
-                           u64 diag_binding_key = 0);
+                           std::vector<u32> spirv,
+                           const Shader::Backend::Bindings& end_binding,
+                           u64 diag_base_runtime_hash = 0,
+                           u64 diag_binding_key = 0,
+                           std::array<u64, 8> diag_runtime_fields = {},
+                           SpirvCacheEntrySource source = SpirvCacheEntrySource::LiveSpeculative);
 
 private:
     mutable std::shared_mutex mutex_;
@@ -374,6 +385,7 @@ private:
         // point a hit is about to be used, whether it's serving a real capture or a guess —
         // load-bearing for diagnosing whether a specific bad hit came from the scanner.
         bool is_speculative = false;
+        SpirvCacheEntrySource source = SpirvCacheEntrySource::Real;
         // The two pre-fold components that were combined (via FoldViewportTransformState /
         // FoldBindingKey) to produce this entry's key.runtime_key — see the Insert() doc
         // comments in this header for the full rationale. Diagnostic-only: not part of
@@ -405,6 +417,7 @@ private:
         // risking a spurious match against an arbitrary 0 default. See
         // ComputeCbufKeyExcludingTextureHandles's doc comment in spirv_cache.cpp.
         u64 diag_cbuf_key_excl_texture_handles = 0;
+        std::array<u64, 8> diag_runtime_fields{};
     };
     ankerl::unordered_dense::map<SpirvKey, Entry, SpirvKeyHash> entries_;
     // Secondary index: which unique_hashes have at least one entry in entries_.
@@ -427,6 +440,9 @@ private:
     ankerl::unordered_dense::map<u64, std::vector<SpirvKey>> keys_by_hash_;
     mutable bool dirty_{false};
     mutable std::atomic<size_t> hit_count_{0};
+    mutable std::atomic<size_t> real_hit_count_{0};
+    mutable std::atomic<size_t> live_speculative_hit_count_{0};
+    mutable std::atomic<size_t> scanner_speculative_hit_count_{0};
     mutable std::atomic<size_t> lookup_count_{0};
     // Incremented when a Lookup() misses on the full SpirvKey (unique_hash +
     // cbuf_key + runtime_key + texture_key) but unique_hashes_ shows this
