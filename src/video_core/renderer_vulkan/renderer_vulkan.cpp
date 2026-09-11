@@ -138,6 +138,10 @@ RendererVulkan::~RendererVulkan() {
     void(device.GetLogical().WaitIdle());
 }
 
+void RendererVulkan::FlushShaderCaches() {
+    rasterizer.FlushShaderCaches();
+}
+
 void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebuffers) {
     if (framebuffers.empty()) {
         return;

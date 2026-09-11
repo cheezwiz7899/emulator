@@ -11,8 +11,10 @@
 #include <mutex>
 #include <optional>
 #include <ranges>
+#include <sstream>
 #include <span>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -31,6 +33,7 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/memory_manager.h"
 #include "video_core/shader_environment.h"
+#include "video_core/shader_program_identity.h"
 #include "video_core/texture_cache/format_lookup_table.h"
 #include "video_core/textures/texture.h"
 
@@ -59,6 +62,24 @@ bool IsValidShaderEntryInstruction(u32 initial_offset, u32 start_address, u32 co
 constexpr std::array<char, 8> MAGIC_NUMBER{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
 
 constexpr size_t INST_SIZE = sizeof(u64);
+// Per-environment limits for transferable-cache input. These are intentionally
+// much larger than real shader captures, but prevent a corrupt count from
+// turning a cache miss into an unbounded allocation or loop during startup.
+constexpr u64 MAX_SERIALIZED_SHADER_BYTES = 64ULL * 1024 * 1024;
+constexpr u64 MAX_SERIALIZED_ENV_ENTRIES = 1ULL * 1024 * 1024;
+constexpr u64 MAX_SERIALIZED_PIPELINE_RECORD_BYTES = 512ULL * 1024 * 1024;
+
+bool IsValidTextureType(Shader::TextureType type) noexcept {
+    return static_cast<u32>(type) < Shader::NUM_TEXTURE_TYPES;
+}
+
+bool IsValidTexturePixelFormat(Shader::TexturePixelFormat format) noexcept {
+    return static_cast<u32>(format) <= static_cast<u32>(Shader::TexturePixelFormat::D32_FLOAT_S8_UINT);
+}
+
+bool IsValidReplaceConstant(Shader::ReplaceConstant value) noexcept {
+    return static_cast<u32>(value) <= static_cast<u32>(Shader::ReplaceConstant::DrawID);
+}
 
 static Shader::TextureType ConvertTextureType(const Tegra::Texture::TICEntry& entry) {
     switch (entry.texture_type) {
@@ -181,7 +202,7 @@ std::optional<u64> GenericEnvironment::Analyze() {
     }
     cached_lowest = start_address;
     cached_highest = start_address + static_cast<u32>(*size);
-    return Common::CityHash64(reinterpret_cast<const char*>(code.data()), *size);
+    return ComputeMaxwellProgramIdentity(code, static_cast<size_t>(*size));
 }
 
 void GenericEnvironment::SetCachedSize(size_t size_bytes) {
@@ -217,7 +238,7 @@ u64 GenericEnvironment::CalculateHash() const {
 }
 
 namespace {
-// Phase 4 (specialization-constant texture-type resolution) feasibility instrumentation —
+// Texture-type specialization feasibility instrumentation.
 // see handoff_04_specialization_constants_investigation.md item 2 and the doc comments on
 // RecordResolvedTextureType()/RecordResolvedTexturePixelFormat() in environment.h.
 //
@@ -253,7 +274,7 @@ std::unordered_map<u64, std::unordered_map<u64, std::unordered_set<Shader::Textu
     g_pixel_formats_seen;
 std::unordered_map<u64, std::unordered_map<u64, std::unordered_set<bool>>> g_is_integer_seen;
 
-// Phase 4 adaptive slot learning (handoff_09) -- coordinates recorded as candidates THIS
+// Adaptive slot learning: coordinates recorded as candidates this
 // session, guarded by g_texture_slot_variance_mutex above since they're only ever touched
 // from inside RecordResolvedTextureType (write) and TakePhase4PrototypeCandidates (read),
 // both already under that lock or taking it themselves. A std::vector, not a set: real counts
@@ -276,8 +297,12 @@ std::vector<Shader::Phase4PrototypeSlot> TakePhase4PrototypeCandidates() {
     return g_phase4_prototype_candidates;
 }
 
-void GenericEnvironment::RecordResolvedTextureType(u32 cbuf_index, u32 cbuf_offset, u32 handle,
+void GenericEnvironment::RecordResolvedTextureType(const Shader::TextureSlot& slot, u32 handle,
                                                     Shader::TextureType type) {
+    logical_texture_slots[slot].type = type;
+    logical_texture_handles.insert(handle);
+    const u32 cbuf_index{slot.cbuf_index};
+    const u32 cbuf_offset{slot.cbuf_offset};
     if (!texture_slot_diag_hash_cache) {
         texture_slot_diag_hash_cache = CalculateHash();
     }
@@ -286,7 +311,7 @@ void GenericEnvironment::RecordResolvedTextureType(u32 cbuf_index, u32 cbuf_offs
                                           [MakeCbufKey(cbuf_index, cbuf_offset)];
     const bool newly_distinct = slot_set.insert(type).second;
 
-    // Phase 4 narrow prototype's texture_key fix — see CapturedPhase4PrototypeHandles's doc
+    // Handle-specialized texture-key path; see CapturedPhase4PrototypeHandles.
     // comment in shader_environment.h. Independent of the newly_distinct/diagnostic logging
     // below: needs every resolved handle for this slot recorded, not just the ones that
     // introduce a new distinct value.
@@ -318,7 +343,7 @@ void GenericEnvironment::RecordResolvedTextureType(u32 cbuf_index, u32 cbuf_offs
                  *texture_slot_diag_hash_cache, cbuf_index, cbuf_offset,
                  static_cast<u32>(type), values);
 
-        // Phase 4 adaptive slot learning (handoff_09, revised — see the chat reply for the
+        // Adaptive slot learning (revised):
         // real-world reasoning this responds to). This IS the trigger — a coordinate that
         // just proved it has real variance, and isn't already active (an already-active
         // slot's own translation-time canonicalization means its variance never reaches this
@@ -328,7 +353,7 @@ void GenericEnvironment::RecordResolvedTextureType(u32 cbuf_index, u32 cbuf_offs
         //
         // 1. Grows THIS session's active table immediately — not deferred to next session.
         // Once a shader's variants are BOTH in the driver's persisted VkPipelineCache blob
-        // (vulkan.bin), Phase 4 in any form does nothing further for THAT shader; the
+        // (vulkan.bin), this does nothing further for that shader; the
         // driver-level cache already skips recompiling it regardless. What immediate growth
         // actually buys is every OTHER shader referencing the same coordinate that hasn't
         // been translated yet THIS session (real for TotK: ~15 shaders share the
@@ -373,8 +398,13 @@ void GenericEnvironment::RecordResolvedTextureType(u32 cbuf_index, u32 cbuf_offs
 }
 
 
-void GenericEnvironment::RecordResolvedTexturePixelFormat(u32 cbuf_index, u32 cbuf_offset,
+void GenericEnvironment::RecordResolvedTexturePixelFormat(const Shader::TextureSlot& slot,
+                                                           u32 handle,
                                                            Shader::TexturePixelFormat format) {
+    logical_texture_slots[slot].pixel_format = format;
+    logical_texture_handles.insert(handle);
+    const u32 cbuf_index{slot.cbuf_index};
+    const u32 cbuf_offset{slot.cbuf_offset};
     if (!texture_slot_diag_hash_cache) {
         texture_slot_diag_hash_cache = CalculateHash();
     }
@@ -383,9 +413,11 @@ void GenericEnvironment::RecordResolvedTexturePixelFormat(u32 cbuf_index, u32 cb
         .insert(format);
 }
 
-void GenericEnvironment::RecordResolvedIsTexturePixelFormatInteger(u32 cbuf_index,
-                                                                    u32 cbuf_offset,
+void GenericEnvironment::RecordResolvedIsTexturePixelFormatInteger(const Shader::TextureSlot& slot,
                                                                     bool is_integer) {
+    logical_texture_slots[slot].is_integer = is_integer;
+    const u32 cbuf_index{slot.cbuf_index};
+    const u32 cbuf_offset{slot.cbuf_offset};
     if (!texture_slot_diag_hash_cache) {
         texture_slot_diag_hash_cache = CalculateHash();
     }
@@ -454,19 +486,55 @@ void GenericEnvironment::Dump(u64 pipeline_hash, u64 shader_hash) {
     DumpImpl(pipeline_hash, shader_hash, code, read_highest, read_lowest, initial_offset, stage);
 }
 
-void GenericEnvironment::Serialize(std::ofstream& file) const {
+void GenericEnvironment::Serialize(std::ostream& file) const {
     const u64 code_size{static_cast<u64>(CachedSizeBytes())};
     const u64 num_texture_types{static_cast<u64>(texture_types.size())};
     const u64 num_texture_pixel_formats{static_cast<u64>(texture_pixel_formats.size())};
+    const u64 num_logical_texture_slots{static_cast<u64>(logical_texture_slots.size())};
+    const u64 num_logical_texture_handles{static_cast<u64>(logical_texture_handles.size())};
     const u64 num_cbuf_values{static_cast<u64>(cbuf_values.size())};
     const u64 num_texture_handle_cbuf_keys{static_cast<u64>(texture_handle_cbuf_keys.size())};
     const u64 num_cbuf_replacement_values{static_cast<u64>(cbuf_replacements.size())};
     const u64 num_cbuf_sizes{static_cast<u64>(cbuf_sizes.size())};
+    // Replay corpus must be byte-stable. Unordered-map iteration otherwise makes
+    // two equivalent captured environments produce different files, defeating
+    // reproducibility and corrupt-file/shuffle tests.
+    const auto sorted_entries = [](const auto& entries) {
+        using Entry = typename std::decay_t<decltype(entries)>::value_type;
+        std::vector<const Entry*> sorted;
+        sorted.reserve(entries.size());
+        for (const Entry& entry : entries) {
+            sorted.push_back(&entry);
+        }
+        std::ranges::sort(sorted, {}, [](const Entry* entry) -> const auto& {
+            return entry->first;
+        });
+        return sorted;
+    };
+    const auto sorted_texture_types{sorted_entries(texture_types)};
+    const auto sorted_texture_pixel_formats{sorted_entries(texture_pixel_formats)};
+    const auto sorted_cbuf_values{sorted_entries(cbuf_values)};
+    const auto sorted_cbuf_replacements{sorted_entries(cbuf_replacements)};
+    const auto sorted_cbuf_sizes{sorted_entries(cbuf_sizes)};
+    std::vector<std::pair<Shader::TextureSlot, Shader::TextureSlotShape>> sorted_logical_slots{
+        logical_texture_slots.begin(), logical_texture_slots.end()};
+    std::ranges::sort(sorted_logical_slots, {},
+                      &std::pair<Shader::TextureSlot, Shader::TextureSlotShape>::first);
+    std::vector<u32> sorted_logical_handles{logical_texture_handles.begin(),
+                                            logical_texture_handles.end()};
+    std::ranges::sort(sorted_logical_handles);
+    std::vector<u64> sorted_texture_handle_cbuf_keys{texture_handle_cbuf_keys.begin(),
+                                                      texture_handle_cbuf_keys.end()};
+    std::ranges::sort(sorted_texture_handle_cbuf_keys);
 
     file.write(reinterpret_cast<const char*>(&code_size), sizeof(code_size))
         .write(reinterpret_cast<const char*>(&num_texture_types), sizeof(num_texture_types))
         .write(reinterpret_cast<const char*>(&num_texture_pixel_formats),
                sizeof(num_texture_pixel_formats))
+        .write(reinterpret_cast<const char*>(&num_logical_texture_slots),
+               sizeof(num_logical_texture_slots))
+        .write(reinterpret_cast<const char*>(&num_logical_texture_handles),
+               sizeof(num_logical_texture_handles))
         .write(reinterpret_cast<const char*>(&num_cbuf_values), sizeof(num_cbuf_values))
         .write(reinterpret_cast<const char*>(&num_texture_handle_cbuf_keys),
                sizeof(num_texture_handle_cbuf_keys))
@@ -482,15 +550,49 @@ void GenericEnvironment::Serialize(std::ofstream& file) const {
                sizeof(viewport_transform_state))
         .write(reinterpret_cast<const char*>(&stage), sizeof(stage))
         .write(reinterpret_cast<const char*>(code.data()), code_size);
-    for (const auto& [key, type] : texture_types) {
+    for (const auto* entry : sorted_texture_types) {
+        const auto& [key, type] = *entry;
         file.write(reinterpret_cast<const char*>(&key), sizeof(key))
             .write(reinterpret_cast<const char*>(&type), sizeof(type));
     }
-    for (const auto& [key, format] : texture_pixel_formats) {
+    for (const auto* entry : sorted_texture_pixel_formats) {
+        const auto& [key, format] = *entry;
         file.write(reinterpret_cast<const char*>(&key), sizeof(key))
             .write(reinterpret_cast<const char*>(&format), sizeof(format));
     }
-    for (const auto& [key, type] : cbuf_values) {
+    for (const auto& [slot, shape] : sorted_logical_slots) {
+        const u8 has_type{shape.type.has_value()};
+        const u8 has_format{shape.pixel_format.has_value()};
+        const u8 has_integer{shape.is_integer.has_value()};
+        const u8 integer_value{shape.is_integer.value_or(false)};
+        const u8 has_secondary{slot.has_secondary};
+        file.write(reinterpret_cast<const char*>(&slot.cbuf_index), sizeof(slot.cbuf_index))
+            .write(reinterpret_cast<const char*>(&slot.cbuf_offset), sizeof(slot.cbuf_offset))
+            .write(reinterpret_cast<const char*>(&slot.shift_left), sizeof(slot.shift_left))
+            .write(reinterpret_cast<const char*>(&slot.secondary_cbuf_index),
+                   sizeof(slot.secondary_cbuf_index))
+            .write(reinterpret_cast<const char*>(&slot.secondary_cbuf_offset),
+                   sizeof(slot.secondary_cbuf_offset))
+            .write(reinterpret_cast<const char*>(&slot.secondary_shift_left),
+                   sizeof(slot.secondary_shift_left))
+            .write(reinterpret_cast<const char*>(&slot.count), sizeof(slot.count))
+            .write(reinterpret_cast<const char*>(&has_secondary), sizeof(has_secondary))
+            .write(reinterpret_cast<const char*>(&has_type), sizeof(has_type))
+            .write(reinterpret_cast<const char*>(&has_format), sizeof(has_format))
+            .write(reinterpret_cast<const char*>(&has_integer), sizeof(has_integer))
+            .write(reinterpret_cast<const char*>(&integer_value), sizeof(integer_value));
+        if (shape.type) {
+            file.write(reinterpret_cast<const char*>(&*shape.type), sizeof(*shape.type));
+        }
+        if (shape.pixel_format) {
+            file.write(reinterpret_cast<const char*>(&*shape.pixel_format), sizeof(*shape.pixel_format));
+        }
+    }
+    for (const u32 handle : sorted_logical_handles) {
+        file.write(reinterpret_cast<const char*>(&handle), sizeof(handle));
+    }
+    for (const auto* entry : sorted_cbuf_values) {
+        const auto& [key, type] = *entry;
         file.write(reinterpret_cast<const char*>(&key), sizeof(key))
             .write(reinterpret_cast<const char*>(&type), sizeof(type));
     }
@@ -499,14 +601,16 @@ void GenericEnvironment::Serialize(std::ofstream& file) const {
     // own count + loop rather than piggybacking on cbuf_values above so a reader can
     // tell which of cbuf_values' entries are texture-handle reads without needing to
     // cross-reference anything beyond this one extra list.
-    for (const u64 key : texture_handle_cbuf_keys) {
+    for (const u64 key : sorted_texture_handle_cbuf_keys) {
         file.write(reinterpret_cast<const char*>(&key), sizeof(key));
     }
-    for (const auto& [key, type] : cbuf_replacements) {
+    for (const auto* entry : sorted_cbuf_replacements) {
+        const auto& [key, type] = *entry;
         file.write(reinterpret_cast<const char*>(&key), sizeof(key))
             .write(reinterpret_cast<const char*>(&type), sizeof(type));
     }
-    for (const auto& [key, size] : cbuf_sizes) {
+    for (const auto* entry : sorted_cbuf_sizes) {
+        const auto& [key, size] = *entry;
         file.write(reinterpret_cast<const char*>(&key), sizeof(key))
             .write(reinterpret_cast<const char*>(&size), sizeof(size));
     }
@@ -526,9 +630,6 @@ std::optional<u64> GenericEnvironment::TryFindSize() {
     static constexpr size_t BLOCK_SIZE = 0x1000;
     static constexpr size_t MAXIMUM_SIZE = 0x100000;
 
-    static constexpr u64 SELF_BRANCH_A = 0xE2400FFFFF87000FULL;
-    static constexpr u64 SELF_BRANCH_B = 0xE2400FFFFF07000FULL;
-
     GPUVAddr guest_addr{program_base + start_address};
     size_t offset{0};
     size_t size{BLOCK_SIZE};
@@ -538,7 +639,7 @@ std::optional<u64> GenericEnvironment::TryFindSize() {
         gpu_memory->ReadBlock(guest_addr, data, BLOCK_SIZE);
         for (size_t index = 0; index < BLOCK_SIZE; index += INST_SIZE) {
             const u64 inst = data[index / INST_SIZE];
-            if (inst == SELF_BRANCH_A || inst == SELF_BRANCH_B) {
+            if (inst == MAXWELL_SELF_BRANCH_A || inst == MAXWELL_SELF_BRANCH_B) {
                 return offset + index;
             }
         }
@@ -598,36 +699,14 @@ Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, 
     return entry;
 }
 
-// Phase 4 narrow prototype's graphics_cache lookup-timing fix (see
-// PipelineCache::ResolvePhase4PrototypeSpecValue, vk_pipeline_cache.cpp, for why this is
-// needed: that function runs BEFORE any Environment exists, so it can't call
-// GenericEnvironment::ReadTextureInfo/GraphicsEnvironment::ReadTextureType directly -- both
-// need a live instance). Duplicates GenericEnvironment::ReadTextureInfo's body exactly, just
-// taking gpu_memory as an explicit parameter instead of implicit instance state (its only
-// dependency on `this` in the original) -- copied character for character from the function
-// immediately above, not reimplemented from scratch, specifically to avoid the two silently
-// drifting apart. Calls ConvertTextureType (this file's anonymous namespace, line ~61)
-// directly by unqualified lookup -- legal and safe: anonymous-namespace members are visible to
-// the rest of this translation unit's enclosing namespace from their point of declaration
-// onward, and this function is defined later in the same file, same as every other place in
-// this file that already calls ConvertTextureType unqualified.
-//
-// UNVERIFIED, same standing as everything else in this session's citron-side work: reasoned
-// through and copied from real existing code, not guessed, but not compiled (no toolchain
-// available here).
+// Resolve a texture type before an Environment exists, using ReadTextureInfo's fallback.
 Shader::TextureType ResolveTextureTypeFromRawHandle(Tegra::MemoryManager& gpu_memory,
                                                      GPUVAddr tic_addr, u32 tic_limit,
                                                      bool via_header_index, u32 raw) {
     const auto handle{Tegra::Texture::TexturePair(raw, via_header_index)};
     Tegra::Texture::TICEntry entry;
     if (handle.first > tic_limit) {
-        // Mirrors ReadTextureInfo's out-of-range fallback exactly -- same safe default
-        // (A8B8G8R8_UNORM, Texture2D), deliberately without the sentinel-detection logging
-        // ReadTextureInfo has: that logging exists to catch translation-time anomalies in a
-        // shader's actual handle-resolution reads, not to log every draw's speculative,
-        // possibly-irrelevant read of a hardcoded cbuf coordinate that may not even mean
-        // anything for whichever shader happens to be bound (see the caller's doc comment for
-        // why this gets called unconditionally rather than only for known-relevant shaders).
+        // Keep the normal safe fallback without per-draw sentinel logging.
         entry = Tegra::Texture::TICEntry{};
         entry.format.Assign(Tegra::Texture::TextureFormat::A8B8G8R8);
         entry.r_type.Assign(Tegra::Texture::ComponentType::UNORM);
@@ -846,6 +925,8 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
     u64 code_size{};
     u64 num_texture_types{};
     u64 num_texture_pixel_formats{};
+    u64 num_logical_texture_slots{};
+    u64 num_logical_texture_handles{};
     u64 num_cbuf_values{};
     u64 num_texture_handle_cbuf_keys{};
     u64 num_cbuf_replacement_values{};
@@ -854,6 +935,10 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
         .read(reinterpret_cast<char*>(&num_texture_types), sizeof(num_texture_types))
         .read(reinterpret_cast<char*>(&num_texture_pixel_formats),
               sizeof(num_texture_pixel_formats))
+        .read(reinterpret_cast<char*>(&num_logical_texture_slots),
+              sizeof(num_logical_texture_slots))
+        .read(reinterpret_cast<char*>(&num_logical_texture_handles),
+              sizeof(num_logical_texture_handles))
         .read(reinterpret_cast<char*>(&num_cbuf_values), sizeof(num_cbuf_values))
         .read(reinterpret_cast<char*>(&num_texture_handle_cbuf_keys),
               sizeof(num_texture_handle_cbuf_keys))
@@ -867,6 +952,23 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
         .read(reinterpret_cast<char*>(&read_highest), sizeof(read_highest))
         .read(reinterpret_cast<char*>(&viewport_transform_state), sizeof(viewport_transform_state))
         .read(reinterpret_cast<char*>(&stage), sizeof(stage));
+    const u64 read_span_size = read_highest >= read_lowest
+                                   ? static_cast<u64>(read_highest) - read_lowest + sizeof(u64)
+                                   : 0;
+    if (code_size == 0 || code_size > MAX_SERIALIZED_SHADER_BYTES ||
+        code_size % sizeof(u64) != 0 || read_span_size == 0 ||
+        read_span_size > code_size || (read_highest - read_lowest) % sizeof(u64) != 0 ||
+        num_texture_types > MAX_SERIALIZED_ENV_ENTRIES ||
+        num_texture_pixel_formats > MAX_SERIALIZED_ENV_ENTRIES ||
+        num_logical_texture_slots > MAX_SERIALIZED_ENV_ENTRIES ||
+        num_logical_texture_handles > MAX_SERIALIZED_ENV_ENTRIES ||
+        num_cbuf_values > MAX_SERIALIZED_ENV_ENTRIES ||
+        num_texture_handle_cbuf_keys > MAX_SERIALIZED_ENV_ENTRIES ||
+        num_cbuf_replacement_values > MAX_SERIALIZED_ENV_ENTRIES ||
+        num_cbuf_sizes > MAX_SERIALIZED_ENV_ENTRIES ||
+        static_cast<u32>(stage) > static_cast<u32>(Shader::Stage::VertexA)) {
+        throw std::ios_base::failure{"invalid serialized shader environment size or stage"};
+    }
     code.resize(Common::DivCeil(code_size, sizeof(u64)));
     file.read(reinterpret_cast<char*>(code.data()), code_size);
     for (size_t i = 0; i < num_texture_types; ++i) {
@@ -874,21 +976,90 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
         Shader::TextureType type;
         file.read(reinterpret_cast<char*>(&key), sizeof(key))
             .read(reinterpret_cast<char*>(&type), sizeof(type));
-        texture_types.emplace(key, type);
+        if (!IsValidTextureType(type)) {
+            throw std::ios_base::failure{"invalid serialized texture type"};
+        }
+        if (!texture_types.emplace(key, type).second) {
+            throw std::ios_base::failure{"duplicate serialized texture type"};
+        }
     }
     for (size_t i = 0; i < num_texture_pixel_formats; ++i) {
         u32 key;
         Shader::TexturePixelFormat format;
         file.read(reinterpret_cast<char*>(&key), sizeof(key))
             .read(reinterpret_cast<char*>(&format), sizeof(format));
-        texture_pixel_formats.emplace(key, format);
+        if (!IsValidTexturePixelFormat(format)) {
+            throw std::ios_base::failure{"invalid serialized texture pixel format"};
+        }
+        if (!texture_pixel_formats.emplace(key, format).second) {
+            throw std::ios_base::failure{"duplicate serialized texture pixel format"};
+        }
+    }
+    for (size_t i = 0; i < num_logical_texture_slots; ++i) {
+        Shader::TextureSlot slot{};
+        u8 has_secondary{}, has_type{}, has_format{}, has_integer{}, integer_value{};
+        file.read(reinterpret_cast<char*>(&slot.cbuf_index), sizeof(slot.cbuf_index))
+            .read(reinterpret_cast<char*>(&slot.cbuf_offset), sizeof(slot.cbuf_offset))
+            .read(reinterpret_cast<char*>(&slot.shift_left), sizeof(slot.shift_left))
+            .read(reinterpret_cast<char*>(&slot.secondary_cbuf_index),
+                  sizeof(slot.secondary_cbuf_index))
+            .read(reinterpret_cast<char*>(&slot.secondary_cbuf_offset),
+                  sizeof(slot.secondary_cbuf_offset))
+            .read(reinterpret_cast<char*>(&slot.secondary_shift_left),
+                  sizeof(slot.secondary_shift_left))
+            .read(reinterpret_cast<char*>(&slot.count), sizeof(slot.count))
+            .read(reinterpret_cast<char*>(&has_secondary), sizeof(has_secondary))
+            .read(reinterpret_cast<char*>(&has_type), sizeof(has_type))
+            .read(reinterpret_cast<char*>(&has_format), sizeof(has_format))
+            .read(reinterpret_cast<char*>(&has_integer), sizeof(has_integer))
+            .read(reinterpret_cast<char*>(&integer_value), sizeof(integer_value));
+        // Primary-only slots retain secondary fields as mirrors of the primary
+        // address. They are not required to be zero when has_secondary is false.
+        if (has_secondary > 1 || has_type > 1 || has_format > 1 || has_integer > 1 ||
+            integer_value > 1 || slot.shift_left > 31 || slot.secondary_shift_left > 31 ||
+            slot.count == 0) {
+            throw std::ios_base::failure{"invalid logical texture slot"};
+        }
+        slot.has_secondary = has_secondary != 0;
+        Shader::TextureSlotShape shape{};
+        if (has_type) {
+            Shader::TextureType type{};
+            file.read(reinterpret_cast<char*>(&type), sizeof(type));
+            if (!IsValidTextureType(type)) {
+                throw std::ios_base::failure{"invalid logical texture slot type"};
+            }
+            shape.type = type;
+        }
+        if (has_format) {
+            Shader::TexturePixelFormat format{};
+            file.read(reinterpret_cast<char*>(&format), sizeof(format));
+            if (!IsValidTexturePixelFormat(format)) {
+                throw std::ios_base::failure{"invalid logical texture slot pixel format"};
+            }
+            shape.pixel_format = format;
+        }
+        if (has_integer) {
+            shape.is_integer = integer_value != 0;
+        }
+        if (!logical_texture_slots.emplace(slot, std::move(shape)).second) {
+            throw std::ios_base::failure{"duplicate logical texture slot"};
+        }
+    }
+    for (size_t i = 0; i < num_logical_texture_handles; ++i) {
+        u32 handle{};
+        file.read(reinterpret_cast<char*>(&handle), sizeof(handle));
+        if (!logical_texture_handles.insert(handle).second) {
+            throw std::ios_base::failure{"duplicate logical texture handle"};
+        }
     }
     for (size_t i = 0; i < num_cbuf_values; ++i) {
         u64 key;
         u32 value;
         file.read(reinterpret_cast<char*>(&key), sizeof(key))
             .read(reinterpret_cast<char*>(&value), sizeof(value));
-        cbuf_values.emplace(key, value);
+        if (!cbuf_values.emplace(key, value).second) {
+            throw std::ios_base::failure{"duplicate serialized cbuf value"};
+        }
     }
     // Same set-of-keys-only format Serialize() wrote — see its doc comment. Read after
     // cbuf_values, matching write order exactly, since this format has no per-field
@@ -896,21 +1067,30 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
     for (size_t i = 0; i < num_texture_handle_cbuf_keys; ++i) {
         u64 key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
-        texture_handle_cbuf_keys.insert(key);
+        if (!texture_handle_cbuf_keys.insert(key).second) {
+            throw std::ios_base::failure{"duplicate serialized texture-handle cbuf key"};
+        }
     }
     for (size_t i = 0; i < num_cbuf_replacement_values; ++i) {
         u64 key;
         Shader::ReplaceConstant value;
         file.read(reinterpret_cast<char*>(&key), sizeof(key))
             .read(reinterpret_cast<char*>(&value), sizeof(value));
-        cbuf_replacements.emplace(key, value);
+        if (!IsValidReplaceConstant(value)) {
+            throw std::ios_base::failure{"invalid serialized cbuf replacement"};
+        }
+        if (!cbuf_replacements.emplace(key, value).second) {
+            throw std::ios_base::failure{"duplicate serialized cbuf replacement"};
+        }
     }
     for (size_t i = 0; i < num_cbuf_sizes; ++i) {
         u32 key;
         u32 size;
         file.read(reinterpret_cast<char*>(&key), sizeof(key))
             .read(reinterpret_cast<char*>(&size), sizeof(size));
-        cbuf_sizes.emplace(key, size);
+        if (!cbuf_sizes.emplace(key, size).second) {
+            throw std::ios_base::failure{"duplicate serialized cbuf size"};
+        }
     }
     if (stage == Shader::Stage::Compute) {
         file.read(reinterpret_cast<char*>(&workgroup_size), sizeof(workgroup_size))
@@ -940,6 +1120,10 @@ u64 FileEnvironment::ReadInstruction(u32 address) {
 bool FileEnvironment::HasValidEntryInstruction() const noexcept {
     return IsValidShaderEntryInstruction(initial_offset, start_address, read_lowest, read_highest,
                                          code);
+}
+
+std::optional<u64> FileEnvironment::ProgramIdentity() const noexcept {
+    return ComputeMaxwellProgramIdentity(code);
 }
 
 u32 FileEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
@@ -1008,6 +1192,37 @@ std::optional<Shader::ReplaceConstant> FileEnvironment::GetReplaceConstBuffer(u3
 
 void SerializePipeline(std::span<const char> key, std::span<const GenericEnvironment* const> envs,
                        const std::filesystem::path& filename, u32 cache_version) try {
+    if (!std::ranges::all_of(envs, &GenericEnvironment::CanBeSerialized)) {
+        return;
+    }
+
+    // A writer can outlive a failed/aborted earlier load. Never append a new
+    // schema record behind an old header: the next reader would otherwise see
+    // a valid old version and decode the new bytes with the wrong layout.
+    {
+        std::ifstream existing(filename, std::ios::binary | std::ios::ate);
+        if (existing.is_open()) {
+            existing.exceptions(std::ifstream::failbit);
+            const auto end{existing.tellg()};
+            const auto end_offset{static_cast<std::streamoff>(end)};
+            existing.seekg(0, std::ios::beg);
+            std::array<char, 8> magic{};
+            u32 existing_version{};
+            if (end_offset < static_cast<std::streamoff>(magic.size() + sizeof(existing_version))) {
+                throw std::ios_base::failure{"truncated pipeline cache header"};
+            }
+            existing.read(magic.data(), magic.size())
+                .read(reinterpret_cast<char*>(&existing_version), sizeof(existing_version));
+            if (magic != MAGIC_NUMBER || existing_version != cache_version) {
+                existing.close();
+                if (!Common::FS::RemoveFile(filename)) {
+                    throw std::ios_base::failure{"failed to replace incompatible pipeline cache"};
+                }
+                LOG_INFO(Common_Filesystem, "Replacing incompatible pipeline cache file");
+            }
+        }
+    }
+
     std::ofstream file(filename, std::ios::binary | std::ios::ate | std::ios::app);
     file.exceptions(std::ifstream::failbit);
     if (!file.is_open()) {
@@ -1020,15 +1235,20 @@ void SerializePipeline(std::span<const char> key, std::span<const GenericEnviron
         file.write(MAGIC_NUMBER.data(), MAGIC_NUMBER.size())
             .write(reinterpret_cast<const char*>(&cache_version), sizeof(cache_version));
     }
-    if (!std::ranges::all_of(envs, &GenericEnvironment::CanBeSerialized)) {
-        return;
-    }
+    std::ostringstream record{std::ios::binary | std::ios::out};
     const u32 num_envs{static_cast<u32>(envs.size())};
-    file.write(reinterpret_cast<const char*>(&num_envs), sizeof(num_envs));
+    record.write(reinterpret_cast<const char*>(&num_envs), sizeof(num_envs));
     for (const GenericEnvironment* const env : envs) {
-        env->Serialize(file);
+        env->Serialize(record);
     }
-    file.write(key.data(), key.size_bytes());
+    record.write(key.data(), key.size_bytes());
+    const std::string payload{record.str()};
+    const u64 payload_size{static_cast<u64>(payload.size())};
+    if (payload_size == 0 || payload_size > MAX_SERIALIZED_PIPELINE_RECORD_BYTES) {
+        throw std::ios_base::failure{"invalid serialized pipeline record size"};
+    }
+    file.write(reinterpret_cast<const char*>(&payload_size), sizeof(payload_size))
+        .write(payload.data(), static_cast<std::streamsize>(payload.size()));
 
 } catch (const std::ios_base::failure& e) {
     LOG_ERROR(Common_Filesystem, "{}", e.what());
@@ -1074,6 +1294,24 @@ void LoadPipelines(
         if (stop_loading.stop_requested()) {
             return;
         }
+        const auto record_size_offset{static_cast<std::streamoff>(file.tellg())};
+        const auto end_offset{static_cast<std::streamoff>(end)};
+        if (end_offset - record_size_offset < static_cast<std::streamoff>(sizeof(u64))) {
+            LOG_WARNING(Common_Filesystem,
+                        "Ignoring truncated trailing pipeline cache record header");
+            return;
+        }
+        u64 record_size{};
+        file.read(reinterpret_cast<char*>(&record_size), sizeof(record_size));
+        const auto record_payload_offset{static_cast<std::streamoff>(file.tellg())};
+        if (record_size == 0 || record_size > MAX_SERIALIZED_PIPELINE_RECORD_BYTES ||
+            record_size > static_cast<u64>(end_offset - record_payload_offset)) {
+            LOG_WARNING(Common_Filesystem,
+                        "Ignoring truncated or oversized trailing pipeline cache record");
+            return;
+        }
+        const std::streamoff record_end_offset{
+            record_payload_offset + static_cast<std::streamoff>(record_size)};
         u32 num_envs{};
         file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
 
@@ -1088,9 +1326,23 @@ void LoadPipelines(
         }
 
         if (envs.front().ShaderStage() == Shader::Stage::Compute) {
+            // Compute records have exactly one environment. Accepting trailing
+            // graphics/duplicate environments here would silently discard their
+            // captured contract while still consuming their bytes and key.
+            if (envs.size() != 1) {
+                throw std::ios_base::failure{"invalid multi-environment compute record"};
+            }
             load_compute(file, std::move(envs.front()));
         } else {
+            if (std::ranges::any_of(envs, [](const FileEnvironment& env) {
+                    return env.ShaderStage() == Shader::Stage::Compute;
+                })) {
+                throw std::ios_base::failure{"compute environment in graphics record"};
+            }
             load_graphics(file, std::move(envs));
+        }
+        if (static_cast<std::streamoff>(file.tellg()) != record_end_offset) {
+            throw std::ios_base::failure{"pipeline cache record size mismatch"};
         }
     }
 

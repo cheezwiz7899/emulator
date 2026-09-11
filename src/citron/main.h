@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <vector>
 #include <QMainWindow>
 #include <QMessageBox>
 #include <QPushButton>
@@ -19,6 +20,7 @@
 #include "common/common_types.h"
 #include "configuration/qt_config.h"
 #include "core/perf_stats.h"
+#include "core/file_sys/vfs/vfs_types.h"
 #include "frontend_common/content_manager.h"
 #include "input_common/drivers/tas_input.h"
 
@@ -303,6 +305,12 @@ private slots:
     void OnGameListShowList(bool show);
     void OnGameListOpenPerGameProperties(const std::string& file, u64 program_id = 0);
     void OnGameListPreCacheShaders(u64 program_id, const std::string& game_path);
+    void BeginPrecacheTargetCapture(u64 program_id, const std::string& game_path,
+                                    const std::filesystem::path& target_path);
+    void PollPrecacheTargetCapture();
+    void FinishPrecacheTargetCapture(bool start_scan);
+    void StartPrecacheScan(u64 program_id, const std::string& game_path,
+                           std::vector<FileSys::VirtualDir> resolved_romfs_roots = {});
     void OnMenuLoadFile();
     void OnMenuLoadFolder();
     void OnMenuInstallToNAND();
@@ -435,6 +443,21 @@ private:
     QHBoxLayout* unified_top_bar_layout = nullptr;
     LoadingScreen* loading_screen;
     QTimer shutdown_timer;
+    struct PrecacheTargetCaptureRequest {
+        u64 program_id{};
+        std::string game_path;
+        std::filesystem::path target_path;
+        int poll_count{};
+        int ready_poll_count{};
+        // Captured while the temporary boot's content provider is alive. These
+        // directories retain the resolved base/update/LayeredFS view without
+        // retaining Core's mount or touching it after shutdown.
+        std::vector<FileSys::VirtualDir> resolved_romfs_roots;
+    };
+    std::optional<PrecacheTargetCaptureRequest> precache_target_capture;
+    bool precache_target_boot_ready{};
+    QTimer precache_target_capture_timer;
+    QProgressDialog* precache_target_capture_dialog{};
     OverlayDialog* shutdown_dialog{};
     PerformanceOverlay* performance_overlay{};
     MultiplayerRoomOverlay* multiplayer_room_overlay{};

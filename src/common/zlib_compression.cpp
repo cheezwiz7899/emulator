@@ -15,17 +15,18 @@ constexpr size_t kDefaultInitialSize = 4096;
 // the output buffer without limit — same defensive spirit as this
 // investigation's other decompressors.
 constexpr size_t kMaxOutputSize = 256ull * 1024 * 1024;
-} // namespace
 
-std::vector<u8> DecompressDataZlib(std::span<const u8> compressed, size_t size_hint) {
+std::vector<u8> DecompressDeflate(std::span<const u8> compressed, size_t size_hint,
+                                  int window_bits) {
     if (compressed.empty()) {
         return {};
     }
 
     z_stream strm{};
-    if (inflateInit(&strm) != Z_OK) {
+    if (inflateInit2(&strm, window_bits) != Z_OK) {
         return {};
     }
+
     strm.next_in = const_cast<Bytef*>(compressed.data());
     strm.avail_in = static_cast<uInt>(compressed.size());
 
@@ -45,19 +46,12 @@ std::vector<u8> DecompressDataZlib(std::span<const u8> compressed, size_t size_h
         ret = inflate(&strm, Z_NO_FLUSH);
         total_out = out.size() - strm.avail_out;
         if (ret != Z_OK && ret != Z_STREAM_END) {
-            // Z_BUF_ERROR with avail_out==0 just means "grow and retry",
-            // handled by the loop condition above; anything else (a
-            // genuinely malformed stream, Z_DATA_ERROR, Z_MEM_ERROR, ...)
-            // is a real failure.
             if (!(ret == Z_BUF_ERROR && strm.avail_out == 0)) {
                 inflateEnd(&strm);
                 return {};
             }
         }
         if (strm.avail_in == 0 && ret != Z_STREAM_END && strm.avail_out != 0) {
-            // Input exhausted without reaching a proper stream end and
-            // without the output buffer being the limiting factor —
-            // truncated/malformed input.
             inflateEnd(&strm);
             return {};
         }
@@ -65,6 +59,15 @@ std::vector<u8> DecompressDataZlib(std::span<const u8> compressed, size_t size_h
     inflateEnd(&strm);
     out.resize(total_out);
     return out;
+}
+} // namespace
+
+std::vector<u8> DecompressDataZlib(std::span<const u8> compressed, size_t size_hint) {
+    return DecompressDeflate(compressed, size_hint, MAX_WBITS);
+}
+
+std::vector<u8> DecompressDataGzip(std::span<const u8> compressed, size_t size_hint) {
+    return DecompressDeflate(compressed, size_hint, MAX_WBITS + 16);
 }
 
 } // namespace Common::Compression

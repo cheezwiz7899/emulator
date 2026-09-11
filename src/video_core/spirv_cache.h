@@ -7,9 +7,11 @@
 #include <array>
 #include <chrono>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -19,6 +21,8 @@
 #include "common/common_types.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/shader_info.h"
+#include "shader_recompiler/stage.h"
+#include "shader_recompiler/texture_slot.h"
 
 namespace VideoCommon {
 
@@ -31,21 +35,30 @@ enum class SpirvCacheEntrySource : u8 {
 // ---------------------------------------------------------------------------
 // SpirvKey — identifies a pre-translated SPIR-V program.
 //   unique_hash : CityHash64 of the raw Maxwell bytecode (matches GenericEnvironment::Analyze).
+//   stage       : source execution stage. Raw bytes are not sufficient to make
+//                 modules interchangeable when bound in different stages.
+//   target_key  : compiler target/profile contract used to emit the module.
 //   cbuf_key    : hash of specialised cbuf values; 0 = speculative/AOT (no specialisation).
 // ---------------------------------------------------------------------------
 struct SpirvKey {
     u64 unique_hash;
+    Shader::Stage stage;
+    u64 target_key;
     u64 cbuf_key; // 0 = speculative/AOT (no cbuf specialisation)
     u64 runtime_key; // Hash of RuntimeInfo fields
     u64 texture_key; // Hash of Texture types and formats
     bool operator==(const SpirvKey& o) const noexcept {
-        return unique_hash == o.unique_hash && cbuf_key == o.cbuf_key && runtime_key == o.runtime_key && texture_key == o.texture_key;
+        return unique_hash == o.unique_hash && stage == o.stage && target_key == o.target_key &&
+               cbuf_key == o.cbuf_key &&
+               runtime_key == o.runtime_key && texture_key == o.texture_key;
     }
 };
 struct SpirvKeyHash {
     size_t operator()(const SpirvKey& k) const noexcept {
-        // Boost hash_combine-style mix of the four 64-bit fields.
+        // Boost hash_combine-style mix of the program identity and five key fields.
         size_t h = k.unique_hash;
+        h ^= static_cast<size_t>(k.stage) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h ^= k.target_key + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
         h ^= k.cbuf_key + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
         h ^= k.runtime_key + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
         h ^= k.texture_key + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
@@ -70,7 +83,21 @@ u64 ComputeCbufKeyExcludingTextureHandles(const std::unordered_map<u64, u32>& cb
 u64 ComputeTextureKey(const std::unordered_map<u32, Shader::TextureType>& texture_types,
                       const std::unordered_map<u32, Shader::TexturePixelFormat>& texture_pixel_formats);
 
-// Phase 4 narrow prototype's texture_key fix. Same shape as
+// Uses source-level texture slots rather than resource handles. Callers must
+// first prove complete coverage with HasCompleteLogicalTextureCoverage(); a
+// direct texture query without a slot remains structurally conservative.
+u64 ComputeLogicalTextureKey(const Shader::LogicalTextureSlots& slots);
+bool HasCompleteLogicalTextureCoverage(
+    const Shader::LogicalTextureSlots& slots, const Shader::LogicalTextureHandles& logical_handles,
+    const std::unordered_map<u32, Shader::TextureType>& texture_types,
+    const std::unordered_map<u32, Shader::TexturePixelFormat>& texture_pixel_formats);
+
+// A polymorphic slot deliberately canonicalizes a texture type and therefore uses
+// the existing specialised raw-key path. Its presence must not disable logical
+// slot matching for every unrelated shader in the same game.
+bool HasActivePhase4LogicalTextureSlot(const Shader::LogicalTextureSlots& slots);
+
+// Excludes handle-specialized texture types before hashing. Same shape as
 // ComputeCbufKeyExcludingTextureHandles above: excludes entries whose key (the raw resolved
 // texture handle, per GraphicsEnvironment::ReadTextureType's texture_types.emplace(handle,
 // result) — NOT the (cbuf_index, cbuf_offset) coordinates, which this map doesn't carry) is in
@@ -151,17 +178,20 @@ u64 FoldBindingKey(u64 runtime_key, u64 binding_key);
 //   u32       num_entries
 //   per entry:
 //     u64     unique_hash
+//     u8      stage
+//     u64     target_key
 //     u64     cbuf_key
 //     u64     runtime_key
 //     u64     texture_key
 //     u32     word_count
 //     u32[]   spirv words (word_count × 4 bytes)
-//     <raw>   end_binding — Shader::Backend::Bindings written as a raw
-//             struct (sizeof(end_binding) bytes; see Save()/Load()), not
-//             field-by-field, so its exact size follows that struct's
-//             layout rather than being spelled out here
-//     u8      is_speculative (0 or 1 — added in v6; see Entry::is_speculative's
-//             doc comment for why this needed to stop being dropped on reload)
+//     u32[7]  end_binding counters, in this explicit order: unified,
+//             uniform_buffer, storage_buffer, texture, image,
+//             texture_scaling_index, image_scaling_index
+//     u8      source enum (Real, LiveSpeculative, or PrecacheScanner; validated
+//             during load and used to restore is_speculative provenance)
+//     u8      compute_recipe_present; followed, when set, by explicit bounded
+//             compute descriptor fields. Only real Compute entries may set it.
 // Entry::diag_base_runtime_hash / diag_binding_key are NOT part of this
 // format — every entry loaded from disk comes back with both at 0
 // regardless of what they originally were (see their own doc comment on
@@ -200,6 +230,18 @@ public:
         // See Entry::is_speculative — carried through so the caller can log/act on it.
         bool is_speculative = false;
         SpirvCacheEntrySource source = SpirvCacheEntrySource::Real;
+        // Present only for real compute entries. It contains exactly the Info
+        // fields ComputePipeline consumes, reconstructed from the bounded disk
+        // recipe; graphics stages deliberately never use it.
+        std::shared_ptr<const Shader::Info> compute_info;
+    };
+
+    // Candidate metadata for the conservative live-compute pre-frontend probe.
+    // Only entries with no texture specialization are returned. cbuf_keys use
+    // MakeCbufKey(index, offset) packing and must be reread before exact Lookup.
+    struct ComputePreFrontendCandidate {
+        SpirvKey key;
+        std::vector<u64> cbuf_keys;
     };
 
     // Look up a pre-translated SPIR-V program.
@@ -234,6 +276,9 @@ public:
                                                        u64 diag_cbuf_key_excl_texture_handles = 0,
                                                        std::array<u64, 8> diag_runtime_fields = {}) const;
 
+    [[nodiscard]] std::vector<ComputePreFrontendCandidate>
+    LookupLiveComputeCandidates(u64 unique_hash, u64 target_key) const;
+
     // Returns true if the cache already contains an entry for @p key.
     // Faster than Lookup() when the SPIR-V itself is not needed — avoids the vector copy.
     [[nodiscard]] bool Contains(const SpirvKey& key) const noexcept;
@@ -256,6 +301,21 @@ public:
     [[nodiscard]] size_t SpeculativeInsertCount() const noexcept { return speculative_insert_count_.load(); }
     /// Number of entries inserted via the real (non-speculative) Insert() overloads since construction.
     [[nodiscard]] size_t RealInsertCount() const noexcept { return real_insert_count_.load(); }
+
+    // Logical-slot coverage evidence. A logical key is chosen only after complete
+    // source-slot coverage is proven; the complementary count is an explicit
+    // conservative fallback, not a failed lookup.
+    void RecordTextureKeyMode(bool logical) const noexcept {
+        if (logical) {
+            ++logical_texture_key_count_;
+        } else {
+            ++raw_texture_key_count_;
+        }
+    }
+    [[nodiscard]] size_t LogicalTextureKeyCount() const noexcept {
+        return logical_texture_key_count_.load();
+    }
+    [[nodiscard]] size_t RawTextureKeyCount() const noexcept { return raw_texture_key_count_.load(); }
 
     // Of StaleMissWithContextCount() (i.e. real, specialization-context-having stale
     // misses only — the case that actually matters for live-play stutter), how many
@@ -342,8 +402,12 @@ public:
                 const Shader::Backend::Bindings& end_binding, bool is_speculative = false,
                 u64 diag_base_runtime_hash = 0, u64 diag_binding_key = 0,
                 u64 diag_cbuf_key_excl_texture_handles = 0,
-                std::array<u64, 8> diag_runtime_fields = {});
-    void Insert(u64 unique_hash, const std::unordered_map<u64, u32>& cbuf_values,
+                std::array<u64, 8> diag_runtime_fields = {},
+                const Shader::Info* compute_info = nullptr,
+                const std::unordered_map<u64, u32>* compute_cbuf_values = nullptr,
+                bool compute_live_probe_safe = false);
+    void Insert(u64 unique_hash, Shader::Stage stage, u64 target_key,
+                const std::unordered_map<u64, u32>& cbuf_values,
                 u64 runtime_key, u64 texture_key, std::vector<u32> spirv,
                 const Shader::Backend::Bindings& end_binding,
                 u64 diag_base_runtime_hash = 0, u64 diag_binding_key = 0,
@@ -359,7 +423,8 @@ public:
     // diag_cbuf_key_excl_texture_handles is not threaded through here: speculative
     // entries already use cbuf_key=0 (empty cbuf_values) unconditionally, so the
     // counterfactual is always 0 too — nothing to narrow on the guessed side.
-    void InsertSpeculative(u64 unique_hash, u64 runtime_key, u64 texture_key,
+    void InsertSpeculative(u64 unique_hash, Shader::Stage stage, u64 target_key,
+                           u64 runtime_key, u64 texture_key,
                            std::vector<u32> spirv,
                            const Shader::Backend::Bindings& end_binding,
                            u64 diag_base_runtime_hash = 0,
@@ -418,6 +483,9 @@ private:
         // ComputeCbufKeyExcludingTextureHandles's doc comment in spirv_cache.cpp.
         u64 diag_cbuf_key_excl_texture_handles = 0;
         std::array<u64, 8> diag_runtime_fields{};
+        std::shared_ptr<const Shader::Info> compute_info;
+        bool compute_live_probe_safe = false;
+        std::vector<u64> compute_cbuf_keys;
     };
     ankerl::unordered_dense::map<SpirvKey, Entry, SpirvKeyHash> entries_;
     // Secondary index: which unique_hashes have at least one entry in entries_.
@@ -434,25 +502,27 @@ private:
     // the stored key(s) actually look like and report which specific
     // field(s) — cbuf_key, runtime_key, or texture_key — differ from what
     // the real draw asked for, instead of just knowing that something does.
-    // Capped per-hash (kMaxStoredKeysPerHashForDiagnostics) purely so a
-    // pathological hash can't grow this unboundedly; diagnostic-only, never
-    // consulted for correctness.
+    // Complete per-hash index. This is intentionally not capped: replay
+    // rejection accounting must not claim exhaustive evidence from a sample.
+    // It remains diagnostic-only and is never consulted for correctness.
     ankerl::unordered_dense::map<u64, std::vector<SpirvKey>> keys_by_hash_;
     mutable bool dirty_{false};
     mutable std::atomic<size_t> hit_count_{0};
     mutable std::atomic<size_t> real_hit_count_{0};
     mutable std::atomic<size_t> live_speculative_hit_count_{0};
     mutable std::atomic<size_t> scanner_speculative_hit_count_{0};
+    mutable std::atomic<size_t> logical_texture_key_count_{0};
+    mutable std::atomic<size_t> raw_texture_key_count_{0};
     mutable std::atomic<size_t> lookup_count_{0};
     // Incremented when a Lookup() misses on the full SpirvKey (unique_hash +
-    // cbuf_key + runtime_key + texture_key) but unique_hashes_ shows this
+    // stage + target_key + cbuf_key + runtime_key + texture_key) but unique_hashes_ shows this
     // exact shader (unique_hash alone) IS present in the cache under some
-    // OTHER combination of the remaining three fields. A high rate here
+    // OTHER combination of the remaining five fields. A high rate here
     // means speculative entries the pre-cache scanner inserted (keyed with
     // guessed cbuf/texture state, since it has no real draw context) are
     // sitting in the cache unused — the shader itself was correctly
     // translated, but real draws can't find it because their actual
-    // cbuf_key/texture_key don't match what was guessed. Distinguishes that
+    // target_key/cbuf_key/texture_key don't match what was captured or guessed. Distinguishes that
     // from the more boring "the scan just didn't cover what was played"
     // explanation, which wouldn't show up here at all.
     mutable std::atomic<size_t> miss_with_hash_present_count_{0};
@@ -510,16 +580,25 @@ private:
     // Frequency of key.cbuf_key == 0 among REAL (has_real_specialization_context
     // == true) Lookup() calls only — i.e. actual gameplay draws, never
     // speculative/scanner lookups themselves. This is the number that settles
-    // whether the speculative-entry approach has a structural ceiling: every
+    // whether the current guessed-final-module approach has a cbuf limitation: every
     // speculative entry is inserted with cbuf_key hardcoded to 0 (nothing
     // captures real cbuf content without a live draw), so it can only ever be
     // hit by a real draw whose OWN cbuf_key also happens to be 0. If this
-    // stays low across real play, that's the ceiling, independent of how
-    // correct the rest of the key is — see SubmitSpeculativeShader's
+    // stays low across real play, exact speculative entries cannot cover those draws
+    // without real cbuf data — see SubmitSpeculativeShader's
     // ReadCbufValue() doc comment for why cbuf can't be guessed the way
     // viewport_transform_state could.
     mutable std::atomic<size_t> real_cbuf_zero_count_{0};
     mutable std::atomic<size_t> real_cbuf_nonzero_count_{0};
+
+    // Complete comparisons of real requests against scanner candidates
+    // with the same program identity. Fields may overlap for one candidate.
+    mutable std::atomic<size_t> scanner_candidate_rejections_{0};
+    mutable std::atomic<size_t> scanner_stage_rejections_{0};
+    mutable std::atomic<size_t> scanner_target_rejections_{0};
+    mutable std::atomic<size_t> scanner_cbuf_rejections_{0};
+    mutable std::atomic<size_t> scanner_runtime_rejections_{0};
+    mutable std::atomic<size_t> scanner_texture_rejections_{0};
 
     // Throttle state for SaveThrottled — updated under mutex_.
     mutable size_t saved_entry_count_{0};

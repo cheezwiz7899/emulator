@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <vector>
 
@@ -33,17 +34,25 @@ ComputePipeline::ComputePipeline(const Device& device_, vk::PipelineCache& pipel
                                  Common::ThreadWorker* thread_worker,
                                  PipelineStatistics* pipeline_statistics,
                                  VideoCore::ShaderNotify* shader_notify, const Shader::Info& info_,
-                                 vk::ShaderModule spv_module_)
+                                 vk::ShaderModule spv_module_, PipelineCache* pipeline_cache_owner_,
+                                 bool is_boot_preload_)
     : device{device_},
-      pipeline_cache(pipeline_cache_), guest_descriptor_queue{guest_descriptor_queue_}, info{info_},
-      spv_module(std::move(spv_module_)) {
+      pipeline_cache(pipeline_cache_), pipeline_cache_owner{pipeline_cache_owner_},
+      is_boot_preload{is_boot_preload_},
+      guest_descriptor_queue{guest_descriptor_queue_}, info{info_}, spv_module(std::move(spv_module_)) {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
     }
     std::copy_n(info.constant_buffer_used_sizes.begin(), uniform_buffer_sizes.size(),
                 uniform_buffer_sizes.begin());
 
-    auto func{[this, &descriptor_pool, shader_notify, pipeline_statistics] {
+    const auto queued_at = std::chrono::steady_clock::now();
+    auto func{[this, &descriptor_pool, shader_notify, pipeline_statistics, queued_at] {
+        if (pipeline_cache_owner) {
+            pipeline_cache_owner->RecordPipelineBuildQueueDelay(
+                true, std::chrono::duration_cast<std::chrono::microseconds>(
+                          std::chrono::steady_clock::now() - queued_at));
+        }
         DescriptorLayoutBuilder builder{device};
         builder.SetSplit(device.IsKhrPushDescriptorSupported());
         builder.Add(info, VK_SHADER_STAGE_COMPUTE_BIT);
@@ -77,7 +86,9 @@ ComputePipeline::ComputePipeline(const Device& device_, vk::PipelineCache& pipel
         if (device.IsKhrPipelineExecutablePropertiesEnabled()) {
             flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
         }
-        pipeline = device.GetLogical().CreateComputePipeline(
+        const auto driver_create_start = std::chrono::steady_clock::now();
+        try {
+            pipeline = device.GetLogical().CreateComputePipeline(
             {
                 .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
                 .pNext = nullptr,
@@ -96,7 +107,20 @@ ComputePipeline::ComputePipeline(const Device& device_, vk::PipelineCache& pipel
                 .basePipelineHandle = 0,
                 .basePipelineIndex = 0,
             },
-            *pipeline_cache);
+                *pipeline_cache);
+        } catch (...) {
+            if (pipeline_cache_owner) {
+                pipeline_cache_owner->RecordPipelineDriverCreate(
+                    true, is_boot_preload, std::chrono::duration_cast<std::chrono::microseconds>(
+                              std::chrono::steady_clock::now() - driver_create_start));
+            }
+            throw;
+        }
+        if (pipeline_cache_owner) {
+            pipeline_cache_owner->RecordPipelineDriverCreate(
+                true, is_boot_preload, std::chrono::duration_cast<std::chrono::microseconds>(
+                          std::chrono::steady_clock::now() - driver_create_start));
+        }
 
         if (pipeline_statistics) {
             pipeline_statistics->Collect(*pipeline);
@@ -291,8 +315,14 @@ void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     if (!is_built.load(std::memory_order::relaxed)) {
         // Wait for the pipeline to be built
         scheduler.Record([this](vk::CommandBuffer) {
+            const auto wait_start = std::chrono::steady_clock::now();
             std::unique_lock lock{build_mutex};
             build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
+            if (pipeline_cache_owner) {
+                pipeline_cache_owner->RecordPipelineBuildWait(
+                    true, is_boot_preload, std::chrono::duration_cast<std::chrono::microseconds>(
+                              std::chrono::steady_clock::now() - wait_start));
+            }
         });
     }
     const auto* const descriptor_data{guest_descriptor_queue.UpdateData()};

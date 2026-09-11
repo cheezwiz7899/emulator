@@ -1004,6 +1004,10 @@ void RasterizerVulkan::LoadDiskResources(u64 title_id, std::stop_token stop_load
     pipeline_cache.LoadDiskResources(title_id, stop_loading, callback);
 }
 
+void RasterizerVulkan::FlushShaderCaches() {
+    pipeline_cache.FlushSpirvCache();
+}
+
 void RasterizerVulkan::FlushWork() {
 #ifdef ANDROID
     static constexpr u32 DRAWS_TO_DISPATCH = 1024;

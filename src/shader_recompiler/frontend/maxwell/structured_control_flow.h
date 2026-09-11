@@ -3,11 +3,14 @@
 
 #pragma once
 
+#include <span>
+
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/frontend/ir/abstract_syntax_list.h"
 #include "shader_recompiler/frontend/ir/basic_block.h"
 #include "shader_recompiler/frontend/ir/value.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
+#include "shader_recompiler/frontend/maxwell/translate/translate.h"
 #include "shader_recompiler/object_pool.h"
 
 namespace Shader {
@@ -16,7 +19,8 @@ namespace Maxwell {
 
 [[nodiscard]] IR::AbstractSyntaxList BuildASL(ObjectPool<IR::Inst>& inst_pool,
                                               ObjectPool<IR::Block>& block_pool, Environment& env,
-                                              Flow::CFG& cfg, const HostTranslateInfo& host_info);
+                                              Flow::CFG& cfg, const HostTranslateInfo& host_info,
+                                              std::span<const PredecodedInstruction> predecoded = {});
 
 } // namespace Maxwell
 } // namespace Shader

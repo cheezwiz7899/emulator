@@ -204,6 +204,12 @@ add_library(video_core STATIC
     shader_cache.h
     phase4_prototype_slots_file.cpp
     phase4_prototype_slots_file.h
+    precache_cfg_artifact.cpp
+    precache_cfg_artifact.h
+    precache_frontend_artifact.cpp
+    precache_frontend_artifact.h
+    precache_compiler_target.cpp
+    precache_compiler_target.h
     spirv_cache.cpp
     spirv_cache.h
     shader_environment.cpp

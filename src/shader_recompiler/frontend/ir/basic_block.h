@@ -39,6 +39,11 @@ public:
     /// Appends a new instruction to the end of this basic block.
     void AppendNewInst(Opcode op, std::initializer_list<Value> args);
 
+    /// Appends a new instruction with unset operands. This is intentionally
+    /// narrow: owned IR restore creates every instruction first, then fixes
+    /// references after all instruction identities exist.
+    [[nodiscard]] Inst& AppendNewInstUnbound(Opcode op, u32 flags = 0);
+
     /// Prepends a copy of an instruction to this basic block before the insertion point.
     iterator PrependNewInst(iterator insertion_point, const Inst& base_inst);
 

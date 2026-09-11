@@ -4,7 +4,7 @@
 
 // GMainWindow::OnGameListPreCacheShaders — the boot-time shader pre-cache scanner.
 // Extracted from main.cpp, where it grew to ~1,400 lines across several rounds of
-// work: the original BNSH/GRSC/SPH scanner, Phase 3's real previous-stage-stores
+// work: the original BNSH/GRSC/SPH scanner, real previous-stage-stores
 // guess refinement, and a broad round of additional container-format support —
 // Yaz0, SARC, pairtable, ARC, XC2's arh/ard+xbc1, CPK+CRILAYLA, and MPR's
 // RFRM/MTRL material archives. See docs/precache-scanner/FINDINGS.md and
@@ -23,7 +23,12 @@
 // with no captures, so hoisting them is behavior-preserving, and each is
 // substantial and independently meaningful enough to read on its own.
 
+#include <algorithm>
+#include <array>
 #include <bitset>
+#include <chrono>
+#include <system_error>
+#include <unordered_set>
 
 #include <QMessageBox>
 #include <QProgressDialog>
@@ -36,6 +41,7 @@
 
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
+#include "common/cityhash.h"
 #include "common/logging.h"
 #include "common/thread_worker.h"
 #include "common/crilayla_compression.h"
@@ -46,6 +52,7 @@
 
 #include "core/loader/loader.h"
 #include "core/loader/nca.h"
+#include "core/core.h"
 #include "core/file_sys/arc_archive.h"
 #include "core/file_sys/card_image.h"
 #include "core/file_sys/common_funcs.h"
@@ -73,7 +80,13 @@
 #include "shader_recompiler/program_header.h"
 #include "shader_recompiler/runtime_info.h"
 
+#include "video_core/precache_cfg_artifact.h"
+#include "video_core/precache_frontend_artifact.h"
 #include "video_core/speculative_shader_environment.h"
+#include "video_core/gpu.h"
+#include "video_core/renderer_base.h"
+#include "video_core/precache_compiler_target.h"
+#include "video_core/shader_program_identity.h"
 #include "video_core/spirv_cache.h"
 
 namespace {
@@ -93,7 +106,7 @@ struct FileWorkItem {
     std::optional<FileSys::MprShaderSource> mpr_range; // set only for MPR MaterialArchive entries below.
 };
 
-// Phase 3 guess refinement. Snapshot of exactly the fields MakeRuntimeInfo()
+// Scanner runtime-state snapshot. Mirrors the fields MakeRuntimeInfo()
 // (vk_pipeline_cache.cpp) pulls from a real previous_program when deriving a real
 // pipeline's previous_stage_stores -- see that function for the reference
 // derivation this mirrors field-for-field. Deliberately NOT holding onto the
@@ -120,15 +133,11 @@ struct PrecacheStageResult {
 };
 
 // One already-unwrapped region of bytes ready for the BNSH/GRSC/SPH scan below —
-// either a whole (post zstd/Yaz0) file, one named entry out of a SARC archive, or
-// one block out of a pairtable-wrapped file (Hyrule Warriors Definitive Edition
-// and, per the investigation this is based on, plausibly sibling Omega Force
-// titles). Built as a list rather than recursing so the existing scan/classify
-// logic runs unmodified, once per unit -- a plain file still produces exactly
-// one unit, so this is a no-op for every title that doesn't need container
-// unwrapping at this stage (TotK included). See
-// docs/precache-scanner/FINDINGS.md for the full investigation behind SARC and
-// pairtable support specifically.
+// either a whole post-decompression file, one named entry out of a SARC/U8
+// archive, or one block out of a pairtable-wrapped file. Built as a list rather
+// than recursing so the existing scan/classify logic runs unmodified, once per
+// unit -- a plain file still produces exactly one unit, so this is a no-op for
+// every title that doesn't need container unwrapping at this stage.
 struct ScanUnit {
     std::vector<u8> owned; // Empty if data points at decompressed_storage/raw instead.
     const u8* data;
@@ -149,20 +158,258 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                                              const std::string& game_path) {
     if (program_id == 0 || game_path.empty()) return;
 
+    if (precache_target_capture) {
+        QMessageBox::information(this, tr("Pre-cache Shaders"),
+                                 tr("A compiler-target capture is already running."));
+        return;
+    }
+    if (emulation_running) {
+        QMessageBox::warning(this, tr("Pre-cache Shaders"),
+                             tr("Stop emulation before starting shader pre-cache."));
+        return;
+    }
+
+    const auto shader_dir = Common::FS::GetCitronPath(Common::FS::CitronPath::ShaderDir);
+    const auto cache_dir = shader_dir / fmt::format("{:016x}", program_id);
+    if (!Common::FS::CreateDirs(cache_dir)) return;
+    BeginPrecacheTargetCapture(program_id, game_path,
+                               cache_dir / "precache_compiler_target.bin");
+}
+
+void GMainWindow::BeginPrecacheTargetCapture(u64 program_id, const std::string& game_path,
+                                             const std::filesystem::path& target_path) {
+    // A previous capture may belong to a different driver or renderer configuration.
+    // Remove it so the poll below can only accept the target written by this boot.
+    std::error_code error;
+    std::filesystem::remove(target_path, error);
+    if (error) {
+        LOG_ERROR(Frontend, "Pre-cache could not clear stale compiler target {}: {}",
+                  Common::FS::PathToUTF8String(target_path), error.message());
+        QMessageBox::warning(this, tr("Pre-cache Shaders"),
+                             tr("Could not refresh the Vulkan compiler target."));
+        return;
+    }
+
+    precache_target_capture = PrecacheTargetCaptureRequest{
+        .program_id = program_id,
+        .game_path = game_path,
+        .target_path = target_path,
+    };
+    precache_target_boot_ready = false;
+    precache_target_capture_dialog = new QProgressDialog(
+        tr("Starting the title briefly to capture the Vulkan compiler target..."), tr("Cancel"),
+        0, 0, this);
+    precache_target_capture_dialog->setWindowTitle(tr("Pre-cache Shaders"));
+    precache_target_capture_dialog->setWindowModality(Qt::WindowModal);
+    precache_target_capture_dialog->setAutoClose(false);
+    precache_target_capture_dialog->show();
+
+    LOG_INFO(Frontend, "Pre-cache starting automatic Vulkan compiler-target capture for {:016x}",
+             program_id);
+
+    // BootGameFromList performs substantial renderer setup synchronously, and may
+    // process Qt events while doing so. Starting the poll timer before it returns
+    // lets PollPrecacheTargetCapture run re-entrantly in the middle of LoadROM:
+    // the target has already been written, but emulation_running is not set yet.
+    // That used to start the multi-minute scanner on the unfinished boot stack,
+    // then let the damaged boot resume afterward. Arm all asynchronous handling
+    // only after the synchronous portion of boot has completed.
+    BootGameFromList(QString::fromStdString(game_path), StartGameType::Normal);
+    if (precache_target_capture && !emulation_running) {
+        LOG_ERROR(Frontend, "Pre-cache target-capture boot did not start for {:016x}", program_id);
+        FinishPrecacheTargetCapture(false);
+    } else if (precache_target_capture) {
+        connect(precache_target_capture_dialog, &QProgressDialog::canceled, this, [this] {
+            if (!precache_target_capture) return;
+            LOG_INFO(Frontend, "Pre-cache compiler-target capture cancelled by user");
+            if (emulation_running) ShutdownGame();
+            FinishPrecacheTargetCapture(false);
+        });
+
+        if (precache_target_capture_dialog->wasCanceled()) {
+            LOG_INFO(Frontend, "Pre-cache compiler-target capture cancelled during boot");
+            ShutdownGame();
+            FinishPrecacheTargetCapture(false);
+            return;
+        }
+
+        disconnect(&precache_target_capture_timer, nullptr, this, nullptr);
+        connect(&precache_target_capture_timer, &QTimer::timeout, this,
+                &GMainWindow::PollPrecacheTargetCapture);
+        PollPrecacheTargetCapture();
+        if (precache_target_capture) {
+            precache_target_capture_timer.start(200);
+        }
+    }
+}
+
+void GMainWindow::PollPrecacheTargetCapture() {
+    if (!precache_target_capture) return;
+
+    const auto request = *precache_target_capture;
+    if (precache_target_boot_ready &&
+        VideoCommon::LoadPrecacheCompilerTarget(request.target_path)) {
+        // Static ROM scanning cannot know real cbuf, interface, or scheduling
+        // state. Keep the title alive briefly to collect exact launch requests;
+        // these are safe entries for the following real play session.
+        constexpr int kWarmupPolls = 75; // 15 seconds at the 200 ms poll interval.
+        if (++precache_target_capture->ready_poll_count < kWarmupPolls) return;
+        LOG_INFO(Frontend,
+                 "Pre-cache captured Vulkan compiler target and 15-second exact warmup for {:016x}; "
+                 "stopping boot",
+                 request.program_id);
+        precache_target_capture_timer.stop();
+        // Do this while the renderer still exists. The warmup's real shaders
+        // include cbuf/interface/resource state static ROM scanning cannot
+        // know, and are valid exact entries for every title. Explicit flush
+        // also prevents a queued save from racing the scanner's Load/Save.
+        if (emulation_running) {
+            system->GPU().Renderer().FlushShaderCaches();
+        }
+        if (emulation_running) ShutdownGame();
+        FinishPrecacheTargetCapture(true);
+        return;
+    }
+
+    if (!emulation_running) {
+        LOG_ERROR(Frontend, "Pre-cache target-capture boot stopped before target creation for {:016x}",
+                  request.program_id);
+        FinishPrecacheTargetCapture(false);
+        return;
+    }
+
+    // File creation happens during early Vulkan setup. Wait instead for the first
+    // displayed frame, where GPU and guest-memory startup are both complete.
+    if (++precache_target_capture->poll_count >= 900) {
+        LOG_ERROR(Frontend, "Pre-cache timed out waiting for Vulkan compiler target for {:016x}",
+                  request.program_id);
+        if (emulation_running) ShutdownGame();
+        FinishPrecacheTargetCapture(false);
+    }
+}
+
+void GMainWindow::FinishPrecacheTargetCapture(bool start_scan) {
+    if (!precache_target_capture) return;
+
+    const auto request = std::move(*precache_target_capture);
+    precache_target_capture.reset();
+    precache_target_boot_ready = false;
+    precache_target_capture_timer.stop();
+    disconnect(&precache_target_capture_timer, nullptr, this, nullptr);
+    if (precache_target_capture_dialog) {
+        precache_target_capture_dialog->disconnect(this);
+        precache_target_capture_dialog->close();
+        precache_target_capture_dialog->deleteLater();
+        precache_target_capture_dialog = nullptr;
+    }
+
+    if (!start_scan) {
+        QMessageBox::warning(this, tr("Pre-cache Shaders"),
+                             tr("Citron could not capture a Vulkan compiler target.\n"
+                                "Make sure Vulkan is selected and the title can boot."));
+        return;
+    }
+
+    StartPrecacheScan(request.program_id, request.game_path,
+                      std::move(request.resolved_romfs_roots));
+}
+
+void GMainWindow::StartPrecacheScan(u64 program_id, const std::string& game_path,
+                                    std::vector<FileSys::VirtualDir> resolved_romfs_roots) {
+    if (program_id == 0 || game_path.empty()) return;
+
     const auto shader_dir = Common::FS::GetCitronPath(Common::FS::CitronPath::ShaderDir);
     const auto cache_dir  = shader_dir / fmt::format("{:016x}", program_id);
     if (!Common::FS::CreateDirs(cache_dir)) return;
     const auto spirv_path = cache_dir / "spirv_cache.bin";
+    const auto target_path = cache_dir / "precache_compiler_target.bin";
+    if (!VideoCommon::LoadPrecacheCompilerTarget(target_path)) {
+        LOG_ERROR(Render_Vulkan,
+                  "PreCacheShaders: refusing to scan without a valid real Vulkan compiler target");
+        QMessageBox::warning(this, tr("Pre-cache Shaders"),
+                             tr("The Vulkan compiler target is missing or invalid."));
+        return;
+    }
 
     const int kMaxSamples = 8;
-    const int kMaxDiagBlobs = 3000;
+    // Keep per-blob tracing bounded. The scan summary contains aggregate
+    // coverage and rejection data; thousands of expected alignment failures
+    // make the user log too large to inspect and add avoidable worker I/O.
+    const int kMaxDiagBlobs = 8;
+    // Must match video_core/precache_cfg_artifact.cpp. Keep a pathological
+        // ROM scan from turning one all-or-nothing artifact file into a save miss.
+    constexpr size_t kMaxPersistedCfgArtifacts = 131072;
+    constexpr size_t kMaxPersistedFrontendArtifacts = 131072;
 
     struct ScanState {
         std::atomic<int>  files_total{0};
         std::atomic<int>  files_processed{0};
         std::atomic<int>  shaders_found{0};
         std::atomic<int>  shaders_translated{0};
+        // Exact final modules and successful translations whose CFG required a
+        // nonzero candidate scheduler alignment. The latter is extraction
+        // telemetry only: a static blob cannot prove that alignment at runtime.
+        std::atomic<int>  final_entries{0};
+        std::atomic<int>  alignment_translated_entries{0};
+        std::atomic<int>  cfg_artifact_candidates{0};
+        std::atomic<int>  cfg_artifact_stored{0};
+        std::atomic<int>  cfg_artifact_cbuf_rejections{0};
+        std::atomic<int>  cfg_artifact_branches_rejections{0};
+        std::atomic<int>  cfg_artifact_capacity_rejections{0};
+        std::atomic<int>  frontend_artifact_candidates{0};
+        std::atomic<int>  frontend_artifact_stored{0};
+        std::atomic<int>  frontend_artifact_info_rejections{0};
+        std::atomic<int>  frontend_artifact_pseudo_rejections{0};
+        std::atomic<int>  frontend_artifact_value_rejections{0};
+        std::atomic<int>  frontend_artifact_graph_rejections{0};
+        std::atomic<int>  frontend_artifact_capacity_rejections{0};
+        // Scanner-returned zero is unknown state, never an observed zero.
+        // Report dependency classes separately so next scan can measure which
+        // candidates need a real contract/template boundary.
+        std::atomic<int>  unknown_cbuf_candidates{0};
+        std::atomic<int>  unknown_texture_candidates{0};
+        std::atomic<int>  unknown_viewport_candidates{0};
+        std::atomic<int>  unknown_compute_candidates{0};
+        std::atomic<int>  unknown_hle_macro_candidates{0};
+        std::atomic<int>  unknown_interface_candidates{0};
+        std::atomic<int>  unknown_scheduling_alignment_candidates{0};
+        std::atomic<int>  final_cbuf_contract_rejections{0};
+        std::atomic<int>  final_texture_contract_rejections{0};
+        std::atomic<int>  final_viewport_contract_rejections{0};
+        std::atomic<int>  final_compute_contract_rejections{0};
+        std::atomic<int>  final_hle_macro_contract_rejections{0};
+        std::atomic<int>  final_interface_contract_rejections{0};
+        std::atomic<int>  final_scheduling_alignment_contract_rejections{0};
+        std::atomic<int>  final_identity_contract_rejections{0};
+        // BuildProgramTemplate() is the proposed scanner artifact boundary.
+        // These counters distinguish candidates that already consumed synthetic
+        // Environment state before finalization from candidates that could be
+        // represented by a future immutable frontend template.
+        std::atomic<int>  template_boundary_eligible{0};
+        std::atomic<int>  template_boundary_cbuf_rejections{0};
+        std::atomic<int>  template_boundary_texture_rejections{0};
+        std::atomic<int>  template_boundary_viewport_rejections{0};
+        std::atomic<int>  template_boundary_compute_rejections{0};
+        std::atomic<int>  template_boundary_hle_macro_rejections{0};
+        std::atomic<int>  template_boundary_interface_rejections{0};
+        std::atomic<int>  template_boundary_scheduling_alignment_rejections{0};
+        // Actual BuildProgramTemplate() query manifest. Unlike the unknown-
+        // dependency counters, this records state that was consumed even when
+        // the scanner happened to have a concrete fallback value for it.
+        std::atomic<int>  frontend_manifest_cbuf{0};
+        std::atomic<int>  frontend_manifest_resource{0};
+        std::atomic<int>  frontend_manifest_viewport{0};
+        std::atomic<int>  frontend_manifest_compute{0};
+        std::atomic<int>  frontend_manifest_hle{0};
+        std::atomic<int>  frontend_manifest_interface{0};
         std::atomic<int>  shaders_failed{0};
+        // Sum of worker CPU-wall time, not scan wall time: workers run in
+        // parallel. This identifies the next template boundary without
+        // falsely presenting concurrent work as a serial duration.
+        std::atomic<u64> cfg_us{0};
+        std::atomic<u64> template_us{0};
+        std::atomic<u64> finalize_us{0};
+        std::atomic<u64> emit_us{0};
         std::atomic<bool> cancelled{false};
         std::string       error_message;
         // Breakdown of what each file's first bytes matched, to see empirically
@@ -190,13 +437,25 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
         // huge ROM doesn't spam the log.
         std::mutex        sample_mutex;
         int               samples_logged{0};
+        std::mutex        cfg_artifact_mutex;
+        std::vector<VideoCommon::PrecacheCfgArtifact> cfg_artifacts;
+        std::unordered_set<VideoCommon::PrecacheCfgArtifactKey,
+                           VideoCommon::PrecacheCfgArtifactKeyHash>
+            cfg_artifact_keys;
+        std::array<int, 7> cfg_artifact_stages{};
+        std::mutex        frontend_artifact_mutex;
+        std::vector<VideoCommon::PrecacheFrontendArtifactRecord> frontend_artifacts;
+        std::unordered_set<VideoCommon::PrecacheFrontendArtifactKey,
+                           VideoCommon::PrecacheFrontendArtifactKeyHash>
+            frontend_artifact_keys;
+        std::array<int, 7> frontend_artifact_stages{};
     };
     auto state = std::make_shared<ScanState>();
 
     struct FinalResult { int translated, failed; std::string error; bool cancelled; };
     FinalResult final_result{};
 
-    QProgressDialog progress(tr("Opening game file..."),
+    QProgressDialog progress(tr("Preparing resolved RomFS scan..."),
                              tr("Cancel"), 0, 0, this);
     progress.setWindowTitle(tr("Pre-cache Shaders"));
     progress.setWindowModality(Qt::WindowModal);
@@ -207,8 +466,13 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
     auto local_vfs = std::make_shared<FileSys::RealVfsFilesystem>();
     const auto game_file = local_vfs->OpenFile(game_path, FileSys::OpenMode::Read);
 
-    auto worker = [state, game_path, spirv_path, game_file]() {
-        // Mount RomFS
+    auto worker = [state, game_path, spirv_path, cache_dir, target_path, game_file,
+                   resolved_romfs_roots = std::move(resolved_romfs_roots)]() mutable {
+        // Prefer the resolved view captured while the short boot was alive. It
+        // contains the same base/update/LayeredFS content the title actually
+        // ran, plus enabled DLC roots. The fallback keeps direct-file scanning
+        // available if a title fails before its first frame.
+        std::vector<FileSys::VirtualDir> romfs_roots = std::move(resolved_romfs_roots);
         FileSys::VirtualFile romfs_raw;
         const auto try_nca = [&]() {
             FileSys::NCA nca{game_file};
@@ -241,22 +505,29 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
             for (auto& ch : e) ch = static_cast<char>(std::tolower(ch));
             return e;
         }();
-        if      (ext=="nca")               try_nca();
-        else if (ext=="nsp"||ext=="nsz")   try_nsp();
-        else if (ext=="xci"||ext=="xcz")   try_xci();
-        else { try_nca(); if (!romfs_raw) try_nsp(); if (!romfs_raw) try_xci(); }
+        if (romfs_roots.empty()) {
+            if      (ext=="nca")               try_nca();
+            else if (ext=="nsp"||ext=="nsz")   try_nsp();
+            else if (ext=="xci"||ext=="xcz")   try_xci();
+            else { try_nca(); if (!romfs_raw) try_nsp(); if (!romfs_raw) try_xci(); }
 
-        if (!romfs_raw) {
-            state->error_message =
-                "Could not mount RomFS. Ensure prod.keys is installed.";
-            LOG_ERROR(Render_Vulkan, "PreCacheShaders: {}", state->error_message);
-            return;
-        }
-        const auto romfs = FileSys::ExtractRomFS(romfs_raw);
-        if (!romfs) {
-            state->error_message = "Failed to extract RomFS.";
-            LOG_ERROR(Render_Vulkan, "PreCacheShaders: {}", state->error_message);
-            return;
+            if (!romfs_raw) {
+                state->error_message =
+                    "Could not mount RomFS. Ensure prod.keys is installed.";
+                LOG_ERROR(Render_Vulkan, "PreCacheShaders: {}", state->error_message);
+                return;
+            }
+            if (const auto romfs = FileSys::ExtractRomFS(romfs_raw)) {
+                romfs_roots.push_back(romfs);
+            } else {
+                state->error_message = "Failed to extract RomFS.";
+                LOG_ERROR(Render_Vulkan, "PreCacheShaders: {}", state->error_message);
+                return;
+            }
+        } else {
+            LOG_INFO(Render_Vulkan,
+                     "PreCacheShaders: scanning {} boot-resolved RomFS root(s); no remount needed",
+                     romfs_roots.size());
         }
 
         // Some titles (e.g. Tears of the Kingdom) compress most RomFS assets
@@ -273,7 +544,13 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
         // so this only needs to survive that copy, but keeping it named makes
         // the lifetime obvious rather than relying on a temporary.
         std::optional<FileSys::SarcArchive> zsdic_sarc;
-        if (const auto zsdic_file = romfs->GetFileRelative("Pack/ZsDic.pack.zs")) {
+        FileSys::VirtualFile zsdic_file;
+        for (const auto& root : romfs_roots) {
+            if (root && (zsdic_file = root->GetFileRelative("Pack/ZsDic.pack.zs"))) {
+                break;
+            }
+        }
+        if (zsdic_file) {
             const auto zsdic_compressed = zsdic_file->ReadAllBytes();
             auto zsdic_decompressed = Common::Compression::DecompressDataZSTD(zsdic_compressed);
             if (zsdic_decompressed.empty()) {
@@ -308,7 +585,9 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                 for (const auto& f : dir->GetFiles())         files.push_back(f);
                 for (const auto& sub : dir->GetSubdirectories()) walk(sub);
             };
-        walk(romfs);
+        for (const auto& root : romfs_roots) {
+            walk(root);
+        }
 
         // Temporary debug aid: set CITRON_PRECACHE_FILTER to a substring (e.g.
         // "grass" or a specific file name) before launching citron to restrict
@@ -442,25 +721,25 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
         VideoCommon::SpirvCache cache;
         cache.Load(spirv_path);
 
-        Shader::Profile profile{};
-        profile.supported_spirv=0x00010300; profile.unified_descriptor_binding=true;
-        profile.support_descriptor_aliasing=true;
-        profile.support_int8=profile.support_int16=profile.support_int64=true;
-        profile.support_float_controls=true; profile.support_vote=true;
-        profile.support_typeless_image_loads=true;
-        profile.support_demote_to_helper_invocation=true;
-        profile.min_ssbo_alignment=16; profile.max_user_clip_distances=8;
-        Shader::HostTranslateInfo host_info{};
-        host_info.support_float64=host_info.support_float16=host_info.support_int64=true;
-        host_info.support_snorm_render_buffer=true;
-        host_info.support_viewport_index_layer=true;
-        host_info.min_ssbo_alignment=16;
-        // Always disable conditional barrier support: shaders cached here may be loaded
-        // on Intel Windows drivers where barriers inside conditional control flow are
-        // illegal.  Stripping barriers from conditional CF is always spec-correct, so
-        // this is safe on all drivers and avoids generating SPIR-V that would be
-        // rejected or miscompiled on the target hardware.
-        host_info.support_conditional_barrier=false;
+        const auto target = VideoCommon::LoadPrecacheCompilerTarget(target_path);
+        if (!target) {
+            state->error_message = "Vulkan compiler target disappeared before scanner start";
+            return;
+        }
+        // Scanner final modules must use target copied from live Vulkan boot.
+        // No generic/default profile exists on this path: unknown target means
+        // no scan, not final SPIR-V compiled under invented capabilities.
+        const Shader::Profile profile{target->profile};
+        const Shader::HostTranslateInfo host_info{target->host_info};
+        // Hash the decoded contract itself. Reconstructing only profile/host_info
+        // here would silently reset the serialized revision triplet to defaults,
+        // merging scanner entries across a recompiler/descriptor/specialization
+        // ABI change even though the target file intentionally namespaces them.
+        const u64 compiler_target_key = VideoCommon::CompilerTargetFingerprint(*target);
+        LOG_INFO(Render_Vulkan,
+                 "PreCacheShaders: using compiler target captured from this Vulkan boot: {:016x} "
+                 "(GPU accuracy {})",
+                 compiler_target_key, target->gpu_accuracy_mode);
 
         std::mutex seen_mutex;
         // Maps a raw blob PLUS its predecessor-output and descriptor context to
@@ -619,10 +898,23 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                                                  // contents recovered."
                     data = decompressed_storage.data();
                     sz = decompressed_storage.size();
+                } else if (sz >= 2 && raw[0] == 0x1f && raw[1] == 0x8b) {
+                    // RFC 1952 gzip is a container-level compression layer, not a
+                    // game rule. Once unwrapped, its contents flow through the same
+                    // SARC/pairtable/BNSH/raw-SPH discovery below as every other
+                    // already-readable scan unit.
+                    decompressed_storage = Common::Compression::DecompressDataGzip(raw);
+                    if (decompressed_storage.empty()) {
+                        ++state->zstd_failed;
+                        return;
+                    }
+                    ++state->zstd_decompressed;
+                    data = decompressed_storage.data();
+                    sz = decompressed_storage.size();
                 }
                 if (sz < 4) return;
 
-                // Phase 3 guess refinement. Snapshot of exactly the fields
+                // Scanner runtime-state snapshot. Mirrors the fields
                 // MakeRuntimeInfo() (vk_pipeline_cache.cpp) pulls from a real
                 // previous_program when deriving a real pipeline's previous_stage_stores
                 // -- see that function for the reference derivation this mirrors
@@ -669,6 +961,74 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                             } else if (entry.data.size() >= 4) {
                                 scan_units.push_back(
                                     ScanUnit{{}, entry.data.data(), entry.data.size(), entry.name});
+                            }
+                        }
+                    }
+                }
+                if (scan_units.empty() && sz >= 0x20 && data[0] == 0x55 && data[1] == 0xAA &&
+                    data[2] == 0x38 && data[3] == 0x2D) {
+                    // Nintendo's U8 archive is a documented big-endian tree of
+                    // 12-byte nodes. It is independent of any particular game:
+                    // a file node gives a byte range directly, so handing that
+                    // range to the ordinary raw-NVN/BNSH scanner avoids a broad,
+                    // error-prone scan of the complete archive.
+                    const auto read_be_u32 = [&](size_t off, u32& out) {
+                        if (off + 4 > sz) return false;
+                        out = (static_cast<u32>(data[off]) << 24) |
+                              (static_cast<u32>(data[off + 1]) << 16) |
+                              (static_cast<u32>(data[off + 2]) << 8) |
+                              static_cast<u32>(data[off + 3]);
+                        return true;
+                    };
+                    u32 root_offset{};
+                    if (read_be_u32(4, root_offset) &&
+                        static_cast<size_t>(root_offset) + 12 <= sz) {
+                        u32 root_kind_and_name{};
+                        u32 node_count{};
+                        if (read_be_u32(root_offset, root_kind_and_name) &&
+                            read_be_u32(static_cast<size_t>(root_offset) + 8, node_count) &&
+                            (root_kind_and_name >> 24) == 1u && node_count >= 1u &&
+                            node_count <= (sz - root_offset) / 12) {
+                            bool valid_tree = true;
+                            std::vector<ScanUnit> u8_units;
+                            u8_units.reserve(node_count > 0 ? node_count - 1 : 0);
+                            for (u32 index = 1; index < node_count; ++index) {
+                                const size_t node = static_cast<size_t>(root_offset) +
+                                                    static_cast<size_t>(index) * 12;
+                                u32 kind_and_name{};
+                                u32 data_offset{};
+                                u32 size_or_end{};
+                                if (!read_be_u32(node, kind_and_name) ||
+                                    !read_be_u32(node + 4, data_offset) ||
+                                    !read_be_u32(node + 8, size_or_end)) {
+                                    valid_tree = false;
+                                    break;
+                                }
+                                const u32 kind = kind_and_name >> 24;
+                                if (kind == 0) {
+                                    if (static_cast<u64>(data_offset) + size_or_end > sz) {
+                                        valid_tree = false;
+                                        break;
+                                    }
+                                    if (size_or_end >= 4) {
+                                        u8_units.push_back(ScanUnit{
+                                            {}, data + data_offset, size_or_end,
+                                            fmt::format("u8_entry_{}", index)});
+                                    }
+                                } else if (kind == 1) {
+                                    // Directory nodes store their exclusive end
+                                    // index, which must stay inside this tree.
+                                    if (size_or_end <= index || size_or_end > node_count) {
+                                        valid_tree = false;
+                                        break;
+                                    }
+                                } else {
+                                    valid_tree = false;
+                                    break;
+                                }
+                            }
+                            if (valid_tree && !u8_units.empty()) {
+                                scan_units = std::move(u8_units);
                             }
                         }
                     }
@@ -802,6 +1162,13 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                     Shader::ProgramHeader bsph{};
                     std::memcpy(&bsph, blob.data(), sizeof(bsph));
 
+                    const auto has_valid_sph = [](const Shader::ProgramHeader& sph) noexcept {
+                        const u32 type = sph.common0.shader_type.Value();
+                        return sph.common0.version.Value() != 0 &&
+                               sph.common0.sass_version.Value() != 0 && type >= 1 && type <= 5 &&
+                               sph.common0.sph_type.Value() == ((type == 5) ? 2u : 1u);
+                    };
+
                     // Validate SPH header fields before attempting to decode.
                     // Real NVIDIA shader program headers have:
                     //   version      (bits  5-9)  != 0  (typically 0x02)
@@ -832,20 +1199,27 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                                  diag_slot, blob.size(), common0_raw, sph_type, version,
                                  shader_type, sass_ver);
                     }
-                    if (version == 0u)              { if (diag_slot >= 0) LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: rejected — version == 0", diag_slot); return false; }
-                    if (shader_type < 1u || shader_type > 5u) { if (diag_slot >= 0) LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: rejected — shader_type out of range", diag_slot); return false; }
-                    const u32 expected_sph_type = (shader_type == 5u) ? 2u : 1u;
-                    if (sph_type != expected_sph_type) { if (diag_slot >= 0) LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: rejected — sph_type={} (expected {} for shader_type={})", diag_slot, sph_type, expected_sph_type, shader_type); return false; }
-                    if (sass_ver == 0u)             { if (diag_slot >= 0) LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: rejected — sass_ver == 0", diag_slot); return false; }
-
-                    // Require at least one instruction beyond the header,
-                    // aligned to 8 bytes (Maxwell instruction size).
-                    const size_t payload = blob.size() - sizeof(Shader::ProgramHeader);
-                    if (payload < 8 || payload % 8 != 0) {
+                    if (!has_valid_sph(bsph)) {
                         if (diag_slot >= 0) {
                             LOG_INFO(Render_Vulkan,
-                                     "PreCacheShaders diag[{}]: rejected — payload={} not 8-aligned "
-                                     "or empty", diag_slot, payload);
+                                     "PreCacheShaders diag[{}]: rejected — invalid SPH signature",
+                                     diag_slot);
+                        }
+                        return false;
+                    }
+
+                    // Require at least one complete instruction beyond the header.
+                    // A raw NVN program can be embedded within a larger archive
+                    // entry, where unrelated trailing metadata makes the remaining
+                    // entry length non-8-aligned. That must not invalidate the
+                    // header-led program; discard only the incomplete tail word.
+                    const size_t available_payload = blob.size() - sizeof(Shader::ProgramHeader);
+                    const size_t payload = available_payload & ~(sizeof(u64) - 1);
+                    if (payload < sizeof(u64)) {
+                        if (diag_slot >= 0) {
+                            LOG_INFO(Render_Vulkan,
+                                     "PreCacheShaders diag[{}]: rejected — payload={} has no complete "
+                                     "instruction", diag_slot, available_payload);
                         }
                         return false;
                     }
@@ -915,11 +1289,10 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                     // code[] now includes the SPH as its first sizeof(ProgramHeader)/8
                     // words, followed by the payload — matching what a live
                     // GraphicsEnvironment's code[] always contains (it's read starting
-                    // at start_address, which IS the SPH's own address there). This is
-                    // what code_lowest=0 in the scanner's SpeculativeShaderEnvironment
-                    // constructor now assumes; see that constructor's doc comment for
-                    // why this alignment is what makes CalculateHash() actually agree
-                    // with GenericEnvironment::Analyze() on the same shader.
+                    // at start_address, which IS the SPH's own address there). The
+                    // scanner varies that address's alignment below, while keeping the
+                    // byte span itself unchanged so CalculateHash() agrees with
+                    // GenericEnvironment::Analyze() on the same shader.
                     std::vector<u64> code(sizeof(Shader::ProgramHeader) / 8 + payload / 8);
                     std::memcpy(code.data(), blob.data(), sizeof(Shader::ProgramHeader));
                     std::memcpy(code.data() + sizeof(Shader::ProgramHeader) / 8,
@@ -931,54 +1304,321 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                                  diag_slot, static_cast<int>(stage));
                     }
 
-                    // Attempts a full translate — CFG, TranslateProgram, and SPIR-V
-                    // emission — starting from a given byte offset WITHIN the
-                    // payload (0 = the naive/default assumption: real code starts
-                    // immediately after the SPH). This is a much stronger success
-                    // signal than just checking whether a few instructions decode
-                    // without throwing: CFG construction validates branch targets
-                    // resolve to in-bounds instruction boundaries, block structure
-                    // is self-consistent, etc. — a wrong alignment is very unlikely
-                    // to satisfy all of that by chance. code is passed by value
-                    // (copied, not moved) so it can be reused across multiple
-                    // attempts at different offsets.
-                    // A brute-force scan can make up to ~1,000 deliberately-invalid
-                    // attempts per candidate.  Log the first failures for diagnosis, but
-                    // never every rejected offset: that grew a normal scan past 100 MB
-                    // before it could reach its completion summary.
+                    // A BNSH/raw-NVN program is serialized from its ProgramHeader
+                    // onward. The missing fact in a static file is not a later entry
+                    // offset: it is the GPU address at which that header is placed.
+                    // Maxwell inserts a scheduler word at each 32-byte instruction
+                    // group, so that address changes which words CFG treats as
+                    // schedulers. Try the four possible 8-byte alignments while
+                    // keeping the program and its identity intact.
                     constexpr size_t kMaxLoggedCandidateFailures = 2;
                     size_t logged_candidate_failures{};
-                    const auto try_translate_at = [&](u32 entry_offset_in_payload) -> bool {
+                    const auto try_translate_at = [&](u32 program_start_address,
+                                                      bool artifact_only) -> bool {
                         try {
-                            VideoCommon::SpeculativeShaderEnvironment env{code, stage, lm, bsph};
+                            VideoCommon::SpeculativeShaderEnvironment env{
+                                code, program_start_address, stage, lm, 0,
+                                std::array<u32, 3>{1u, 1u, 1u}, 1u, bsph,
+                                /*code_offset_in_program=*/0u};
+                            // The scan can enumerate scheduler alignments, but
+                            // a static file does not prove which GPU address the
+                            // runtime will use. Keep every result out of exact
+                            // publication (and the current post-CFG template
+                            // boundary) until a deeper pre-CFG artifact exists.
+                            env.MarkSchedulingAlignmentUnknown();
                             Shader::ObjectPool<Shader::Maxwell::Flow::Block> fp(16);
                             Shader::ObjectPool<Shader::IR::Inst> ip(8192);
                             Shader::ObjectPool<Shader::IR::Block> bp(32);
-                            const u32 start_address =
-                                static_cast<u32>(sizeof(Shader::ProgramHeader)) + entry_offset_in_payload;
-                            Shader::Maxwell::Flow::CFG cfg(env, fp, start_address, false);
+                            const auto cfg_begin = std::chrono::steady_clock::now();
+                            Shader::Maxwell::Flow::CFG cfg(
+                                env, fp, program_start_address +
+                                             static_cast<u32>(sizeof(Shader::ProgramHeader)), false);
+                            state->cfg_us.fetch_add(static_cast<u64>(
+                                std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - cfg_begin).count()));
                             if (diag_slot >= 0) {
-                                LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: CFG construction OK at entry +{}",
-                                         diag_slot, entry_offset_in_payload);
+                                LOG_INFO(Render_Vulkan,
+                                         "PreCacheShaders diag[{}]: CFG construction OK at program alignment {}",
+                                         diag_slot, program_start_address);
                             }
 
-                            // Compute the authoritative hash AFTER CFG determines shader bounds.
-                            // This must match GenericEnvironment::CalculateHash() used by the live path.
+                            // This is the same two-path identity calculation the live shader
+                            // cache uses: SPH-to-self-branch when the fast path can identify a
+                            // terminal branch, otherwise the complete CFG-read span. The latter
+                            // matters for legitimate BNSH programs that end without either of
+                            // the two historical self-branch encodings.
                             const u64 unique_hash = env.CalculateHash();
                             if (diag_slot >= 0) {
                                 LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: unique_hash={:016x}",
                                          diag_slot, unique_hash);
                             }
-                            ++state->shaders_found;
+                            if (!artifact_only) {
+                                ++state->shaders_found;
+                            }
 
-                            auto prog = Shader::Maxwell::TranslateProgram(ip,bp,env,cfg,host_info);
+                            // Persist CFG artifacts with known control flow.
+                            ++state->cfg_artifact_candidates;
+                            // CFG construction observes cbuf-backed control flow. Scheduler
+                            // placement is captured in the artifact key; later lowering state is
+                            // checked by fresh-module validation, not this CFG-only gate.
+                            if (env.HasUnknownCbufDependencies()) {
+                                ++state->cfg_artifact_cbuf_rejections;
+                            } else {
+                                try {
+                                    auto artifact_cfg = cfg.MakeTemplate();
+                                    const bool has_indirect_branch = std::any_of(
+                                        artifact_cfg.blocks.begin(), artifact_cfg.blocks.end(),
+                                        [](const auto& block) {
+                                            return !block.indirect_branches.empty();
+                                        });
+                                    const auto artifact_key =
+                                        artifact_cfg.functions.empty()
+                                            ? std::optional<VideoCommon::PrecacheCfgArtifactKey>{}
+                                            : VideoCommon::MakePrecacheCfgArtifactKey(
+                                                  unique_hash, stage,
+                                                  artifact_cfg.functions.front().entrypoint.Offset());
+                                    if (has_indirect_branch || !artifact_key) {
+                                        ++state->cfg_artifact_branches_rejections;
+                                    } else {
+                                        std::vector<Shader::Maxwell::PredecodedInstruction>
+                                            decoded_instructions;
+                                        for (const auto& block : artifact_cfg.blocks) {
+                                            for (auto location = block.begin; location != block.end;
+                                                 ++location) {
+                                                const u64 instruction{
+                                                    env.ReadInstruction(location.Offset())};
+                                                decoded_instructions.push_back(
+                                                    {.location = location.Offset(),
+                                                     .instruction = instruction,
+                                                     .opcode = Shader::Maxwell::Decode(instruction)});
+                                            }
+                                        }
+                                        std::ranges::sort(decoded_instructions, {},
+                                                          &Shader::Maxwell::PredecodedInstruction::location);
+                                        const auto duplicate = std::adjacent_find(
+                                            decoded_instructions.begin(), decoded_instructions.end(),
+                                            [](const auto& lhs, const auto& rhs) {
+                                                return lhs.location == rhs.location;
+                                            });
+                                        if (decoded_instructions.empty() ||
+                                            duplicate != decoded_instructions.end()) {
+                                            ++state->cfg_artifact_branches_rejections;
+                                        } else {
+                                            VideoCommon::PrecacheCfgArtifact artifact{
+                                                .key = *artifact_key,
+                                                .cfg = std::move(artifact_cfg),
+                                                .decoded_instructions = std::move(decoded_instructions),
+                                            };
+                                            if (artifact.IsValid()) {
+                                                std::lock_guard lock{state->cfg_artifact_mutex};
+                                                if (state->cfg_artifact_keys.insert(artifact.key).second) {
+                                                    if (state->cfg_artifacts.size() <
+                                                        kMaxPersistedCfgArtifacts) {
+                                                        ++state->cfg_artifact_stages[
+                                                            static_cast<size_t>(artifact.key.stage)];
+                                                        state->cfg_artifacts.push_back(std::move(artifact));
+                                                        ++state->cfg_artifact_stored;
+                                                    } else {
+                                                        ++state->cfg_artifact_capacity_rejections;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                } catch (...) {
+                                    // Keep scanner translation usable on artifact failure.
+                                    ++state->cfg_artifact_branches_rejections;
+                                }
+                            }
+
+                            // Later scheduler alignments add CFG artifacts only.
+                            if (artifact_only) {
+                                return true;
+                            }
+
+                            // CFG discovery may read cbuf-backed branch data and the scanner
+                            // itself records that this alignment was synthetic. Those facts
+                            // remain disqualifying for a final SPIR-V module, but they do not
+                            // answer whether the following frontend boundary consumed unknown
+                            // runtime state. Snapshot them, measure BuildProgramTemplate alone,
+                            // then restore them before finalization/final-module validation.
+                            const auto cfg_dependencies = env.TakeDependencySnapshot();
+                            const auto template_begin = std::chrono::steady_clock::now();
+                            auto prog = Shader::Maxwell::BuildProgramTemplate(ip, bp, env, cfg,
+                                                                                host_info);
+                            const auto& frontend_dependencies{prog.frontend_dependencies};
+                            const auto uses = [&frontend_dependencies](
+                                                 Shader::IR::FrontendDependency dependency) {
+                                return frontend_dependencies.Uses(dependency);
+                            };
+                            if (uses(Shader::IR::FrontendDependency::ConstantBuffer) ||
+                                uses(Shader::IR::FrontendDependency::ConstantBufferSize) ||
+                                uses(Shader::IR::FrontendDependency::ConstantBufferReplacement)) {
+                                ++state->frontend_manifest_cbuf;
+                            }
+                            if (uses(Shader::IR::FrontendDependency::TextureType) ||
+                                uses(Shader::IR::FrontendDependency::TexturePixelFormat) ||
+                                uses(Shader::IR::FrontendDependency::TextureIntegerFormat) ||
+                                uses(Shader::IR::FrontendDependency::TextureBinding) ||
+                                uses(Shader::IR::FrontendDependency::ProprietaryDriver)) {
+                                ++state->frontend_manifest_resource;
+                            }
+                            if (uses(Shader::IR::FrontendDependency::ViewportTransform)) {
+                                ++state->frontend_manifest_viewport;
+                            }
+                            if (uses(Shader::IR::FrontendDependency::ComputeLaunch)) {
+                                ++state->frontend_manifest_compute;
+                            }
+                            if (uses(Shader::IR::FrontendDependency::HLEMacro)) {
+                                ++state->frontend_manifest_hle;
+                            }
+                            if (uses(Shader::IR::FrontendDependency::GeometryPassthrough)) {
+                                ++state->frontend_manifest_interface;
+                            }
+                            state->template_us.fetch_add(static_cast<u64>(
+                                std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - template_begin).count()));
+                            // Snapshot dependencies exactly at proposed template
+                            // boundary. FinalizeProgramTemplate() is allowed to
+                            // consume real cbuf/resource/interface state later;
+                            // consuming it here would make scanner reuse unsound.
+                            const bool template_unknown_cbuf = env.HasUnknownCbufDependencies();
+                            const bool template_unknown_texture =
+                                env.HasUnknownTextureDependencies();
+                            const bool template_unknown_viewport =
+                                env.HasUnknownViewportDependency();
+                            const bool template_unknown_compute =
+                                env.HasUnknownComputeLaunchDependency();
+                            const bool template_unknown_hle_macro =
+                                env.HasUnknownHLEMacroDependency();
+                            const bool template_unknown_interface =
+                                env.HasUnknownInterfaceDependency();
+                            const bool template_unknown_scheduling_alignment =
+                                env.HasUnknownSchedulingAlignmentDependency();
+                            if (env.HasStateIndependentTemplateContract()) {
+                                ++state->template_boundary_eligible;
+                                ++state->frontend_artifact_candidates;
+                                VideoCommon::PrecacheFrontendFreezeError freeze_error;
+                                auto frozen = VideoCommon::FreezePrecacheFrontendArtifact(
+                                    prog, freeze_error);
+                                if (!frozen) {
+                                    switch (freeze_error) {
+                                    case VideoCommon::PrecacheFrontendFreezeError::UnsupportedInfo:
+                                        ++state->frontend_artifact_info_rejections;
+                                        break;
+                                    case VideoCommon::PrecacheFrontendFreezeError::AssociatedPseudoOperation:
+                                        ++state->frontend_artifact_pseudo_rejections;
+                                        break;
+                                    case VideoCommon::PrecacheFrontendFreezeError::UnsupportedValue:
+                                        ++state->frontend_artifact_value_rejections;
+                                        break;
+                                    case VideoCommon::PrecacheFrontendFreezeError::InvalidGraph:
+                                    case VideoCommon::PrecacheFrontendFreezeError::TooLarge:
+                                        ++state->frontend_artifact_graph_rejections;
+                                        break;
+                                    case VideoCommon::PrecacheFrontendFreezeError::None:
+                                        break;
+                                    }
+                                } else {
+                                    VideoCommon::PrecacheFrontendArtifactRecord record{
+                                        .key = {
+                                            .program_identity = unique_hash,
+                                            .compiler_target_fingerprint = compiler_target_key,
+                                            .source_header = Common::CityHash64(
+                                                reinterpret_cast<const char*>(&bsph), sizeof(bsph)),
+                                            .local_memory_size = prog.local_memory_size,
+                                            .stage = stage,
+                                            .scheduler_slot = static_cast<u8>(
+                                                program_start_address % 32),
+                                            .exits_to_dispatcher = false,
+                                        },
+                                        .artifact = std::move(*frozen),
+                                    };
+                                    if (!record.IsValid()) {
+                                        ++state->frontend_artifact_graph_rejections;
+                                    } else {
+                                        std::lock_guard lock{state->frontend_artifact_mutex};
+                                        if (state->frontend_artifact_keys.insert(record.key).second) {
+                                            if (state->frontend_artifacts.size() <
+                                                kMaxPersistedFrontendArtifacts) {
+                                                state->frontend_artifacts.push_back(std::move(record));
+                                                ++state->frontend_artifact_stages[
+                                                    static_cast<size_t>(stage)];
+                                                ++state->frontend_artifact_stored;
+                                            } else {
+                                                ++state->frontend_artifact_capacity_rejections;
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                if (template_unknown_cbuf) {
+                                    ++state->template_boundary_cbuf_rejections;
+                                }
+                                if (template_unknown_texture) {
+                                    ++state->template_boundary_texture_rejections;
+                                }
+                                if (template_unknown_viewport) {
+                                    ++state->template_boundary_viewport_rejections;
+                                }
+                                if (template_unknown_compute) {
+                                    ++state->template_boundary_compute_rejections;
+                                }
+                                if (template_unknown_hle_macro) {
+                                    ++state->template_boundary_hle_macro_rejections;
+                                }
+                                if (template_unknown_interface) {
+                                    ++state->template_boundary_interface_rejections;
+                                }
+                                if (template_unknown_scheduling_alignment) {
+                                    ++state->template_boundary_scheduling_alignment_rejections;
+                                }
+                            }
+                            env.MergeDependencySnapshot(cfg_dependencies);
+                            const auto finalize_begin = std::chrono::steady_clock::now();
+                            Shader::Maxwell::FinalizeProgramTemplate(prog, env, host_info);
+                            state->finalize_us.fetch_add(static_cast<u64>(
+                                std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - finalize_begin).count()));
+                            const bool has_unknown_cbuf = env.HasUnknownCbufDependencies();
+                            const bool has_unknown_texture = env.HasUnknownTextureDependencies();
+                            const bool has_unknown_viewport = env.HasUnknownViewportDependency();
+                            const bool has_unknown_compute =
+                                env.HasUnknownComputeLaunchDependency();
+                            const bool has_unknown_hle_macro = env.HasUnknownHLEMacroDependency();
+                            const bool has_unknown_interface =
+                                env.HasUnknownInterfaceDependency();
+                            const bool has_unknown_scheduling_alignment =
+                                env.HasUnknownSchedulingAlignmentDependency();
+                            if (has_unknown_cbuf) {
+                                ++state->unknown_cbuf_candidates;
+                            }
+                            if (has_unknown_texture) {
+                                ++state->unknown_texture_candidates;
+                            }
+                            if (has_unknown_viewport) {
+                                ++state->unknown_viewport_candidates;
+                            }
+                            if (has_unknown_compute) {
+                                ++state->unknown_compute_candidates;
+                            }
+                            if (has_unknown_hle_macro) {
+                                ++state->unknown_hle_macro_candidates;
+                            }
+                            if (has_unknown_interface) {
+                                ++state->unknown_interface_candidates;
+                            }
+                            if (has_unknown_scheduling_alignment) {
+                                ++state->unknown_scheduling_alignment_candidates;
+                            }
                             if (diag_slot >= 0) {
-                                LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: TranslateProgram OK at entry +{}",
-                                         diag_slot, entry_offset_in_payload);
+                                LOG_INFO(Render_Vulkan,
+                                         "PreCacheShaders diag[{}]: TranslateProgram OK at program alignment {}",
+                                         diag_slot, program_start_address);
                             }
                             Shader::Backend::Bindings binding = starting_binding;
                             Shader::RuntimeInfo rt{};
-                            // Phase 3 guess refinement: for every stage except VertexB,
+                            // Scanner runtime-state snapshot: for every stage except VertexB,
                             // previous_stage_stores is a real, IS-read field of
                             // SpirvRelevantHash(stage) (see that function's own comment)
                             // -- and for a REAL draw it reflects the actual preceding
@@ -1018,13 +1658,34 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                                 // Accept all frag color output types conservatively.
                                 rt.frag_color_types.fill(Shader::FragmentOutputType::Float);
                             }
-                            // Phase 5 free wins (runtime_info.h) -- deliberate defaults for
+                            // Deliberate runtime defaults (runtime_info.h) for
                             // the fields this speculative path has no real per-draw signal
                             // for.
                             rt.ApplySpeculativeDefaults(stage, prog.info);
                             Shader::Maxwell::ConvertLegacyToGeneric(prog, rt);
+                            const auto emit_begin = std::chrono::steady_clock::now();
                             auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile,rt,prog,binding);
-                            const u64 texture_key = VideoCommon::ComputeTextureKey(env.CapturedTextureTypes(), env.CapturedTexturePixelFormats());
+                            state->emit_us.fetch_add(static_cast<u64>(
+                                std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - emit_begin).count()));
+                            // The scanner supplies synthetic descriptor handles. Match real
+                            // execution by keying complete observations on the cbuf slot that
+                            // produced each handle; retain the raw key for any untracked query
+                            // or while handle-specific polymorphism is active.
+                            const bool use_logical_texture_key =
+                                !VideoCommon::HasActivePhase4LogicalTextureSlot(
+                                    env.CapturedLogicalTextureSlots()) &&
+                                VideoCommon::HasCompleteLogicalTextureCoverage(
+                                    env.CapturedLogicalTextureSlots(),
+                                    env.CapturedLogicalTextureHandles(),
+                                    env.CapturedTextureTypes(), env.CapturedTexturePixelFormats());
+                            const u64 texture_key =
+                                use_logical_texture_key
+                                    ? VideoCommon::ComputeLogicalTextureKey(
+                                          env.CapturedLogicalTextureSlots())
+                                    : VideoCommon::ComputeTextureKey(env.CapturedTextureTypes(),
+                                                                     env.CapturedTexturePixelFormats());
+                            cache.RecordTextureKeyMode(use_logical_texture_key);
                             // Every real Lookup()/Insert() call folds viewport_transform_state
                             // (VertexB only) and binding_key into runtime_key before touching
                             // the cache (see FoldViewportTransformState/FoldBindingKey's doc
@@ -1065,15 +1726,56 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                                 runtime_key = VideoCommon::FoldBindingKey(runtime_key,
                                                                           diag_binding_key);
                             }
-                            cache.InsertSpeculative(unique_hash, runtime_key, texture_key, std::move(spirv),
-                                                    binding, diag_base_runtime_hash, diag_binding_key,
-                                                    diag_runtime_fields,
-                                                    VideoCommon::SpirvCacheEntrySource::PrecacheScanner);
+                            // Scanner defaults are unknown state, never observed
+                            // values. Any unknown cbuf, texture shape, viewport, compute,
+                            // HLE, or geometry-interface dependency can alter lowering or
+                            // metadata, so none may publish an exact final module.
+                            // Translation still runs for template work, stage-chain
+                            // diagnostics, and timing.
+                            if (env.HasCompleteFinalModuleContract() && unique_hash != 0 &&
+                                !spirv.empty()) {
+                                cache.InsertSpeculative(
+                                    unique_hash, stage, compiler_target_key, runtime_key,
+                                    texture_key, std::move(spirv), binding,
+                                    diag_base_runtime_hash, diag_binding_key,
+                                    diag_runtime_fields,
+                                    VideoCommon::SpirvCacheEntrySource::PrecacheScanner);
+                                ++state->final_entries;
+                            } else {
+                                if (has_unknown_cbuf) {
+                                    ++state->final_cbuf_contract_rejections;
+                                }
+                                if (has_unknown_texture) {
+                                    ++state->final_texture_contract_rejections;
+                                }
+                                if (has_unknown_viewport) {
+                                    ++state->final_viewport_contract_rejections;
+                                }
+                                if (has_unknown_compute) {
+                                    ++state->final_compute_contract_rejections;
+                                }
+                                if (has_unknown_hle_macro) {
+                                    ++state->final_hle_macro_contract_rejections;
+                                }
+                                if (has_unknown_interface) {
+                                    ++state->final_interface_contract_rejections;
+                                }
+                                if (has_unknown_scheduling_alignment) {
+                                    ++state->final_scheduling_alignment_contract_rejections;
+                                }
+                                if (unique_hash == 0 || spirv.empty()) {
+                                    ++state->final_identity_contract_rejections;
+                                }
+                            }
 
                             ++state->shaders_translated;
+                            if (program_start_address != 0) {
+                                ++state->alignment_translated_entries;
+                            }
                             if (diag_slot >= 0) {
-                                LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: fully translated OK at entry +{}",
-                                         diag_slot, entry_offset_in_payload);
+                                LOG_INFO(Render_Vulkan,
+                                         "PreCacheShaders diag[{}]: fully translated OK at program alignment {}",
+                                         diag_slot, program_start_address);
                             }
                             // Written only here, on confirmed full success (translate +
                             // emit + insert all completed) -- not right after
@@ -1109,105 +1811,31 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                         } catch (const std::exception& e) {
                             if (diag_slot >= 0 &&
                                 logged_candidate_failures++ < kMaxLoggedCandidateFailures) {
-                                LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: entry +{} threw std::exception: {}",
-                                         diag_slot, entry_offset_in_payload, e.what());
+                                LOG_INFO(Render_Vulkan,
+                                         "PreCacheShaders diag[{}]: program alignment {} threw std::exception: {}",
+                                         diag_slot, program_start_address, e.what());
                             }
                             return false;
                         } catch (...) {
                             if (diag_slot >= 0 &&
                                 logged_candidate_failures++ < kMaxLoggedCandidateFailures) {
-                                LOG_INFO(Render_Vulkan, "PreCacheShaders diag[{}]: entry +{} threw unknown exception",
-                                         diag_slot, entry_offset_in_payload);
+                                LOG_INFO(Render_Vulkan,
+                                         "PreCacheShaders diag[{}]: program alignment {} threw unknown exception",
+                                         diag_slot, program_start_address);
                             }
                             return false;
                         }
                     };
 
-                    if (try_translate_at(0)) {
+                    bool full_translation_succeeded{};
+                    for (const u32 alignment : {0u, 8u, 16u, 24u}) {
+                        if (try_translate_at(alignment, full_translation_succeeded)) {
+                            full_translation_succeeded = true;
+                        }
+                    }
+                    if (full_translation_succeeded) {
                         return true;
                     }
-
-                    // On by default as of this build — was opt-in behind
-                    // CITRON_PRECACHE_BRUTEFORCE_ENTRY=1 while this was still being
-                    // validated. It's still expensive (each candidate re-runs the
-                    // whole translate pipeline, not a cheap decode check), so a full
-                    // ROM scan takes meaningfully longer than the naive-offset-only
-                    // pass, but that's the intended default now rather than
-                    // something to remember to opt into per session.
-                    // Set CITRON_PRECACHE_BRUTEFORCE_ENTRY=0 to disable it (e.g. to
-                    // fall back to the old, faster, naive-offset-only behavior).
-                    // Window and step are in bytes; CITRON_PRECACHE_FILTER remains
-                    // useful for restricting a scan to a small, known set of files.
-                    static const bool bruteforce_entry = [] {
-                        const char* v = std::getenv("CITRON_PRECACHE_BRUTEFORCE_ENTRY");
-                        return !(v && *v && std::string(v) == "0");
-                    }();
-                    if (bruteforce_entry) {
-                        // Default window bumped from 512 to 8192 bytes: a scan with
-                        // the old 4096-byte default logged failed=9389, of which 507
-                        // were specifically "no working entry within +4096 bytes" —
-                        // i.e. window-limited, not a translation failure. 8192 gives
-                        // that tail more room without needing CITRON_PRECACHE_
-                        // BRUTEFORCE_WINDOW set by hand. Don'''t expect this to move
-                        // `failed` by much on its own, though — the other ~8900
-                        // failures in that run were for unrelated reasons (unsupported
-                        // instructions, genuine translation errors, etc.) a bigger
-                        // window can'''t fix. Still overridable via the env var, larger
-                        // or smaller, same as before.
-                        u32 window_bytes = 8192;
-                        if (const char* w = std::getenv("CITRON_PRECACHE_BRUTEFORCE_WINDOW")) {
-                            const int parsed = std::atoi(w);
-                            if (parsed > 0) window_bytes = static_cast<u32>(parsed);
-                        }
-                        const u32 limit = std::min<u32>(window_bytes, static_cast<u32>(payload));
-
-                        // Fast pass: across two independent stages (vertex and
-                        // fragment) and 55 real successes found scanning every
-                        // 8-byte position, every single one landed at
-                        // payload_offset % 32 == 8, with zero exceptions. That's
-                        // not coincidence at that sample size — it's a real
-                        // structural fact (almost certainly the entry point
-                        // sitting right after a variable-length, 32-byte-granular
-                        // embedded-constants region — consistent with e.g. 4x4
-                        // matrices or similar GPU-aligned data preceding the real
-                        // code). Try this residue class first: same recall so
-                        // far, 4x fewer candidates.
-                        for (u32 off = 8; off < limit; off += 32) {
-                            if (try_translate_at(off)) {
-                                if (diag_slot >= 0) {
-                                    LOG_INFO(Render_Vulkan,
-                                             "PreCacheShaders diag[{}]: BRUTEFORCE (fast pass, %32==8) found "
-                                             "working entry at payload offset +{} (naive offset was +0)",
-                                             diag_slot, off);
-                                }
-                                return true;
-                            }
-                        }
-                        // Fallback: exhaustive search of the remaining phases, in
-                        // case some shader's true entry doesn't fit the pattern
-                        // above. Only reached when the fast pass above found
-                        // nothing, so this doesn't cost anything extra for the
-                        // (so far) common case.
-                        for (u32 off = 0; off < limit; off += 8) {
-                            if (off % 32 == 8) continue; // already tried above
-                            if (try_translate_at(off)) {
-                                if (diag_slot >= 0) {
-                                    LOG_INFO(Render_Vulkan,
-                                             "PreCacheShaders diag[{}]: BRUTEFORCE (fallback pass) found "
-                                             "working entry at payload offset +{} (naive offset was +0, "
-                                             "did NOT fit the %32==8 pattern)",
-                                             diag_slot, off);
-                                }
-                                return true;
-                            }
-                        }
-                        if (diag_slot >= 0) {
-                            LOG_INFO(Render_Vulkan,
-                                     "PreCacheShaders diag[{}]: BRUTEFORCE found no working entry within "
-                                     "+{} bytes", diag_slot, limit);
-                        }
-                    }
-
                     ++state->shaders_failed;
                     return false;
                 };
@@ -1397,7 +2025,7 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                         if (binary_offset == 0) continue;
 
                         const size_t prog_hdr = base + static_cast<size_t>(binary_offset);
-                        // Phase 3 guess refinement: fields 0-4 (Vertex, TessControl,
+                        // Scanner runtime-state snapshot: fields 0-4 (Vertex, TessControl,
                         // TessEval, Geometry, Fragment) are a real graphics pipeline
                         // chain within this one shader program, in this order (matching
                         // BnshShaderProgramHeader's own layout) -- processed here in
@@ -1481,6 +2109,12 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                 // full scan does. See docs/precache-scanner/FINDINGS.md section 5.
                 constexpr u32 kRawNvnShaderMagic = 0x12345678u; // bytes 78 56 34 12 read as LE u32
                 constexpr size_t kNvnHeaderSize = 0x30;
+                const auto has_valid_sph = [](const Shader::ProgramHeader& sph) noexcept {
+                    const u32 type = sph.common0.shader_type.Value();
+                    return sph.common0.version.Value() != 0 &&
+                           sph.common0.sass_version.Value() != 0 && type >= 1 && type <= 5 &&
+                           sph.common0.sph_type.Value() == ((type == 5) ? 2u : 1u);
+                };
                 bool any_raw_nvn = false;
                 if (!any_bnsh) {
                     for (size_t base = 0; base + 4 <= sz; base += 4) {
@@ -1490,7 +2124,7 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                         if (sph_off + sizeof(Shader::ProgramHeader) > sz) continue;
                         Shader::ProgramHeader sph{};
                         std::memcpy(&sph, data + sph_off, sizeof(sph));
-                        if (sph.common0.shader_type.Value() >= 1 && sph.common0.shader_type.Value() <= 5) {
+                        if (has_valid_sph(sph)) {
                             any_raw_nvn = true;
                             // No BNSH shader-program grouping for a raw-NVN scan
                             // unit either (same reasoning as the pre-existing
@@ -1526,7 +2160,7 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                     for (size_t off = 0; off + sizeof(Shader::ProgramHeader) <= sz; off += 4) {
                         Shader::ProgramHeader sph{};
                         std::memcpy(&sph, data + off, sizeof(sph));
-                        if (sph.common0.shader_type.Value() >= 1 && sph.common0.shader_type.Value() <= 5) {
+                        if (has_valid_sph(sph)) {
                             any_raw_matched = true;
                             // Same reasoning as the raw-NVN call site above: no
                             // sibling-stage data for a pairtable-derived scan unit.
@@ -1544,11 +2178,11 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
                     }
                 } else if (sz>=sizeof(Shader::ProgramHeader)) {
                     Shader::ProgramHeader sph{}; std::memcpy(&sph,data,sizeof(sph));
-                    if (sph.common0.shader_type.Value()>=1 && sph.common0.shader_type.Value()<=5) {
+                    if (has_valid_sph(sph)) {
                         ++state->raw_matched;
                         // No BNSH shader-program grouping for a standalone raw-matched
                         // file, so no real sibling-stage data exists here -- nullptr for
-                        // both falls back to exactly the previous (pre-Phase-3) sentinel
+                        // both fall back to the prior sentinel
                         // behavior for this path, unchanged.
                         process_blob(std::vector<u8>(data, data+sz), /*is_bnsh_derived=*/false,
                                      /*previous_stage=*/nullptr, /*out_stage_snapshot=*/nullptr,
@@ -1565,17 +2199,96 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
             });
         }
         workers.WaitForRequests();
+        std::vector<VideoCommon::PrecacheCfgArtifact> cfg_artifact_snapshot;
+        {
+            std::lock_guard lock{state->cfg_artifact_mutex};
+            cfg_artifact_snapshot = state->cfg_artifacts;
+        }
+        const bool cfg_artifacts_saved = !cfg_artifact_snapshot.empty() &&
+                                         VideoCommon::SavePrecacheCfgArtifacts(
+                                             cache_dir / fmt::format(
+                                                 "precache_cfg_artifacts_{:016x}.bin",
+                                                 compiler_target_key),
+                                             cfg_artifact_snapshot);
+        std::vector<VideoCommon::PrecacheFrontendArtifactRecord> frontend_artifact_snapshot;
+        {
+            std::lock_guard lock{state->frontend_artifact_mutex};
+            frontend_artifact_snapshot = state->frontend_artifacts;
+        }
+        const bool frontend_artifacts_saved = !frontend_artifact_snapshot.empty() &&
+                                              VideoCommon::SavePrecacheFrontendArtifacts(
+                                                  cache_dir / fmt::format(
+                                                      "precache_frontend_artifacts_{:016x}.bin",
+                                                      compiler_target_key),
+                                                  frontend_artifact_snapshot);
         cache.Save(spirv_path);
         LOG_INFO(Render_Vulkan,
                  "PreCacheShaders: done. files={} processed={} zstd_decompressed={} "
                  "zstd_failed={} bnsh_matched={} raw_matched={} unrecognized={} "
-                 "shaders_found={} translated={} failed={} cache_size={}",
+                 "shaders_found={} translated={} final_entries={} alignment_translated_entries={} "
+                 "unknown_deps(cbuf/texture/viewport/compute/hle_macro/interface/scheduling_alignment)={}/{}/{}/{}/{}/{}/{} "
+                 "final_contract_rejections(cbuf/texture/viewport/compute/hle_macro/interface/scheduling_alignment/identity)={}/{}/{}/{}/{}/{}/{}/{} "
+                 "template_boundary(eligible/reject_cbuf/reject_texture/reject_viewport/reject_compute/reject_hle_macro/reject_interface/reject_scheduling_alignment)={}/{}/{}/{}/{}/{}/{}/{} "
+                 "frontend_manifest(cbuf/resource/viewport/compute/hle/interface)={}/{}/{}/{}/{}/{} "
+                 "cfg_artifacts(candidates/stored/saved/cbuf/indirect/capacity)={}/{}/{}/{}/{}/{} "
+                 "frontend_artifacts(candidates/stored/saved/info/pseudo/value/graph/capacity)={}/{}/{}/{}/{}/{}/{}/{} "
+                 "frontend_artifact_stages(VB/TC/TE/G/F/C/VA)={}/{}/{}/{}/{}/{}/{} "
+                 "cfg_artifact_stages(VB/TC/TE/G/F/C/VA)={}/{}/{}/{}/{}/{}/{} "
+                 "failed={} cache_size={} texture_key_mode(logical/raw_fallback)={}/{} "
+                 "worker_cpu_ms(cfg/template/finalize/emit)={}/{}/{}/{}",
                  state->files_total.load(), state->files_processed.load(),
                  state->zstd_decompressed.load(), state->zstd_failed.load(),
                  state->bnsh_matched.load(), state->raw_matched.load(),
                  state->unrecognized.load(), state->shaders_found.load(),
-                 state->shaders_translated.load(), state->shaders_failed.load(),
-                 cache.Size());
+                 state->shaders_translated.load(), state->final_entries.load(),
+                 state->alignment_translated_entries.load(), state->unknown_cbuf_candidates.load(),
+                 state->unknown_texture_candidates.load(), state->unknown_viewport_candidates.load(),
+                 state->unknown_compute_candidates.load(), state->unknown_hle_macro_candidates.load(),
+                 state->unknown_interface_candidates.load(),
+                 state->unknown_scheduling_alignment_candidates.load(),
+                 state->final_cbuf_contract_rejections.load(),
+                 state->final_texture_contract_rejections.load(),
+                 state->final_viewport_contract_rejections.load(),
+                 state->final_compute_contract_rejections.load(),
+                 state->final_hle_macro_contract_rejections.load(),
+                 state->final_interface_contract_rejections.load(),
+                 state->final_scheduling_alignment_contract_rejections.load(),
+                 state->final_identity_contract_rejections.load(),
+                 state->template_boundary_eligible.load(),
+                 state->template_boundary_cbuf_rejections.load(),
+                 state->template_boundary_texture_rejections.load(),
+                 state->template_boundary_viewport_rejections.load(),
+                 state->template_boundary_compute_rejections.load(),
+                 state->template_boundary_hle_macro_rejections.load(),
+                 state->template_boundary_interface_rejections.load(),
+                 state->template_boundary_scheduling_alignment_rejections.load(),
+                 state->frontend_manifest_cbuf.load(), state->frontend_manifest_resource.load(),
+                 state->frontend_manifest_viewport.load(),
+                 state->frontend_manifest_compute.load(), state->frontend_manifest_hle.load(),
+                 state->frontend_manifest_interface.load(),
+                 state->cfg_artifact_candidates.load(), state->cfg_artifact_stored.load(),
+                 cfg_artifacts_saved ? 1 : 0, state->cfg_artifact_cbuf_rejections.load(),
+                 state->cfg_artifact_branches_rejections.load(),
+                 state->cfg_artifact_capacity_rejections.load(),
+                 state->frontend_artifact_candidates.load(),
+                 state->frontend_artifact_stored.load(), frontend_artifacts_saved ? 1 : 0,
+                 state->frontend_artifact_info_rejections.load(),
+                 state->frontend_artifact_pseudo_rejections.load(),
+                 state->frontend_artifact_value_rejections.load(),
+                 state->frontend_artifact_graph_rejections.load(),
+                 state->frontend_artifact_capacity_rejections.load(),
+                 state->frontend_artifact_stages[0], state->frontend_artifact_stages[1],
+                 state->frontend_artifact_stages[2], state->frontend_artifact_stages[3],
+                 state->frontend_artifact_stages[4], state->frontend_artifact_stages[5],
+                 state->frontend_artifact_stages[6],
+                 state->cfg_artifact_stages[0], state->cfg_artifact_stages[1],
+                 state->cfg_artifact_stages[2], state->cfg_artifact_stages[3],
+                 state->cfg_artifact_stages[4], state->cfg_artifact_stages[5],
+                 state->cfg_artifact_stages[6],
+                 state->shaders_failed.load(),
+                 cache.Size(), cache.LogicalTextureKeyCount(), cache.RawTextureKeyCount(),
+                 state->cfg_us.load() / 1000, state->template_us.load() / 1000,
+                 state->finalize_us.load() / 1000, state->emit_us.load() / 1000);
     };
 
     auto future = QtConcurrent::run(std::move(worker));
@@ -1589,7 +2302,10 @@ void GMainWindow::OnGameListPreCacheShaders(u64 program_id,
         const int translated= state->shaders_translated.load();
         if (total==0) {
             progress.setMaximum(0);
-            progress.setLabelText(tr("Mounting RomFS..."));
+            // The normal path already captured a resolved RomFS directory
+            // during the short boot. Until the background worker has finished
+            // indexing its files, total is zero; this is not a second mount.
+            progress.setLabelText(tr("Indexing resolved RomFS files..."));
         } else if (processed<total) {
             progress.setMaximum(total); progress.setValue(processed);
             progress.setLabelText(tr("Scanning files... %1 / %2  (%3 shaders found)")

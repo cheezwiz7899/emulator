@@ -7,6 +7,7 @@
 #include <queue>
 
 #include "common/settings.h"
+#include "shader_recompiler/environment.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ir/basic_block.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
@@ -19,6 +20,125 @@
 
 namespace Shader::Maxwell {
 namespace {
+class FrontendEnvironment final : public Environment {
+public:
+    explicit FrontendEnvironment(Environment& source_) : source{source_} {
+        sph = source.SPH();
+        stage = source.ShaderStage();
+        start_address = source.StartAddress();
+        // BuildProgramTemplate never consumes this state. Its only shader
+        // recompiler consumer is ConstantPropagationPass, which runs later
+        // through FinalizeProgramTemplate with the real Environment. Reading
+        // it here made every scanner candidate appear to depend on an unknown
+        // driver binding despite no frontend instruction observing it.
+        is_proprietary_driver = false;
+    }
+
+    [[nodiscard]] IR::FrontendDependencyManifest Manifest() const noexcept {
+        return {.flags = dependencies};
+    }
+
+    VideoCommon::GenericEnvironment* AsGenericEnvironment() noexcept override {
+        return source.AsGenericEnvironment();
+    }
+    const VideoCommon::GenericEnvironment* AsGenericEnvironment() const noexcept override {
+        return source.AsGenericEnvironment();
+    }
+    VideoCommon::FileEnvironment* AsFileEnvironment() noexcept override {
+        return source.AsFileEnvironment();
+    }
+    const VideoCommon::FileEnvironment* AsFileEnvironment() const noexcept override {
+        return source.AsFileEnvironment();
+    }
+
+    u64 ReadInstruction(u32 address) override {
+        Record(IR::FrontendDependency::Instruction);
+        return source.ReadInstruction(address);
+    }
+    u32 ReadCbufValue(u32 index, u32 offset) override {
+        Record(IR::FrontendDependency::ConstantBuffer);
+        return source.ReadCbufValue(index, offset);
+    }
+    u32 ReadCbufValueForTextureHandle(u32 index, u32 offset) override {
+        Record(IR::FrontendDependency::ConstantBuffer);
+        return source.ReadCbufValueForTextureHandle(index, offset);
+    }
+    u32 ReadCbufSize(u32 index) override {
+        Record(IR::FrontendDependency::ConstantBufferSize);
+        return source.ReadCbufSize(index);
+    }
+    TextureType ReadTextureType(u32 handle) override {
+        Record(IR::FrontendDependency::TextureType);
+        return source.ReadTextureType(handle);
+    }
+    TexturePixelFormat ReadTexturePixelFormat(u32 handle) override {
+        Record(IR::FrontendDependency::TexturePixelFormat);
+        return source.ReadTexturePixelFormat(handle);
+    }
+    bool IsTexturePixelFormatInteger(u32 handle) override {
+        Record(IR::FrontendDependency::TextureIntegerFormat);
+        return source.IsTexturePixelFormatInteger(handle);
+    }
+    u32 ReadViewportTransformState() override {
+        Record(IR::FrontendDependency::ViewportTransform);
+        return source.ReadViewportTransformState();
+    }
+    u32 TextureBoundBuffer() const override {
+        Record(IR::FrontendDependency::TextureBinding);
+        return source.TextureBoundBuffer();
+    }
+    u32 LocalMemorySize() const override {
+        Record(IR::FrontendDependency::LocalMemory);
+        return source.LocalMemorySize();
+    }
+    u32 SharedMemorySize() const override {
+        Record(IR::FrontendDependency::ComputeLaunch);
+        return source.SharedMemorySize();
+    }
+    std::array<u32, 3> WorkgroupSize() const override {
+        Record(IR::FrontendDependency::ComputeLaunch);
+        return source.WorkgroupSize();
+    }
+    bool HasHLEMacroState() const override {
+        Record(IR::FrontendDependency::HLEMacro);
+        return source.HasHLEMacroState();
+    }
+    std::optional<ReplaceConstant> GetReplaceConstBuffer(u32 bank, u32 offset) override {
+        Record(IR::FrontendDependency::ConstantBufferReplacement);
+        return source.GetReplaceConstBuffer(bank, offset);
+    }
+    const std::array<u32, 8>& GpPassthroughMask() const noexcept override {
+        Record(IR::FrontendDependency::GeometryPassthrough);
+        return source.GpPassthroughMask();
+    }
+    bool IsProprietaryDriver() const noexcept override {
+        Record(IR::FrontendDependency::ProprietaryDriver);
+        return source.IsProprietaryDriver();
+    }
+    void RecordResolvedTextureType(const TextureSlot& slot, u32 handle, TextureType type) override {
+        source.RecordResolvedTextureType(slot, handle, type);
+    }
+    void RecordResolvedTexturePixelFormat(const TextureSlot& slot, u32 handle,
+                                          TexturePixelFormat format) override {
+        source.RecordResolvedTexturePixelFormat(slot, handle, format);
+    }
+    void RecordResolvedIsTexturePixelFormatInteger(const TextureSlot& slot,
+                                                    bool is_integer) override {
+        source.RecordResolvedIsTexturePixelFormatInteger(slot, is_integer);
+    }
+    void Dump(u64 pipeline_hash, u64 shader_hash) override {
+        source.Dump(pipeline_hash, shader_hash);
+    }
+
+private:
+    void Record(IR::FrontendDependency dependency) const noexcept {
+        dependencies |= static_cast<u32>(dependency);
+    }
+
+    Environment& source;
+    mutable u32 dependencies{};
+};
+
 IR::BlockList GenerateBlocks(const IR::AbstractSyntaxList& syntax_list) {
     size_t num_syntax_blocks{};
     for (const auto& node : syntax_list) {
@@ -237,28 +357,32 @@ void LowerGeometryPassthrough(const IR::Program& program, const HostTranslateInf
 
 } // Anonymous namespace
 
-IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Block>& block_pool,
-                             Environment& env, Flow::CFG& cfg, const HostTranslateInfo& host_info) {
+IR::Program BuildProgramTemplate(ObjectPool<IR::Inst>& inst_pool,
+                                 ObjectPool<IR::Block>& block_pool, Environment& env,
+                                 Flow::CFG& cfg, const HostTranslateInfo& host_info,
+                                 std::span<const PredecodedInstruction> predecoded) {
+    FrontendEnvironment frontend_env{env};
     IR::Program program;
-    program.syntax_list = BuildASL(inst_pool, block_pool, env, cfg, host_info);
+    program.syntax_list =
+        BuildASL(inst_pool, block_pool, frontend_env, cfg, host_info, predecoded);
     program.blocks = GenerateBlocks(program.syntax_list);
     program.post_order_blocks = PostOrder(program.syntax_list.front());
-    program.stage = env.ShaderStage();
-    program.local_memory_size = env.LocalMemorySize();
+    program.stage = frontend_env.ShaderStage();
+    program.local_memory_size = frontend_env.LocalMemorySize();
     switch (program.stage) {
     case Stage::TessellationControl: {
-        const ProgramHeader& sph{env.SPH()};
+        const ProgramHeader& sph{frontend_env.SPH()};
         program.invocations = sph.common2.threads_per_input_primitive;
         break;
     }
     case Stage::Geometry: {
-        const ProgramHeader& sph{env.SPH()};
+        const ProgramHeader& sph{frontend_env.SPH()};
         program.output_topology = sph.common3.output_topology;
         program.output_vertices = sph.common4.max_output_vertices;
         program.invocations = sph.common2.threads_per_input_primitive;
         program.is_geometry_passthrough = sph.common0.geometry_passthrough != 0;
         if (program.is_geometry_passthrough) {
-            const auto& mask{env.GpPassthroughMask()};
+            const auto& mask{frontend_env.GpPassthroughMask()};
             for (size_t i = 0; i < mask.size() * 32; ++i) {
                 program.info.passthrough.mask[i] = ((mask[i / 32] >> (i % 32)) & 1) == 0;
             }
@@ -271,8 +395,8 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
         break;
     }
     case Stage::Compute:
-        program.workgroup_size = env.WorkgroupSize();
-        program.shared_memory_size = env.SharedMemorySize();
+        program.workgroup_size = frontend_env.WorkgroupSize();
+        program.shared_memory_size = frontend_env.SharedMemorySize();
         break;
     default:
         break;
@@ -293,7 +417,13 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
         Optimization::ConditionalBarrierPass(program);
     }
     Optimization::SsaRewritePass(program);
+    program.frontend_dependencies = frontend_env.Manifest();
 
+    return program;
+}
+
+void FinalizeProgramTemplate(IR::Program& program, Environment& env,
+                             const HostTranslateInfo& host_info) {
     Optimization::ConstantPropagationPass(env, program);
 
     Optimization::PositionPass(env, program);
@@ -314,6 +444,12 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
 
     CollectInterpolationInfo(env, program);
     AddNVNStorageBuffers(program);
+}
+
+IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Block>& block_pool,
+                             Environment& env, Flow::CFG& cfg, const HostTranslateInfo& host_info) {
+    IR::Program program{BuildProgramTemplate(inst_pool, block_pool, env, cfg, host_info)};
+    FinalizeProgramTemplate(program, env, host_info);
     return program;
 }
 

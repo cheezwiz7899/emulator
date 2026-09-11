@@ -276,6 +276,8 @@ struct ImageDescriptor {
 using ImageDescriptors = boost::container::small_vector<ImageDescriptor, 4>;
 
 struct Info {
+    bool operator==(const Info&) const = default;
+
     static constexpr size_t MAX_INDIRECT_CBUFS{14};
     static constexpr size_t MAX_CBUFS{18};
     static constexpr size_t MAX_SSBOS{32};

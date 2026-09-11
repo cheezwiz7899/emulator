@@ -15,6 +15,7 @@
 #include "shader_recompiler/program_header.h"
 #include "shader_recompiler/shader_info.h"
 #include "shader_recompiler/stage.h"
+#include "shader_recompiler/texture_slot.h"
 
 namespace Shader {
 
@@ -113,12 +114,11 @@ public:
     // this data actually gets surfaced, and its own doc comment for why this whole mechanism
     // is unverified: written without the ability to build or run this codebase, needs a real
     // compile and a real play session before anyone trusts its output.
-    virtual void RecordResolvedTextureType([[maybe_unused]] u32 cbuf_index,
-                                           [[maybe_unused]] u32 cbuf_offset,
+    virtual void RecordResolvedTextureType([[maybe_unused]] const TextureSlot& slot,
                                            [[maybe_unused]] u32 handle,
                                            [[maybe_unused]] TextureType type) {}
-    virtual void RecordResolvedTexturePixelFormat([[maybe_unused]] u32 cbuf_index,
-                                                  [[maybe_unused]] u32 cbuf_offset,
+    virtual void RecordResolvedTexturePixelFormat([[maybe_unused]] const TextureSlot& slot,
+                                                  [[maybe_unused]] u32 handle,
                                                   [[maybe_unused]] TexturePixelFormat format) {}
 
     [[nodiscard]] virtual bool IsTexturePixelFormatInteger(u32 raw_handle) = 0;
@@ -138,7 +138,7 @@ public:
     // IsTexturePixelFormatInteger(env, cbuf) already gets called, default no-op so only real
     // GenericEnvironment translations contribute.
     virtual void RecordResolvedIsTexturePixelFormatInteger(
-        [[maybe_unused]] u32 cbuf_index, [[maybe_unused]] u32 cbuf_offset,
+        [[maybe_unused]] const TextureSlot& slot,
         [[maybe_unused]] bool is_integer) {}
 
     [[nodiscard]] virtual u32 ReadViewportTransformState() = 0;
@@ -162,7 +162,10 @@ public:
         return sph;
     }
 
-    [[nodiscard]] const std::array<u32, 8>& GpPassthroughMask() const noexcept {
+    // Geometry passthrough uses a live post-VTG register mask. A scanner has
+    // no draw-state register image, so its environment must be able to report
+    // when the fallback value was actually consumed.
+    [[nodiscard]] virtual const std::array<u32, 8>& GpPassthroughMask() const noexcept {
         return gp_passthrough_mask;
     }
 
@@ -174,7 +177,7 @@ public:
         return start_address;
     }
 
-    [[nodiscard]] bool IsProprietaryDriver() const noexcept {
+    [[nodiscard]] virtual bool IsProprietaryDriver() const noexcept {
         return is_proprietary_driver;
     }
 

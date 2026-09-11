@@ -3,8 +3,10 @@
 
 #include <algorithm>
 #include <array>
+#include <limits>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 
 #include <fmt/format.h>
@@ -213,6 +215,291 @@ CFG::CFG(Environment& env_, ObjectPool<Block>& block_pool_, Location start_addre
         dispatch_block->end = last_block->end + 1;
         functions[0].blocks.insert(*dispatch_block);
     }
+}
+
+bool CFG::IsValidTemplate(const Template& source) {
+    if (source.functions.empty() || source.blocks.empty()) {
+        return false;
+    }
+    std::vector<bool> seen_blocks(source.blocks.size());
+    const auto valid_block = [&source](size_t id) {
+        return id == NoTemplateBlock || id < source.blocks.size();
+    };
+    for (FunctionId function_id = 0; function_id < source.functions.size(); ++function_id) {
+        const TemplateFunction& function{source.functions[function_id]};
+        if (!Location::IsRawOffset(function.entrypoint.Offset()) || function.blocks.empty()) {
+            return false;
+        }
+        bool owns_entrypoint{};
+        for (const size_t block_id : function.blocks) {
+            if (block_id >= source.blocks.size() || seen_blocks[block_id] ||
+                source.blocks[block_id].owner != function_id) {
+                return false;
+            }
+            seen_blocks[block_id] = true;
+            owns_entrypoint |= source.blocks[block_id].begin == function.entrypoint;
+        }
+        // Function construction begins with a label at its entrypoint. A
+        // persisted form whose function has no corresponding entry block can
+        // reconstruct an intrusive graph that looks valid but is unreachable
+        // or has stale control-flow ownership.
+        if (!owns_entrypoint) {
+            return false;
+        }
+    }
+    if (std::find(seen_blocks.begin(), seen_blocks.end(), false) != seen_blocks.end()) {
+        return false;
+    }
+    for (const TemplateBlock& block : source.blocks) {
+        const auto [pred, pred_negated] = block.cond.GetPred();
+        static_cast<void>(pred_negated);
+        if (!Location::IsRawOffset(block.begin.Offset()) || !Location::IsRawOffset(block.end.Offset()) ||
+            block.end < block.begin || block.owner >= source.functions.size() ||
+            block.function_call >= source.functions.size() || !valid_block(block.branch_true) ||
+            !valid_block(block.branch_false) || !valid_block(block.return_block) ||
+            static_cast<u64>(pred) > static_cast<u64>(IR::Pred::PT) ||
+            static_cast<u64>(block.cond.GetFlowTest()) > static_cast<u64>(IR::FlowTest::RGT) ||
+            static_cast<u64>(block.branch_reg) > static_cast<u64>(IR::Reg::RZ)) {
+            return false;
+        }
+        for (const StackEntry& entry : block.stack.Entries()) {
+            if (!Location::IsRawOffset(entry.target.Offset()) ||
+                static_cast<u8>(entry.token) > static_cast<u8>(Token::PLONGJMP)) {
+                return false;
+            }
+        }
+        for (const auto& [target, address] : block.indirect_branches) {
+            static_cast<void>(address);
+            if (!valid_block(target)) {
+                return false;
+            }
+        }
+    }
+    if (source.exits_to_dispatcher) {
+        const size_t dispatch_id{source.functions.front().blocks.back()};
+        const TemplateBlock& dispatch{source.blocks[dispatch_id]};
+        if (dispatch.end_class != EndClass::Exit || dispatch.branch_true != NoTemplateBlock ||
+            dispatch.branch_false != NoTemplateBlock || !dispatch.indirect_branches.empty()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+CFG::CFG(Environment& env_, ObjectPool<Block>& block_pool_, const Template& source)
+    : env{env_}, block_pool{block_pool_},
+      program_start{source.functions.empty() ? Location{} : source.functions.front().entrypoint},
+      exits_to_dispatcher{source.exits_to_dispatcher} {
+    if (!IsValidTemplate(source)) {
+        throw InvalidArgument("Invalid CFG template");
+    }
+
+    functions.reserve(source.functions.size());
+    for (const TemplateFunction& source_function : source.functions) {
+        functions.emplace_back();
+        functions.back().entrypoint = source_function.entrypoint;
+    }
+
+    std::vector<Block*> blocks;
+    blocks.reserve(source.blocks.size());
+    for (const TemplateBlock& source_block : source.blocks) {
+        if (source_block.owner >= functions.size()) {
+            throw InvalidArgument("Invalid CFG template block owner");
+        }
+        Block* const block{block_pool.Create(Block{})};
+        block->begin = source_block.begin;
+        block->end = source_block.end;
+        block->end_class = source_block.end_class;
+        block->cond = source_block.cond;
+        block->stack = source_block.stack;
+        block->function_call = source_block.function_call;
+        block->branch_reg = source_block.branch_reg;
+        block->branch_offset = source_block.branch_offset;
+        blocks.push_back(block);
+    }
+
+    const auto resolve_block = [&blocks](size_t index) -> Block* {
+        if (index == NoTemplateBlock) {
+            return nullptr;
+        }
+        if (index >= blocks.size()) {
+            throw InvalidArgument("Invalid CFG template block reference");
+        }
+        return blocks[index];
+    };
+    for (size_t index = 0; index < source.blocks.size(); ++index) {
+        const TemplateBlock& source_block{source.blocks[index]};
+        Block& block{*blocks[index]};
+        if (block.function_call >= functions.size()) {
+            throw InvalidArgument("Invalid CFG template function reference");
+        }
+        block.branch_true = resolve_block(source_block.branch_true);
+        block.branch_false = resolve_block(source_block.branch_false);
+        block.return_block = resolve_block(source_block.return_block);
+        block.indirect_branches.reserve(source_block.indirect_branches.size());
+        for (const auto& [target, address] : source_block.indirect_branches) {
+            block.indirect_branches.push_back({resolve_block(target), address});
+        }
+    }
+
+    for (size_t function_id = 0; function_id < source.functions.size(); ++function_id) {
+        for (const size_t block_id : source.functions[function_id].blocks) {
+            if (block_id >= blocks.size() || source.blocks[block_id].owner != function_id) {
+                throw InvalidArgument("Invalid CFG template function block list");
+            }
+            functions[function_id].blocks.insert(*blocks[block_id]);
+        }
+    }
+    if (exits_to_dispatcher) {
+        dispatch_block = blocks[source.functions.front().blocks.back()];
+    }
+}
+
+bool CFG::RoundTripMatchesTemplate(Environment& env, ObjectPool<Block>& block_pool,
+                                   const Template& source) {
+    if (!IsValidTemplate(source)) {
+        return false;
+    }
+    CFG replay{env, block_pool, source};
+    return replay.MakeTemplate() == source;
+}
+
+std::optional<CFG::Template> CFG::RebaseTemplate(const Template& source, Location source_origin,
+                                                  Location destination_origin,
+                                                  bool require_matching_scheduler_phase) {
+    if (!IsValidTemplate(source) || source_origin.IsVirtual() || destination_origin.IsVirtual() ||
+        source.functions.front().entrypoint != source_origin ||
+        (require_matching_scheduler_phase &&
+         source_origin.Offset() % 32 != destination_origin.Offset() % 32)) {
+        return std::nullopt;
+    }
+
+    // A valid serialized Location alone does not prove it belongs to this
+    // shader. Keep corrupt/out-of-range data bounded rather than turning a
+    // failed cache record into billions of scheduler steps.
+    constexpr u32 kMaxRebaseInstructions = 1U << 20;
+    const auto instruction_index = [source_origin](Location location) -> std::optional<u32> {
+        const bool is_virtual = location.IsVirtual();
+        if (is_virtual) {
+            if (location.Offset() > std::numeric_limits<u32>::max() - 4) {
+                return std::nullopt;
+            }
+            location = Location::FromRawOffset(location.Offset() + 4);
+        }
+        Location cursor{source_origin};
+        for (u32 index = 0; index < kMaxRebaseInstructions; ++index, ++cursor) {
+            if (cursor == location) {
+                return index;
+            }
+            if (cursor > location) {
+                return std::nullopt;
+            }
+        }
+        return std::nullopt;
+    };
+    const auto rebase_location = [&instruction_index, destination_origin](Location location)
+        -> std::optional<Location> {
+        const bool is_virtual = location.IsVirtual();
+        const auto index = instruction_index(location);
+        if (!index) {
+            return std::nullopt;
+        }
+        Location rebased{destination_origin};
+        for (u32 step = 0; step < *index; ++step) {
+            ++rebased;
+        }
+        return is_virtual ? rebased.Virtual() : rebased;
+    };
+
+    Template result{source};
+    for (TemplateFunction& function : result.functions) {
+        const auto entrypoint = rebase_location(function.entrypoint);
+        if (!entrypoint) {
+            return std::nullopt;
+        }
+        function.entrypoint = *entrypoint;
+    }
+    for (TemplateBlock& block : result.blocks) {
+        // BRX targets are raw guest addresses populated from runtime cbuf
+        // data. A relative CFG artifact must model them separately, never
+        // guess that an absolute value can be shifted with block Locations.
+        if (!block.indirect_branches.empty()) {
+            return std::nullopt;
+        }
+        const auto begin = rebase_location(block.begin);
+        const auto end = rebase_location(block.end);
+        if (!begin || !end) {
+            return std::nullopt;
+        }
+        block.begin = *begin;
+        block.end = *end;
+        std::vector<StackEntry> entries{block.stack.Entries()};
+        for (StackEntry& entry : entries) {
+            const auto target = rebase_location(entry.target);
+            if (!target) {
+                return std::nullopt;
+            }
+            entry.target = *target;
+        }
+        block.stack.SetEntries(std::move(entries));
+    }
+    if (!IsValidTemplate(result)) {
+        return std::nullopt;
+    }
+    return result;
+}
+
+CFG::Template CFG::MakeTemplate() const {
+    Template result;
+    result.exits_to_dispatcher = exits_to_dispatcher;
+
+    std::unordered_map<const Block*, size_t> block_indices;
+    for (FunctionId function_id = 0; function_id < functions.size(); ++function_id) {
+        TemplateFunction& result_function{result.functions.emplace_back()};
+        result_function.entrypoint = functions[function_id].entrypoint;
+        for (const Block& block : functions[function_id].blocks) {
+            const size_t block_id{result.blocks.size()};
+            block_indices.emplace(&block, block_id);
+            result_function.blocks.push_back(block_id);
+            result.blocks.emplace_back();
+        }
+    }
+
+    const auto index_of = [&block_indices](const Block* block) -> size_t {
+        if (block == nullptr) {
+            return NoTemplateBlock;
+        }
+        const auto it{block_indices.find(block)};
+        if (it == block_indices.end()) {
+            throw InvalidArgument("CFG template references block outside CFG");
+        }
+        return it->second;
+    };
+    for (FunctionId function_id = 0; function_id < functions.size(); ++function_id) {
+        for (const Block& block : functions[function_id].blocks) {
+            TemplateBlock& destination{result.blocks.at(block_indices.at(&block))};
+            destination.begin = block.begin;
+            destination.end = block.end;
+            destination.end_class = block.end_class;
+            destination.cond = block.cond;
+            destination.stack = block.stack;
+            destination.branch_true = index_of(block.branch_true);
+            destination.branch_false = index_of(block.branch_false);
+            destination.function_call = block.function_call;
+            destination.return_block = index_of(block.return_block);
+            destination.branch_reg = block.branch_reg;
+            destination.branch_offset = block.branch_offset;
+            destination.owner = function_id;
+            destination.indirect_branches.reserve(block.indirect_branches.size());
+            for (const IndirectBranch& branch : block.indirect_branches) {
+                destination.indirect_branches.push_back({index_of(branch.block), branch.address});
+            }
+        }
+    }
+    if (!IsValidTemplate(result)) {
+        throw LogicError("Generated invalid CFG template");
+    }
+    return result;
 }
 
 void CFG::AnalyzeLabel(FunctionId function_id, Label& label) {

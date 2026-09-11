@@ -16,6 +16,19 @@ class Location {
 public:
     constexpr Location() = default;
 
+    // Serialized CFGs store Location's encoded representation. Reconstructing
+    // through the public address constructor is incorrect: it performs the
+    // Maxwell instruction alignment adjustment again.
+    [[nodiscard]] static constexpr bool IsRawOffset(u32 raw_offset) noexcept {
+        return raw_offset != 0xccccccccU && (raw_offset % 8 == 0 || raw_offset % 8 == VIRTUAL_BIAS);
+    }
+
+    [[nodiscard]] static constexpr Location FromRawOffset(u32 raw_offset) noexcept {
+        Location location;
+        location.offset = raw_offset;
+        return location;
+    }
+
     constexpr Location(u32 initial_offset) : offset{initial_offset} {
         if (initial_offset % 8 != 0) {
             throw InvalidArgument("initial_offset={} is not a multiple of 8", initial_offset);

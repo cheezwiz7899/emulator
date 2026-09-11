@@ -398,6 +398,19 @@ u32 GetTextureHandle(Environment& env, const ConstBufferAddr& cbuf) {
     return lhs_raw | rhs_raw;
 }
 
+TextureSlot MakeTextureSlot(const ConstBufferAddr& cbuf) {
+    return TextureSlot{
+        .cbuf_index = cbuf.index,
+        .cbuf_offset = cbuf.offset,
+        .shift_left = cbuf.shift_left,
+        .secondary_cbuf_index = cbuf.has_secondary ? cbuf.secondary_index : cbuf.index,
+        .secondary_cbuf_offset = cbuf.has_secondary ? cbuf.secondary_offset : cbuf.offset,
+        .secondary_shift_left = cbuf.secondary_shift_left,
+        .count = cbuf.count,
+        .has_secondary = cbuf.has_secondary,
+    };
+}
+
 TextureType ReadTextureType(Environment& env, const ConstBufferAddr& cbuf) {
     const u32 handle{GetTextureHandle(env, cbuf)};
     const TextureType type{env.ReadTextureType(handle)};
@@ -405,15 +418,16 @@ TextureType ReadTextureType(Environment& env, const ConstBufferAddr& cbuf) {
     // instrumentation, no-op for every Environment except GenericEnvironment. Passing handle
     // too now (not just cbuf coordinates) — needed by the texture_key exclusion fix, see
     // CapturedPhase4PrototypeHandles's doc comment in shader_environment.h.
-    env.RecordResolvedTextureType(cbuf.index, cbuf.offset, handle, type);
+    env.RecordResolvedTextureType(MakeTextureSlot(cbuf), handle, type);
     return type;
 }
 
 TexturePixelFormat ReadTexturePixelFormat(Environment& env, const ConstBufferAddr& cbuf) {
-    const TexturePixelFormat format{env.ReadTexturePixelFormat(GetTextureHandle(env, cbuf))};
+    const u32 handle{GetTextureHandle(env, cbuf)};
+    const TexturePixelFormat format{env.ReadTexturePixelFormat(handle)};
     // See RecordResolvedTexturePixelFormat's doc comment in environment.h — same Phase 4
     // instrumentation as ReadTextureType above.
-    env.RecordResolvedTexturePixelFormat(cbuf.index, cbuf.offset, format);
+    env.RecordResolvedTexturePixelFormat(MakeTextureSlot(cbuf), handle, format);
     return format;
 }
 
@@ -421,7 +435,7 @@ bool IsTexturePixelFormatInteger(Environment& env, const ConstBufferAddr& cbuf) 
     const bool is_integer{env.IsTexturePixelFormatInteger(GetTextureHandle(env, cbuf))};
     // Third axis of the same instrumentation as ReadTextureType/ReadTexturePixelFormat above
     // -- see RecordResolvedIsTexturePixelFormatInteger's doc comment in environment.h.
-    env.RecordResolvedIsTexturePixelFormatInteger(cbuf.index, cbuf.offset, is_integer);
+    env.RecordResolvedIsTexturePixelFormatInteger(MakeTextureSlot(cbuf), is_integer);
     return is_integer;
 }
 

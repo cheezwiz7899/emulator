@@ -25,6 +25,7 @@ namespace Vulkan {
 
 class Device;
 class PipelineStatistics;
+class PipelineCache;
 class Scheduler;
 
 class ComputePipeline {
@@ -35,7 +36,8 @@ public:
                              Common::ThreadWorker* thread_worker,
                              PipelineStatistics* pipeline_statistics,
                              VideoCore::ShaderNotify* shader_notify, const Shader::Info& info,
-                             vk::ShaderModule spv_module);
+                             vk::ShaderModule spv_module, PipelineCache* pipeline_cache_owner,
+                             bool is_boot_preload);
 
     ComputePipeline& operator=(ComputePipeline&&) noexcept = delete;
     ComputePipeline(ComputePipeline&&) noexcept = delete;
@@ -49,6 +51,8 @@ public:
 private:
     const Device& device;
     vk::PipelineCache& pipeline_cache;
+    PipelineCache* const pipeline_cache_owner;
+    const bool is_boot_preload;
     GuestDescriptorQueue& guest_descriptor_queue;
     Shader::Info info;
 

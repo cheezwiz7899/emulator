@@ -188,6 +188,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/service/am/am.h"
 #include "core/hle/service/filesystem/filesystem.h"
+#include "core/hle/service/filesystem/romfs_controller.h"
 #include "core/hle/service/sm/sm.h"
 #include "core/loader/loader.h"
 #include "core/perf_stats.h"
@@ -2322,6 +2323,11 @@ void GMainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletP
 
         QtConfig per_game_config(config_file_name, Config::ConfigType::PerGameConfig);
 
+        // PipelineCache reads this while Vulkan is constructed, before GPU::Start
+        // normally refreshes it. Do it immediately after loading the title's
+        // config so target capture and ordinary boots both use its override.
+        Settings::UpdateGPUAccuracy();
+
         system->HIDCore().ReloadInputDevices();
 
         system->ApplySettings();
@@ -2332,6 +2338,10 @@ void GMainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletP
                      "Applying workaround: forcing single-core mode for Final Fantasy Tactics");
             Settings::values.use_multi_core.SetValue(false);
         }
+    } else {
+        // Keep the global boot path equally explicit; a previous per-game run
+        // must not leave current_gpu_accuracy stale for this renderer creation.
+        Settings::UpdateGPUAccuracy();
     }
 
     Settings::LogSettings();
@@ -2387,7 +2397,6 @@ void GMainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletP
 
     connect(emu_thread.get(), &EmuThread::LoadProgress, loading_screen,
             &LoadingScreen::OnLoadProgress, Qt::QueuedConnection);
-
     // Start the thread AFTER all connections are set up
     emu_thread->start();
 
@@ -4189,6 +4198,66 @@ bool GMainWindow::ConfirmShutdownGame() {
 
 void GMainWindow::OnLoadComplete() {
     loading_screen->OnLoadComplete();
+    if (precache_target_capture) {
+        // FirstFrameDisplayed is the earliest point at which the renderer, GPU,
+        // guest memory, and emulation threads have all completed startup. An
+        // automated pre-cache boot must not tear the system down before this.
+        precache_target_boot_ready = true;
+        auto& request = *precache_target_capture;
+        auto& filesystem = system->GetFileSystemController();
+        std::shared_ptr<Service::FileSystem::SaveDataController> save_data_controller;
+        std::shared_ptr<Service::FileSystem::RomFsController> romfs_controller;
+        u64 registered_program_id{};
+        const auto process = system->Kernel().ApplicationProcess();
+        const auto result = filesystem.OpenProcess(
+            &registered_program_id, &save_data_controller, &romfs_controller,
+            process ? process->GetProcessId() : 0);
+        if (result.IsSuccess() && romfs_controller) {
+            const auto add_root = [&request](FileSys::VirtualFile raw_romfs) {
+                if (const auto root = FileSys::ExtractRomFS(raw_romfs)) {
+                    request.resolved_romfs_roots.push_back(root);
+                }
+            };
+
+            // This uses the exact factory registered for the running process:
+            // base content plus installed/packed update and LayeredFS.
+            add_root(romfs_controller->OpenRomFSCurrentProcess());
+
+            // DLC is separate RomFS content. Capture each enabled Data entry
+            // through the same factory so its LayeredFS overrides also apply.
+            const auto& disabled = Settings::values.disabled_addons[request.program_id];
+            const bool all_dlc_disabled =
+                std::find(disabled.begin(), disabled.end(), "DLC") != disabled.end();
+            if (!all_dlc_disabled) {
+                const auto entries = system->GetContentProvider().ListEntriesFilter(
+                    FileSys::TitleType::AOC, FileSys::ContentRecordType::Data);
+                for (const auto& entry : entries) {
+                    if (FileSys::GetBaseTitleID(entry.title_id) != request.program_id) {
+                        continue;
+                    }
+                    const auto item = fmt::format("DLC {:04d}", entry.title_id & 0x7FF);
+                    if (std::find(disabled.begin(), disabled.end(), item) != disabled.end()) {
+                        continue;
+                    }
+                    const auto dlc_nca = system->GetContentProvider().GetEntry(entry);
+                    if (!dlc_nca || dlc_nca->GetStatus() != Loader::ResultStatus::Success) {
+                        continue;
+                    }
+                    add_root(romfs_controller->OpenPatchedRomFS(
+                        entry.title_id, FileSys::ContentRecordType::Data));
+                }
+            }
+            LOG_INFO(Frontend,
+                     "Pre-cache captured {} resolved RomFS root(s): base/update/mod plus enabled DLC",
+                     request.resolved_romfs_roots.size());
+        } else {
+            LOG_WARNING(Frontend,
+                        "Pre-cache could not snapshot the resolved RomFS; scanner will use its "
+                        "standalone game-file fallback");
+        }
+        LOG_INFO(Frontend,
+                 "Pre-cache capture reached first frame; warming exact shader cache for 5 seconds");
+    }
     UpdateMenuState();
 }
 

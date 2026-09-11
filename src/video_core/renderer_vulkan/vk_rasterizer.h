@@ -143,6 +143,10 @@ public:
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback) override;
 
+    // Used by the short pre-cache boot. Keep exact modules created during the
+    // warmup before the frontend shuts the temporary session down.
+    void FlushShaderCaches();
+
     void InitializeChannel(Tegra::Control::ChannelState& channel) override;
 
     void BindChannel(Tegra::Control::ChannelState& channel) override;

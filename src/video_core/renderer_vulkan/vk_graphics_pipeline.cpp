@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <span>
 #include <vector>
@@ -19,6 +20,7 @@
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
@@ -251,11 +253,14 @@ GraphicsPipeline::GraphicsPipeline(
     const Device& device_, DescriptorPool& descriptor_pool,
     GuestDescriptorQueue& guest_descriptor_queue_, Common::ThreadWorker* worker_thread,
     PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
+    PipelineCache* pipeline_cache_owner_, bool is_boot_preload_,
     const GraphicsPipelineCacheKey& key_, std::array<vk::ShaderModule, NUM_STAGES> stages,
     const std::array<const Shader::Info*, NUM_STAGES>& infos)
     : key{key_}, device{device_}, texture_cache{texture_cache_}, buffer_cache{buffer_cache_},
-      pipeline_cache(pipeline_cache_), scheduler{scheduler_},
-      guest_descriptor_queue{guest_descriptor_queue_}, spv_modules{std::move(stages)} {
+      pipeline_cache(pipeline_cache_), pipeline_cache_owner{pipeline_cache_owner_},
+      is_boot_preload{is_boot_preload_}, scheduler{scheduler_},
+      guest_descriptor_queue{guest_descriptor_queue_},
+      spv_modules{std::move(stages)} {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
     }
@@ -269,7 +274,13 @@ GraphicsPipeline::GraphicsPipeline(
         std::ranges::copy(info->constant_buffer_used_sizes, uniform_buffer_sizes[stage].begin());
         num_textures += Shader::NumDescriptors(info->texture_descriptors);
     }
-    auto func{[this, shader_notify, &render_pass_cache, &descriptor_pool, pipeline_statistics] {
+    const auto queued_at = std::chrono::steady_clock::now();
+    auto func{[this, shader_notify, &render_pass_cache, &descriptor_pool, pipeline_statistics, queued_at] {
+        if (pipeline_cache_owner) {
+            pipeline_cache_owner->RecordPipelineBuildQueueDelay(
+                false, std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now() - queued_at));
+        }
         try {
             DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos)};
             split_descriptor_sets = builder.IsSplit();
@@ -625,8 +636,14 @@ void GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                       uses_render_area = render_area.uses_render_area,
                       render_area_data = render_area.words](vk::CommandBuffer cmdbuf) {
         if (!is_built.load(std::memory_order::acquire)) {
+            const auto wait_start = std::chrono::steady_clock::now();
             std::unique_lock lock{build_mutex};
             build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::acquire); });
+            if (pipeline_cache_owner) {
+                pipeline_cache_owner->RecordPipelineBuildWait(
+                    false, is_boot_preload, std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::steady_clock::now() - wait_start));
+            }
         }
         if (build_failed.load(std::memory_order::acquire)) {
             return;
@@ -1170,7 +1187,9 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
     if (device.IsKhrPipelineExecutablePropertiesEnabled()) {
         flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
     }
-    pipeline = device.GetLogical().CreateGraphicsPipeline(
+    const auto driver_create_start = std::chrono::steady_clock::now();
+    try {
+        pipeline = device.GetLogical().CreateGraphicsPipeline(
         {
             .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
             .pNext = nullptr,
@@ -1192,7 +1211,38 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
             .basePipelineHandle = nullptr,
             .basePipelineIndex = 0,
         },
-        *pipeline_cache);
+            *pipeline_cache);
+    } catch (...) {
+        if (pipeline_cache_owner) {
+            const auto driver_create_time = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - driver_create_start);
+            pipeline_cache_owner->RecordPipelineDriverCreate(
+                false, is_boot_preload, driver_create_time);
+            static std::atomic<u32> slow_driver_logs{};
+            if (driver_create_time >= std::chrono::milliseconds{16} &&
+                slow_driver_logs.fetch_add(1, std::memory_order_relaxed) < 32) {
+                LOG_WARNING(Render_Vulkan,
+                            "Slow {} graphics driver pipeline create: hash={:016x}, {} ms",
+                            is_boot_preload ? "boot" : "live", key.Hash(),
+                            driver_create_time.count() / 1000);
+            }
+        }
+        throw;
+    }
+    if (pipeline_cache_owner) {
+        const auto driver_create_time = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - driver_create_start);
+        pipeline_cache_owner->RecordPipelineDriverCreate(
+            false, is_boot_preload, driver_create_time);
+        static std::atomic<u32> slow_driver_logs{};
+        if (driver_create_time >= std::chrono::milliseconds{16} &&
+            slow_driver_logs.fetch_add(1, std::memory_order_relaxed) < 32) {
+            LOG_WARNING(Render_Vulkan,
+                        "Slow {} graphics driver pipeline create: hash={:016x}, {} ms",
+                        is_boot_preload ? "boot" : "live", key.Hash(),
+                        driver_create_time.count() / 1000);
+        }
+    }
 }
 
 void GraphicsPipeline::Validate() {

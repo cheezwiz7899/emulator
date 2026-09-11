@@ -3,10 +3,13 @@
 
 #pragma once
 
+#include <span>
+
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/frontend/ir/basic_block.h"
 #include "shader_recompiler/frontend/ir/program.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
+#include "shader_recompiler/frontend/maxwell/translate/translate.h"
 #include "shader_recompiler/object_pool.h"
 #include "shader_recompiler/runtime_info.h"
 
@@ -15,6 +18,26 @@ struct HostTranslateInfo;
 }
 
 namespace Shader::Maxwell {
+
+// Builds the initial frontend IR. This is not an immutable scanner boundary:
+// BuildASL still reads instructions, SPH/stage/local-memory state, and some
+// instruction paths consult cbuf-backed Environment state. The returned
+// Program owns handles allocated from the supplied pools, so it is neither
+// independently owned nor safe to persist. FinalizeProgramTemplate() defers
+// further environment-dependent lowering, but does not make this first half
+// state-independent.
+[[nodiscard]] IR::Program BuildProgramTemplate(ObjectPool<IR::Inst>& inst_pool,
+                                                ObjectPool<IR::Block>& block_pool,
+                                                Environment& env, Flow::CFG& cfg,
+                                                const HostTranslateInfo& host_info,
+                                                std::span<const PredecodedInstruction> predecoded = {});
+
+// Applies all real-environment-dependent lowering to a template. Keeping this
+// as a separate entry point makes the old TranslateProgram sequence explicit
+// without changing it; callers that do not retain templates should continue
+// using TranslateProgram().
+void FinalizeProgramTemplate(IR::Program& program, Environment& env,
+                             const HostTranslateInfo& host_info);
 
 [[nodiscard]] IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool,
                                            ObjectPool<IR::Block>& block_pool, Environment& env,

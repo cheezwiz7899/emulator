@@ -18,6 +18,14 @@ add_executable(tests
     core/internal_network/network.cpp
     precompiled_headers.h
     video_core/memory_tracker.cpp
+    video_core/maxwell_location.cpp
+    video_core/precache_compiler_target.cpp
+    video_core/shader_program_identity.cpp
+    ../video_core/precache_compiler_target.cpp
+    ../video_core/precache_cfg_artifact.cpp
+    ../video_core/precache_frontend_artifact.cpp
+    ../video_core/spirv_cache.cpp
+    video_core/spirv_cache.cpp
     input_common/calibration_configuration_job.cpp
 )
 
@@ -26,7 +34,7 @@ set_property(TARGET tests PROPERTY UNITY_BUILD OFF)
 
 create_target_directory_groups(tests)
 
-target_link_libraries(tests PRIVATE common core input_common)
+target_link_libraries(tests PRIVATE common core input_common shader_recompiler)
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
 
 add_test(NAME tests COMMAND tests)

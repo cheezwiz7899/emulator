@@ -87,7 +87,7 @@ public:
 
     void Dump(u64 pipeline_hash, u64 shader_hash) override;
 
-    void Serialize(std::ofstream& file) const;
+    void Serialize(std::ostream& file) const;
 
     /// GPL: copy the cached Maxwell code words into @p out.
     void CopyCode(std::vector<u64>& out) const { out = code; }
@@ -137,14 +137,14 @@ public:
     // ReadCbufValueForTextureHandle above — real and confirmed (5 real sessions' worth of
     // data behind it now, see handoff_09/handoff_10), not the "unverified when written" state
     // the first two shipped in.
-    void RecordResolvedTextureType(u32 cbuf_index, u32 cbuf_offset, u32 handle,
+    void RecordResolvedTextureType(const Shader::TextureSlot& slot, u32 handle,
                                    Shader::TextureType type) override final;
-    void RecordResolvedTexturePixelFormat(u32 cbuf_index, u32 cbuf_offset,
+    void RecordResolvedTexturePixelFormat(const Shader::TextureSlot& slot, u32 handle,
                                           Shader::TexturePixelFormat format) override final;
 
     // Third axis -- see RecordResolvedIsTexturePixelFormatInteger's doc comment in
     // environment.h for why this one was added. Not yet tested against any real session.
-    void RecordResolvedIsTexturePixelFormatInteger(u32 cbuf_index, u32 cbuf_offset,
+    void RecordResolvedIsTexturePixelFormatInteger(const Shader::TextureSlot& slot,
                                                     bool is_integer) override final;
 
     // Phase 4 narrow prototype's texture_key fix. Populated inside RecordResolvedTextureType
@@ -177,6 +177,12 @@ public:
     /// GPL: read-only view of texture pixel formats captured during translation.
     const std::unordered_map<u32, Shader::TexturePixelFormat>& CapturedTexturePixelFormats() const noexcept {
         return texture_pixel_formats;
+    }
+    const Shader::LogicalTextureSlots& CapturedLogicalTextureSlots() const noexcept {
+        return logical_texture_slots;
+    }
+    const Shader::LogicalTextureHandles& CapturedLogicalTextureHandles() const noexcept {
+        return logical_texture_handles;
     }
 
     /// No-RTTI downcast: GenericEnvironment is always a GenericEnvironment.
@@ -214,6 +220,8 @@ protected:
     std::vector<u64> code;
     std::unordered_map<u32, Shader::TextureType> texture_types;
     std::unordered_map<u32, Shader::TexturePixelFormat> texture_pixel_formats;
+    Shader::LogicalTextureSlots logical_texture_slots;
+    Shader::LogicalTextureHandles logical_texture_handles;
     std::unordered_map<u64, u32> cbuf_values;
     // See ReadCbufValueForTextureHandle() and CapturedTextureHandleCbufKeys() above.
     std::unordered_set<u64> texture_handle_cbuf_keys;
@@ -347,6 +355,12 @@ public:
         CapturedTexturePixelFormats() const noexcept {
         return texture_pixel_formats;
     }
+    const Shader::LogicalTextureSlots& CapturedLogicalTextureSlots() const noexcept {
+        return logical_texture_slots;
+    }
+    const Shader::LogicalTextureHandles& CapturedLogicalTextureHandles() const noexcept {
+        return logical_texture_handles;
+    }
     /// Mirrors GenericEnvironment::CapturedTextureHandleCbufKeys() — see its doc
     /// comment there. Populated from disk (see Deserialize()) starting with
     /// TRANSFERABLE_CACHE_VERSION 16; caches written by older versions never had
@@ -361,6 +375,11 @@ public:
     [[nodiscard]] u64 ReadInstruction(u32 address) override;
 
     [[nodiscard]] bool HasValidEntryInstruction() const noexcept;
+
+    // Stable identity of serialized program bytes. Used only to validate that
+    // a transferable replay record's environment still belongs to its stored
+    // pipeline key before any frontend work begins.
+    [[nodiscard]] std::optional<u64> ProgramIdentity() const noexcept;
 
     [[nodiscard]] u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) override;
 
@@ -395,6 +414,8 @@ private:
     std::vector<u64> code;
     std::unordered_map<u32, Shader::TextureType> texture_types;
     std::unordered_map<u32, Shader::TexturePixelFormat> texture_pixel_formats;
+    Shader::LogicalTextureSlots logical_texture_slots;
+    Shader::LogicalTextureHandles logical_texture_handles;
     std::unordered_map<u64, u32> cbuf_values;
     // See CapturedTextureHandleCbufKeys() above.
     std::unordered_set<u64> texture_handle_cbuf_keys;

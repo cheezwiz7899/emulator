@@ -98,6 +98,7 @@ namespace Vulkan {
 
 class Device;
 class PipelineStatistics;
+class PipelineCache;
 class RenderPassCache;
 class RescalingPushConstant;
 class RenderAreaPushConstant;
@@ -113,6 +114,7 @@ public:
         const Device& device, DescriptorPool& descriptor_pool,
         GuestDescriptorQueue& guest_descriptor_queue, Common::ThreadWorker* worker_thread,
         PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
+        PipelineCache* pipeline_cache_owner, bool is_boot_preload,
         const GraphicsPipelineCacheKey& key, std::array<vk::ShaderModule, NUM_STAGES> stages,
         const std::array<const Shader::Info*, NUM_STAGES>& infos);
 
@@ -173,6 +175,8 @@ private:
     TextureCache& texture_cache;
     BufferCache& buffer_cache;
     vk::PipelineCache& pipeline_cache;
+    PipelineCache* const pipeline_cache_owner;
+    const bool is_boot_preload;
     Scheduler& scheduler;
     GuestDescriptorQueue& guest_descriptor_queue;
 

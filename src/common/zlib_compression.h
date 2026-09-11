@@ -36,4 +36,12 @@ namespace Common::Compression {
  */
 [[nodiscard]] std::vector<u8> DecompressDataZlib(std::span<const u8> compressed, size_t size_hint = 0);
 
+/**
+ * Decompresses a gzip-wrapped deflate stream (RFC 1952). Like the zlib helper,
+ * the output grows up to a fixed safety limit and does not trust an archive's
+ * advertised uncompressed size.
+ */
+[[nodiscard]] std::vector<u8> DecompressDataGzip(std::span<const u8> compressed,
+                                                  size_t size_hint = 0);
+
 } // namespace Common::Compression

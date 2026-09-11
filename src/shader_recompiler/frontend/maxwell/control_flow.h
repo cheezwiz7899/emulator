@@ -4,8 +4,10 @@
 #pragma once
 
 #include <optional>
+#include <limits>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <boost/container/small_vector.hpp>
@@ -52,10 +54,19 @@ struct StackEntry {
 
 class Stack {
 public:
+    bool operator==(const Stack&) const noexcept = default;
+
     void Push(Token token, Location target);
     [[nodiscard]] std::pair<Location, Stack> Pop(Token token) const;
     [[nodiscard]] std::optional<Location> Peek(Token token) const;
     [[nodiscard]] Stack Remove(Token token) const;
+
+    [[nodiscard]] const std::vector<StackEntry>& Entries() const noexcept {
+        return entries;
+    }
+    void SetEntries(std::vector<StackEntry> source) {
+        entries = std::move(source);
+    }
 
 private:
     std::vector<StackEntry> entries;
@@ -96,6 +107,7 @@ struct Label {
 };
 
 struct Function {
+    Function() = default;
     explicit Function(ObjectPool<Block>& block_pool, Location start_address);
 
     Location entrypoint;
@@ -110,8 +122,67 @@ class CFG {
     };
 
 public:
+    // Owned, pointer-free control-flow form used by the live template cache.
+    // It deliberately stores no Environment data: callers may only publish a
+    // template after proving CFG construction made no cbuf reads.
+    static constexpr size_t NoTemplateBlock = std::numeric_limits<size_t>::max();
+
+    struct TemplateBlock {
+        bool operator==(const TemplateBlock&) const noexcept = default;
+
+        Location begin;
+        Location end;
+        EndClass end_class{};
+        IR::Condition cond{};
+        Stack stack;
+        size_t branch_true{NoTemplateBlock};
+        size_t branch_false{NoTemplateBlock};
+        FunctionId function_call{};
+        size_t return_block{NoTemplateBlock};
+        IR::Reg branch_reg{};
+        s32 branch_offset{};
+        std::vector<std::pair<size_t, u32>> indirect_branches;
+        FunctionId owner{};
+    };
+    struct TemplateFunction {
+        bool operator==(const TemplateFunction&) const noexcept = default;
+
+        Location entrypoint;
+        std::vector<size_t> blocks;
+    };
+    struct Template {
+        bool operator==(const Template&) const noexcept = default;
+
+        std::vector<TemplateBlock> blocks;
+        std::vector<TemplateFunction> functions;
+        bool exits_to_dispatcher{};
+    };
+
+    /// Checks the complete pointer-free representation before it is published,
+    /// serialized, or reconstructed into intrusive block sets.
+    [[nodiscard]] static bool IsValidTemplate(const Template& source);
+
+    // Shadow-only replay oracle. Reconstructs a validated source into fresh
+    // intrusive pools, then compares its canonical pointer-free form byte for
+    // byte by value. It never publishes or consumes reconstructed CFGs.
+    [[nodiscard]] static bool RoundTripMatchesTemplate(Environment& env,
+                                                        ObjectPool<Block>& block_pool,
+                                                        const Template& source);
+
+    // Rebase an already validated pointer-free CFG from one absolute shader
+    // placement to another with the same Maxwell scheduler phase by default.
+    // Templates store absolute Locations, while a future scanner artifact must
+    // be portable across allocations. A caller may relax the phase check only
+    // for a shadow comparison; it must never publish that result for replay.
+    // Indirect branches are intentionally rejected: their raw target values
+    // need an additional explicit contract.
+    [[nodiscard]] static std::optional<Template> RebaseTemplate(
+        const Template& source, Location source_origin, Location destination_origin,
+        bool require_matching_scheduler_phase = true);
+
     explicit CFG(Environment& env, ObjectPool<Block>& block_pool, Location start_address,
                  bool exits_to_dispatcher = false);
+    CFG(Environment& env, ObjectPool<Block>& block_pool, const Template& source);
 
     CFG& operator=(const CFG&) = delete;
     CFG(const CFG&) = delete;
@@ -131,6 +202,8 @@ public:
     [[nodiscard]] bool ExitsToDispatcher() const {
         return exits_to_dispatcher;
     }
+
+    [[nodiscard]] Template MakeTemplate() const;
 
 private:
     void AnalyzeLabel(FunctionId function_id, Label& label);

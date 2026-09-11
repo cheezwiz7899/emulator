@@ -54,6 +54,8 @@ public:
         return device.GetDriverName();
     }
 
+    void FlushShaderCaches() override;
+
 private:
     void Report() const;
 

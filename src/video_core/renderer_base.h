@@ -55,6 +55,12 @@ public:
 
     [[nodiscard]] virtual std::string GetDeviceVendor() const = 0;
 
+    // Persist renderer-owned shader artifacts before a caller tears down a
+    // short-lived emulation session. Most renderers have no such artifact, so
+    // this intentionally defaults to a no-op. Vulkan overrides it for the
+    // pre-cache warmup path.
+    virtual void FlushShaderCaches() {}
+
     // Getter/setter functions:
     // ------------------------
 

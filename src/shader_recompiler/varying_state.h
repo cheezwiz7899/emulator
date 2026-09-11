@@ -11,6 +11,8 @@
 namespace Shader {
 
 struct VaryingState {
+    bool operator==(const VaryingState&) const noexcept = default;
+
     std::bitset<512> mask{};
 
     void Set(IR::Attribute attribute, bool state = true) {

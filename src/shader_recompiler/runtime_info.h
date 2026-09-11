@@ -339,46 +339,11 @@ struct RuntimeInfo {
     // directly from the real MakeRuntimeInfo()/fixed_pipeline_state.cpp path, some is a
     // documented best guess with no measurement behind it yet.
     void ApplySpeculativeDefaults(Stage stage, const Info& info) {
-        // generic_input_types: Set by scanner? No / Set by GPL path? No (handoff_13's field
-        // audit) -- left at zero-init (every slot AttributeType::Disabled) until now. This
-        // isn't just a wrong-value guess the way the fields below are: DefineInputs
-        // (spirv_emit_context.cpp) skips declaring the Input variable ENTIRELY for a
-        // Disabled slot ("if (input_type == AttributeType::Disabled) continue;"), so any
-        // shader that actually loads a generic attribute got a speculatively-translated
-        // module MISSING that Input variable altogether -- not a different
-        // SpirvRelevantHash by chance, a guaranteed-different one, unconditionally, for
-        // every shader that loads any generic attribute at all. Real measurement (a real
-        // two-session gameplay log, RecordGenericInputTypesCardinalityDiagnostic) puts the
-        // field at 93.6%-95.9% single-observed-state per shader -- close to Phase 3's own
-        // 94.5% finding for the whole core-runtime-state -- so for the large majority of
-        // shaders, any correct-enough guess would match every real draw they ever see.
-        // AttributeType::Float for every slot this shader's own IR actually loads
-        // (info.loads.Generic(index)) is that guess: modern vertex/varying data is
-        // float-typed in the large majority of real cases (position/normal/UV/color-as-
-        // float all common; packed-integer formats like vertex colors as UNORM8x4 or bone
-        // indices as UInt are the minority this won't catch). Also gated on
-        // previous_stage_stores.Generic(index) -- already populated with real (or best-
-        // available) data by both speculative call sites before this runs -- matching
-        // DefineInputs' own two-part gate exactly (minus the Disabled check itself, which
-        // is what this sets): guessing Float for a slot the preceding stage doesn't even
-        // store would create a mismatch where zero-init's Disabled was actually correct.
-        // For VertexB, previous_stage_stores is always the all-ones "no restriction"
-        // sentinel (no previous program ever exists there), so this reduces to just the
-        // loads check, same as the real gate does.
-        //
-        // A wrong concrete type is still a real mismatch, not glossed over: GetAttributeType
-        // (spirv_emit_context.cpp) picks the actual SPIR-V type from this field, and unlike
-        // y_negate's plain value, a spec constant can't paper over a different
-        // OpTypePointer -- SPIR-V types are resolved at translation time, not
-        // pipeline-creation time, so generic_input_types isn't a spec-constant candidate
-        // the way y_negate was, cardinality result or not. This stops the *guaranteed* miss
-        // Disabled caused, which was strictly worse: a structural absence, not just a
-        // wrong-typed presence.
-        for (size_t index = 0; index < generic_input_types.size(); ++index) {
-            if (previous_stage_stores.Generic(index) && info.loads.Generic(index)) {
-                generic_input_types[index] = AttributeType::Float;
-            }
-        }
+        // AttributeType::Float is enum value zero. Thus RuntimeInfo{} already guesses
+        // Float for every generic input; prior code/comments claimed zero meant Disabled
+        // and then repeated this same no-op assignment for loaded inputs. Real input types
+        // remain structural state and belong in late template finalization, not here.
+        static_cast<void>(info);
 
         if (stage == Stage::VertexB || stage == Stage::Geometry) {
             // gl_ndc = (regs.depth_mode == DepthMode::MinusOneToOne) in the real path

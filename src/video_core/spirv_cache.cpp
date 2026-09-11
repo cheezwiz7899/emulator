@@ -8,14 +8,55 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 
 #include "common/cityhash.h"
 #include "common/logging.h"
+#include "shader_recompiler/environment.h"
 #include "video_core/spirv_cache.h"
 
 namespace {
 constexpr std::array<char, 8> SPIRV_CACHE_MAGIC{'c', 'i', 't', 'r', 's', 'p', 'v', '\0'};
-constexpr u32 SPIRV_CACHE_VERSION = 15; // v15: restores the full input-interface key.
+// v30: texture-free real compute entries persist cbuf coordinates, allowing a
+// live exact-key probe before CFG/frontend by rereading only known inputs.
+// v29: real compute entries persist the bounded descriptor recipe needed to
+// construct a ComputePipeline before CFG/frontend work.
+// v28: scanner final modules require a proven GPU scheduling alignment. Static
+// blobs do not contain the placement address, so v27 entries may have used one
+// guessed CFG alignment.
+// v27: scanner final modules also require a known geometry-passthrough
+// interface mask. v26 scanner entries may contain a guessed all-zero mask.
+// v26: scanner final modules require complete cbuf, texture, and viewport
+// dependency contracts. v25 scanner entries may contain guessed shapes/state.
+// v25: serialize the seven Bindings counters field-by-field. Raw-struct
+// persistence made cache compatibility depend on compiler ABI padding.
+// v24: texture_key uses source-level descriptor slots whenever all texture
+// queries have validated slot provenance. Older raw-handle keys cannot match.
+// v23: compute entries use ShaderCache's canonical program identity. Older
+// entries may use the CFG-read-range hash, which cannot match scanner/runtime
+// lookup consistently.
+// v22: add compiler target fingerprint to SpirvKey. SPIR-V emitted for a generic
+// scanner profile must not be reused by a real renderer with different features.
+// v21: add Shader::Stage to SpirvKey. The same raw guest program can compile
+// differently when used by different execution stages.
+// v20: scanner preserves the serialized ProgramHeader and varies only its
+// unknown GPU-address alignment when validating scheduler layout. v19's
+// suffix-search entries did not identify the live program and are discarded.
+// v19: scanner uses the live cache's complete two-path shader identity rule,
+// including the CFG-read fallback for valid programs without a self-branch.
+// v18: scanner recognizes and rebases a validated nested SPH immediately before
+// a discovered code entry. This gives that real inner program its own identity.
+// v17: only scanner candidates with a proven live entry (payload offset zero)
+// may populate the exact SPIR-V cache. Discard v16's brute-force-suffix modules.
+// v16: scanner program identity is the same SPH-to-self-branch span as the
+// live fast path; v15 restored the full input-interface key.
+constexpr u32 SPIRV_CACHE_VERSION = 30;
+constexpr std::streamoff SPIRV_CACHE_HEADER_SIZE = 8 + sizeof(u32) + sizeof(u32);
+// unique_hash, stage, four remaining key u64s, word count, one SPIR-V word,
+// seven binding counters, source, and eight diagnostic u64s.
+constexpr std::streamoff SPIRV_CACHE_MIN_ENTRY_SIZE =
+    sizeof(u64) + sizeof(u8) + 4 * sizeof(u64) + sizeof(u32) + sizeof(u32) +
+    7 * sizeof(u32) + sizeof(u8) + 8 * sizeof(u64) + sizeof(u8);
                                         // v13: canonicalizes cbuf/texture key serialization
                                         // and persists speculative-entry provenance.
                                         // v12: persists RuntimeInfo's diagnostic
@@ -41,11 +82,11 @@ constexpr u32 SPIRV_CACHE_VERSION = 15; // v15: restores the full input-interfac
                                         // fails to match, same as any other cache miss. One-time
                                         // bump for this one field's mechanism change, same
                                         // category as v9/v8 below — does not need re-bumping
-                                        // for any other Phase 5 field converted the same way
+                                        // for any other runtime field converted the same way
                                         // later (each such field's own conversion is its own,
                                         // separate bump when it happens, not covered in advance
                                         // by this one);
-                                        // (v9: the Phase 4 slot table (which shaders get
+                                        // (v9: the polymorphic slot table (which shaders get
                                         // texture_key's handle-exclusion treatment) switched from a fixed, compile-time
                                         // list to a runtime-published, adaptively-grown one
                                         // (Shader::ActivePhase4PrototypeSlots(), environment.h) that starts EMPTY on a
@@ -66,11 +107,11 @@ constexpr u32 SPIRV_CACHE_VERSION = 15; // v15: restores the full input-interfac
                                         // number — see ActivePhase4PrototypeSlots's own doc comment for the detailed
                                         // argument. This bump covers only the one-time mechanism change, fixed table
                                         // to adaptive table, not any particular slot or count of slots;
-                                        // (v8: texture_key now excludes the one Phase-4
+                                        // (v8: texture_key now excludes the handle-specialized
                                         // -prototype-marked slot's resolved handle for shaders that
                                         // have it (ComputeTextureKeyExcludingHandles,
                                         // vk_pipeline_cache.cpp's CreateGraphicsPipeline/
-                                        // CreateComputePipeline — see the "Phase 4 narrow
+                                        // CreateComputePipeline — see the texture-slot
                                         // prototype's texture_key fix" comments there). Same
                                         // category of change as v7's cbuf_key narrowing below,
                                         // not a coincidence: no on-disk byte format change, but
@@ -90,7 +131,7 @@ constexpr u32 SPIRV_CACHE_VERSION = 15; // v15: restores the full input-interfac
                                         // (v7: cbuf_key now excludes texture-handle-only
                                         // reads (ComputeCbufKeyExcludingTextureHandles,
                                         // vk_pipeline_cache.cpp's CreateGraphicsPipeline/
-                                        // CreateComputePipeline — see the "PHASE 1 —
+                                        // CreateComputePipeline — see the cbuf narrowing
                                         // narrowing enabled" comments there for the
                                         // validation data). No on-disk byte format
                                         // change, but the VALUE stored under cbuf_key
@@ -153,7 +194,7 @@ u64 ComputeCbufKey(const std::unordered_map<u64, u32>& cbuf_values) {
 }
 
 // ---------------------------------------------------------------------------
-// UPDATE (v7 / Phase 1): this IS now used by the real cache key —
+// UPDATE (v7): this is now used by the real cache key.
 // CreateGraphicsPipeline()/CreateComputePipeline() (vk_pipeline_cache.cpp) compute
 // the real cbuf_key with this function directly, not ComputeCbufKey() above. The
 // paragraph below describes why this function exists and was originally added as
@@ -302,12 +343,186 @@ u64 FoldBindingKey(u64 runtime_key, u64 binding_key) {
                           (runtime_key << 6) + (runtime_key >> 2));
 }
 
+void WriteBindings(std::ofstream& file, const Shader::Backend::Bindings& bindings) {
+    const std::array<u32, 7> fields{
+        bindings.unified,
+        bindings.uniform_buffer,
+        bindings.storage_buffer,
+        bindings.texture,
+        bindings.image,
+        bindings.texture_scaling_index,
+        bindings.image_scaling_index,
+    };
+    file.write(reinterpret_cast<const char*>(fields.data()), sizeof(fields));
+}
+
+void ReadBindings(std::ifstream& file, Shader::Backend::Bindings& bindings) {
+    std::array<u32, 7> fields{};
+    file.read(reinterpret_cast<char*>(fields.data()), sizeof(fields));
+    bindings = Shader::Backend::Bindings{
+        .unified = fields[0],
+        .uniform_buffer = fields[1],
+        .storage_buffer = fields[2],
+        .texture = fields[3],
+        .image = fields[4],
+        .texture_scaling_index = fields[5],
+        .image_scaling_index = fields[6],
+    };
+}
+
+constexpr u32 MAX_PERSISTED_COMPUTE_DESCRIPTORS = 1024;
+constexpr u32 MAX_PERSISTED_COMPUTE_CBUF_KEYS = 4096;
+
+std::shared_ptr<const Shader::Info> MakeComputeInfo(const Shader::Info& source) {
+    if (source.constant_buffer_descriptors.size() > Shader::Info::MAX_CBUFS ||
+        source.storage_buffers_descriptors.size() > Shader::Info::MAX_SSBOS ||
+        source.texture_buffer_descriptors.size() > MAX_PERSISTED_COMPUTE_DESCRIPTORS ||
+        source.image_buffer_descriptors.size() > MAX_PERSISTED_COMPUTE_DESCRIPTORS ||
+        source.texture_descriptors.size() > MAX_PERSISTED_COMPUTE_DESCRIPTORS ||
+        source.image_descriptors.size() > MAX_PERSISTED_COMPUTE_DESCRIPTORS) {
+        return {};
+    }
+    auto result = std::make_shared<Shader::Info>();
+    result->constant_buffer_mask = source.constant_buffer_mask;
+    result->constant_buffer_used_sizes = source.constant_buffer_used_sizes;
+    result->constant_buffer_descriptors = source.constant_buffer_descriptors;
+    result->storage_buffers_descriptors = source.storage_buffers_descriptors;
+    result->texture_buffer_descriptors = source.texture_buffer_descriptors;
+    result->image_buffer_descriptors = source.image_buffer_descriptors;
+    result->texture_descriptors = source.texture_descriptors;
+    result->image_descriptors = source.image_descriptors;
+    return result;
+}
+
+void WriteComputeInfo(std::ofstream& file, const std::shared_ptr<const Shader::Info>& info,
+                      bool live_probe_safe, std::span<const u64> cbuf_keys) {
+    const u8 present = info ? 1 : 0;
+    file.write(reinterpret_cast<const char*>(&present), sizeof(present));
+    if (!info) return;
+    const auto write_u32 = [&file](u32 value) {
+        file.write(reinterpret_cast<const char*>(&value), sizeof(value));
+    };
+    const auto write_bool = [&file](bool value) {
+        const u8 byte = value ? 1 : 0;
+        file.write(reinterpret_cast<const char*>(&byte), sizeof(byte));
+    };
+    write_u32(info->constant_buffer_mask);
+    file.write(reinterpret_cast<const char*>(info->constant_buffer_used_sizes.data()),
+               sizeof(info->constant_buffer_used_sizes));
+    const auto write_count = [&write_u32](size_t count) { write_u32(static_cast<u32>(count)); };
+    write_count(info->constant_buffer_descriptors.size());
+    for (const auto& d : info->constant_buffer_descriptors) { write_u32(d.index); write_u32(d.count); }
+    write_count(info->storage_buffers_descriptors.size());
+    for (const auto& d : info->storage_buffers_descriptors) {
+        write_u32(d.cbuf_index); write_u32(d.cbuf_offset); write_u32(d.count); write_bool(d.is_written);
+    }
+    write_count(info->texture_buffer_descriptors.size());
+    for (const auto& d : info->texture_buffer_descriptors) {
+        write_bool(d.has_secondary); write_u32(d.cbuf_index); write_u32(d.cbuf_offset); write_u32(d.shift_left);
+        write_u32(d.secondary_cbuf_index); write_u32(d.secondary_cbuf_offset); write_u32(d.secondary_shift_left);
+        write_u32(d.count); write_u32(d.size_shift);
+    }
+    write_count(info->image_buffer_descriptors.size());
+    for (const auto& d : info->image_buffer_descriptors) {
+        write_u32(static_cast<u32>(d.format)); write_bool(d.is_written); write_bool(d.is_read); write_bool(d.is_integer);
+        write_u32(d.cbuf_index); write_u32(d.cbuf_offset); write_u32(d.count); write_u32(d.size_shift);
+    }
+    write_count(info->texture_descriptors.size());
+    for (const auto& d : info->texture_descriptors) {
+        write_u32(static_cast<u32>(d.type)); write_bool(d.is_depth); write_bool(d.is_multisample); write_bool(d.has_secondary);
+        write_u32(d.cbuf_index); write_u32(d.cbuf_offset); write_u32(d.shift_left); write_u32(d.secondary_cbuf_index);
+        write_u32(d.secondary_cbuf_offset); write_u32(d.secondary_shift_left); write_u32(d.count); write_u32(d.size_shift);
+        write_bool(d.phase4_prototype_polymorphic); write_u32(d.phase4_prototype_slot_id);
+    }
+    write_count(info->image_descriptors.size());
+    for (const auto& d : info->image_descriptors) {
+        write_u32(static_cast<u32>(d.type)); write_u32(static_cast<u32>(d.format)); write_bool(d.is_written);
+        write_bool(d.is_read); write_bool(d.is_integer); write_u32(d.cbuf_index); write_u32(d.cbuf_offset);
+        write_u32(d.count); write_u32(d.size_shift);
+    }
+    write_bool(live_probe_safe);
+    write_u32(static_cast<u32>(cbuf_keys.size()));
+    file.write(reinterpret_cast<const char*>(cbuf_keys.data()),
+               static_cast<std::streamsize>(cbuf_keys.size() * sizeof(u64)));
+}
+
+std::shared_ptr<const Shader::Info> ReadComputeInfo(std::ifstream& file, bool& live_probe_safe,
+                                                     std::vector<u64>& cbuf_keys) {
+    u8 present{};
+    file.read(reinterpret_cast<char*>(&present), sizeof(present));
+    if (present == 0) return {};
+    if (present != 1) throw std::ios_base::failure{"Invalid compute recipe presence"};
+    auto result = std::make_shared<Shader::Info>();
+    const auto read_u32 = [&file] { u32 value{}; file.read(reinterpret_cast<char*>(&value), sizeof(value)); return value; };
+    const auto read_bool = [&file] { u8 value{}; file.read(reinterpret_cast<char*>(&value), sizeof(value)); if (value > 1) throw std::ios_base::failure{"Invalid compute recipe bool"}; return value != 0; };
+    const auto read_count = [&read_u32](u32 maximum) { const u32 count = read_u32(); if (count > maximum) throw std::ios_base::failure{"Invalid compute recipe count"}; return count; };
+    result->constant_buffer_mask = read_u32();
+    file.read(reinterpret_cast<char*>(result->constant_buffer_used_sizes.data()), sizeof(result->constant_buffer_used_sizes));
+    for (u32 i = 0, count = read_count(Shader::Info::MAX_CBUFS); i < count; ++i) {
+        result->constant_buffer_descriptors.push_back({read_u32(), read_u32()});
+    }
+    for (u32 i = 0, count = read_count(Shader::Info::MAX_SSBOS); i < count; ++i) {
+        result->storage_buffers_descriptors.push_back({read_u32(), read_u32(), read_u32(), read_bool()});
+    }
+    for (u32 i = 0, count = read_count(MAX_PERSISTED_COMPUTE_DESCRIPTORS); i < count; ++i) {
+        result->texture_buffer_descriptors.push_back({read_bool(), read_u32(), read_u32(), read_u32(), read_u32(), read_u32(), read_u32(), read_u32(), read_u32()});
+    }
+    for (u32 i = 0, count = read_count(MAX_PERSISTED_COMPUTE_DESCRIPTORS); i < count; ++i) {
+        const u32 format = read_u32(); if (format > static_cast<u32>(Shader::ImageFormat::R32G32B32A32_SFLOAT)) throw std::ios_base::failure{"Invalid compute image-buffer format"};
+        result->image_buffer_descriptors.push_back({static_cast<Shader::ImageFormat>(format), read_bool(), read_bool(), read_bool(), read_u32(), read_u32(), read_u32(), read_u32()});
+    }
+    for (u32 i = 0, count = read_count(MAX_PERSISTED_COMPUTE_DESCRIPTORS); i < count; ++i) {
+        const u32 type = read_u32(); if (type >= Shader::NUM_TEXTURE_TYPES) throw std::ios_base::failure{"Invalid compute texture type"};
+        result->texture_descriptors.push_back({static_cast<Shader::TextureType>(type), read_bool(), read_bool(), read_bool(), read_u32(), read_u32(), read_u32(), read_u32(), read_u32(), read_u32(), read_u32(), read_u32(), read_bool(), read_u32()});
+    }
+    for (u32 i = 0, count = read_count(MAX_PERSISTED_COMPUTE_DESCRIPTORS); i < count; ++i) {
+        const u32 type = read_u32(); const u32 format = read_u32();
+        if (type >= Shader::NUM_TEXTURE_TYPES || format > static_cast<u32>(Shader::ImageFormat::R32G32B32A32_SFLOAT)) throw std::ios_base::failure{"Invalid compute image descriptor"};
+        result->image_descriptors.push_back({static_cast<Shader::TextureType>(type), static_cast<Shader::ImageFormat>(format), read_bool(), read_bool(), read_bool(), read_u32(), read_u32(), read_u32(), read_u32()});
+    }
+    live_probe_safe = read_bool();
+    const u32 cbuf_count = read_count(MAX_PERSISTED_COMPUTE_CBUF_KEYS);
+    cbuf_keys.resize(cbuf_count);
+    file.read(reinterpret_cast<char*>(cbuf_keys.data()),
+              static_cast<std::streamsize>(cbuf_keys.size() * sizeof(u64)));
+    if (!std::ranges::is_sorted(cbuf_keys) ||
+        std::adjacent_find(cbuf_keys.begin(), cbuf_keys.end()) != cbuf_keys.end()) {
+        throw std::ios_base::failure{"Invalid compute recipe cbuf keys"};
+    }
+    return result;
+}
+
+
 
 void SpirvCache::Load(const std::filesystem::path& path) {
     std::unique_lock lock{mutex_};
+    // Load is a replacement operation. In particular, a missing, stale, or
+    // corrupt disk file must not leave entries from an earlier Load() usable:
+    // that would turn a clean cache miss into an unvalidated warm hit.
+    entries_.clear();
+    unique_hashes_.clear();
+    keys_by_hash_.clear();
+    saved_entry_count_ = 0;
+    dirty_ = false;
     try {
         std::ifstream file(path, std::ios::binary);
-        if (!file.is_open()) return;
+        if (!file.is_open()) {
+            // Save() retains this only across the short Windows replacement
+            // window. Recover it if process termination happened there.
+            const auto backup_path = path.parent_path() / (path.filename().string() + ".bak");
+            file.clear();
+            file.open(backup_path, std::ios::binary);
+            if (!file.is_open()) {
+                return;
+            }
+            LOG_WARNING(Render_Vulkan, "Recovering SPIR-V cache from interrupted save");
+        }
+        file.seekg(0, std::ios::end);
+        const std::streamoff file_size = file.tellg();
+        file.seekg(0);
+        if (file_size < SPIRV_CACHE_HEADER_SIZE) {
+            throw std::ios_base::failure{"Truncated SPIR-V cache header"};
+        }
         file.exceptions(std::ifstream::failbit);
 
         std::array<char, 8> magic{};
@@ -321,6 +536,10 @@ void SpirvCache::Load(const std::filesystem::path& path) {
 
         u32 num_entries{};
         file.read(reinterpret_cast<char*>(&num_entries), sizeof(num_entries));
+        if (num_entries >
+            static_cast<u64>((file_size - SPIRV_CACHE_HEADER_SIZE) / SPIRV_CACHE_MIN_ENTRY_SIZE)) {
+            throw std::ios_base::failure{"Invalid SPIR-V cache entry count"};
+        }
         entries_.reserve(num_entries);
         unique_hashes_.reserve(num_entries);
 
@@ -328,27 +547,47 @@ void SpirvCache::Load(const std::filesystem::path& path) {
             SpirvKey key{};
             u32 word_count{};
             file.read(reinterpret_cast<char*>(&key.unique_hash), sizeof(key.unique_hash));
+            u8 stage{};
+            file.read(reinterpret_cast<char*>(&stage), sizeof(stage));
+            if (stage > static_cast<u8>(Shader::Stage::VertexA)) {
+                throw std::ios_base::failure{"Invalid SPIR-V cache shader stage"};
+            }
+            key.stage = static_cast<Shader::Stage>(stage);
+            file.read(reinterpret_cast<char*>(&key.target_key), sizeof(key.target_key));
             file.read(reinterpret_cast<char*>(&key.cbuf_key),    sizeof(key.cbuf_key));
             file.read(reinterpret_cast<char*>(&key.runtime_key), sizeof(key.runtime_key));
             file.read(reinterpret_cast<char*>(&key.texture_key), sizeof(key.texture_key));
             file.read(reinterpret_cast<char*>(&word_count),       sizeof(word_count));
 
             if (word_count == 0 || word_count > 4 * 1024 * 1024) {
-                LOG_WARNING(Render_Vulkan, "Bogus SPIR-V word count {}, stopping load", word_count);
-                break;
+                throw std::ios_base::failure{"Bogus SPIR-V word count"};
             }
             if (key.unique_hash == 0) {
-                file.seekg(word_count * sizeof(u32), std::ios::cur);
-                continue;
+                throw std::ios_base::failure{"Invalid SPIR-V cache program identity"};
             }
             std::vector<u32> spirv(word_count);
             file.read(reinterpret_cast<char*>(spirv.data()), word_count * sizeof(u32));
             Shader::Backend::Bindings end_binding{};
-            file.read(reinterpret_cast<char*>(&end_binding), sizeof(end_binding));
+            ReadBindings(file, end_binding);
             u8 source_byte{};
             file.read(reinterpret_cast<char*>(&source_byte), sizeof(source_byte));
+            if (source_byte > static_cast<u8>(SpirvCacheEntrySource::PrecacheScanner)) {
+                throw std::ios_base::failure{"Invalid SPIR-V cache entry source"};
+            }
             std::array<u64, 8> diag_runtime_fields{};
             file.read(reinterpret_cast<char*>(diag_runtime_fields.data()), sizeof(diag_runtime_fields));
+            bool compute_live_probe_safe{};
+            std::vector<u64> compute_cbuf_keys;
+            auto compute_info =
+                ReadComputeInfo(file, compute_live_probe_safe, compute_cbuf_keys);
+            if (compute_info &&
+                (key.stage != Shader::Stage::Compute ||
+                 source_byte != static_cast<u8>(SpirvCacheEntrySource::Real))) {
+                throw std::ios_base::failure{"Invalid compute recipe source"};
+            }
+            if (compute_live_probe_safe && key.texture_key != 0) {
+                throw std::ios_base::failure{"Invalid live compute recipe texture key"};
+            }
             // Trailing three diag_* fields: diag_base_runtime_hash/diag_binding_key stay
             // at their documented 0/0 "no data" default (unaffected by this load). The
             // third, diag_cbuf_key_excl_texture_handles, deliberately defaults to
@@ -359,28 +598,40 @@ void SpirvCache::Load(const std::filesystem::path& path) {
             // would produce a real value is session-scoped, not persisted). Defaulting
             // to a bare 0 here would have been silently wrong for the common case of a
             // reloaded entry with a genuinely nonzero cbuf_key.
-            entries_.emplace(key, Entry{std::make_shared<const std::vector<u32>>(std::move(spirv)),
-                                        end_binding, source_byte != 0,
-                                        static_cast<SpirvCacheEntrySource>(source_byte),
-                                        0, 0, key.cbuf_key,
-                                        diag_runtime_fields});
-            unique_hashes_.insert(key.unique_hash);
-            constexpr size_t kMaxStoredKeysPerHashForDiagnosticsLoad = 8;
-            auto& stored_keys = keys_by_hash_[key.unique_hash];
-            if (stored_keys.size() < kMaxStoredKeysPerHashForDiagnosticsLoad) {
-                stored_keys.push_back(key);
+            if (!entries_
+                     .emplace(key, Entry{std::make_shared<const std::vector<u32>>(std::move(spirv)),
+                                         end_binding, source_byte != 0,
+                                         static_cast<SpirvCacheEntrySource>(source_byte),
+                                         0, 0, key.cbuf_key,
+                                         diag_runtime_fields, std::move(compute_info),
+                                         compute_live_probe_safe,
+                                         std::move(compute_cbuf_keys)})
+                     .second) {
+                throw std::ios_base::failure{"Duplicate SPIR-V cache key"};
             }
+            unique_hashes_.insert(key.unique_hash);
+            auto& stored_keys = keys_by_hash_[key.unique_hash];
+            stored_keys.push_back(key);
+        }
+        if (file.peek() != std::char_traits<char>::eof()) {
+            throw std::ios_base::failure{"Unexpected trailing SPIR-V cache data"};
         }
         LOG_INFO(Render_Vulkan, "Loaded {} SPIR-V cache entries", entries_.size());
         saved_entry_count_ = entries_.size();
         last_save_time_    = std::chrono::steady_clock::now();
     } catch (...) {
+        // Never publish a prefix of a malformed file. A partial cache makes
+        // corruption look like a valid but inexplicable subset of warm hits.
+        entries_.clear();
+        unique_hashes_.clear();
+        keys_by_hash_.clear();
+        saved_entry_count_ = 0;
         LOG_WARNING(Render_Vulkan, "Failed to load SPIR-V cache (corrupt or truncated)");
     }
 }
 
 void SpirvCache::Save(const std::filesystem::path& path) const {
-    // Phase 1: snapshot under exclusive lock.
+    // Snapshot under exclusive lock.
     std::vector<std::pair<SpirvKey, Entry>> snapshot;
     {
         std::unique_lock lock{mutex_};
@@ -389,7 +640,18 @@ void SpirvCache::Save(const std::filesystem::path& path) const {
         dirty_ = false;
         saved_entry_count_ = entries_.size();
     }
-    // Phase 2: write to disk without holding the mutex.
+    // unordered_dense iteration order is an implementation detail. A stable
+    // file makes replay-corpus comparisons meaningful and prevents insertion
+    // order from changing a cache artifact without changing its contents.
+    std::sort(snapshot.begin(), snapshot.end(), [](const auto& lhs, const auto& rhs) {
+        const SpirvKey& a{lhs.first};
+        const SpirvKey& b{rhs.first};
+        return std::tie(a.unique_hash, a.stage, a.target_key, a.cbuf_key, a.runtime_key,
+                        a.texture_key) <
+               std::tie(b.unique_hash, b.stage, b.target_key, b.cbuf_key, b.runtime_key,
+                        b.texture_key);
+    });
+    // Write to disk without holding the mutex.
     const auto tmp_path = path.parent_path() / (path.filename().string() + ".tmp");
     try {
         std::ofstream file(tmp_path, std::ios::binary | std::ios::trunc);
@@ -409,16 +671,21 @@ void SpirvCache::Save(const std::filesystem::path& path) const {
         for (const auto& [key, entry] : snapshot) {
             const u32 word_count = static_cast<u32>(entry.spirv->size());
             file.write(reinterpret_cast<const char*>(&key.unique_hash), sizeof(key.unique_hash));
+            const u8 stage = static_cast<u8>(key.stage);
+            file.write(reinterpret_cast<const char*>(&stage), sizeof(stage));
+            file.write(reinterpret_cast<const char*>(&key.target_key), sizeof(key.target_key));
             file.write(reinterpret_cast<const char*>(&key.cbuf_key),    sizeof(key.cbuf_key));
             file.write(reinterpret_cast<const char*>(&key.runtime_key), sizeof(key.runtime_key));
             file.write(reinterpret_cast<const char*>(&key.texture_key), sizeof(key.texture_key));
             file.write(reinterpret_cast<const char*>(&word_count),      sizeof(word_count));
             file.write(reinterpret_cast<const char*>(entry.spirv->data()), word_count * sizeof(u32));
-            file.write(reinterpret_cast<const char*>(&entry.end_binding), sizeof(entry.end_binding));
+            WriteBindings(file, entry.end_binding);
             const u8 source_byte = static_cast<u8>(entry.source);
             file.write(reinterpret_cast<const char*>(&source_byte), sizeof(source_byte));
             file.write(reinterpret_cast<const char*>(entry.diag_runtime_fields.data()),
                        sizeof(entry.diag_runtime_fields));
+            WriteComputeInfo(file, entry.compute_info, entry.compute_live_probe_safe,
+                             entry.compute_cbuf_keys);
         }
     } catch (const std::exception& e) {
         LOG_ERROR(Render_Vulkan, "Failed to write SPIR-V cache: {}", e.what());
@@ -428,19 +695,97 @@ void SpirvCache::Save(const std::filesystem::path& path) const {
     }
 
     std::error_code ec;
-    // std::filesystem::rename is not atomic-replace on Windows when the destination
-    // already exists — it fails with an error. Remove first, then rename.
-    // This is the same pattern used throughout the rest of the citron codebase.
-    std::filesystem::remove(path, ec); // ignore error — file may not exist yet
+    // Windows does not allow rename() to replace an existing destination. Do
+    // not remove the old cache first: an interruption in that gap turns a
+    // completed scanner result into no cache at all. Move it aside, install
+    // the complete temporary file, then remove the backup. A failed install
+    // restores the previous cache before returning.
+    const auto backup_path = path.parent_path() / (path.filename().string() + ".bak");
+    std::filesystem::remove(backup_path, ec);
+    ec.clear();
+    const bool had_previous_cache = std::filesystem::exists(path, ec) && !ec;
+    if (had_previous_cache) {
+        std::filesystem::rename(path, backup_path, ec);
+        if (ec) {
+            LOG_ERROR(Render_Vulkan, "Failed to preserve previous SPIR-V cache: {}", ec.message());
+            std::filesystem::remove(tmp_path, ec);
+            std::unique_lock lock{mutex_};
+            dirty_ = true;
+            return;
+        }
+    }
     std::filesystem::rename(tmp_path, path, ec);
     if (ec) {
         LOG_ERROR(Render_Vulkan, "Failed to rename SPIR-V cache: {}", ec.message());
         std::filesystem::remove(tmp_path, ec);
+        if (had_previous_cache) {
+            std::error_code restore_ec;
+            std::filesystem::rename(backup_path, path, restore_ec);
+            if (restore_ec) {
+                LOG_CRITICAL(Render_Vulkan,
+                             "Could not restore previous SPIR-V cache after failed save: {}",
+                             restore_ec.message());
+            }
+        }
         std::unique_lock lock{mutex_};
         dirty_ = true; // restore so next Save() retries
         return;
     }
+    if (had_previous_cache) {
+        std::filesystem::remove(backup_path, ec);
+    }
     LOG_INFO(Render_Vulkan, "Saved {} SPIR-V cache entries", snapshot.size());
+}
+
+u64 ComputeLogicalTextureKey(const Shader::LogicalTextureSlots& slots) {
+    if (slots.empty()) {
+        return 0;
+    }
+    std::vector<std::pair<Shader::TextureSlot, Shader::TextureSlotShape>> sorted{slots.begin(),
+                                                                                   slots.end()};
+    std::sort(sorted.begin(), sorted.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.first < rhs.first;
+    });
+    std::vector<u64> canonical;
+    canonical.reserve(1 + sorted.size() * 11);
+    canonical.push_back(0x4C4F47534C4F5400ULL); // "LOGSLOT"
+    for (const auto& [slot, shape] : sorted) {
+        canonical.push_back(slot.cbuf_index);
+        canonical.push_back(slot.cbuf_offset);
+        canonical.push_back(slot.shift_left);
+        canonical.push_back(slot.secondary_cbuf_index);
+        canonical.push_back(slot.secondary_cbuf_offset);
+        canonical.push_back(slot.secondary_shift_left);
+        canonical.push_back(slot.count);
+        canonical.push_back(slot.has_secondary ? 1 : 0);
+        canonical.push_back(shape.type ? static_cast<u64>(*shape.type) + 1 : 0);
+        canonical.push_back(shape.pixel_format ? static_cast<u64>(*shape.pixel_format) + 1 : 0);
+        canonical.push_back(shape.is_integer ? (*shape.is_integer ? 2 : 1) : 0);
+    }
+    return Common::CityHash64(reinterpret_cast<const char*>(canonical.data()),
+                              canonical.size() * sizeof(u64));
+}
+
+bool HasCompleteLogicalTextureCoverage(
+    const Shader::LogicalTextureSlots& slots, const Shader::LogicalTextureHandles& logical_handles,
+    const std::unordered_map<u32, Shader::TextureType>& texture_types,
+    const std::unordered_map<u32, Shader::TexturePixelFormat>& texture_pixel_formats) {
+    if (slots.empty()) {
+        return texture_types.empty() && texture_pixel_formats.empty();
+    }
+    return std::ranges::all_of(texture_types, [&logical_handles](const auto& value) {
+               return logical_handles.contains(value.first);
+           }) &&
+           std::ranges::all_of(texture_pixel_formats, [&logical_handles](const auto& value) {
+               return logical_handles.contains(value.first);
+           });
+}
+
+bool HasActivePhase4LogicalTextureSlot(const Shader::LogicalTextureSlots& slots) {
+    return std::ranges::any_of(slots, [](const auto& value) {
+        const Shader::TextureSlot& slot{value.first};
+        return Shader::IsPhase4PrototypeSlot(slot.cbuf_index, slot.cbuf_offset);
+    });
 }
 
 void SpirvCache::SaveThrottled(const std::filesystem::path& path,
@@ -510,6 +855,14 @@ void SpirvCache::SaveThrottled(const std::filesystem::path& path,
         const size_t real_hits = real_hit_count_.load();
         const size_t live_speculative_hits = live_speculative_hit_count_.load();
         const size_t scanner_speculative_hits = scanner_speculative_hit_count_.load();
+        const size_t logical_texture_keys = logical_texture_key_count_.load();
+        const size_t raw_texture_keys = raw_texture_key_count_.load();
+        const size_t scanner_rejections = scanner_candidate_rejections_.load();
+        const size_t scanner_stage_rejections = scanner_stage_rejections_.load();
+        const size_t scanner_target_rejections = scanner_target_rejections_.load();
+        const size_t scanner_cbuf_rejections = scanner_cbuf_rejections_.load();
+        const size_t scanner_runtime_rejections = scanner_runtime_rejections_.load();
+        const size_t scanner_texture_rejections = scanner_texture_rejections_.load();
         // The cbuf-narrowing eligible/would-have-matched line that used to print here is
         // gone along with the counters it read (see Lookup()'s comment where that logic
         // used to live) — narrowing shipped in production (v7) after two full sessions
@@ -523,28 +876,40 @@ void SpirvCache::SaveThrottled(const std::filesystem::path& path,
                      "hits {}/{}/{}), {} misses where the shader was "
                      "already cached under a different key ({} had no real cbuf/texture "
                      "context [FileEnvironment] / {} had real context that still mismatched). "
-                     "Real-draw cbuf_key==0 so far: {}/{} ({}%) — the ceiling on how many real "
-                     "draws a speculative entry could ever match, regardless of key correctness. "
+                     "Real-draw cbuf_key==0 so far: {}/{} ({}%) — an upper bound on how many real "
+                     "draws a guessed-final speculative entry could match without cbuf capture. "
                      "Of {} real-context stale misses so far, {} could not have matched on the "
                      "binding-offset component alone (vs any stored variant) / {} could not have "
                      "matched on the core RuntimeInfo component alone — whichever is closer to "
-                     "{} is the dominant runtime_key blocker.",
+                     "{} is the dominant runtime_key blocker. Scanner candidates rejected so far: "
+                     "{} (stage/target/cbuf/runtime/texture {}/{}/{}/{}/{}; fields may overlap). "
+                     "Texture-key mode selections so far: logical={} raw-fallback={}.",
                      entries_now, speculative_insert_count_.load(), real_insert_count_.load(),
                      window_hits, window_probes, window_pct, real_hits, live_speculative_hits,
                      scanner_speculative_hits, window_stale_misses,
                      window_no_ctx, window_with_ctx, cbuf_zero, cbuf_total, cbuf_zero_pct,
-                     with_ctx_total, binding_never_matched, core_never_matched, with_ctx_total);
+                     with_ctx_total, binding_never_matched, core_never_matched, with_ctx_total,
+                     scanner_rejections, scanner_stage_rejections, scanner_target_rejections,
+                     scanner_cbuf_rejections,
+                     scanner_runtime_rejections,
+                     scanner_texture_rejections, logical_texture_keys, raw_texture_keys);
         } else {
             LOG_INFO(Render_Vulkan,
                      "SPIR-V cache: {} entries ({} speculative / {} real inserted so far) — "
                      "no lookups since last log (real/live-speculative/scanner-speculative hits "
                      "{}/{}/{}). Real-draw cbuf_key==0 so far: {}/{} ({}%). "
                      "Of {} real-context stale misses so far, {} binding-component-never-matched / "
-                     "{} core-component-never-matched.",
+                     "{} core-component-never-matched. Scanner candidates rejected so far: {} "
+                     "(stage/target/cbuf/runtime/texture {}/{}/{}/{}/{}; fields may overlap). "
+                     "Texture-key mode selections so far: logical={} raw-fallback={}.",
                      entries_now, speculative_insert_count_.load(), real_insert_count_.load(),
                      real_hits, live_speculative_hits, scanner_speculative_hits,
                      cbuf_zero, cbuf_total, cbuf_zero_pct,
-                     with_ctx_total, binding_never_matched, core_never_matched);
+                     with_ctx_total, binding_never_matched, core_never_matched,
+                     scanner_rejections, scanner_stage_rejections, scanner_target_rejections,
+                     scanner_cbuf_rejections,
+                     scanner_runtime_rejections,
+                     scanner_texture_rejections, logical_texture_keys, raw_texture_keys);
         }
     }
 }
@@ -595,6 +960,36 @@ std::optional<SpirvCache::LookupResult> SpirvCache::Lookup(const SpirvKey& key,
             // (throttled) per-field LOG_INFO samples.
             const auto hit_it = keys_by_hash_.find(key.unique_hash);
             const bool have_stored_keys = hit_it != keys_by_hash_.end() && !hit_it->second.empty();
+
+            // Complete, source-specific rejection accounting. Unlike the
+            // throttled human-readable samples below, this compares every
+            // retained candidate for this identity, so it remains valid when
+            // a shader has more than eight cached variants.
+            if (has_real_specialization_context && have_stored_keys) {
+                for (const SpirvKey& stored : hit_it->second) {
+                    const auto stored_it = entries_.find(stored);
+                    if (stored_it == entries_.end() ||
+                        stored_it->second.source != SpirvCacheEntrySource::PrecacheScanner) {
+                        continue;
+                    }
+                    ++scanner_candidate_rejections_;
+                    if (key.stage != stored.stage) {
+                        ++scanner_stage_rejections_;
+                    }
+                    if (key.target_key != stored.target_key) {
+                        ++scanner_target_rejections_;
+                    }
+                    if (key.cbuf_key != stored.cbuf_key) {
+                        ++scanner_cbuf_rejections_;
+                    }
+                    if (key.runtime_key != stored.runtime_key) {
+                        ++scanner_runtime_rejections_;
+                    }
+                    if (key.texture_key != stored.texture_key) {
+                        ++scanner_texture_rejections_;
+                    }
+                }
+            }
 
             // Uncapped: for every real (has_real_specialization_context) stale miss,
             // check whether the REQUESTED side's pre-fold runtime_key components
@@ -671,7 +1066,7 @@ std::optional<SpirvCache::LookupResult> SpirvCache::Lookup(const SpirvKey& key,
                         stored_it != entries_.end() ? stored_it->second.diag_base_runtime_hash : 0;
                     const u64 stored_binding_key =
                         stored_it != entries_.end() ? stored_it->second.diag_binding_key : 0;
-                    // Added alongside the Phase 3 guess-refinement work: nothing above
+                    // Added with scanner runtime-state refinement: nothing above
                     // this line could previously tell you whether a given mismatch
                     // sample was against a real entry from earlier in the same session
                     // (ordinary, expected cardinality — see
@@ -684,15 +1079,17 @@ std::optional<SpirvCache::LookupResult> SpirvCache::Lookup(const SpirvKey& key,
                         stored_it != entries_.end() && stored_it->second.is_speculative;
                     LOG_INFO(Render_Vulkan,
                              "SPIR-V cache field mismatch [{}] (real_context={}): requested "
-                             "cbuf={:016x} runtime={:016x} (base_runtime={:016x} binding_key={:016x}) "
-                             "texture={:016x} vs stored[speculative={}] cbuf={:016x} runtime={:016x} "
+                             "target={:016x} cbuf={:016x} runtime={:016x} (base_runtime={:016x} binding_key={:016x}) "
+                             "texture={:016x} vs stored[speculative={}] target={:016x} cbuf={:016x} runtime={:016x} "
                              "(base_runtime={:016x} binding_key={:016x}) texture={:016x} "
-                             "(cbuf {}, runtime {} [base_runtime {}, binding_key {}], texture {})",
+                             "(target {}, cbuf {}, runtime {} [base_runtime {}, binding_key {}], texture {})",
                              expected, has_real_specialization_context,
-                             key.cbuf_key, key.runtime_key, diag_base_runtime_hash, diag_binding_key,
-                             key.texture_key, stored_is_speculative,
-                             stored.cbuf_key, stored.runtime_key, stored_base_rt, stored_binding_key,
+                             key.target_key, key.cbuf_key, key.runtime_key, diag_base_runtime_hash,
+                             diag_binding_key, key.texture_key, stored_is_speculative,
+                             stored.target_key, stored.cbuf_key, stored.runtime_key, stored_base_rt,
+                             stored_binding_key,
                              stored.texture_key,
+                             key.target_key == stored.target_key ? "matches" : "DIFFERS",
                              key.cbuf_key == stored.cbuf_key ? "matches" : "DIFFERS",
                              key.runtime_key == stored.runtime_key ? "matches" : "DIFFERS",
                              diag_base_runtime_hash == stored_base_rt ? "matches" : "DIFFERS",
@@ -733,26 +1130,77 @@ std::optional<SpirvCache::LookupResult> SpirvCache::Lookup(const SpirvKey& key,
         break;
     }
     return LookupResult{it->second.spirv, it->second.end_binding, it->second.is_speculative,
-                        it->second.source};
+                        it->second.source, it->second.compute_info};
+}
+
+std::vector<SpirvCache::ComputePreFrontendCandidate>
+SpirvCache::LookupLiveComputeCandidates(u64 unique_hash, u64 target_key) const {
+    std::shared_lock lock{mutex_};
+    const auto keys_it = keys_by_hash_.find(unique_hash);
+    if (keys_it == keys_by_hash_.end()) {
+        return {};
+    }
+    std::vector<ComputePreFrontendCandidate> candidates;
+    for (const SpirvKey& key : keys_it->second) {
+        if (key.stage != Shader::Stage::Compute || key.target_key != target_key ||
+            key.texture_key != 0) {
+            continue;
+        }
+        const auto entry_it = entries_.find(key);
+        if (entry_it == entries_.end()) {
+            continue;
+        }
+        const Entry& entry = entry_it->second;
+        if (entry.is_speculative || !entry.compute_info || !entry.compute_live_probe_safe) {
+            continue;
+        }
+        candidates.push_back({key, entry.compute_cbuf_keys});
+    }
+    return candidates;
 }
 
 void SpirvCache::Insert(const SpirvKey& key, std::vector<u32> spirv,
                         const Shader::Backend::Bindings& end_binding, bool is_speculative,
                         u64 diag_base_runtime_hash, u64 diag_binding_key,
                         u64 diag_cbuf_key_excl_texture_handles,
-                        std::array<u64, 8> diag_runtime_fields) {
+                        std::array<u64, 8> diag_runtime_fields,
+                        const Shader::Info* compute_info,
+                        const std::unordered_map<u64, u32>* compute_cbuf_values,
+                        bool compute_live_probe_safe) {
+    // Keep writer and loader contracts identical. An invalid in-memory entry
+    // would otherwise poison the next saved artifact, whose strict loader
+    // correctly rejects the whole file.
+    if (key.unique_hash == 0 || spirv.empty()) [[unlikely]] return;
     std::unique_lock lock{mutex_};
+    const auto stored_compute_info = key.stage == Shader::Stage::Compute && !is_speculative &&
+                                             compute_info != nullptr
+                                         ? MakeComputeInfo(*compute_info)
+                                         : std::shared_ptr<const Shader::Info>{};
+    std::vector<u64> compute_cbuf_keys;
+    bool stored_live_probe_safe = stored_compute_info && compute_live_probe_safe &&
+                                  key.texture_key == 0 && compute_cbuf_values != nullptr;
+    if (stored_live_probe_safe) {
+        compute_cbuf_keys.reserve(compute_cbuf_values->size());
+        for (const auto& [cbuf_key, _] : *compute_cbuf_values) {
+            compute_cbuf_keys.push_back(cbuf_key);
+        }
+        std::ranges::sort(compute_cbuf_keys);
+        if (compute_cbuf_keys.size() > MAX_PERSISTED_COMPUTE_CBUF_KEYS) {
+            compute_cbuf_keys.clear();
+            stored_live_probe_safe = false;
+        }
+    }
     entries_.insert_or_assign(key, Entry{std::make_shared<const std::vector<u32>>(std::move(spirv)),
                                          end_binding, is_speculative,
                                          is_speculative ? SpirvCacheEntrySource::LiveSpeculative
                                                         : SpirvCacheEntrySource::Real,
                                          diag_base_runtime_hash, diag_binding_key,
-                                         diag_cbuf_key_excl_texture_handles, diag_runtime_fields});
+                                         diag_cbuf_key_excl_texture_handles, diag_runtime_fields,
+                                         stored_compute_info, stored_live_probe_safe,
+                                         std::move(compute_cbuf_keys)});
     unique_hashes_.insert(key.unique_hash);
-    constexpr size_t kMaxStoredKeysPerHashForDiagnostics = 8;
     auto& stored_keys = keys_by_hash_[key.unique_hash];
-    if (std::find(stored_keys.begin(), stored_keys.end(), key) == stored_keys.end() &&
-        stored_keys.size() < kMaxStoredKeysPerHashForDiagnostics) {
+    if (std::find(stored_keys.begin(), stored_keys.end(), key) == stored_keys.end()) {
         stored_keys.push_back(key);
     }
     dirty_ = true;
@@ -768,17 +1216,21 @@ size_t SpirvCache::Size() const {
     return entries_.size();
 }
 
-void SpirvCache::Insert(u64 unique_hash, const std::unordered_map<u64, u32>& cbuf_values,
+void SpirvCache::Insert(u64 unique_hash, Shader::Stage stage, u64 target_key,
+                        const std::unordered_map<u64, u32>& cbuf_values,
                         u64 runtime_key, u64 texture_key, std::vector<u32> spirv,
                         const Shader::Backend::Bindings& end_binding,
                         u64 diag_base_runtime_hash, u64 diag_binding_key,
                         u64 diag_cbuf_key_excl_texture_handles) {
-    Insert(SpirvKey{unique_hash, ComputeCbufKey(cbuf_values), runtime_key, texture_key},
+    Insert(SpirvKey{unique_hash, stage, target_key, ComputeCbufKey(cbuf_values), runtime_key,
+                    texture_key},
            std::move(spirv), end_binding, /*is_speculative=*/false,
            diag_base_runtime_hash, diag_binding_key, diag_cbuf_key_excl_texture_handles);
 }
 
-void SpirvCache::InsertSpeculative(u64 unique_hash, u64 runtime_key, u64 texture_key,
+void SpirvCache::InsertSpeculative(u64 unique_hash, Shader::Stage stage, u64 target_key,
+                                   u64 runtime_key,
+                                   u64 texture_key,
                                    std::vector<u32> spirv,
                                    const Shader::Backend::Bindings& end_binding,
                                    u64 diag_base_runtime_hash,
@@ -795,15 +1247,13 @@ void SpirvCache::InsertSpeculative(u64 unique_hash, u64 runtime_key, u64 texture
         source = SpirvCacheEntrySource::LiveSpeculative;
     }
     std::unique_lock lock{mutex_};
-    const SpirvKey key{unique_hash, 0, runtime_key, texture_key};
+    const SpirvKey key{unique_hash, stage, target_key, 0, runtime_key, texture_key};
     entries_.insert_or_assign(key, Entry{std::make_shared<const std::vector<u32>>(std::move(spirv)),
                                          end_binding, true, source, diag_base_runtime_hash,
-                                         diag_binding_key, 0, diag_runtime_fields});
+                                         diag_binding_key, 0, diag_runtime_fields, {}, false, {}});
     unique_hashes_.insert(key.unique_hash);
-    constexpr size_t kMaxStoredKeysPerHashForDiagnostics = 8;
     auto& stored_keys = keys_by_hash_[key.unique_hash];
-    if (std::find(stored_keys.begin(), stored_keys.end(), key) == stored_keys.end() &&
-        stored_keys.size() < kMaxStoredKeysPerHashForDiagnostics) {
+    if (std::find(stored_keys.begin(), stored_keys.end(), key) == stored_keys.end()) {
         stored_keys.push_back(key);
     }
     dirty_ = true;
