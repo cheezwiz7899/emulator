@@ -105,7 +105,7 @@ fi
 # defaults or the AppDir layout underneath us; bump QUICK_SHARUN_REF
 # deliberately when needed. HOOKSRC is pinned to the same commit so
 # ADD_HOOKS below resolves against a matching tree.
-QUICK_SHARUN_REF="e9414c02f713359b551bcfa3832576d2992b13da"
+QUICK_SHARUN_REF="176c4ca149ca74270a1ecbaa82bf2d12847ec8af"
 QUICK_SHARUN_URL="https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/${QUICK_SHARUN_REF}/useful-tools/quick-sharun.sh"
 export HOOKSRC="https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/${QUICK_SHARUN_REF}/useful-tools/hooks"
 curl -fL --retry 30 "${QUICK_SHARUN_URL}" -o quick-sharun \
