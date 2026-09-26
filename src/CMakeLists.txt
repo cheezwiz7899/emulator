@@ -123,6 +123,15 @@ if (MSVC)
         add_compile_options(/Zi)
     endif()
 
+    if (CITRON_CLANGCL AND CITRON_CLANGCL_FULL_LTO_LINE_TABLES)
+        # These must follow the /Z7 or /Zi option above so full-LTO RelWithDebInfo
+        # emits source lines without the type records that overwhelm lld-link.
+        add_compile_options(
+            "$<$<CONFIG:RelWithDebInfo>:/clang:-gcodeview>"
+            "$<$<CONFIG:RelWithDebInfo>:/clang:-gline-tables-only>"
+        )
+    endif()
+
     if (ARCHITECTURE_x86_64)
         add_compile_options(/QIntel-jcc-erratum)
     endif()

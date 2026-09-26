@@ -130,7 +130,8 @@ function(citron_build_clangcl_ffmpeg)
 
     set(_ffnvcodec_nvdec_flags "")
     set(_ffnvcodec_export_pkgconfig "")
-    set(_ffnvcodec_pkg_config_opt "")
+    # Without CPM ffnvcodec, avoid the host MSYS2 pkg-config database entirely.
+    set(_ffnvcodec_pkg_config_opt "--pkg-config=false")
     if (_ffnvcodec_inc_dir)
         message(STATUS "[FFmpeg/clang-cl] ffnvcodec headers found at: ${_ffnvcodec_inc_dir}")
         execute_process(
@@ -151,10 +152,14 @@ function(citron_build_clangcl_ffmpeg)
             endif()
         endif()
 
-        # Provide a pkg-config wrapper in build dir to guarantee configure check_pkg_config succeeds
-        # even if pkgconf is not installed in the MSYS2 environment.
+        # Resolve only ffnvcodec from CPM; forwarding other packages to MSYS2 pkg-config
+        # mixes MinGW headers and libraries into the MSVC clang-cl build.
         file(WRITE "${_build_dir_win}/pkg-config"
 "#!/bin/sh
+if [ \"\$1\" = \"--version\" ]; then
+    echo 1.0
+    exit 0
+fi
 case \" \$* \" in
     *ffnvcodec*)
         for arg in \"\$@\"; do
@@ -183,18 +188,8 @@ case \" \$* \" in
         exit 0
         ;;
 esac
-_pkg_config_wrapper=\"\$(cd -P \"\$(dirname \"\$0\")\" && pwd -P)/\$(basename \"\$0\")\"
-for _pkg_config_candidate in pkgconf pkg-config /usr/bin/pkgconf /usr/bin/pkg-config /clang64/bin/pkg-config; do
-    case \"\$_pkg_config_candidate\" in
-        /*) _pkg_config_delegate=\"\$_pkg_config_candidate\" ;;
-        *) _pkg_config_delegate=\"\$(command -v \"\$_pkg_config_candidate\" 2>/dev/null)\" || continue ;;
-    esac
-    [ -n \"\$_pkg_config_delegate\" ] || continue
-    [ -x \"\$_pkg_config_delegate\" ] || continue
-    _pkg_config_delegate=\"\$(cd -P \"\$(dirname \"\$_pkg_config_delegate\")\" && pwd -P)/\$(basename \"\$_pkg_config_delegate\")\" || continue
-    [ \"\$_pkg_config_delegate\" = \"\$_pkg_config_wrapper\" ] && continue
-    exec \"\$_pkg_config_delegate\" \"\$@\"
-done
+# Other MSYS2 pkg-config packages point at MinGW headers and libraries.
+# Vulkan falls back to the explicit include path in --extra-cflags.
 exit 1
 ")
         execute_process(
@@ -265,12 +260,31 @@ exit 1
         file(READ "${_ffmpeg_flags_sentinel}" _ffmpeg_flags_sentinel_content)
         string(STRIP "${_ffmpeg_flags_sentinel_content}" _ffmpeg_flags_sentinel_content)
     endif()
-    if (EXISTS "${_build_stamp}" AND NOT _ffmpeg_flags_sentinel_content STREQUAL "${_current_sentinel_hash}")
+    # A cache built by another CMake/Ninja build tree has no entry in this tree's
+    # .ninja_log. Do not attach a build command to an already complete install:
+    # Ninja would rerun it despite the stamp being newer than its inputs.
+    set(_ffmpeg_cache_complete TRUE)
+    foreach(_artifact IN ITEMS
+            "${_build_stamp}"
+            "${_install_dir}/lib/avfilter.lib"
+            "${_install_dir}/lib/swscale.lib"
+            "${_install_dir}/lib/avcodec.lib"
+            "${_install_dir}/lib/avutil.lib")
+        if(NOT EXISTS "${_artifact}")
+            set(_ffmpeg_cache_complete FALSE)
+        endif()
+    endforeach()
+    if(_ffmpeg_cache_complete AND
+       NOT _ffmpeg_flags_sentinel_content STREQUAL _current_sentinel_hash)
         message(STATUS "[FFmpeg/clang-cl] Configure flags changed; invalidating cache and rebuilding FFmpeg")
+        set(_ffmpeg_cache_complete FALSE)
+    endif()
+    if(NOT _ffmpeg_cache_complete)
         file(REMOVE "${_build_stamp}")
     endif()
     file(WRITE "${_ffmpeg_flags_sentinel}" "${_current_sentinel_hash}")
 
+    if(NOT _ffmpeg_cache_complete)
     add_custom_command(
         OUTPUT "${_build_stamp}"
         BYPRODUCTS
@@ -294,6 +308,7 @@ exit 1
         WORKING_DIRECTORY "${_build_dir_win}"
         VERBATIM
     )
+    endif()
     add_custom_target(ffmpeg-build ALL DEPENDS "${_build_stamp}")
 
     # Expose the stamp path so video_core/CMakeLists.txt can set OBJECT_DEPENDS

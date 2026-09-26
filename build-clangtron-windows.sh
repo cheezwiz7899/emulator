@@ -160,7 +160,7 @@
 #                              fe   = Frontend PGO; more flag-change tolerant; no CS-IRPGO
 #                              none = No PGO; use → build/use-nopgo/, LTO still applies
 #     --release                Release build (default)
-#     --relwithdebinfo         RelWithDebInfo (adds -g, keeps O3/LTO/PGO)
+#     --relwithdebinfo         RelWithDebInfo (clang-cl full LTO keeps source lines, not variable/type debug info)
 #     --unity                  Unity builds (~30-90% faster compile, no runtime effect)
 #     --tracy                  Enable Tracy profiler instrumentation (default off)
 #     --tracy-alloc             Enable Tracy heap allocator tracking (default off, requires --tracy)
@@ -3948,13 +3948,22 @@ stage_clangcl() {
     fi
 
     local config="${BUILD_TYPE}" stage_name flags="" pgo_flags="" pgo_link_flags="" pgo_flags_dash="" config_compile_flags config_link_flags
+    local debug_info_configs="Debug,RelWithDebInfo" full_lto_line_tables="OFF"
     case "${config}" in
         Release)
             config_compile_flags="/O2 /DNDEBUG /clang:-fno-strict-aliasing"
             config_link_flags="/OPT:REF /OPT:ICF /force:multiple"
             ;;
         RelWithDebInfo)
-            config_compile_flags="/O2 /Z7 /DNDEBUG /clang:-fno-strict-aliasing"
+            if [[ "${LTO_MODE}" == "full" ]]; then
+                # Full LTO with /Z7 spends excessive time and memory merging CodeView types.
+                # Keep source-line stacks in the PDB without embedding variable/type records.
+                config_compile_flags="/O2 /DNDEBUG /clang:-fno-strict-aliasing /clang:-gcodeview /clang:-gline-tables-only"
+                debug_info_configs="Debug"
+                full_lto_line_tables="ON"
+            else
+                config_compile_flags="/O2 /Z7 /DNDEBUG /clang:-fno-strict-aliasing"
+            fi
             config_link_flags="/DEBUG /OPT:REF /OPT:ICF /force:multiple"
             ;;
         Debug)
@@ -4421,10 +4430,10 @@ cmake -S "${source_win}" -B "${build_win}" -G "Ninja Multi-Config" ^
   -DCMAKE_MAKE_PROGRAM="${ninja_win}" ^
   -DCMAKE_C_COMPILER="${clang_cl_win}" -DCMAKE_CXX_COMPILER="${clang_cl_win}" ^
 ${sccache_cmake_args}
-  -DCMAKE_POLICY_DEFAULT_CMP0141=NEW -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT="$<$<CONFIG:Debug,RelWithDebInfo>:Embedded>" ^
+  -DCMAKE_POLICY_DEFAULT_CMP0141=NEW -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT="$<$<CONFIG:${debug_info_configs}>:Embedded>" ^
   -DCITRON_USE_CPM=ON -DCITRON_USE_BUNDLED_VCPKG=OFF -DCITRON_CHECK_SUBMODULES=OFF ^
   -DCPM_SOURCE_CACHE="${cpm_win}" ^
-  -DCITRON_CLANGCL=ON -DCITRON_USE_BUNDLED_QT=ON -DCITRON_USE_BUNDLED_FFMPEG=ON ^
+  -DCITRON_CLANGCL=ON -DCITRON_CLANGCL_FULL_LTO_LINE_TABLES=${full_lto_line_tables} -DCITRON_USE_BUNDLED_QT=ON -DCITRON_USE_BUNDLED_FFMPEG=ON ^
   -DBUILD_TESTING=OFF -DCITRON_TESTS=OFF -DCITRON_SHADER_TOOL=OFF ^
   -DCITRON_CRASH_DUMPS=OFF ^
   -DENABLE_UNITY_BUILD=${UNITY_BUILD} ^
