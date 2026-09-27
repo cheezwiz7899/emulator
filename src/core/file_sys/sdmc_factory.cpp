@@ -71,7 +71,7 @@ u64 SDMCFactory::GetSDMCFreeSpace() const {
         return used >= SDMC_TOTAL_SIZE ? 0 : SDMC_TOTAL_SIZE - used;
     }
 
-    return space_info.free;
+    return space_info.available;
 }
 
 u64 SDMCFactory::GetSDMCTotalSpace() const {

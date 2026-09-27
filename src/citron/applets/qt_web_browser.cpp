@@ -436,7 +436,7 @@ QtWebBrowser::QtWebBrowser(GMainWindow& main_window) {
     connect(this, &QtWebBrowser::MainWindowSendInteractiveData, &main_window,
             &GMainWindow::WebBrowserDeliverInteractiveData, Qt::QueuedConnection);
     connect(&main_window, &GMainWindow::WebBrowserExtractOfflineRomFS, this,
-            &QtWebBrowser::MainWindowExtractOfflineRomFS, Qt::QueuedConnection);
+            &QtWebBrowser::MainWindowExtractOfflineRomFS, Qt::BlockingQueuedConnection);
     connect(&main_window, &GMainWindow::WebBrowserClosed, this,
             &QtWebBrowser::MainWindowWebBrowserClosed, Qt::QueuedConnection);
     connect(&main_window, &GMainWindow::WebBrowserInteractiveDataReceived, this,

@@ -93,6 +93,7 @@ protected:
 
 private:
     void InitWebView2();
+    void FailInitialization();
     void FlushPendingNavigation(); // runs a Load*WebPage request queued before
                                    // webview finished initializing
     void SyncBounds();
@@ -145,6 +146,7 @@ private:
     bool local_resource_validation_complete = false;
     bool local_resource_retry_used = false;
     bool script_registration_failed = false;
+    std::atomic<bool> init_failed{false};
     int pending_script_registrations = 0;
     UserAgent pending_user_agent = UserAgent::WebApplet;
     std::shared_ptr<bool> alive = std::make_shared<bool>(true);

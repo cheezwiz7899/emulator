@@ -414,7 +414,15 @@ WebKitGTKView::~WebKitGTKView() {
     SetFinished(true);
     StopInputThread(); // joins the thread; any invokeMethod(this, ...) still queued
                        // at this point is auto-dropped by Qt once `this` is gone
+    if (webview) {
+        if (WebKitUserContentManager* content_manager =
+                webkit_web_view_get_user_content_manager(webview)) {
+            g_signal_handlers_disconnect_by_data(content_manager, this);
+        }
+        g_signal_handlers_disconnect_by_data(webview, this);
+    }
     if (gtk_window) {
+        g_signal_handlers_disconnect_by_data(gtk_window, this);
         gtk_widget_destroy(gtk_window);
     }
     if (cancellable) {
@@ -736,8 +744,10 @@ void WebKitGTKView::SendKeyEvent(const QString& key, const QString& code, int ke
 }
 
 void WebKitGTKView::hideEvent(QHideEvent* event) {
-    SetFinished(true);
-    StopInputThread();
+    if (!event->spontaneous()) {
+        SetFinished(true);
+        StopInputThread();
+    }
     if (gtk_window) {
         gtk_widget_hide(gtk_window);
     }

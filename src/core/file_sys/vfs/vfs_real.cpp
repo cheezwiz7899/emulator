@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <filesystem>
+#include <system_error>
 #include <utility>
 #include "common/assert.h"
 #include "common/fs/file.h"
@@ -43,7 +44,35 @@ namespace {
 
 constexpr size_t MaxOpenFiles = 512;
 
-bool IsUltimateSWebMenuCapabilityFile(std::string_view path) {
+bool HasSkylinePlugin(const std::filesystem::path& ultimate_dir) {
+    const auto mods_dir = ultimate_dir / "mods";
+    std::error_code error;
+    for (std::filesystem::directory_iterator mod{mods_dir, error}, end; !error && mod != end;
+         mod.increment(error)) {
+        if (!mod->is_directory(error) || error) {
+            continue;
+        }
+
+        const auto& mod_dir = mod->path();
+        if (FS::IsFile(mod_dir / "plugin.nro")) {
+            return true;
+        }
+
+        // Also recognize the standard Atmosphere/LayeredFS layout used to ship Skyline plugins.
+        const auto plugins_dir = mod_dir / "romfs" / "skyline" / "plugins";
+        std::error_code plugin_error;
+        for (std::filesystem::directory_iterator plugin{plugins_dir, plugin_error}, plugin_end;
+             !plugin_error && plugin != plugin_end; plugin.increment(plugin_error)) {
+            if (plugin->is_regular_file(plugin_error) && !plugin_error &&
+                plugin->path().extension() == ".nro") {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool IsWebMenuCapabilityFile(std::string_view path) {
     const auto components = FS::SplitPathComponentsCopy(path);
     const size_t count = components.size();
     if (count < 3 || components[count - 1] != "web_menus.flag" ||
@@ -51,11 +80,30 @@ bool IsUltimateSWebMenuCapabilityFile(std::string_view path) {
         return false;
     }
 
-    // Expose the opt-in only while Citron is loading the installed Arcropolis plugin. This is a
-    // virtual VFS entry: it never writes into the user's shared SD card.
+    // Expose the emulator's web-menu capability to the Skyline/LayeredFS consumer whenever a
+    // Skyline plugin is installed, without coupling support to a particular mod package. This is
+    // a virtual VFS entry: it never writes into the user's shared SD card.
     const auto ultimate_dir =
         std::filesystem::path{std::string{path}}.parent_path().parent_path();
-    return FS::IsFile(ultimate_dir / "mods" / "Ultimate S Arcropolis" / "plugin.nro");
+    return HasSkylinePlugin(ultimate_dir);
+}
+
+bool IsWebMenuCapabilityDirectory(std::string_view path) {
+    const auto components = FS::SplitPathComponentsCopy(path);
+    const size_t count = components.size();
+    if (count < 2 || components[count - 1] != "ult-s" ||
+        components[count - 2] != "ultimate") {
+        return false;
+    }
+
+    // If the host has not created this directory yet, expose it as a read-only VFS directory so
+    // the synthetic capability file is reachable through normal directory traversal.
+    const auto directory = std::filesystem::path{std::string{path}};
+    if (FS::Exists(directory)) {
+        return false;
+    }
+    const auto ultimate_dir = directory.parent_path();
+    return HasSkylinePlugin(ultimate_dir);
 }
 
 constexpr FS::FileAccessMode ModeFlagsToFileAccessMode(OpenMode mode) {
@@ -91,7 +139,10 @@ bool RealVfsFilesystem::IsWritable() const {
 
 VfsEntryType RealVfsFilesystem::GetEntryType(std::string_view path_) const {
     const auto path = FS::SanitizePath(path_, FS::DirectorySeparator::PlatformDefault);
-    if (IsUltimateSWebMenuCapabilityFile(path)) {
+    if (IsWebMenuCapabilityDirectory(path)) {
+        return VfsEntryType::Directory;
+    }
+    if (IsWebMenuCapabilityFile(path)) {
         return VfsEntryType::File;
     }
     if (!FS::Exists(path)) {
@@ -107,7 +158,7 @@ VfsEntryType RealVfsFilesystem::GetEntryType(std::string_view path_) const {
 VirtualFile RealVfsFilesystem::OpenFileFromEntry(std::string_view path_, std::optional<u64> size,
                                                  OpenMode perms) {
     const auto path = FS::SanitizePath(path_, FS::DirectorySeparator::PlatformDefault);
-    if (IsUltimateSWebMenuCapabilityFile(path)) {
+    if (IsWebMenuCapabilityFile(path)) {
         return std::make_shared<VectorVfsFile>(std::vector<u8>{}, "web_menus.flag");
     }
     std::scoped_lock lk{list_lock};
@@ -138,6 +189,9 @@ VirtualFile RealVfsFilesystem::OpenFile(std::string_view path_, OpenMode perms) 
 
 VirtualFile RealVfsFilesystem::CreateFile(std::string_view path_, OpenMode perms) {
     const auto path = FS::SanitizePath(path_, FS::DirectorySeparator::PlatformDefault);
+    if (IsWebMenuCapabilityFile(path)) {
+        return nullptr;
+    }
     {
         std::scoped_lock lk{list_lock};
         cache.erase(path);
@@ -171,6 +225,9 @@ VirtualFile RealVfsFilesystem::CopyFile(std::string_view old_path_, std::string_
 VirtualFile RealVfsFilesystem::MoveFile(std::string_view old_path_, std::string_view new_path_) {
     const auto old_path = FS::SanitizePath(old_path_, FS::DirectorySeparator::PlatformDefault);
     const auto new_path = FS::SanitizePath(new_path_, FS::DirectorySeparator::PlatformDefault);
+    if (IsWebMenuCapabilityFile(old_path) || IsWebMenuCapabilityFile(new_path)) {
+        return nullptr;
+    }
     {
         std::scoped_lock lk{list_lock};
         cache.erase(old_path);
@@ -184,6 +241,9 @@ VirtualFile RealVfsFilesystem::MoveFile(std::string_view old_path_, std::string_
 
 bool RealVfsFilesystem::DeleteFile(std::string_view path_) {
     const auto path = FS::SanitizePath(path_, FS::DirectorySeparator::PlatformDefault);
+    if (IsWebMenuCapabilityFile(path)) {
+        return false;
+    }
     {
         std::scoped_lock lk{list_lock};
         cache.erase(path);
@@ -424,7 +484,8 @@ RealVfsDirectory::RealVfsDirectory(RealVfsFilesystem& base_, const std::string& 
                                    OpenMode perms_)
     : base(base_), path(FS::RemoveTrailingSlash(path_)), parent_path(FS::GetParentPath(path)),
       path_components(FS::SplitPathComponentsCopy(path)), perms(perms_) {
-    if (!FS::Exists(path) && True(perms & OpenMode::Write)) {
+    if (!FS::Exists(path) && True(perms & OpenMode::Write) &&
+        !IsWebMenuCapabilityDirectory(path)) {
         void(FS::CreateDirs(path));
     }
 }
@@ -433,7 +494,7 @@ RealVfsDirectory::~RealVfsDirectory() = default;
 
 VirtualFile RealVfsDirectory::GetFileRelative(std::string_view relative_path) const {
     const auto full_path = FS::SanitizePath(path + '/' + std::string(relative_path));
-    if (IsUltimateSWebMenuCapabilityFile(full_path)) {
+    if (IsWebMenuCapabilityFile(full_path)) {
         return base.OpenFile(full_path, perms);
     }
     if (!FS::Exists(full_path) || FS::IsDir(full_path)) {
@@ -444,6 +505,9 @@ VirtualFile RealVfsDirectory::GetFileRelative(std::string_view relative_path) co
 
 VirtualDir RealVfsDirectory::GetDirectoryRelative(std::string_view relative_path) const {
     const auto full_path = FS::SanitizePath(path + '/' + std::string(relative_path));
+    if (IsWebMenuCapabilityDirectory(full_path)) {
+        return base.OpenDirectory(full_path, OpenMode::Read);
+    }
     if (!FS::Exists(full_path) || !FS::IsDir(full_path)) {
         return nullptr;
     }
@@ -460,6 +524,12 @@ VirtualDir RealVfsDirectory::GetSubdirectory(std::string_view name) const {
 
 VirtualFile RealVfsDirectory::CreateFileRelative(std::string_view relative_path) {
     const auto full_path = FS::SanitizePath(path + '/' + std::string(relative_path));
+    if (IsWebMenuCapabilityFile(full_path)) {
+        return nullptr;
+    }
+    if (IsWebMenuCapabilityDirectory(path)) {
+        return nullptr;
+    }
     if (!FS::CreateParentDirs(full_path)) {
         return nullptr;
     }
@@ -467,6 +537,9 @@ VirtualFile RealVfsDirectory::CreateFileRelative(std::string_view relative_path)
 }
 
 VirtualDir RealVfsDirectory::CreateDirectoryRelative(std::string_view relative_path) {
+    if (IsWebMenuCapabilityDirectory(path)) {
+        return nullptr;
+    }
     const auto full_path = FS::SanitizePath(path + '/' + std::string(relative_path));
     return base.CreateDirectory(full_path, perms);
 }
@@ -477,7 +550,26 @@ bool RealVfsDirectory::DeleteSubdirectoryRecursive(std::string_view name) {
 }
 
 std::vector<VirtualFile> RealVfsDirectory::GetFiles() const {
-    return IterateEntries<RealVfsFile, VfsFile>();
+    auto out = IterateEntries<RealVfsFile, VfsFile>();
+    if (perms != OpenMode::AllowAppend &&
+        IsWebMenuCapabilityFile(path + "/web_menus.flag")) {
+        // This is a virtual capability entry, so it must participate in directory
+        // enumeration as well as direct lookup. If a physical file shadows it,
+        // OpenFile still returns the synthetic zero-length capability file.
+        const auto entry = std::find_if(out.begin(), out.end(), [](const VirtualFile& file) {
+            return file && file->GetName() == "web_menus.flag";
+        });
+        auto capability = base.OpenFile(path + "/web_menus.flag", perms);
+        if (!capability) {
+            return out;
+        }
+        if (entry == out.end()) {
+            out.emplace_back(std::move(capability));
+        } else {
+            *entry = std::move(capability);
+        }
+    }
+    return out;
 }
 
 FileTimeStampRaw RealVfsDirectory::GetFileTimeStamp(std::string_view path_) const {
@@ -503,11 +595,21 @@ FileTimeStampRaw RealVfsDirectory::GetFileTimeStamp(std::string_view path_) cons
 }
 
 std::vector<VirtualDir> RealVfsDirectory::GetSubdirectories() const {
-    return IterateEntries<RealVfsDirectory, VfsDirectory>();
+    auto out = IterateEntries<RealVfsDirectory, VfsDirectory>();
+    if (perms != OpenMode::AllowAppend &&
+        IsWebMenuCapabilityDirectory(path + "/ult-s")) {
+        const auto entry = std::find_if(out.begin(), out.end(), [](const VirtualDir& dir) {
+            return dir && dir->GetName() == "ult-s";
+        });
+        if (entry == out.end()) {
+            out.emplace_back(base.OpenDirectory(path + "/ult-s", OpenMode::Read));
+        }
+    }
+    return out;
 }
 
 bool RealVfsDirectory::IsWritable() const {
-    return True(perms & OpenMode::Write);
+    return !IsWebMenuCapabilityDirectory(path) && True(perms & OpenMode::Write);
 }
 
 bool RealVfsDirectory::IsReadable() const {
@@ -527,11 +629,17 @@ VirtualDir RealVfsDirectory::GetParentDirectory() const {
 }
 
 VirtualDir RealVfsDirectory::CreateSubdirectory(std::string_view name) {
+    if (IsWebMenuCapabilityDirectory(path)) {
+        return nullptr;
+    }
     const std::string subdir_path = (path + '/').append(name);
     return base.CreateDirectory(subdir_path, perms);
 }
 
 VirtualFile RealVfsDirectory::CreateFile(std::string_view name) {
+    if (IsWebMenuCapabilityDirectory(path) && name != "web_menus.flag") {
+        return nullptr;
+    }
     const std::string file_path = (path + '/').append(name);
     return base.CreateFile(file_path, perms);
 }
@@ -572,6 +680,13 @@ std::map<std::string, VfsEntryType, std::less<>> RealVfsDirectory::GetEntries() 
     };
 
     FS::IterateDirEntries(path, callback);
+
+    if (IsWebMenuCapabilityDirectory(path + "/ult-s")) {
+        out.insert_or_assign("ult-s", VfsEntryType::Directory);
+    }
+    if (IsWebMenuCapabilityFile(path + "/web_menus.flag")) {
+        out.insert_or_assign("web_menus.flag", VfsEntryType::File);
+    }
 
     return out;
 }

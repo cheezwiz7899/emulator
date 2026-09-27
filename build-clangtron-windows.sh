@@ -1624,9 +1624,10 @@ build_common_cmake_args() {
         # compile with MinGW"). Corrected from a 2-rounds-ago mistake: assumed
         # this specific line was clang-cl-only without tracing whether the
         # *function* itself was shared too. It is -- 6 call sites, and
-        # COMPILER_MODE defaults to llvm-mingw. The real clang-cl-only ON
-        # setting lives entirely separately, in the generated .cmd heredoc
-        # further down this file, untouched by this.
+        # COMPILER_MODE defaults to llvm-mingw. The clang-cl-specific backend
+        # selection lives separately in the generated .cmd heredoc below. It
+        # selects WebView2; switching to QtWebEngine there requires turning
+        # WebView2 off as well.
         "-DCITRON_USE_QT_WEB_ENGINE=OFF"
         "-DCITRON_USE_WEBVIEW2_WEB_ENGINE=ON"
         "-Wno-dev"
@@ -4408,11 +4409,9 @@ stage_clangcl() {
     local _clangcl_pgo_generate="OFF"
     local _clangcl_pgo_use="OFF"
 
-    # All three build paths (Linux, llvm-mingw, clang-cl here) default
-    # CITRON_USE_QT_WEB_ENGINE off now -- no backend forced on by default
-    # anywhere until one of the replacements (WebKitGTK/WebView2) is actually
-    # validated. To try QtWebEngine here specifically (still the one backend
-    # that's genuinely known-working on this target), flip this one flag back.
+    # This generated clang-cl command explicitly selects WebView2. To switch to
+    # QtWebEngine on this MSVC-ABI target, turn CITRON_USE_QT_WEB_ENGINE on and
+    # CITRON_USE_WEBVIEW2_WEB_ENGINE off below; CMake rejects multiple backends.
     cat > "${build_dir}/build-clang-cl.cmd" <<CLANGCL_CMD_EOF
 @echo off
 setlocal

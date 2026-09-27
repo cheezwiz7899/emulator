@@ -271,32 +271,27 @@ void WebView2View::InitWebView2() {
             [this, life = alive](HRESULT result, ICoreWebView2Environment* env) -> HRESULT {
                 if (!*life)
                     return S_OK; // `this` may already be destroyed
-                if (FAILED(result)) {
-                    SetFinished(true);
-                    SetExitReason(Service::AM::Frontend::WebExitReason::WindowClosed);
-                    return result;
+                if (FAILED(result) || !env) {
+                    FailInitialization();
+                    return FAILED(result) ? result : E_FAIL;
                 }
                 environment = env;
-                environment->CreateCoreWebView2Controller(
+                const HRESULT controller_create_result = environment->CreateCoreWebView2Controller(
                     reinterpret_cast<HWND>(winId()),
                     Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
                         [this, life](HRESULT ctrl_result,
                                      ICoreWebView2Controller* ctrl) -> HRESULT {
                             if (!*life)
                                 return S_OK;
-                            if (FAILED(ctrl_result)) {
-                                SetFinished(true);
-                                SetExitReason(Service::AM::Frontend::WebExitReason::WindowClosed);
-                                return ctrl_result;
+                            if (FAILED(ctrl_result) || !ctrl) {
+                                FailInitialization();
+                                return FAILED(ctrl_result) ? ctrl_result : E_FAIL;
                             }
                             controller = ctrl;
-                            // get_CoreWebView2 can fail; unchecked, webview stays
-                            // null and everything below dereferences it (finding #14).
                             HRESULT webview_result =
                                 controller->get_CoreWebView2(webview.GetAddressOf());
                             if (FAILED(webview_result) || !webview) {
-                                SetFinished(true);
-                                SetExitReason(Service::AM::Frontend::WebExitReason::WindowClosed);
+                                FailInitialization();
                                 return FAILED(webview_result) ? webview_result : E_FAIL;
                             }
                             const HRESULT dialog_result = webview->add_ScriptDialogOpening(
@@ -316,11 +311,10 @@ void WebView2View::InitWebView2() {
                             // a runtime/profile default: WebSession pages use it for their initial
                             // "loaded" handshake and every subsequent option change.
                             ComPtr<ICoreWebView2Settings> settings;
-                            HRESULT settings_result = webview->get_Settings(settings.GetAddressOf());
+                            HRESULT settings_result =
+                                webview->get_Settings(settings.GetAddressOf());
                             if (FAILED(settings_result) || !settings) {
-                                SetFinished(true);
-                                SetExitReason(
-                                    Service::AM::Frontend::WebExitReason::WindowClosed);
+                                FailInitialization();
                                 return FAILED(settings_result) ? settings_result : E_FAIL;
                             }
                             settings->put_IsScriptEnabled(TRUE);
@@ -329,16 +323,12 @@ void WebView2View::InitWebView2() {
                             // implementation is disabled explicitly.
                             settings_result = settings->put_AreDefaultScriptDialogsEnabled(FALSE);
                             if (FAILED(settings_result)) {
-                                SetFinished(true);
-                                SetExitReason(
-                                    Service::AM::Frontend::WebExitReason::WindowClosed);
+                                FailInitialization();
                                 return settings_result;
                             }
                             settings_result = settings->put_IsWebMessageEnabled(TRUE);
                             if (FAILED(settings_result)) {
-                                SetFinished(true);
-                                SetExitReason(
-                                    Service::AM::Frontend::WebExitReason::WindowClosed);
+                                FailInitialization();
                                 return settings_result;
                             }
 
@@ -354,8 +344,7 @@ void WebView2View::InitWebView2() {
                                     .Get(),
                                 &web_message_received_token);
                             if (FAILED(event_result)) {
-                                SetFinished(true);
-                                SetExitReason(Service::AM::Frontend::WebExitReason::WindowClosed);
+                                FailInitialization();
                                 return event_result;
                             }
                             web_message_received_registered = true;
@@ -372,8 +361,7 @@ void WebView2View::InitWebView2() {
                                     .Get(),
                                 &navigation_starting_token);
                             if (FAILED(event_result)) {
-                                SetFinished(true);
-                                SetExitReason(Service::AM::Frontend::WebExitReason::WindowClosed);
+                                FailInitialization();
                                 return event_result;
                             }
                             navigation_starting_registered = true;
@@ -381,8 +369,7 @@ void WebView2View::InitWebView2() {
                             // Mirrors qt_web_browser.cpp:94-102's windowCloseRequested.
                             event_result = webview->add_WindowCloseRequested(
                                 Callback<ICoreWebView2WindowCloseRequestedEventHandler>(
-                                    [this, life](ICoreWebView2* sender,
-                                                         IUnknown* args) -> HRESULT {
+                                    [this, life](ICoreWebView2* sender, IUnknown* args) -> HRESULT {
                                         if (!*life)
                                             return S_OK;
                                         return OnWindowCloseRequested(sender, args);
@@ -390,8 +377,7 @@ void WebView2View::InitWebView2() {
                                     .Get(),
                                 &window_close_requested_token);
                             if (FAILED(event_result)) {
-                                SetFinished(true);
-                                SetExitReason(Service::AM::Frontend::WebExitReason::WindowClosed);
+                                FailInitialization();
                                 return event_result;
                             }
                             window_close_requested_registered = true;
@@ -400,9 +386,9 @@ void WebView2View::InitWebView2() {
                             // re-runs LOAD_NX_FONT on every navigation.
                             event_result = webview->add_NavigationCompleted(
                                 Callback<ICoreWebView2NavigationCompletedEventHandler>(
-                                    [this, life](
-                                        ICoreWebView2*,
-                                        ICoreWebView2NavigationCompletedEventArgs*) -> HRESULT {
+                                    [this,
+                                     life](ICoreWebView2*,
+                                           ICoreWebView2NavigationCompletedEventArgs*) -> HRESULT {
                                         if (!*life)
                                             return S_OK;
                                         EvaluateJavaScript(
@@ -419,8 +405,7 @@ void WebView2View::InitWebView2() {
                                     .Get(),
                                 &navigation_completed_token);
                             if (FAILED(event_result)) {
-                                SetFinished(true);
-                                SetExitReason(Service::AM::Frontend::WebExitReason::WindowClosed);
+                                FailInitialization();
                                 return event_result;
                             }
                             navigation_completed_registered = true;
@@ -435,14 +420,24 @@ void WebView2View::InitWebView2() {
                             return S_OK;
                         })
                         .Get());
+                if (FAILED(controller_create_result)) {
+                    FailInitialization();
+                    return controller_create_result;
+                }
                 return S_OK;
             })
             .Get());
 
     if (FAILED(create_result)) {
-        SetFinished(true);
-        SetExitReason(Service::AM::Frontend::WebExitReason::WindowClosed);
+        FailInitialization();
     }
+}
+
+void WebView2View::FailInitialization() {
+    init_failed = true;
+    has_pending_navigation = false;
+    SetFinished(true);
+    SetExitReason(Service::AM::Frontend::WebExitReason::WindowClosed);
 }
 
 void WebView2View::InjectPersistentScripts() {
@@ -519,9 +514,7 @@ void WebView2View::InjectPersistentScripts() {
 
 void WebView2View::FailScriptRegistration() {
     script_registration_failed = true;
-    has_pending_navigation = false;
-    SetFinished(true);
-    SetExitReason(Service::AM::Frontend::WebExitReason::WindowClosed);
+    FailInitialization();
 }
 
 void WebView2View::SetUserAgent(UserAgent user_agent) {
@@ -675,6 +668,9 @@ void WebView2View::ValidateInitialLocalResources() {
 
 void WebView2View::LoadLocalWebPage(const std::string& main_url,
                                     const std::string& additional_args) {
+    if (init_failed) {
+        return;
+    }
     is_local = true;
     pending_user_agent = UserAgent::WebApplet; // applied in FlushPendingNavigation --
                                                // SetUserAgent silently no-ops if
@@ -745,6 +741,9 @@ void WebView2View::LoadLocalWebPage(const std::string& main_url,
 
 void WebView2View::LoadExternalWebPage(const std::string& main_url,
                                        const std::string& additional_args) {
+    if (init_failed) {
+        return;
+    }
     is_local = false;
     pending_user_agent = UserAgent::WebApplet;
     SetFinished(false);
@@ -766,7 +765,7 @@ void WebView2View::LoadExternalWebPage(const std::string& main_url,
 void WebView2View::FlushPendingNavigation() {
     if (!has_pending_navigation || !webview)
         return;
-    if (script_registration_failed)
+    if (init_failed || script_registration_failed)
         return;
     // Persistent scripts (window_nx/gamepad) not registered yet -- their own
     // completion handlers call back in here once the counter hits 0
@@ -788,9 +787,14 @@ void WebView2View::FlushPendingNavigation() {
             FailScriptRegistration();
             return;
         }
+    }
+
+    if (is_local) {
+        // Register the Nintendo font stylesheet for every local applet page. The
+        // completion handler navigates to pending_url, which may be either a
+        // virtual-host URL or a regular file:// URL.
         pending_script_registrations += 1;
-        LoadExtractedFonts(); // navigates from its own completion handler, or
-                              // immediately if the script was already registered
+        LoadExtractedFonts();
     } else {
         webview->Navigate(pending_url.c_str());
     }
@@ -907,8 +911,10 @@ void WebView2View::hideEvent(QHideEvent* event) {
     if (controller) {
         controller->put_IsVisible(FALSE);
     }
-    SetFinished(true);
-    StopInputThread();
+    if (!event->spontaneous()) {
+        SetFinished(true);
+        StopInputThread();
+    }
     QWidget::hideEvent(event);
 }
 

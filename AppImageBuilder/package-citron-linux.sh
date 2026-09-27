@@ -375,10 +375,10 @@ chmod +x ./AppDir/bin/04-webkitgtk.hook
 # deploys xdg-dbus-proxy automatically. Verify that supported integration made it into the final
 # AppDir rather than duplicating its launcher construction here.
 if [ -d "${_appdir}/lib/webkit2gtk-4.1" ]; then
-    for _webkit_tool_path in bin/bwrap shared/bin/bwrap \
-                                bin/xdg-dbus-proxy shared/bin/xdg-dbus-proxy; do
-        if [ ! -x "${_appdir}/${_webkit_tool_path}" ]; then
-            echo "Error: quick-sharun did not deploy required WebKitGTK helper ${_webkit_tool_path}" >&2
+    for _webkit_tool in bwrap xdg-dbus-proxy; do
+        if [ ! -x "${_appdir}/bin/${_webkit_tool}" ] &&
+           [ ! -x "${_appdir}/shared/bin/${_webkit_tool}" ]; then
+            echo "Error: quick-sharun did not deploy required WebKitGTK helper ${_webkit_tool} in bin/ or shared/bin/" >&2
             exit 1
         fi
     done
