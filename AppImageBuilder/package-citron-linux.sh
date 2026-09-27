@@ -106,7 +106,7 @@ fi
 # defaults or the AppDir layout underneath us; bump QUICK_SHARUN_REF
 # deliberately when needed. HOOKSRC is pinned to the same commit so
 # ADD_HOOKS below resolves against a matching tree.
-QUICK_SHARUN_REF="e9414c02f713359b551bcfa3832576d2992b13da"
+QUICK_SHARUN_REF="176c4ca149ca74270a1ecbaa82bf2d12847ec8af"
 QUICK_SHARUN_URL="https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/${QUICK_SHARUN_REF}/useful-tools/quick-sharun.sh"
 export HOOKSRC="https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/${QUICK_SHARUN_REF}/useful-tools/hooks"
 curl -fL --retry 30 "${QUICK_SHARUN_URL}" -o quick-sharun \
@@ -257,6 +257,24 @@ for _vendor in /sys/class/drm/card*/device/vendor; do
             ;;
     esac
 done
+
+# Host CUDA / NVDEC driver discovery for Debian/Ubuntu/Mint multiarch.
+# When proprietary NVIDIA is present, host driver libraries (libcuda.so.1,
+# libnvcuvid.so.1) live in distro-specific directories not in standard /usr/lib.
+# Appending them to LD_LIBRARY_PATH allows FFmpeg's runtime dlopen to find the
+# driver while preserving bundled libraries earlier in the search path.
+if [ -n "${_citron_has_proprietary_nvidia}" ]; then
+    for _cuda_dir in \
+        /usr/lib/x86_64-linux-gnu \
+        /usr/lib/x86_64-linux-gnu/nvidia/current \
+        /usr/lib/nvidia-* \
+        /opt/cuda/lib64 \
+        /run/opengl-driver/lib; do
+        if [ -e "${_cuda_dir}/libcuda.so.1" ] || [ -e "${_cuda_dir}/libcuda.so" ]; then
+            export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}${_cuda_dir}"
+        fi
+    done
+fi
 
 # Use bundled VAAPI only when it has a driver for an installed open GPU.
 # Proprietary NVIDIA remains host-side because its video driver must match the

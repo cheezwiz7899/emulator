@@ -200,8 +200,8 @@ dependencies {
     implementation("androidx.core:core-splashscreen:1.2.0")
     implementation("androidx.window:window:1.5.1")
     implementation("androidx.swiperefreshlayout:swiperefreshlayout:1.2.0")
-    implementation("androidx.navigation:navigation-fragment-ktx:2.9.8")
-    implementation("androidx.navigation:navigation-ui-ktx:2.9.8")
+    implementation("androidx.navigation:navigation-fragment-ktx:2.10.0")
+    implementation("androidx.navigation:navigation-ui-ktx:2.10.0")
     implementation("info.debatty:java-string-similarity:2.0.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
 }

@@ -953,6 +953,21 @@ jboolean Java_org_citron_citron_1emu_NativeLibrary_isRunning(JNIEnv* env, jclass
     return static_cast<jboolean>(session.IsRunning() || session.IsShuttingDown());
 }
 
+jint Java_org_citron_citron_1emu_NativeLibrary_clearShaderCache(JNIEnv* env, jclass clazz) {
+    constexpr jint Success = 0;
+    constexpr jint EmulationActive = 1;
+    constexpr jint FilesystemFailure = 2;
+
+    auto& session = EmulationSession::GetInstance();
+    const auto session_lock = session.AcquireSessionLock();
+    if (session.IsRunning() || session.IsShuttingDown()) {
+        return EmulationActive;
+    }
+
+    const auto shader_dir = Common::FS::GetCitronPath(Common::FS::CitronPath::ShaderDir);
+    return Common::FS::RemoveDirRecursively(shader_dir) ? Success : FilesystemFailure;
+}
+
 jboolean Java_org_citron_citron_1emu_NativeLibrary_isPaused(JNIEnv* env, jclass clazz) {
     return static_cast<jboolean>(EmulationSession::GetInstance().IsPaused());
 }

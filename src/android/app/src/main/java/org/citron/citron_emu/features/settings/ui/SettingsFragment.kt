@@ -8,22 +8,29 @@ import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.widget.Toast
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.updatePadding
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.activityViewModels
+import androidx.lifecycle.lifecycleScope
 import androidx.navigation.findNavController
 import androidx.navigation.fragment.navArgs
 import androidx.recyclerview.widget.LinearLayoutManager
 import com.google.android.material.transition.MaterialSharedAxis
+import org.citron.citron_emu.NativeLibrary
 import org.citron.citron_emu.R
 import org.citron.citron_emu.databinding.FragmentSettingsBinding
 import org.citron.citron_emu.features.input.NativeInput
 import org.citron.citron_emu.features.settings.model.Settings
 import org.citron.citron_emu.fragments.MessageDialogFragment
+import org.citron.citron_emu.utils.DirectoryInitialization
 import org.citron.citron_emu.utils.ViewUtils.updateMargins
 import org.citron.citron_emu.utils.collect
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class SettingsFragment : Fragment() {
     private lateinit var presenter: SettingsFragmentPresenter
@@ -128,6 +135,12 @@ class SettingsFragment : Fragment() {
                 ).show(parentFragmentManager, MessageDialogFragment.TAG)
             }
         }
+        settingsViewModel.shouldShowClearShaderCacheDialog.collect(
+            viewLifecycleOwner,
+            resetState = { settingsViewModel.setShouldShowClearShaderCacheDialog(false) }
+        ) {
+            if (it) showClearShaderCacheDialog()
+        }
         if (args.menuTag == Settings.MenuTag.SECTION_ROOT) {
             binding.toolbarSettings.inflateMenu(R.menu.menu_settings)
             binding.toolbarSettings.setOnMenuItemClickListener {
@@ -146,6 +159,38 @@ class SettingsFragment : Fragment() {
         presenter.onViewCreated()
 
         setInsets()
+    }
+
+    private fun showClearShaderCacheDialog() {
+        MessageDialogFragment.newInstance(
+            activity = requireActivity(),
+            titleId = R.string.clear_all_shader_caches,
+            descriptionId = R.string.clear_all_shader_caches_warning_description,
+            positiveAction = {
+                viewLifecycleOwner.lifecycleScope.launch {
+                    val result = withContext(Dispatchers.IO) {
+                        when {
+                            DirectoryInitialization.userDirectory == null ->
+                                SHADER_CACHE_CLEAR_FILESYSTEM_FAILURE
+                            NativeLibrary.isRunning() -> SHADER_CACHE_CLEAR_EMULATION_ACTIVE
+                            else -> NativeLibrary.clearShaderCache()
+                        }
+                    }
+                    Toast.makeText(
+                        requireContext(),
+                        when (result) {
+                            SHADER_CACHE_CLEAR_SUCCESS ->
+                                R.string.cleared_all_shader_caches_successfully
+                            SHADER_CACHE_CLEAR_EMULATION_ACTIVE ->
+                                R.string.clear_all_shader_caches_emulation_active
+                            else -> R.string.clear_all_shader_caches_failed
+                        },
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            },
+            showNegativeButton = true
+        ).show(parentFragmentManager, MessageDialogFragment.TAG)
     }
 
     private fun getPlayerIndex(): Int =
@@ -177,5 +222,11 @@ class SettingsFragment : Fragment() {
             binding.appbarSettings.updateMargins(left = leftInsets, right = rightInsets)
             windowInsets
         }
+    }
+
+    companion object {
+        private const val SHADER_CACHE_CLEAR_SUCCESS = 0
+        private const val SHADER_CACHE_CLEAR_EMULATION_ACTIVE = 1
+        private const val SHADER_CACHE_CLEAR_FILESYSTEM_FAILURE = 2
     }
 }

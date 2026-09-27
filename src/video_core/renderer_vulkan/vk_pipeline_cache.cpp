@@ -468,6 +468,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
 }
 
 PipelineCache::~PipelineCache() {
+    workers.WaitForRequests();
     // Drain all pending SerializePipeline tasks before the serialization_thread
     // member is destroyed.
     serialization_thread.WaitForRequests();

@@ -160,7 +160,7 @@
 #                              fe   = Frontend PGO; more flag-change tolerant; no CS-IRPGO
 #                              none = No PGO; use → build/use-nopgo/, LTO still applies
 #     --release                Release build (default)
-#     --relwithdebinfo         RelWithDebInfo (adds -g, keeps O3/LTO/PGO)
+#     --relwithdebinfo         RelWithDebInfo (clang-cl full LTO keeps source lines, not variable/type debug info)
 #     --unity                  Unity builds (~30-90% faster compile, no runtime effect)
 #     --tracy                  Enable Tracy profiler instrumentation (default off)
 #     --tracy-alloc             Enable Tracy heap allocator tracking (default off, requires --tracy)
@@ -573,6 +573,7 @@ stage_setup_clangcl() {
         mingw-w64-clang-x86_64-nasm mingw-w64-clang-x86_64-yasm \
         mingw-w64-clang-x86_64-glslang mingw-w64-clang-x86_64-ninja \
         mingw-w64-clang-x86_64-sccache mingw-w64-clang-x86_64-jom \
+        pkgconf mingw-w64-clang-x86_64-pkgconf \
         2>/dev/null || error "Failed to install required MSYS2 packages."
 
     # Locate Python 3.12 — pre-installed on CI runners, installed via winget on dev machines.
@@ -697,7 +698,8 @@ stage_setup() {
         fi
         info "Installing toolchain and build tools via pacman..."
         pacman -S --needed --noconfirm \
-            base-devel git curl wget \
+            base-devel git curl wget pkgconf \
+            mingw-w64-clang-x86_64-pkgconf \
             mingw-w64-clang-x86_64-python-pip \
             mingw-w64-clang-x86_64-python-psutil \
             mingw-w64-clang-x86_64-toolchain \
@@ -3957,18 +3959,27 @@ stage_clangcl() {
     fi
 
     local config="${BUILD_TYPE}" stage_name flags="" pgo_flags="" pgo_link_flags="" pgo_flags_dash="" config_compile_flags config_link_flags
+    local debug_info_configs="Debug,RelWithDebInfo" full_lto_line_tables="OFF"
     case "${config}" in
         Release)
-            config_compile_flags="/O2 /DNDEBUG"
-            config_link_flags="/OPT:REF /OPT:ICF"
+            config_compile_flags="/O2 /DNDEBUG /clang:-fno-strict-aliasing"
+            config_link_flags="/OPT:REF /OPT:ICF /force:multiple"
             ;;
         RelWithDebInfo)
-            config_compile_flags="/O2 /Z7 /DNDEBUG"
-            config_link_flags="/DEBUG /OPT:REF /OPT:ICF"
+            if [[ "${LTO_MODE}" == "full" ]]; then
+                # Full LTO with /Z7 spends excessive time and memory merging CodeView types.
+                # Keep source-line stacks in the PDB without embedding variable/type records.
+                config_compile_flags="/O2 /DNDEBUG /clang:-fno-strict-aliasing /clang:-gcodeview /clang:-gline-tables-only"
+                debug_info_configs="Debug"
+                full_lto_line_tables="ON"
+            else
+                config_compile_flags="/O2 /Z7 /DNDEBUG /clang:-fno-strict-aliasing"
+            fi
+            config_link_flags="/DEBUG /OPT:REF /OPT:ICF /force:multiple"
             ;;
         Debug)
             config_compile_flags="/Od /Z7"
-            config_link_flags="/DEBUG"
+            config_link_flags="/DEBUG /force:multiple"
             ;;
         *) error "Unsupported clang-cl build type: ${config}" ;;
     esac
@@ -4280,11 +4291,11 @@ stage_clangcl() {
         none) ;;
         thin)
             flags="${flags} /clang:-flto=thin"
-            pgo_flags_dash="${pgo_flags_dash} -flto=thin"
+            config_link_flags="${config_link_flags} /opt:lldltojobs=all"
             ;;
         full)
             flags="${flags} /clang:-flto=full"
-            pgo_flags_dash="${pgo_flags_dash} -flto=full"
+            config_link_flags="${config_link_flags} /opt:lldltopartitions=${JOBS:-16} /opt:lldltojobs=all"
             ;;
     esac
 
@@ -4349,7 +4360,12 @@ stage_clangcl() {
     # Each distinct (LTO, PGO, stage, profile) combination gets its own dir —
     # prevents execute_process-based builds (OpenSSL, FFmpeg) from silently reusing
     # a cache built with different flags.
-    local _pgo_lto_cache_key="lto-${LTO_MODE}_pgo-${PGO_MODE}_${STAGE}"
+    # OpenSSL and FFmpeg deliberately stay native COFF even when the application
+    # uses LTO. lld-link can then resolve members from these lazy archives after
+    # its LTO phase; LLVM-bitcode archive members cannot be loaded at that point.
+    # Include the dependency object format in the key so old bitcode archives are
+    # never reused.
+    local _pgo_lto_cache_key="deps-coff_lto-${LTO_MODE}_pgo-${PGO_MODE}_${STAGE}"
     if [[ -n "${_pd_hash:-}" ]]; then
         _pgo_lto_cache_key="${_pgo_lto_cache_key}_${_pd_hash}"
     fi
@@ -4410,10 +4426,10 @@ cmake -S "${source_win}" -B "${build_win}" -G "Ninja Multi-Config" ^
   -DCMAKE_MAKE_PROGRAM="${ninja_win}" ^
   -DCMAKE_C_COMPILER="${clang_cl_win}" -DCMAKE_CXX_COMPILER="${clang_cl_win}" ^
 ${sccache_cmake_args}
-  -DCMAKE_POLICY_DEFAULT_CMP0141=NEW -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT="$<$<CONFIG:Debug,RelWithDebInfo>:Embedded>" ^
+  -DCMAKE_POLICY_DEFAULT_CMP0141=NEW -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT="$<$<CONFIG:${debug_info_configs}>:Embedded>" ^
   -DCITRON_USE_CPM=ON -DCITRON_USE_BUNDLED_VCPKG=OFF -DCITRON_CHECK_SUBMODULES=OFF ^
   -DCPM_SOURCE_CACHE="${cpm_win}" ^
-  -DCITRON_CLANGCL=ON -DCITRON_USE_BUNDLED_QT=ON -DCITRON_USE_BUNDLED_FFMPEG=ON ^
+  -DCITRON_CLANGCL=ON -DCITRON_CLANGCL_FULL_LTO_LINE_TABLES=${full_lto_line_tables} -DCITRON_USE_BUNDLED_QT=ON -DCITRON_USE_BUNDLED_FFMPEG=ON ^
   -DCITRON_USE_QT_WEB_ENGINE=OFF ^
   -DCITRON_USE_WEBVIEW2_WEB_ENGINE=ON ^
   -DBUILD_TESTING=OFF -DCITRON_TESTS=OFF -DCITRON_SHADER_TOOL=OFF ^
@@ -4433,10 +4449,18 @@ ${qt_cmake_line}
   -DCITRON_ENABLE_TRACY_ALLOC=${TRACY_ALLOC_BUILD} ^
   -DCITRON_ENABLE_PGO_GENERATE=${_clangcl_pgo_generate} -DCITRON_ENABLE_PGO_USE=${_clangcl_pgo_use} ^
   -DCMAKE_C_FLAGS_${config^^}="${config_compile_flags} ${flags_batch}" -DCMAKE_CXX_FLAGS_${config^^}="${config_compile_flags} ${flags_batch}" ^
-  -DCMAKE_EXE_LINKER_FLAGS_${config^^}="${config_link_flags}" ^
+  -DCMAKE_EXE_LINKER_FLAGS_${config^^}:STRING="${config_link_flags}" ^
+  -DCMAKE_SHARED_LINKER_FLAGS_${config^^}:STRING="${config_link_flags}" ^
+  -DCMAKE_MODULE_LINKER_FLAGS_${config^^}:STRING="${config_link_flags}" ^
   -DCITRON_CLANGCL_PGO_COMPILE_FLAGS="${pgo_flags_batch}" -DCITRON_CLANGCL_PGO_LINK_FLAGS="${pgo_link_flags_batch}" ^
   -DCMAKE_RC_FLAGS="" -DCMAKE_RC_FLAGS_DEBUG="" -DCMAKE_RC_FLAGS_RELEASE="" -DCMAKE_RC_FLAGS_RELWITHDEBINFO=""
 if errorlevel 1 exit /b %errorlevel%
+cmake --build "${build_win}" --config ${config} --parallel ${JOBS} --target citron-room
+if not %errorlevel%==0 exit /b 1
+cmake --build "${build_win}" --config ${config} --parallel ${JOBS} --target citron-cmd
+if not %errorlevel%==0 exit /b 1
+cmake --build "${build_win}" --config ${config} --parallel ${JOBS} --target citron
+if not %errorlevel%==0 exit /b 1
 cmake --build "${build_win}" --config ${config} --parallel ${JOBS} --target citron-runtime
 if not %errorlevel%==0 exit /b 1
 ${sccache_stats_cmd}

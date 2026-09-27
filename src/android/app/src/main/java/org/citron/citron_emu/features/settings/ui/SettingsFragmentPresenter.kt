@@ -200,6 +200,14 @@ class SettingsFragmentPresenter(
             add(IntSetting.VERTICAL_ALIGNMENT.key)
             add(BooleanSetting.PICTURE_IN_PICTURE.key)
             add(BooleanSetting.RENDERER_USE_DISK_SHADER_CACHE.key)
+            add(
+                RunnableSetting(
+                    titleId = R.string.clear_all_shader_caches,
+                    descriptionId = R.string.clear_all_shader_caches_description,
+                    isRunnable = !NativeLibrary.isRunning(),
+                    iconId = R.drawable.ic_delete
+                ) { settingsViewModel.setShouldShowClearShaderCacheDialog(true) }
+            )
             add(BooleanSetting.RENDERER_FORCE_MAX_CLOCK.key)
             add(BooleanSetting.RENDERER_ASYNCHRONOUS_SHADERS.key)
             add(BooleanSetting.RENDERER_REACTIVE_FLUSHING.key)

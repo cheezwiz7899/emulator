@@ -42,6 +42,22 @@ if (MSVC)
     add_compile_options(/wd4267)  # Suppress size_t conversion warnings
 endif()
 
+
+# Emulator code extensively type-puns memory (reinterpret_cast across unrelated
+# types, union-based access, etc.).  Strict aliasing lets the optimizer assume
+# pointers of different types never alias, which is wrong for this codebase.
+# With full LTO the resulting alias-analysis scope covers the entire merged
+# module and can stall the optimiser for hours.  Disable it globally.
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND MSVC)
+    # clang-cl: Clang flags must be forwarded through /clang:
+    add_compile_options(/clang:-fno-strict-aliasing)
+    # Parallelize lld-link Full LTO code generation across all CPU cores, and allow
+    # duplicate symbols from SDK/dependency import libraries (e.g. CM_Get_Child in SetupAPI/libusb).
+    add_link_options(/opt:lldltopartitions=16 /opt:lldltojobs=all /force:multiple)
+elseif (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    add_compile_options(-fno-strict-aliasing)
+endif()
+
 # Check if SDL2::SDL2 target exists; if not, create an alias
 if (TARGET SDL2::SDL2-static)
     add_library(SDL2::SDL2 ALIAS SDL2::SDL2-static)
@@ -128,6 +144,7 @@ CMAKE_DEPENDENT_OPTION(CITRON_CRASH_DUMPS "Compile crash dump (Minidump) support
 option(CITRON_USE_BUNDLED_VCPKG "Use vcpkg for citron dependencies" "${MSVC}")
 option(CITRON_USE_CPM "Use CPM.cmake to fetch dependencies" OFF)
 option(CITRON_CLANGCL "Build natively on Windows with clang-cl and the MSVC ABI" OFF)
+option(CITRON_CLANGCL_FULL_LTO_LINE_TABLES "Use CodeView line tables for clang-cl full-LTO RelWithDebInfo" OFF)
 
 # Avoid per-project /MP oversubscription under MSBuild.
 if(CITRON_CLANGCL AND MSVC AND CMAKE_GENERATOR MATCHES "Visual Studio")
@@ -544,10 +561,8 @@ if (MINGW)
     find_library(MSWSOCK_LIBRARY mswsock REQUIRED)
 endif()
 
-if(ENABLE_OPENSSL)
-    if (NOT (TARGET OpenSSL::SSL AND TARGET OpenSSL::Crypto))
-        find_package(OpenSSL 1.1.1 REQUIRED)
-    endif()
+if (NOT (TARGET OpenSSL::SSL AND TARGET OpenSSL::Crypto))
+    find_package(OpenSSL 1.1.1 REQUIRED)
 endif()
 
 if (UNIX AND NOT APPLE)
