@@ -449,15 +449,17 @@ void QtWebBrowser::Close() const {
     // Do not clear the active request here. Its completion callback is needed to complete the
     // guest applet before a queued foreground page is allowed to start.
     bool request_visible_page_close = false;
+    quint64 page_to_close{};
     {
         std::scoped_lock lock{callback_mutex};
-        if (active_web_page && !close_requested) {
-            close_requested = true;
+        if (active_web_page && close_requested_page_id != active_web_page->request_id) {
+            close_requested_page_id = active_web_page->request_id;
             request_visible_page_close = true;
+            page_to_close = active_web_page->request_id;
         }
     }
     if (request_visible_page_close) {
-        emit MainWindowRequestExit();
+        emit MainWindowRequestExit(page_to_close);
     }
 }
 
@@ -476,14 +478,17 @@ void QtWebBrowser::OpenLocalWebPage(const std::string& local_url,
     };
 
     bool request_visible_page_close = false;
+    quint64 page_to_close{};
     std::optional<PendingWebPage> page_to_start;
     {
         std::scoped_lock lock{callback_mutex};
+        request.request_id = next_request_id++;
         if (active_web_page) {
             pending_web_pages.emplace_back(std::move(request));
-            if (!close_requested) {
-                close_requested = true;
+            if (close_requested_page_id != active_web_page->request_id) {
+                close_requested_page_id = active_web_page->request_id;
                 request_visible_page_close = true;
+                page_to_close = active_web_page->request_id;
             }
         } else {
             active_web_page.emplace(std::move(request));
@@ -496,7 +501,7 @@ void QtWebBrowser::OpenLocalWebPage(const std::string& local_url,
         // current page's event processing used to overwrite GMainWindow::web_applet and leave
         // the nested Loading Web Applet dialog at 66%. Close the visible page first; its close
         // callback starts the queued request below.
-        emit MainWindowRequestExit();
+        emit MainWindowRequestExit(page_to_close);
     } else if (page_to_start) {
         StartWebPageRequest(*page_to_start);
     }
@@ -515,14 +520,17 @@ void QtWebBrowser::OpenExternalWebPage(const std::string& external_url,
     };
 
     bool request_visible_page_close = false;
+    quint64 page_to_close{};
     std::optional<PendingWebPage> page_to_start;
     {
         std::scoped_lock lock{callback_mutex};
+        request.request_id = next_request_id++;
         if (active_web_page) {
             pending_web_pages.emplace_back(std::move(request));
-            if (!close_requested) {
-                close_requested = true;
+            if (close_requested_page_id != active_web_page->request_id) {
+                close_requested_page_id = active_web_page->request_id;
                 request_visible_page_close = true;
+                page_to_close = active_web_page->request_id;
             }
         } else {
             active_web_page.emplace(std::move(request));
@@ -531,14 +539,15 @@ void QtWebBrowser::OpenExternalWebPage(const std::string& external_url,
     }
 
     if (request_visible_page_close) {
-        emit MainWindowRequestExit();
+        emit MainWindowRequestExit(page_to_close);
     } else if (page_to_start) {
         StartWebPageRequest(*page_to_start);
     }
 }
 
 void QtWebBrowser::StartWebPageRequest(const PendingWebPage& request) const {
-    emit MainWindowOpenWebPage(request.main_url, request.additional_args, request.is_local);
+    emit MainWindowOpenWebPage(request.main_url, request.additional_args, request.is_local,
+                               request.request_id);
 }
 
 void QtWebBrowser::SendInteractiveData(const std::string& data) const {
@@ -566,9 +575,12 @@ void QtWebBrowser::MainWindowWebBrowserClosed(Service::AM::Frontend::WebExitReas
         std::scoped_lock lock{callback_mutex};
         if (!active_web_page) {
             LOG_WARNING(Frontend, "Web browser closed without an active request (pending={}, "
-                        "close_requested={})",
-                        pending_web_pages.size(), close_requested);
-            if (!pending_web_pages.empty() && !close_requested) {
+                        "close_requested_page_id={})",
+                        pending_web_pages.size(), close_requested_page_id);
+            // No page owns a close request now. Drop the stale record and let the
+            // queued request proceed; the main window also filters any late close by id.
+            close_requested_page_id = 0;
+            if (!pending_web_pages.empty()) {
                 active_web_page.emplace(std::move(pending_web_pages.front()));
                 pending_web_pages.pop_front();
                 next_page = *active_web_page;
@@ -577,11 +589,12 @@ void QtWebBrowser::MainWindowWebBrowserClosed(Service::AM::Frontend::WebExitReas
             completed_page.emplace(std::move(*active_web_page));
             active_web_page.reset();
 
-            // This completion belongs to the one deferred close emitted while queueing the
-            // replacement. Clear that record before promoting the next page so it cannot close
-            // the newly opened view; any further request stays queued until that view completes.
-            close_requested = false;
-            if (!pending_web_pages.empty()) {
+            // Consume only the close associated with this page. A delayed exit from it will be
+            // ignored by GMainWindow after the next request has been promoted.
+            if (close_requested_page_id == completed_page->request_id) {
+                close_requested_page_id = 0;
+            }
+            if (!pending_web_pages.empty() && close_requested_page_id == 0) {
                 active_web_page.emplace(std::move(pending_web_pages.front()));
                 pending_web_pages.pop_front();
                 next_page = *active_web_page;

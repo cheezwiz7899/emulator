@@ -240,8 +240,8 @@ public slots:
     void ProfileSelectorSelectProfile(const Core::Frontend::ProfileSelectParameters& parameters);
     void ProfileSelectorRequestExit();
     void WebBrowserOpenWebPage(const std::string& main_url, const std::string& additional_args,
-                               bool is_local);
-    void WebBrowserRequestExit();
+                               bool is_local, quint64 request_id);
+    void WebBrowserRequestExit(quint64 request_id);
     /// Delivers data pushed by the guest (WebBrowser::ExecuteInteractive) into the page currently
     /// open in the web applet, dispatched as a "message" event so window.nx.addEventListener
     /// ("message", ...) listeners (used e.g. for ARCropolis's "GetModSize" reply) receive it.
@@ -515,6 +515,7 @@ private:
     QDialog* error_applet = nullptr;
     QtSoftwareKeyboardDialog* software_keyboard = nullptr;
     ActiveWebEngineView* web_applet = nullptr;
+    quint64 web_applet_request_id{};
     QAction* action_exit_fullscreen;
     bool is_amiibo_file_select_active{};
     bool is_load_file_select_active{};

@@ -222,13 +222,14 @@ public:
 
 signals:
     void MainWindowOpenWebPage(const std::string& main_url, const std::string& additional_args,
-                               bool is_local) const;
-    void MainWindowRequestExit() const;
+                               bool is_local, quint64 request_id) const;
+    void MainWindowRequestExit(quint64 request_id) const;
     /// Emitted to hand data received from the guest to the GUI thread for delivery into the page.
     void MainWindowSendInteractiveData(const std::string& data) const;
 
 private:
     struct PendingWebPage {
+        quint64 request_id{};
         std::string main_url;
         std::string additional_args;
         bool is_local{};
@@ -255,8 +256,9 @@ private:
     /// this when switching from Workspaces to its Smash/mod-manager page.
     mutable std::optional<PendingWebPage> active_web_page;
     mutable std::deque<PendingWebPage> pending_web_pages;
-    // Only one exit is needed to replace the visible page. This is guarded with the request
-    // queue so a second deferred exit cannot close the page promoted by the first close.
-    mutable bool close_requested = false;
+    // Close requests are tied to the visible page. A queued Qt exit for a completed page must
+    // never terminate the replacement promoted by its completion callback.
+    mutable quint64 next_request_id = 1;
+    mutable quint64 close_requested_page_id = 0;
     mutable std::mutex callback_mutex;
 };

@@ -151,15 +151,16 @@ var citron_key_callbacks = [];
             return;
         }
 
+        const target = event.target;
+        if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement ||
+            (target instanceof HTMLElement && target.isContentEditable)) {
+            return;
+        }
+
         const configured = window.citron_host_key_bindings;
         const direction_key_code = configured && configured.directions
             ? configured.directions[event.keyCode] : undefined;
         if (direction_key_code !== undefined && direction_key_code !== event.keyCode) {
-            const target = event.target;
-            if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement ||
-                (target instanceof HTMLElement && target.isContentEditable)) {
-                return;
-            }
             const direction = {
                 37: ["ArrowLeft", "ArrowLeft"],
                 38: ["ArrowUp", "ArrowUp"],

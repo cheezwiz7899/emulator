@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cinttypes>
+#include <algorithm>
 #include <clocale>
 #include <random>
 #include "citron/theme.h"
@@ -894,7 +895,8 @@ void GMainWindow::SoftwareKeyboardExit() {
 }
 
 void GMainWindow::WebBrowserOpenWebPage(const std::string& main_url,
-                                        const std::string& additional_args, bool is_local) {
+                                        const std::string& additional_args, bool is_local,
+                                        quint64 request_id) {
 #if defined(CITRON_USE_QT_WEB_ENGINE) || defined(CITRON_USE_WEBKITGTK_WEB_ENGINE) || \
     defined(CITRON_USE_WEBVIEW2_WEB_ENGINE)
 
@@ -917,6 +919,7 @@ void GMainWindow::WebBrowserOpenWebPage(const std::string& main_url,
 #elif defined(CITRON_USE_WEBVIEW2_WEB_ENGINE)
     web_applet = new WebView2View(*this, *system, input_subsystem.get());
 #endif
+    web_applet_request_id = request_id;
 
     ui->action_Pause->setEnabled(false);
     ui->action_Restart->setEnabled(false);
@@ -953,10 +956,19 @@ void GMainWindow::WebBrowserOpenWebPage(const std::string& main_url,
         }
 
         const auto& layout = render_window->GetFramebufferLayout();
+#if defined(CITRON_USE_WEBKITGTK_WEB_ENGINE)
+        const qreal reported_pixel_ratio = render_window->windowPixelRatio();
+        const qreal pixel_ratio = reported_pixel_ratio > 0.0 ? reported_pixel_ratio : 1.0;
+        web_applet->resize(qRound(layout.screen.GetWidth() / pixel_ratio),
+                           qRound(layout.screen.GetHeight() / pixel_ratio));
+        web_applet->move(qRound(layout.screen.left / pixel_ratio),
+                         qRound(layout.screen.top / pixel_ratio) + menuBar()->height());
+#else
         web_applet->resize(layout.screen.GetWidth(), layout.screen.GetHeight());
         web_applet->move(layout.screen.left, (layout.screen.top) + menuBar()->height());
         web_applet->SetPageZoomFactor(static_cast<qreal>(layout.screen.GetWidth()) /
                                       static_cast<qreal>(Layout::ScreenUndocked::Width));
+#endif
 
         web_applet->setFocus();
         web_applet->show();
@@ -1068,6 +1080,7 @@ void GMainWindow::WebBrowserOpenWebPage(const std::string& main_url,
     // notifying the guest, which may immediately request the next web applet.
     auto* completed_web_applet = web_applet;
     web_applet = nullptr;
+    web_applet_request_id = 0;
     completed_web_applet->hide();
     delete completed_web_applet;
 
@@ -1095,10 +1108,10 @@ void GMainWindow::WebBrowserOpenWebPage(const std::string& main_url,
 #endif
 }
 
-void GMainWindow::WebBrowserRequestExit() {
+void GMainWindow::WebBrowserRequestExit(quint64 request_id) {
 #if defined(CITRON_USE_QT_WEB_ENGINE) || defined(CITRON_USE_WEBKITGTK_WEB_ENGINE) || \
     defined(CITRON_USE_WEBVIEW2_WEB_ENGINE)
-    if (web_applet) {
+    if (web_applet && web_applet_request_id == request_id) {
         web_applet->SetExitReason(Service::AM::Frontend::WebExitReason::ExitRequested);
         web_applet->SetFinished(true);
     }

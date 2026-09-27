@@ -5,15 +5,16 @@
 
 #ifdef CITRON_USE_WEBKITGTK_WEB_ENGINE
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
+#include <optional>
 
 #include <QGuiApplication>
-#include <QInputDialog>
+#include <QDir>
 #include <QJsonDocument>
 #include <QJsonObject>
-#include <QLineEdit>
-#include <QMessageBox>
 #include <QMetaObject>
 #include <QMoveEvent>
 #include <QResizeEvent>
@@ -102,6 +103,110 @@ constexpr DomKey HIDButtonToDomKey(Core::HID::NpadButton button) {
 struct EvalCallbackContext {
     std::function<void(const QVariant&)> callback;
 };
+
+void FinishSchemeRequestError(WebKitURISchemeRequest* request, GIOErrorEnum code,
+                              const char* message) {
+    GError* error = g_error_new_literal(G_IO_ERROR, code, message);
+    webkit_uri_scheme_request_finish_error(request, error);
+    g_error_free(error);
+}
+
+void ServeCitronAppletResource(WebKitURISchemeRequest* request, gpointer user_data) {
+    const char* uri = webkit_uri_scheme_request_get_uri(request);
+    const QUrl parsed(QString::fromUtf8(uri ? uri : ""));
+    if (!parsed.isValid() || parsed.host() != QStringLiteral("cache")) {
+        FinishSchemeRequestError(request, G_IO_ERROR_NOT_FOUND, "Invalid applet resource URI");
+        return;
+    }
+
+    const QString decoded_path = parsed.path(QUrl::FullyDecoded);
+    if (decoded_path.isEmpty() || !decoded_path.startsWith(QLatin1Char('/'))) {
+        FinishSchemeRequestError(request, G_IO_ERROR_NOT_FOUND, "Invalid applet resource path");
+        return;
+    }
+
+    const auto& cache_root = *static_cast<const std::filesystem::path*>(user_data);
+    std::error_code path_error;
+    const auto canonical_root = std::filesystem::canonical(cache_root, path_error);
+    if (path_error) {
+        FinishSchemeRequestError(request, G_IO_ERROR_NOT_FOUND, "Applet cache is unavailable");
+        return;
+    }
+    const auto canonical_file = std::filesystem::canonical(
+        cache_root / std::filesystem::u8path(decoded_path.mid(1).toUtf8().constData()), path_error);
+    if (path_error || !std::filesystem::is_regular_file(canonical_file, path_error)) {
+        FinishSchemeRequestError(request, G_IO_ERROR_NOT_FOUND, "Applet resource not found");
+        return;
+    }
+    const auto relative = canonical_file.lexically_relative(canonical_root);
+    if (relative.empty() || relative.is_absolute() || *relative.begin() == "..") {
+        FinishSchemeRequestError(request, G_IO_ERROR_PERMISSION_DENIED,
+                                 "Applet resource is outside the cache directory");
+        return;
+    }
+    const std::string cache_area = relative.begin()->generic_string();
+    if (cache_area != "fonts" && !cache_area.starts_with("offline_web_applet_")) {
+        FinishSchemeRequestError(request, G_IO_ERROR_PERMISSION_DENIED,
+                                 "Resource is outside the web applet cache");
+        return;
+    }
+
+    GFile* file = g_file_new_for_path(canonical_file.string().c_str());
+    GError* error = nullptr;
+    GFileInfo* info = g_file_query_info(file, G_FILE_ATTRIBUTE_STANDARD_SIZE ","
+                                             G_FILE_ATTRIBUTE_STANDARD_CONTENT_TYPE,
+                                        G_FILE_QUERY_INFO_NONE, nullptr, &error);
+    if (!info) {
+        g_object_unref(file);
+        webkit_uri_scheme_request_finish_error(request, error);
+        g_error_free(error);
+        return;
+    }
+    GFileInputStream* stream = g_file_read(file, nullptr, &error);
+    g_object_unref(file);
+    if (!stream) {
+        g_object_unref(info);
+        webkit_uri_scheme_request_finish_error(request, error);
+        g_error_free(error);
+        return;
+    }
+
+    const char* content_type = g_file_info_get_content_type(info);
+    gchar* mime_type = content_type ? g_content_type_get_mime_type(content_type) : nullptr;
+    webkit_uri_scheme_request_finish(request, G_INPUT_STREAM(stream),
+                                     g_file_info_get_size(info),
+                                     mime_type ? mime_type : "application/octet-stream");
+    g_object_unref(stream);
+    g_free(mime_type);
+    g_object_unref(info);
+}
+
+std::optional<QString> ToCitronAppletUri(const std::filesystem::path& cache_root,
+                                         const std::string& path) {
+    std::error_code error;
+    const auto root = std::filesystem::canonical(cache_root, error);
+    if (error) {
+        return std::nullopt;
+    }
+    error.clear();
+    const auto file = std::filesystem::canonical(std::filesystem::path{path}, error);
+    if (error || !std::filesystem::is_regular_file(file, error)) {
+        return std::nullopt;
+    }
+    const auto relative = file.lexically_relative(root);
+    if (relative.empty() || relative.is_absolute() || *relative.begin() == "..") {
+        return std::nullopt;
+    }
+    if (!relative.begin()->generic_string().starts_with("offline_web_applet_")) {
+        return std::nullopt;
+    }
+    QUrl result;
+    result.setScheme(QStringLiteral("citron-applet"));
+    result.setHost(QStringLiteral("cache"));
+    result.setPath(QStringLiteral("/") +
+                   QDir::fromNativeSeparators(QString::fromStdString(relative.generic_string())));
+    return result.toString(QUrl::FullyEncoded);
+}
 
 void OnEvaluateJavaScriptFinished(GObject* source, GAsyncResult* result, gpointer user_data) {
     auto* ctx = static_cast<EvalCallbackContext*>(user_data);
@@ -234,6 +339,15 @@ WebKitGTKView::WebKitGTKView(GMainWindow& main_window_, Core::System& system_,
         profile_dir_utf8.constData(), nullptr);
     WebKitWebContext* web_context =
         webkit_web_context_new_with_website_data_manager(data_manager);
+    const auto cache_root = Common::FS::GetCitronPath(Common::FS::CitronPath::CacheDir);
+    webkit_web_context_register_uri_scheme(
+        web_context, "citron-applet", ServeCitronAppletResource,
+        new std::filesystem::path(cache_root),
+        [](gpointer data) { delete static_cast<std::filesystem::path*>(data); });
+    WebKitSecurityManager* security_manager = webkit_web_context_get_security_manager(web_context);
+    webkit_security_manager_register_uri_scheme_as_secure(security_manager, "citron-applet");
+    webkit_security_manager_register_uri_scheme_as_cors_enabled(security_manager,
+                                                                 "citron-applet");
 
     // WebKitGTK launches its own bubblewrap sandbox. Portable builds route that
     // launch through sharun's compatibility wrapper, but on the tested AppImage
@@ -243,11 +357,14 @@ WebKitGTKView::WebKitGTKView(GMainWindow& main_window_, Core::System& system_,
     const bool portable_bundle =
         g_getenv("APPIMAGE") != nullptr || g_getenv("APPDIR") != nullptr;
     if (is_local && portable_bundle) {
+        local_portable_sandbox_disabled = true;
         webkit_web_context_set_sandbox_enabled(web_context, FALSE);
         LOG_WARNING(Frontend,
                     "WebKitGTK: disabled nested web-process sandbox for local portable content");
     }
     WebKitSettings* web_settings = webkit_settings_new();
+    webkit_settings_set_allow_file_access_from_file_urls(web_settings, FALSE);
+    webkit_settings_set_allow_universal_access_from_file_urls(web_settings, FALSE);
     if (is_x11) {
         // NVIDIA/X11 can leave WebKitGTK's imported accelerated frame invisible
         // even though the DOM, context menu, and input work. NEVER selects
@@ -267,9 +384,9 @@ WebKitGTKView::WebKitGTKView(GMainWindow& main_window_, Core::System& system_,
                          // this releases the one webkit_user_content_manager_new()
                          // returned, which nothing was releasing before
     g_signal_connect(webview, "decide-policy", G_CALLBACK(OnDecidePolicy), this);
-    // WebKit's default JavaScript dialogs are top-level GTK windows. In an embedded
-    // WebView they can land partly off-screen, so handle them as Qt dialogs parented
-    // to the applet instead.
+    g_signal_connect(webview, "size-allocate", G_CALLBACK(OnSizeAllocate), this);
+    // The Qt widget is only a placeholder; JavaScript dialogs must be transient to the
+    // actual GTK top-level window on both X11 and Wayland.
     g_signal_connect(webview, "script-dialog", G_CALLBACK(OnScriptDialog), this);
     g_signal_connect(webview, "close", G_CALLBACK(OnClose), this);
     g_signal_connect(webview, "load-changed", G_CALLBACK(OnLoadChanged), this);
@@ -330,6 +447,22 @@ void WebKitGTKView::FallbackToTopLevelWindow() {
     gtk_widget_set_vexpand(GTK_WIDGET(webview), TRUE);
     gtk_container_add(GTK_CONTAINER(gtk_window), GTK_WIDGET(webview));
     gtk_widget_realize(gtk_window);
+    g_signal_connect(gtk_window, "delete-event",
+                     G_CALLBACK(+[](GtkWidget*, GdkEvent*, gpointer user_data) -> gboolean {
+                         auto* self = static_cast<WebKitGTKView*>(user_data);
+                         if (self->webview) {
+                             const char* uri = webkit_web_view_get_uri(self->webview);
+                             if (uri) {
+                                 self->requested_url = QString::fromUtf8(uri);
+                                 self->SetLastURL(self->requested_url.toStdString());
+                             }
+                         }
+                         self->SetExitReason(
+                             Service::AM::Frontend::WebExitReason::WindowClosed);
+                         self->SetFinished(true);
+                         return TRUE;
+                     }),
+                     this);
 
 #if defined(GDK_WINDOWING_X11)
     // Make the overlay a transient child of Citron so the window manager keeps
@@ -432,11 +565,7 @@ void WebKitGTKView::LoadExtractedFonts() {
     }
     fonts_injected = true;
 
-    const QString fonts_dir =
-        QUrl::fromLocalFile(QString::fromStdString(Common::FS::PathToUTF8String(
-                                Common::FS::GetCitronPath(Common::FS::CitronPath::CacheDir) /
-                                "fonts/")))
-            .toString();
+    const QString fonts_dir = QStringLiteral("citron-applet://cache/fonts/");
 
     const QString css_source =
         QString::fromUtf8(WEB_BROWSER_NX_FONT_CSS)
@@ -487,13 +616,6 @@ void WebKitGTKView::LoadLocalWebPage(const std::string& main_url,
         return; // already SetFinished(true) in the constructor
     is_local = true;
 
-    // ARCropolis loads generated state (mods.json/workspaces.json) with XMLHttpRequest. WebKit
-    // treats each file:// URL as an opaque origin unless this setting is enabled, so the HTML and
-    // scripts rendered while their JSON requests silently failed. Restrict the relaxation to
-    // local applet pages; external pages retain WebKit's normal origin policy.
-    WebKitSettings* settings = webkit_web_view_get_settings(webview);
-    webkit_settings_set_allow_file_access_from_file_urls(settings, TRUE);
-
     LoadExtractedFonts();
     FocusFirstLinkElement();
     SetUserAgent(UserAgent::WebApplet);
@@ -501,14 +623,16 @@ void WebKitGTKView::LoadLocalWebPage(const std::string& main_url,
     SetExitReason(Service::AM::Frontend::WebExitReason::EndButtonPressed);
     SetLastURL("http://localhost/");
 
-    gchar* file_uri = g_filename_to_uri(main_url.c_str(), nullptr, nullptr);
-    if (!file_uri) {
+    const auto cache_root = Common::FS::GetCitronPath(Common::FS::CitronPath::CacheDir);
+    const auto applet_uri = ToCitronAppletUri(cache_root, main_url);
+    if (!applet_uri) {
+        LOG_ERROR(Frontend, "WebKitGTK local applet path is outside the cache directory: {}",
+                  main_url);
         SetFinished(true);
         SetExitReason(Service::AM::Frontend::WebExitReason::WindowClosed);
         return;
     }
-    std::string uri = std::string(file_uri) + additional_args;
-    g_free(file_uri);
+    const std::string uri = applet_uri->toStdString() + additional_args;
     load_committed = false;
     load_failed = false;
     LOG_INFO(Frontend, "WebKitGTK loading local URI: {}", uri);
@@ -521,11 +645,6 @@ void WebKitGTKView::LoadExternalWebPage(const std::string& main_url,
     if (init_failed)
         return;
     is_local = false;
-
-    // LoadLocalWebPage relaxes file-to-file XMLHttpRequest for offline applets. Do not retain
-    // that relaxation after the same view is reused for an external page.
-    WebKitSettings* settings = webkit_web_view_get_settings(webview);
-    webkit_settings_set_allow_file_access_from_file_urls(settings, FALSE);
 
     FocusFirstLinkElement();
     SetUserAgent(UserAgent::WebApplet);
@@ -568,6 +687,17 @@ void WebKitGTKView::SetPageZoomFactor(qreal factor) {
     webkit_web_view_set_zoom_level(webview, static_cast<gdouble>(factor));
 }
 
+void WebKitGTKView::OnSizeAllocate(WebKitWebView*, void* raw_allocation, gpointer user_data) {
+    const auto* allocation = static_cast<GtkAllocation*>(raw_allocation);
+    if (allocation && allocation->width > 0) {
+        auto* self = static_cast<WebKitGTKView*>(user_data);
+        // GTK uses logical pixels here, including on HiDPI Wayland. Derive zoom from its
+        // actual native allocation rather than Qt's framebuffer-pixel layout dimensions.
+        self->SetPageZoomFactor(static_cast<qreal>(allocation->width) /
+                                static_cast<qreal>(Layout::ScreenUndocked::Width));
+    }
+}
+
 void WebKitGTKView::SendKeyEvent(const QString& key, const QString& code, int key_code) {
     const QString script =
         // keyCode and which are read-only legacy properties in WebKit. ARCropolis' pages use
@@ -579,13 +709,14 @@ void WebKitGTKView::SendKeyEvent(const QString& key, const QString& code, int ke
                        "{ key: '%1', code: '%2', bubbles: true, cancelable: true }); "
                        "try { Object.defineProperty(event, 'keyCode', { value: keyCode }); "
                        "Object.defineProperty(event, 'which', { value: keyCode }); } catch (_) {} "
-                       "target.dispatchEvent(event); } send('keydown'); send('keyup'); "
+                       "return target.dispatchEvent(event); } var handled = send('keydown'); "
+                       "send('keyup'); "
                        "function visible(el) { var s = getComputedStyle(el); return s.display !== 'none' && "
                        "s.visibility !== 'hidden' && el.getClientRects().length !== 0; } "
                        "var buttons = Array.from(document.querySelectorAll('button:not([disabled]), "
                        "input:not([disabled]), a[href]:not([tabindex=\"-1\"])')).filter(visible); "
                        "if ((keyCode === 37 || keyCode === 38 || keyCode === 39 || keyCode === 40) && "
-                       "document.activeElement === before && buttons.length) { "
+                       "!handled && document.activeElement === before && buttons.length) { "
                        "var current = document.querySelector('.is-focused') || before; "
                        "var i = buttons.indexOf(current); "
                        "if (i < 0) i = 0; else if (keyCode === 37 || keyCode === 38) "
@@ -593,11 +724,11 @@ void WebKitGTKView::SendKeyEvent(const QString& key, const QString& code, int ke
                        "document.querySelectorAll('.is-focused').forEach(function(el) { "
                        "if (el !== buttons[i]) el.classList.remove('is-focused'); }); "
                        "buttons[i].classList.add('is-focused'); buttons[i].focus(); } "
-                       "else if (keyCode === 65) { var active = document.activeElement; "
+                       "else if (!handled && keyCode === 65) { var active = document.activeElement; "
                        "if (!active || active === document.body || active === document.documentElement) { "
                        "active = document.querySelector('button:not([disabled]), a[href], input:not([disabled])'); "
                        "if (active) active.focus(); } if (active && active.click) active.click(); } "
-                       "else if (keyCode === 66) { if (history.length > 2) history.back(); "
+                       "else if (!handled && keyCode === 66) { if (history.length > 2) history.back(); "
                        "else window.location.href = 'http://localhost/'; } })();")
             .arg(key, code)
             .arg(key_code);
@@ -855,6 +986,17 @@ int WebKitGTKView::OnDecidePolicy(WebKitWebView*, WebKitPolicyDecision* decision
         return TRUE;
     }
 
+    if (self->local_portable_sandbox_disabled) {
+        const QUrl url(self->requested_url);
+        if (url.scheme() != QStringLiteral("citron-applet") ||
+            url.host() != QStringLiteral("cache")) {
+            LOG_WARNING(Frontend, "WebKitGTK blocked navigation outside local applet cache: {}",
+                        self->requested_url.toStdString());
+            webkit_policy_decision_ignore(decision);
+            return TRUE;
+        }
+    }
+
     // Re-run load_nx_font on every navigation, mirroring qt_web_browser.cpp:380-386
     // (50 ms debounce). Skipped above when finishing -- pointless if the view's
     // already closing.
@@ -869,32 +1011,59 @@ int WebKitGTKView::OnDecidePolicy(WebKitWebView*, WebKitPolicyDecision* decision
 int WebKitGTKView::OnScriptDialog(WebKitWebView*, WebKitScriptDialog* dialog,
                                   gpointer user_data) {
     auto* self = static_cast<WebKitGTKView*>(user_data);
-    const QString title = QStringLiteral("ARCropolis");
+    if (!self->gtk_window) {
+        return FALSE;
+    }
     const char* raw_message = webkit_script_dialog_get_message(dialog);
-    const QString text = QString::fromUtf8(raw_message ? raw_message : "");
+    const char* message = raw_message ? raw_message : "";
 
     switch (webkit_script_dialog_get_dialog_type(dialog)) {
-    case WEBKIT_SCRIPT_DIALOG_ALERT:
-        QMessageBox::information(self, title, text);
+    case WEBKIT_SCRIPT_DIALOG_ALERT: {
+        GtkWidget* native_dialog = gtk_message_dialog_new(
+            GTK_WINDOW(self->gtk_window), GTK_DIALOG_MODAL, GTK_MESSAGE_INFO, GTK_BUTTONS_OK,
+            "%s", message);
+        gtk_window_set_title(GTK_WINDOW(native_dialog), "ARCropolis");
+        gtk_window_set_position(GTK_WINDOW(native_dialog), GTK_WIN_POS_CENTER_ON_PARENT);
+        gtk_dialog_run(GTK_DIALOG(native_dialog));
+        gtk_widget_destroy(native_dialog);
         return TRUE;
+    }
 
     case WEBKIT_SCRIPT_DIALOG_CONFIRM:
     case WEBKIT_SCRIPT_DIALOG_BEFORE_UNLOAD_CONFIRM: {
-        const bool accepted =
-            QMessageBox::question(self, title, text, QMessageBox::Yes | QMessageBox::No,
-                                  QMessageBox::No) == QMessageBox::Yes;
+        GtkWidget* native_dialog = gtk_message_dialog_new(
+            GTK_WINDOW(self->gtk_window), GTK_DIALOG_MODAL, GTK_MESSAGE_QUESTION,
+            GTK_BUTTONS_YES_NO, "%s", message);
+        gtk_window_set_title(GTK_WINDOW(native_dialog), "ARCropolis");
+        gtk_window_set_position(GTK_WINDOW(native_dialog), GTK_WIN_POS_CENTER_ON_PARENT);
+        const bool accepted = gtk_dialog_run(GTK_DIALOG(native_dialog)) == GTK_RESPONSE_YES;
+        gtk_widget_destroy(native_dialog);
         webkit_script_dialog_confirm_set_confirmed(dialog, accepted);
         return TRUE;
     }
 
     case WEBKIT_SCRIPT_DIALOG_PROMPT: {
-        bool accepted = false;
+        GtkWidget* native_dialog = gtk_dialog_new_with_buttons(
+            "ARCropolis", GTK_WINDOW(self->gtk_window), GTK_DIALOG_MODAL, "Cancel",
+            GTK_RESPONSE_CANCEL, "OK", GTK_RESPONSE_ACCEPT, nullptr);
+        gtk_window_set_position(GTK_WINDOW(native_dialog), GTK_WIN_POS_CENTER_ON_PARENT);
+        GtkWidget* content = gtk_dialog_get_content_area(GTK_DIALOG(native_dialog));
+        gtk_container_set_border_width(GTK_CONTAINER(content), 12);
+        GtkWidget* label = gtk_label_new(message);
+        gtk_label_set_line_wrap(GTK_LABEL(label), TRUE);
+        gtk_widget_set_halign(label, GTK_ALIGN_START);
+        gtk_box_pack_start(GTK_BOX(content), label, FALSE, FALSE, 8);
+        GtkWidget* entry = gtk_entry_new();
         const char* default_text = webkit_script_dialog_prompt_get_default_text(dialog);
-        const QString result = QInputDialog::getText(
-            self, title, text, QLineEdit::Normal,
-            QString::fromUtf8(default_text ? default_text : ""), &accepted);
-        webkit_script_dialog_prompt_set_text(dialog,
-                                             accepted ? result.toUtf8().constData() : nullptr);
+        gtk_entry_set_text(GTK_ENTRY(entry), default_text ? default_text : "");
+        gtk_box_pack_start(GTK_BOX(content), entry, FALSE, FALSE, 8);
+        gtk_widget_show_all(native_dialog);
+        const bool accepted = gtk_dialog_run(GTK_DIALOG(native_dialog)) == GTK_RESPONSE_ACCEPT;
+        if (accepted) {
+            webkit_script_dialog_prompt_set_text(dialog,
+                                                 gtk_entry_get_text(GTK_ENTRY(entry)));
+        }
+        gtk_widget_destroy(native_dialog);
         return TRUE;
     }
 

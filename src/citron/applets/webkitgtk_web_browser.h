@@ -123,6 +123,7 @@ private:
     // Return gboolean (erased to int here) so WebKitGTK does not show its own
     // unparented script dialogs. The .cpp presents Qt dialogs parented to this view.
     static int OnScriptDialog(WebKitWebView*, WebKitScriptDialog*, gpointer);
+    static void OnSizeAllocate(WebKitWebView*, void*, gpointer);
     static void OnClose(WebKitWebView*, gpointer);
     static void OnLoadChanged(WebKitWebView*, int, gpointer);
     static int OnLoadFailed(WebKitWebView*, int, const char*, GError*, gpointer);
@@ -140,6 +141,7 @@ private:
     std::atomic<bool> input_thread_running{};
 
     bool is_local = false;
+    bool local_portable_sandbox_disabled = false;
     bool is_x11 = false;
     bool is_wayland = false;
     bool init_failed = false;
