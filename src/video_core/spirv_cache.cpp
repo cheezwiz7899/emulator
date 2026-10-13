@@ -17,6 +17,8 @@
 
 namespace {
 constexpr std::array<char, 8> SPIRV_CACHE_MAGIC{'c', 'i', 't', 'r', 's', 'p', 'v', '\0'};
+// v31: B1 replaces YDirection's pipeline specialization constant with a graphics
+// push-constant ABI. v30 modules lack that ABI and must miss normally.
 // v30: texture-free real compute entries persist cbuf coordinates, allowing a
 // live exact-key probe before CFG/frontend by rereading only known inputs.
 // v29: real compute entries persist the bounded descriptor recipe needed to
@@ -50,7 +52,7 @@ constexpr std::array<char, 8> SPIRV_CACHE_MAGIC{'c', 'i', 't', 'r', 's', 'p', 'v
 // may populate the exact SPIR-V cache. Discard v16's brute-force-suffix modules.
 // v16: scanner program identity is the same SPH-to-self-branch span as the
 // live fast path; v15 restored the full input-interface key.
-constexpr u32 SPIRV_CACHE_VERSION = 30;
+constexpr u32 SPIRV_CACHE_VERSION = 31;
 constexpr std::streamoff SPIRV_CACHE_HEADER_SIZE = 8 + sizeof(u32) + sizeof(u32);
 // unique_hash, stage, four remaining key u64s, word count, one SPIR-V word,
 // seven binding counters, source, and eight diagnostic u64s.

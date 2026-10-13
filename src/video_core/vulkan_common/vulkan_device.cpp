@@ -1211,6 +1211,11 @@ bool Device::GetSuitability(bool requires_swapchain) {
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT;
         SetNext(next, properties.transform_feedback);
     }
+    if (extensions.graphics_pipeline_library) {
+        properties.graphics_pipeline_library.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT;
+        SetNext(next, properties.graphics_pipeline_library);
+    }
 
     // Perform the property fetch.
     physical.GetProperties2(properties2);
@@ -1218,6 +1223,15 @@ bool Device::GetSuitability(bool requires_swapchain) {
 
     // Unload extensions if feature support is insufficient.
     RemoveUnsuitableExtensions();
+    LOG_INFO(Render_Vulkan,
+             "Graphics pipeline library: serving=permanently-disabled advertised(ext/pipeline-library)={}/{} "
+             "enabled={} fast-link={} independent-interpolation={} disable-optimization-experiment={}",
+             supported_extensions.contains(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME),
+             supported_extensions.contains(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME),
+             extensions.graphics_pipeline_library,
+             IsGraphicsPipelineLibraryFastLinkingSupported(),
+             IsGraphicsPipelineLibraryIndependentInterpolationDecorationSupported(),
+             Settings::values.graphics_pipeline_disable_optimization_experiment.GetValue());
 
     // Check limits.
     struct Limit {
@@ -1284,13 +1298,19 @@ void Device::RemoveUnsuitableExtensions() {
     dynamic_state3_enables =
         features.extended_dynamic_state3.extendedDynamicState3DepthClampEnable &&
         features.extended_dynamic_state3.extendedDynamicState3LogicOpEnable;
-
     extensions.extended_dynamic_state3 = dynamic_state3_blending || dynamic_state3_enables;
     dynamic_state3_blending = dynamic_state3_blending && extensions.extended_dynamic_state3;
     dynamic_state3_enables = dynamic_state3_enables && extensions.extended_dynamic_state3;
     RemoveExtensionFeatureIfUnsuitable(extensions.extended_dynamic_state3,
                                        features.extended_dynamic_state3,
                                        VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
+
+    // VK_EXT_graphics_pipeline_library requires VK_KHR_pipeline_library as well as its feature.
+    extensions.graphics_pipeline_library =
+        extensions.pipeline_library && features.graphics_pipeline_library.graphicsPipelineLibrary;
+    RemoveExtensionFeatureIfUnsuitable(extensions.graphics_pipeline_library,
+                                       features.graphics_pipeline_library,
+                                       VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
 
     // VK_EXT_provoking_vertex
     extensions.provoking_vertex =

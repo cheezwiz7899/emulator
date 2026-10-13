@@ -522,7 +522,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     DefineGlobalMemoryFunctions(program.info);
     DefineRescalingInput(program.info);
     DefineRenderArea(program.info);
-    DefineRuntimeStateSpecConstants(program.info);
+    DefineYDirectionPushConstant(program.info);
 }
 
 EmitContext::~EmitContext() = default;
@@ -1053,7 +1053,7 @@ void EmitContext::DefineRescalingInput(const Info& info) {
     if (!info.uses_rescaling_uniform) {
         return;
     }
-    if (profile.unified_descriptor_binding) {
+    if (profile.unified_descriptor_binding && !info.uses_y_direction) {
         DefineRescalingInputPushConstant();
     } else {
         DefineRescalingInputUniformConstant();
@@ -1117,7 +1117,7 @@ void EmitContext::DefineRescalingInputUniformConstant() {
 }
 
 void EmitContext::DefineRenderArea(const Info& info) {
-    if (!info.uses_render_area) {
+    if (!info.uses_render_area || info.uses_y_direction) {
         return;
     }
 
@@ -1132,7 +1132,8 @@ void EmitContext::DefineRenderArea(const Info& info) {
         Decorate(push_constant_struct, spv::Decoration::Block);
         Name(push_constant_struct, "RenderAreaInfo");
 
-        MemberDecorate(push_constant_struct, render_are_member_index, spv::Decoration::Offset, 0);
+        MemberDecorate(push_constant_struct, render_are_member_index, spv::Decoration::Offset,
+                       RENDERAREA_LAYOUT_OFFSET);
         MemberName(push_constant_struct, render_are_member_index, "render_area");
 
         const Id pointer_type{TypePointer(spv::StorageClass::PushConstant, push_constant_struct)};
@@ -1146,22 +1147,78 @@ void EmitContext::DefineRenderArea(const Info& info) {
     }
 }
 
-void EmitContext::DefineRuntimeStateSpecConstants(const Info& info) {
+void EmitContext::DefineYDirectionPushConstant(const Info& info) {
     if (!info.uses_y_direction) {
         return;
     }
-    // Same shape as Phase 4's own SpecConstantFalse+Decorate(SpecId)+Name block for texture-
-    // type resolution (see DefineImages below) -- SpecId is Shader::kYNegateSpecId
-    // (environment.h), fixed rather than table-indexed like Phase 4's own SpecIds, since
-    // there's exactly one y_negate per shader, not one per descriptor. Default -1.0f matches
-    // EmitYDirection's old baked "negated" branch; the real per-draw value (+1.0f or -1.0f,
-    // from key.state.y_negate) is supplied at pipeline-creation time via
-    // VkSpecializationMapEntry (vk_graphics_pipeline.cpp) and never affects this cached SPIR-V
-    // module or its cache key -- see SpirvRelevantHash's own comment on why y_negate is no
-    // longer hashed there.
-    y_negate_spec_const = SpecConstant(F32[1], -1.0f);
-    Decorate(y_negate_spec_const, spv::Decoration::SpecId, Shader::kYNegateSpecId);
-    Name(y_negate_spec_const, "y_negate");
+    // Maxwell lowering only emits YDirection for graphics. Compute keeps its existing
+    // rescaling-only ABI and never enters this graphics-only declaration path.
+
+    boost::container::static_vector<Id, 5> members{};
+    u32 member_index{};
+    const bool use_rescaling_push_constants{profile.unified_descriptor_binding &&
+                                             info.uses_rescaling_uniform};
+    const bool use_render_area_push_constants{profile.unified_descriptor_binding &&
+                                               info.uses_render_area};
+    if (use_rescaling_push_constants) {
+        rescaling_textures_type = TypeArray(U32[1], Const(4u));
+        Decorate(rescaling_textures_type, spv::Decoration::ArrayStride, 4u);
+        members.push_back(rescaling_textures_type);
+        rescaling_textures_member_index = member_index++;
+        rescaling_images_type = TypeArray(U32[1], Const(NUM_IMAGE_SCALING_WORDS));
+        Decorate(rescaling_images_type, spv::Decoration::ArrayStride, 4u);
+        members.push_back(rescaling_images_type);
+        rescaling_images_member_index = member_index++;
+        members.push_back(F32[1]);
+        rescaling_downfactor_member_index = member_index++;
+    }
+    if (use_render_area_push_constants) {
+        members.push_back(F32[4]);
+        render_are_member_index = member_index++;
+    }
+    members.push_back(F32[1]);
+    y_direction_member_index = member_index++;
+
+    const Id push_constant_struct{TypeStruct(std::span(members.data(), members.size()))};
+    Decorate(push_constant_struct, spv::Decoration::Block);
+    Name(push_constant_struct, "GraphicsRuntimeState");
+    if (use_rescaling_push_constants) {
+        MemberDecorate(push_constant_struct, rescaling_textures_member_index,
+                       spv::Decoration::Offset,
+                       static_cast<u32>(offsetof(GraphicsRuntimeStateLayout, rescaling) +
+                                        offsetof(RescalingLayout, rescaling_textures)));
+        MemberName(push_constant_struct, rescaling_textures_member_index, "rescaling_textures");
+        MemberDecorate(push_constant_struct, rescaling_images_member_index,
+                       spv::Decoration::Offset,
+                       static_cast<u32>(offsetof(GraphicsRuntimeStateLayout, rescaling) +
+                                        offsetof(RescalingLayout, rescaling_images)));
+        MemberName(push_constant_struct, rescaling_images_member_index, "rescaling_images");
+        MemberDecorate(push_constant_struct, rescaling_downfactor_member_index,
+                       spv::Decoration::Offset,
+                       static_cast<u32>(offsetof(GraphicsRuntimeStateLayout, rescaling) +
+                                        offsetof(RescalingLayout, down_factor)));
+        MemberName(push_constant_struct, rescaling_downfactor_member_index, "down_factor");
+    }
+    if (use_render_area_push_constants) {
+        MemberDecorate(push_constant_struct, render_are_member_index, spv::Decoration::Offset,
+                       RENDERAREA_LAYOUT_OFFSET);
+        MemberName(push_constant_struct, render_are_member_index, "render_area");
+    }
+    MemberDecorate(push_constant_struct, y_direction_member_index, spv::Decoration::Offset,
+                   Y_DIRECTION_LAYOUT_OFFSET);
+    MemberName(push_constant_struct, y_direction_member_index, "y_direction");
+    const Id pointer_type{TypePointer(spv::StorageClass::PushConstant, push_constant_struct)};
+    y_direction_push_constant = AddGlobalVariable(pointer_type, spv::StorageClass::PushConstant);
+    Name(y_direction_push_constant, "graphics_runtime_state_push_constants");
+    if (use_rescaling_push_constants) {
+        rescaling_push_constants = y_direction_push_constant;
+    }
+    if (use_render_area_push_constants) {
+        render_area_push_constant = y_direction_push_constant;
+    }
+    if (profile.supported_spirv >= 0x00010400) {
+        interfaces.push_back(y_direction_push_constant);
+    }
 }
 
 void EmitContext::DefineConstantBuffers(const Info& info, u32& binding) {

@@ -288,9 +288,8 @@ struct Info {
     bool uses_invocation_info{};
     bool uses_sample_id{};
     bool uses_is_helper_invocation{};
-    // Phase 5: whether this shader's IR contains a YDirection query (runtime_info.h /
-    // EmitYDirection). Gates declaring the y_negate spec constant (spirv_emit_context.cpp)
-    // to shaders that actually consume it.
+    // Whether this shader's IR contains a YDirection query. Gates declaration of the graphics
+    // draw-time YDirection push-constant field to shaders that actually consume it.
     bool uses_y_direction{};
     bool uses_subgroup_invocation_id{};
     bool uses_subgroup_shuffles{};

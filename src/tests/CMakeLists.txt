@@ -20,10 +20,12 @@ add_executable(tests
     video_core/memory_tracker.cpp
     video_core/maxwell_location.cpp
     video_core/precache_compiler_target.cpp
+    video_core/precache_program_contract.cpp
     video_core/shader_program_identity.cpp
     ../video_core/precache_compiler_target.cpp
     ../video_core/precache_cfg_artifact.cpp
     ../video_core/precache_frontend_artifact.cpp
+    ../video_core/precache_program_contract.cpp
     ../video_core/spirv_cache.cpp
     video_core/spirv_cache.cpp
     input_common/calibration_configuration_job.cpp

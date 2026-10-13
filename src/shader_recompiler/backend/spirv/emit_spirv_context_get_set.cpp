@@ -582,13 +582,10 @@ Id EmitIsHelperInvocation(EmitContext& ctx) {
 }
 
 Id EmitYDirection(EmitContext& ctx) {
-    // Phase 5: y_negate is now Shader::kYNegateSpecId, declared once by
-    // DefineRuntimeStateSpecConstants (called from the constructor whenever
-    // info.uses_y_direction, which is exactly when this function can even be reached) --
-    // not baked from ctx.runtime_info.y_negate at translation time anymore. That field is
-    // still populated by MakeRuntimeInfo (vestigial for this specific path now, left alone
-    // rather than pruned -- see SpirvRelevantHash's comment) but nothing here reads it.
-    return ctx.y_negate_spec_const;
+    const Id pointer_type{ctx.TypePointer(spv::StorageClass::PushConstant, ctx.F32[1])};
+    const Id index{ctx.Const(ctx.y_direction_member_index)};
+    const Id pointer{ctx.OpAccessChain(pointer_type, ctx.y_direction_push_constant, index)};
+    return ctx.OpLoad(ctx.F32[1], pointer);
 }
 
 Id EmitResolutionDownFactor(EmitContext& ctx) {

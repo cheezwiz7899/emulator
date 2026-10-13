@@ -61,7 +61,7 @@ public:
     void RequestOutsideRenderPassOperationContext();
 
     /// Update the pipeline to the current execution context.
-    bool UpdateGraphicsPipeline(GraphicsPipeline* pipeline);
+    bool UpdateGraphicsPipeline(GraphicsPipeline* pipeline, u64 generation);
 
     /// Update the rescaling state. Returns true if the state has to be updated.
     bool UpdateRescaling(bool is_rescaling);
@@ -212,6 +212,7 @@ private:
         VkFramebuffer framebuffer = nullptr;
         VkExtent2D render_area = {0, 0};
         GraphicsPipeline* graphics_pipeline = nullptr;
+        u64 graphics_pipeline_generation{};
         bool is_rescaling = false;
         bool rescaling_defined = false;
     };

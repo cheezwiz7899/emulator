@@ -208,6 +208,8 @@ add_library(video_core STATIC
     precache_cfg_artifact.h
     precache_frontend_artifact.cpp
     precache_frontend_artifact.h
+    precache_program_contract.cpp
+    precache_program_contract.h
     precache_compiler_target.cpp
     precache_compiler_target.h
     spirv_cache.cpp

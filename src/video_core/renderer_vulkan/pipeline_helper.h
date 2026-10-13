@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <type_traits>
+#include <vector>
 
 #include <boost/container/small_vector.hpp>
 
@@ -19,6 +20,34 @@
 namespace Vulkan {
 
 using Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS;
+
+// Canonical descriptor/pipeline-layout contract for a graphics GPL recipe.
+// This intentionally records values, not VkDescriptorSetLayout/VkPipelineLayout
+// handles: separately allocated but identically defined layouts are compatible.
+struct DescriptorLayoutSignature {
+    struct Binding {
+        u32 set{};
+        u32 binding{};
+        VkDescriptorType type{};
+        u32 count{};
+        VkShaderStageFlags stages{};
+        VkDescriptorBindingFlags flags{};
+
+        bool operator==(const Binding&) const noexcept = default;
+    };
+
+    std::vector<Binding> bindings;
+    VkDescriptorSetLayoutCreateFlags uniform_set_flags{};
+    VkDescriptorSetLayoutCreateFlags resource_set_flags{};
+    VkPipelineLayoutCreateFlags pipeline_layout_flags{};
+    VkShaderStageFlags push_constant_stages{};
+    u32 push_constant_offset{};
+    u32 push_constant_size{};
+    bool split_mode{};
+    bool uses_push_descriptor{};
+
+    bool operator==(const DescriptorLayoutSignature&) const noexcept = default;
+};
 
 class DescriptorLayoutBuilder {
 public:
@@ -41,6 +70,31 @@ public:
         const u32 push_check =
             split_mode ? uniform_set.num_descriptors : (uniform_set.num_descriptors + resource_set.num_descriptors);
         return device->IsKhrPushDescriptorSupported() && push_check <= device->MaxPushDescriptors();
+    }
+
+    // Every field here is consumed by descriptor-set or pipeline-layout creation.
+    // Keep this in lockstep with CreateLayoutFor/CreatePipelineLayout. GPL code must
+    // fall back rather than omit a newly consumed field from this signature.
+    [[nodiscard]] DescriptorLayoutSignature MakeSignature(bool use_push_descriptor) const {
+        using Shader::Backend::SPIRV::GRAPHICS_RUNTIME_STATE_PUSH_CONSTANT_SIZE;
+        using Shader::Backend::SPIRV::RescalingLayout;
+        DescriptorLayoutSignature signature;
+        signature.split_mode = split_mode;
+        signature.uses_push_descriptor = use_push_descriptor;
+        const u32 size_offset = is_compute ? sizeof(RescalingLayout::down_factor) : 0u;
+        signature.push_constant_stages = static_cast<VkShaderStageFlags>(
+            is_compute ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_ALL_GRAPHICS);
+        signature.push_constant_offset = 0;
+        signature.push_constant_size = is_compute
+                                           ? static_cast<u32>(sizeof(RescalingLayout)) - size_offset
+                                           : GRAPHICS_RUNTIME_STATE_PUSH_CONSTANT_SIZE;
+        AppendSignatureBindings(signature, uniform_set, 0, use_push_descriptor);
+        if (split_mode) {
+            AppendSignatureBindings(signature, resource_set, 1, false);
+        }
+        signature.uniform_set_flags = LayoutFlags(uniform_set, use_push_descriptor);
+        signature.resource_set_flags = split_mode ? LayoutFlags(resource_set, false) : 0;
+        return signature;
     }
 
     // Set 0 layout. In single-set mode this contains everything (cbufs + rest);
@@ -76,15 +130,15 @@ public:
 
     vk::PipelineLayout CreatePipelineLayout(VkDescriptorSetLayout descriptor_set_layout,
                                             VkDescriptorSetLayout resource_set_layout = nullptr) const {
-        using Shader::Backend::SPIRV::RenderAreaLayout;
+        using Shader::Backend::SPIRV::GRAPHICS_RUNTIME_STATE_PUSH_CONSTANT_SIZE;
         using Shader::Backend::SPIRV::RescalingLayout;
         const u32 size_offset = is_compute ? sizeof(RescalingLayout::down_factor) : 0u;
         const VkPushConstantRange range{
             .stageFlags = static_cast<VkShaderStageFlags>(
                 is_compute ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_ALL_GRAPHICS),
             .offset = 0,
-            .size = static_cast<u32>(sizeof(RescalingLayout)) - size_offset +
-                    static_cast<u32>(sizeof(RenderAreaLayout)),
+            .size = is_compute ? static_cast<u32>(sizeof(RescalingLayout)) - size_offset
+                               : GRAPHICS_RUNTIME_STATE_PUSH_CONSTANT_SIZE,
         };
         std::array<VkDescriptorSetLayout, 2> set_layouts{descriptor_set_layout, resource_set_layout};
         u32 set_count = 0;
@@ -207,13 +261,7 @@ private:
                 .pBindingFlags = binding_flags.data(),
             };
         }
-        VkDescriptorSetLayoutCreateFlags flags = 0;
-        if (use_push_descriptor) {
-            flags |= VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-        }
-        if (use_uab) {
-            flags |= VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
-        }
+        const VkDescriptorSetLayoutCreateFlags flags = LayoutFlags(set, use_push_descriptor);
         return device->GetLogical().CreateDescriptorSetLayout({
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
             .pNext = use_uab ? &binding_flags_ci : nullptr,
@@ -221,6 +269,42 @@ private:
             .bindingCount = static_cast<u32>(set.bindings.size()),
             .pBindings = set.bindings.data(),
         });
+    }
+
+    [[nodiscard]] VkDescriptorSetLayoutCreateFlags LayoutFlags(const SetData& set,
+                                                                 bool use_push_descriptor) const {
+        VkDescriptorSetLayoutCreateFlags flags{};
+        // CreateLayoutFor returns VK_NULL_HANDLE for this case, so no layout
+        // flags exist to become part of its semantic signature.
+        if (set.bindings.empty()) {
+            return flags;
+        }
+        if (use_push_descriptor) {
+            flags |= VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+        }
+        if (!use_push_descriptor && device->IsDescriptorIndexingSupported() &&
+            !set.bindings.empty()) {
+            flags |= VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+        }
+        return flags;
+    }
+
+    void AppendSignatureBindings(DescriptorLayoutSignature& signature, const SetData& set,
+                                 u32 set_index, bool use_push_descriptor) const {
+        const bool use_uab = !use_push_descriptor && device->IsDescriptorIndexingSupported();
+        for (const VkDescriptorSetLayoutBinding& binding : set.bindings) {
+            signature.bindings.push_back({
+                .set = set_index,
+                .binding = binding.binding,
+                .type = binding.descriptorType,
+                .count = binding.descriptorCount,
+                .stages = binding.stageFlags,
+                .flags = use_uab && binding.descriptorCount > 1
+                             ? (VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |
+                                VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT)
+                             : 0,
+            });
+        }
     }
 
     vk::DescriptorUpdateTemplate CreateTemplateFor(const SetData& set,

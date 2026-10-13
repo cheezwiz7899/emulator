@@ -5,11 +5,12 @@
 #pragma once
 
 #include <algorithm>
-#include <atomic>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -34,14 +35,14 @@
 #include "shader_recompiler/varying_state.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/precache_cfg_artifact.h"
+#include "video_core/precache_compiler_target.h"
+#include "video_core/precache_frontend_artifact.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
-#include "video_core/precache_compiler_target.h"
-#include "video_core/precache_cfg_artifact.h"
-#include "video_core/precache_frontend_artifact.h"
 #include "video_core/shader_cache.h"
 #include "video_core/spirv_cache.h"
 
@@ -136,6 +137,7 @@ public:
 private:
     friend class GraphicsPipeline;
     friend class ComputePipeline;
+    friend class RasterizerVulkan;
 
     // First template-cache layer: immutable, cbuf-independent CFG snapshots.
     // start_address is part of identity because Flow::Location is guest-address
@@ -150,8 +152,8 @@ private:
     struct CfgTemplateKeyHash {
         size_t operator()(const CfgTemplateKey& key) const noexcept {
             size_t hash{static_cast<size_t>(key.unique_hash)};
-            hash ^= static_cast<size_t>(key.start_address) + 0x9e3779b9U + (hash << 6) +
-                    (hash >> 2);
+            hash ^=
+                static_cast<size_t>(key.start_address) + 0x9e3779b9U + (hash << 6) + (hash >> 2);
             return hash ^ static_cast<size_t>(key.exits_to_dispatcher);
         }
     };
@@ -192,27 +194,23 @@ private:
         CfgTemplateKey key, const VideoCommon::PrecacheCfgArtifactKey* scanner_artifact);
     void ValidateCfgTemplateGraphicsModule(
         CfgTemplateKey key, Shader::Environment& env,
-        const Shader::Maxwell::Flow::CFG::Template& source,
-        u32 cfg_request_address,
+        const Shader::Maxwell::Flow::CFG::Template& source, u32 cfg_request_address,
         const Shader::RuntimeInfo& runtime_info, const Shader::IR::Program& expected_program,
-        const std::vector<u32>& expected_spirv,
-        const Shader::Backend::Bindings& starting_binding,
+        const std::vector<u32>& expected_spirv, const Shader::Backend::Bindings& starting_binding,
         const Shader::Backend::Bindings& expected_end_binding,
         const VideoCommon::PrecacheCfgArtifactKey* scanner_artifact);
-    void ValidateCfgTemplateComputeModule(CfgTemplateKey key, Shader::Environment& env,
-                                          const Shader::Maxwell::Flow::CFG::Template& source,
-                                          u32 cfg_request_address,
-                                          const Shader::IR::Program& expected_program,
-                                          const std::vector<u32>& expected_spirv,
-                                          const VideoCommon::PrecacheCfgArtifactKey* scanner_artifact);
+    void ValidateCfgTemplateComputeModule(
+        CfgTemplateKey key, Shader::Environment& env,
+        const Shader::Maxwell::Flow::CFG::Template& source, u32 cfg_request_address,
+        const Shader::IR::Program& expected_program, const std::vector<u32>& expected_spirv,
+        const VideoCommon::PrecacheCfgArtifactKey* scanner_artifact);
     void ValidateCfgTemplateMergedVertexModule(
         CfgTemplateKey key, Shader::Environment& vertex_a_env,
         const Shader::Maxwell::Flow::CFG::Template& vertex_a_source,
         Shader::Environment& vertex_b_env,
         const Shader::Maxwell::Flow::CFG::Template& vertex_b_source,
         const Shader::RuntimeInfo& runtime_info, const Shader::IR::Program& expected_program,
-        const std::vector<u32>& expected_spirv,
-        const Shader::Backend::Bindings& starting_binding,
+        const std::vector<u32>& expected_spirv, const Shader::Backend::Bindings& starting_binding,
         const Shader::Backend::Bindings& expected_end_binding,
         const VideoCommon::PrecacheCfgArtifactKey* vertex_a_artifact,
         const VideoCommon::PrecacheCfgArtifactKey* vertex_b_artifact);
@@ -226,23 +224,21 @@ private:
     };
 
     void LoadPrecacheCfgArtifactCache(const std::filesystem::path& path);
-    void ShadowValidatePrecacheCfgArtifact(
-        u64 program_identity, Shader::Stage stage, bool exits_to_dispatcher,
-        const Shader::Maxwell::Flow::CFG& fresh_cfg) const;
-    [[nodiscard]] std::optional<PrecacheCfgReplay>
-    LookupPrecacheCfgArtifact(u64 program_identity, Shader::Stage stage, u32 cfg_request_address,
-                              bool exits_to_dispatcher) const;
+    void ShadowValidatePrecacheCfgArtifact(u64 program_identity, Shader::Stage stage,
+                                           bool exits_to_dispatcher,
+                                           const Shader::Maxwell::Flow::CFG& fresh_cfg) const;
+    [[nodiscard]] std::optional<PrecacheCfgReplay> LookupPrecacheCfgArtifact(
+        u64 program_identity, Shader::Stage stage, u32 cfg_request_address,
+        bool exits_to_dispatcher) const;
     void QuarantinePrecacheCfgArtifact(const VideoCommon::PrecacheCfgArtifactKey& key) const;
     mutable std::shared_mutex precache_cfg_artifacts_mutex;
-    std::unordered_map<VideoCommon::PrecacheCfgArtifactKey,
-                       VideoCommon::PrecacheCfgArtifact,
-        VideoCommon::PrecacheCfgArtifactKeyHash>
+    std::unordered_map<VideoCommon::PrecacheCfgArtifactKey, VideoCommon::PrecacheCfgArtifact,
+                       VideoCommon::PrecacheCfgArtifactKeyHash>
         precache_cfg_artifacts;
     mutable std::unordered_set<VideoCommon::PrecacheCfgArtifactKey,
                                VideoCommon::PrecacheCfgArtifactKeyHash>
         precache_cfg_artifact_quarantine;
-    std::unordered_set<VideoCommon::PrecacheCfgArtifactKey,
-                       VideoCommon::PrecacheCfgArtifactKeyHash>
+    std::unordered_set<VideoCommon::PrecacheCfgArtifactKey, VideoCommon::PrecacheCfgArtifactKeyHash>
         precache_cfg_artifact_module_claimed_keys;
     mutable std::atomic<u64> precache_cfg_artifact_loaded{};
     mutable std::atomic<u64> precache_cfg_artifact_probes{};
@@ -343,6 +339,11 @@ private:
     mutable std::atomic<u64> graphics_pipeline_wait_live_count{};
     mutable std::atomic<u64> graphics_pipeline_wait_live_us{};
     mutable std::atomic<u64> graphics_pipeline_wait_live_max_us{};
+    // D0: exact request -> first command-recording lead. Index 0 means the worker had already
+    // completed; index 1 means first use still had to enter the existing wait path.
+    mutable std::array<std::atomic<u64>, 2> graphics_first_draw_lead_count{};
+    mutable std::array<std::atomic<u64>, 2> graphics_first_draw_lead_us{};
+    mutable std::array<std::atomic<u64>, 2> graphics_first_draw_lead_max_us{};
     mutable std::atomic<u64> compute_pipeline_queue_us{};
     mutable std::atomic<u64> compute_pipeline_queue_max_us{};
     mutable std::atomic<u64> compute_pipeline_driver_count{};
@@ -363,6 +364,43 @@ private:
     mutable std::atomic<u64> compute_pipeline_wait_live_count{};
     mutable std::atomic<u64> compute_pipeline_wait_live_us{};
     mutable std::atomic<u64> compute_pipeline_wait_live_max_us{};
+    // Exact final-SPIR-V recipe capture for GPL. These counters deliberately
+    // describe owned CPU recipe data, not driver library hits.
+    mutable std::atomic<u64> graphics_recipe_spirv_hits{};
+    mutable std::atomic<u64> graphics_recipe_spirv_inserts{};
+    mutable std::atomic<u64> graphics_recipe_spirv_capacity_rejects{};
+    mutable std::atomic<u64> graphics_library_hits{};
+    mutable std::atomic<u64> graphics_library_misses{};
+    // [vertex input, complete pre-raster+fragment shader group, fragment output].
+    // Aggregate totals hide whether one partition is defeating reuse.
+    mutable std::array<std::atomic<u64>, 3> graphics_library_hits_by_kind{};
+    mutable std::array<std::atomic<u64>, 3> graphics_library_misses_by_kind{};
+    // [vertex-input library, complete shader library, fragment-output library, link].
+    mutable std::array<std::atomic<u64>, 4> graphics_gpl_driver_create_count{};
+    mutable std::array<std::atomic<u64>, 4> graphics_gpl_driver_create_us{};
+    mutable std::array<std::atomic<u64>, 4> graphics_gpl_driver_create_max_us{};
+    mutable std::atomic<u64> graphics_library_inflight_waits{};
+    mutable std::atomic<u64> graphics_library_failures{};
+    mutable std::atomic<u64> graphics_library_capacity_rejects{};
+    mutable std::atomic<u64> graphics_gpl_ineligible_missing_recipe{};
+    mutable std::atomic<u64> graphics_gpl_ineligible_stage_shape{};
+    mutable std::atomic<u64> graphics_gpl_ineligible_xfb{};
+    // [boot preload, live]. Keep C1's actual driver work separate from all graphics work.
+    mutable std::array<std::atomic<u64>, 2> graphics_disable_optimization_driver_count{};
+    mutable std::array<std::atomic<u64>, 2> graphics_disable_optimization_driver_us{};
+    mutable std::array<std::atomic<u64>, 2> graphics_disable_optimization_driver_max_us{};
+    mutable std::atomic<u64> graphics_optimization_queued{};
+    mutable std::atomic<u64> graphics_optimization_capacity_rejects{};
+    mutable std::atomic<u64> graphics_optimization_published{};
+    mutable std::atomic<u64> graphics_optimization_failures{};
+    mutable std::atomic<u64> graphics_optimization_driver_count{};
+    mutable std::atomic<u64> graphics_optimization_driver_us{};
+    mutable std::atomic<u64> graphics_optimization_driver_max_us{};
+    // B1 proof-of-use: each count is one recorded graphics draw that uploaded the exact
+    // captured YDirection value. This is intentionally a draw counter, not a guessed
+    // pipeline-variant estimate.
+    mutable std::atomic<u64> graphics_y_direction_push_positive{};
+    mutable std::atomic<u64> graphics_y_direction_push_negative{};
     mutable std::mutex shader_compiler_stats_mutex;
     mutable std::chrono::steady_clock::time_point shader_compiler_stats_last_log{};
 
@@ -374,23 +412,63 @@ private:
     void RecordShaderCompilerWork(std::chrono::microseconds cfg_time,
                                   std::chrono::microseconds template_time,
                                   std::chrono::microseconds finalize_time,
-                                  std::chrono::microseconds emit_time,
-                                  bool exact_module_hit) const;
+                                  std::chrono::microseconds emit_time, bool exact_module_hit) const;
     void RecordPipelineCreateWork(bool compute, std::chrono::microseconds create_time) const;
     void RecordPipelineBuildQueueDelay(bool compute, std::chrono::microseconds delay) const;
     void RecordPipelineDriverCreate(bool compute, bool boot_preload,
                                     std::chrono::microseconds duration) const;
+    void RecordGraphicsGplDriverCreate(u8 part, std::chrono::microseconds duration) const;
+    void RecordGraphicsDisableOptimizationDriverCreate(bool boot_preload,
+                                                       std::chrono::microseconds duration) const;
+    void RecordGraphicsOptimizationDriverCreate(std::chrono::microseconds duration) const;
+    void RecordGraphicsOptimizationPublished() const;
+    void RecordGraphicsOptimizationFailure() const;
+    void RecordGraphicsYDirectionPush(bool negative) const noexcept;
+    void RecordGraphicsFirstDrawLead(bool ready_before_first_draw,
+                                     std::chrono::microseconds duration) const noexcept;
+    [[nodiscard]] bool QueueGraphicsPipelineOptimization(GraphicsPipeline& pipeline);
+    [[nodiscard]] bool IsShuttingDown() const noexcept;
     void RecordPipelineBuildWait(bool compute, bool boot_preload,
                                  std::chrono::microseconds duration) const;
+    void RecordGraphicsGplIneligible(bool complete_recipe, bool supported_stage_shape,
+                                     bool transform_feedback) const noexcept;
+
+    struct GraphicsPipelineLibraryKey {
+        enum class Kind : u8 { VertexInput, CompleteShaderGroup, FragmentOutput };
+        Kind kind{};
+        // Explicit scalar values only; never Vk*CreateInfo bytes or pointers.
+        std::vector<u64> words;
+        bool operator==(const GraphicsPipelineLibraryKey&) const noexcept = default;
+    };
+    struct GraphicsPipelineLibraryKeyHash {
+        size_t operator()(const GraphicsPipelineLibraryKey& key) const noexcept;
+    };
+    struct GraphicsPipelineLibraryEntry {
+        enum class State : u8 { Building, Ready, Failed };
+        std::mutex mutex;
+        std::condition_variable ready;
+        std::optional<vk::Pipeline> pipeline;
+        State state{State::Building};
+    };
+    [[nodiscard]] std::optional<VkPipeline> AcquireGraphicsPipelineLibrary(
+        const GraphicsPipelineLibraryKey& key, const std::function<vk::Pipeline()>& create);
+    [[nodiscard]] GraphicsPipelineLibraryKey MakeGraphicsPipelineLibraryKey(
+        GraphicsPipelineLibraryKey::Kind kind, const GraphicsPipelineRecipe& recipe) const;
+
+    // GPL measured worse and is permanently dormant. Keep code only for its existing diagnostics.
+    [[nodiscard]] bool ShouldCaptureGraphicsPipelineRecipe() const noexcept;
+    [[nodiscard]] bool ShouldUseGraphicsPipelineDisableOptimization() const noexcept;
+    [[nodiscard]] bool ShouldUseGraphicsPipelineOptimization() const noexcept;
+    [[nodiscard]] std::shared_ptr<const std::vector<u32>> InternGraphicsPipelineSpirv(
+        std::vector<u32>&& words);
 
     void SubmitSpeculativeShader(u64 unique_hash, std::vector<u64> maxwell_code,
-                               Shader::Stage stage, u32 local_memory_size,
-                               u32 shared_memory_size, std::array<u32, 3> workgroup_size,
-                               u32 start_address, u32 texture_bound,
-                               Shader::ProgramHeader sph,
-                               std::optional<RealStageStoresSnapshot> previous_stage_snapshot);
+                                 Shader::Stage stage, u32 local_memory_size, u32 shared_memory_size,
+                                 std::array<u32, 3> workgroup_size, u32 start_address,
+                                 u32 texture_bound, Shader::ProgramHeader sph,
+                                 std::optional<RealStageStoresSnapshot> previous_stage_snapshot);
     void OnNewShaderSeen(VideoCommon::GenericEnvironment& env, u64 unique_hash,
-                        u64 previous_stage_unique_hash) override;
+                         u64 previous_stage_unique_hash) override;
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath();
 
     [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) const noexcept;
@@ -500,7 +578,8 @@ public:
     // real synchronization, not a borrowed lock that would make this diagnostic's writes
     // block that table's unrelated reads or vice versa.
     mutable std::shared_mutex phase3_diag_runtime_variants_mutex;
-    mutable ankerl::unordered_dense::map<u64, std::vector<u64>> phase3_diag_cbuf_zero_runtime_variants_by_hash;
+    mutable ankerl::unordered_dense::map<u64, std::vector<u64>>
+        phase3_diag_cbuf_zero_runtime_variants_by_hash;
     mutable std::chrono::steady_clock::time_point phase3_diag_last_log_time{};
 
     // Records one observation for the diagnostic above (capped at 8 distinct values per
@@ -525,19 +604,20 @@ public:
     // values a spec constant or scan-time guess could plausibly cover); high cardinality
     // would mean it isn't.
     //
-    // Deliberately no cbuf_key==0 gate at the call site, unlike RecordPhase3RuntimeVariantDiagnostic
-    // above: that gate exists there because InsertSpeculative() hardcodes cbuf_key=0, so
-    // cbuf_key!=0 real inserts are structurally unreachable by any speculative entry
-    // regardless of cbuf narrowing. generic_input_types' speculative-matching
-    // potential isn't tied to cbuf narrowing at all, so restricting to that same subset
-    // here would just throw away real, relevant data for no reason -- the full real
+    // Deliberately no cbuf_key==0 gate at the call site, unlike
+    // RecordPhase3RuntimeVariantDiagnostic above: that gate exists there because
+    // InsertSpeculative() hardcodes cbuf_key=0, so cbuf_key!=0 real inserts are structurally
+    // unreachable by any speculative entry regardless of cbuf narrowing. generic_input_types'
+    // speculative-matching potential isn't tied to cbuf narrowing at all, so restricting to that
+    // same subset here would just throw away real, relevant data for no reason -- the full real
     // population is the right one for this specific question.
     //
     // Own dedicated mutex, same reasoning as phase3_diag_runtime_variants_mutex above:
     // unrelated data, written from the same worker-thread context, shouldn't share a lock
     // with something unrelated.
     mutable std::shared_mutex phase5_diag_generic_input_types_mutex;
-    mutable ankerl::unordered_dense::map<u64, std::vector<u64>> phase5_diag_generic_input_types_variants_by_hash;
+    mutable ankerl::unordered_dense::map<u64, std::vector<u64>>
+        phase5_diag_generic_input_types_variants_by_hash;
     mutable std::chrono::steady_clock::time_point phase5_diag_generic_input_types_last_log_time{};
 
     // Same shape as RecordPhase3RuntimeVariantDiagnostic (capped at 8 distinct values per
@@ -545,7 +625,7 @@ public:
     // just above for why both those choices are made the way they are; identical reasoning
     // applies here. Safe to call from any worker thread.
     void RecordGenericInputTypesCardinalityDiagnostic(u64 unique_hash,
-                                                        u64 generic_input_types_hash) const;
+                                                      u64 generic_input_types_hash) const;
 
     // ---- Runtime-state diagnostic: confirming (or correcting) two speculative-default
     // guesses runtime_info.h's ApplySpeculativeDefaults flags as REASONED rather than
@@ -576,19 +656,54 @@ public:
     // relatively rare across the real game library, which is exactly why this trio had
     // nothing stronger than an internal-consistency argument to lean on in the first place.
     mutable std::mutex phase5_diag_tess_state_mutex;
-    mutable ankerl::unordered_dense::map<Shader::TessPrimitive, u64> phase5_diag_tess_primitive_counts;
+    mutable ankerl::unordered_dense::map<Shader::TessPrimitive, u64>
+        phase5_diag_tess_primitive_counts;
     mutable ankerl::unordered_dense::map<Shader::TessSpacing, u64> phase5_diag_tess_spacing_counts;
     mutable u64 phase5_diag_tess_clockwise_true_count{0};
     mutable u64 phase5_diag_tess_total_count{0};
     mutable std::chrono::steady_clock::time_point phase5_diag_tess_state_last_log_time{};
     void RecordTessellationStateDiagnostic(Shader::TessPrimitive primitive,
-                                            Shader::TessSpacing spacing, bool clockwise) const;
+                                           Shader::TessSpacing spacing, bool clockwise) const;
+
+    // B-family admission gate. Each map key is the full semantic graphics key with just the
+    // candidate fields cleared. A multi-bit mask therefore means real NEW pipelines differed
+    // only in that one candidate, not merely that the game used several unrelated states.
+    // This stays diagnostic-only and bounded: it never changes cache lookup or creation.
+    struct FixedStateVariantDiagnostic {
+        u8 polygon_mode_mask{};
+        u8 alpha_to_coverage_mask{};
+        u8 alpha_to_one_mask{};
+    };
+    static constexpr size_t FIXED_STATE_VARIANT_DIAGNOSTIC_MAX_BASE_KEYS = 4096;
+    mutable std::mutex fixed_state_variant_diagnostic_mutex;
+    mutable std::unordered_map<GraphicsPipelineCacheKey, FixedStateVariantDiagnostic>
+        fixed_state_variant_diagnostic_by_base_key;
+    mutable u64 fixed_state_variant_diagnostic_capacity_rejects{};
+    mutable std::chrono::steady_clock::time_point fixed_state_variant_diagnostic_last_log_time{};
+    void RecordFixedStateVariantDiagnostic(const GraphicsPipelineCacheKey& key) const;
 
     GraphicsPipelineCacheKey graphics_key{};
     GraphicsPipeline* current_pipeline{};
 
     std::unordered_map<ComputePipelineCacheKey, std::unique_ptr<ComputePipeline>> compute_cache;
     std::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>> graphics_cache;
+
+    // Process-local interner: 64 MiB / 4,096 variants matches GPL v1 admission
+    // limits. Never evict live recipe data; reject new capture and keep normal
+    // monolithic creation when a limit is reached.
+    static constexpr size_t GRAPHICS_RECIPE_MAX_SPIRV_BYTES = 64 * 1024 * 1024;
+    static constexpr size_t GRAPHICS_RECIPE_MAX_SPIRV_VARIANTS = 4096;
+    mutable std::mutex graphics_recipe_spirv_mutex;
+    std::unordered_map<u64, std::vector<std::shared_ptr<const std::vector<u32>>>>
+        graphics_recipe_spirv;
+    size_t graphics_recipe_spirv_bytes{};
+    size_t graphics_recipe_spirv_variants{};
+
+    static constexpr size_t GRAPHICS_LIBRARY_MAX_ENTRIES = 4096;
+    std::mutex graphics_library_mutex;
+    std::unordered_map<GraphicsPipelineLibraryKey, std::shared_ptr<GraphicsPipelineLibraryEntry>,
+                       GraphicsPipelineLibraryKeyHash>
+        graphics_library_cache;
 
     std::unordered_map<const GraphicsPipeline*, u64> graphics_pipeline_last_use;
     std::unordered_map<const ComputePipeline*, u64> compute_pipeline_last_use;
@@ -608,8 +723,14 @@ public:
     vk::PipelineCache vulkan_pipeline_cache;
 
     Common::ThreadWorker workers;
+    // C2 never occupies first-use compiler workers. Queue admission is bounded below.
+    Common::ThreadWorker optimization_workers{1, "VulkanPipelineOptimize"};
+    std::atomic<u32> graphics_optimization_pending{};
+    std::atomic<u32> graphics_optimization_admitted{};
+    std::atomic_bool shutting_down{};
+    static constexpr u32 GRAPHICS_OPTIMIZATION_MAX_PENDING = 16;
+    static constexpr u32 GRAPHICS_OPTIMIZATION_MAX_ADMITTED = 128;
     DynamicFeatures dynamic_features;
-
 };
 
 } // namespace Vulkan

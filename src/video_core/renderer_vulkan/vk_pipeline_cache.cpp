@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cstddef>
 #include <fstream>
@@ -27,13 +28,18 @@
 #include "core/core.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/environment.h"
+#include "shader_recompiler/frontend/ir/program.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
-#include "shader_recompiler/frontend/ir/program.h"
 #include "shader_recompiler/program_header.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
+#include "video_core/phase4_prototype_slots_file.h"
+#include "video_core/precache_cfg_artifact.h"
+#include "video_core/precache_compiler_target.h"
+#include "video_core/precache_frontend_artifact.h"
+#include "video_core/precache_program_contract.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
@@ -45,14 +51,10 @@
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/shader_cache.h"
-#include "video_core/phase4_prototype_slots_file.h"
-#include "video_core/precache_compiler_target.h"
-#include "video_core/precache_cfg_artifact.h"
-#include "video_core/precache_frontend_artifact.h"
-#include "video_core/spirv_cache.h"
 #include "video_core/shader_environment.h"
-#include "video_core/speculative_shader_environment.h"
 #include "video_core/shader_notify.h"
+#include "video_core/speculative_shader_environment.h"
+#include "video_core/spirv_cache.h"
 #include "video_core/surface.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -65,22 +67,22 @@ using Shader::Maxwell::ConvertLegacyToGeneric;
 using Shader::Maxwell::GenerateGeometryPassthrough;
 using Shader::Maxwell::MergeDualVertexPrograms;
 using Shader::Maxwell::TranslateProgram;
-using VideoCommon::ComputeEnvironment;
-using VideoCommon::FileEnvironment;
-using VideoCommon::GenericEnvironment;
-using VideoCommon::GraphicsEnvironment;
-using VideoCommon::SpirvKey;
+using VideoCommon::ComputeBindingKey;
 using VideoCommon::ComputeCbufKey;
 using VideoCommon::ComputeCbufKeyExcludingTextureHandles;
+using VideoCommon::ComputeEnvironment;
+using VideoCommon::ComputeLogicalTextureKey;
 using VideoCommon::ComputeTextureKey;
 using VideoCommon::ComputeTextureKeyExcludingHandles;
-using VideoCommon::ComputeLogicalTextureKey;
-using VideoCommon::HasCompleteLogicalTextureCoverage;
-using VideoCommon::HasActivePhase4LogicalTextureSlot;
-using VideoCommon::ComputeBindingKey;
 using VideoCommon::ComputeWorkgroupKey;
-using VideoCommon::FoldViewportTransformState;
+using VideoCommon::FileEnvironment;
 using VideoCommon::FoldBindingKey;
+using VideoCommon::FoldViewportTransformState;
+using VideoCommon::GenericEnvironment;
+using VideoCommon::GraphicsEnvironment;
+using VideoCommon::HasActivePhase4LogicalTextureSlot;
+using VideoCommon::HasCompleteLogicalTextureCoverage;
+using VideoCommon::SpirvKey;
 
 // v21: each transferable record has a byte length. A partial final append can
 // be ignored without discarding earlier records. v20 records lack framing.
@@ -101,7 +103,11 @@ using VideoCommon::FoldBindingKey;
 // measurement. Old caches have no data for this field at all (not a partial-
 // data situation — the bytes genuinely aren't there), hence the version bump
 // rather than trying to read old files as if they had it.
-constexpr u32 TRANSFERABLE_CACHE_VERSION = 21;
+// v22: B1 canonicalizes FixedPipelineState::y_negate. Older graphics key records can only
+// recreate redundant origin variants, so reject them rather than preload unusable identities.
+// v23 briefly enabled dynamic alpha-to-one. It proved disable-only and hot-path expensive, and
+// is now retired. Reject those records: they may have canonicalized a true alpha-to-one state.
+constexpr u32 TRANSFERABLE_CACHE_VERSION = 24;
 constexpr u32 VULKAN_PIPELINE_CACHE_VERSION = 14;
 constexpr std::array<char, 8> CFG_TEMPLATE_CACHE_MAGIC{'c', 'i', 't', 'r', 'c', 'f', 'g', '\0'};
 // v2: only templates which pass fresh in-memory reconstruction are persisted.
@@ -145,8 +151,7 @@ bool BindingsEqual(const Shader::Backend::Bindings& lhs,
            lhs.image_scaling_index == rhs.image_scaling_index;
 }
 
-bool ProgramMetadataEqual(const Shader::IR::Program& lhs,
-                          const Shader::IR::Program& rhs) noexcept {
+bool ProgramMetadataEqual(const Shader::IR::Program& lhs, const Shader::IR::Program& rhs) noexcept {
     return lhs.info == rhs.info && lhs.stage == rhs.stage &&
            lhs.workgroup_size == rhs.workgroup_size && lhs.output_topology == rhs.output_topology &&
            lhs.output_vertices == rhs.output_vertices && lhs.invocations == rhs.invocations &&
@@ -409,12 +414,24 @@ bool ComputePipelineCacheKey::operator==(const ComputePipelineCacheKey& rhs) con
 }
 
 size_t GraphicsPipelineCacheKey::Hash() const noexcept {
-    const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(this), Size());
+    // The active FixedPipelineState prefix has variable length, while phase4 is physically
+    // after the complete FixedPipelineState. Hash semantic fields separately: a raw prefix
+    // ending at unique_hashes + state.Size() + sizeof(phase4) lands inside state's inactive
+    // tail, not on phase4 itself.
+    const u64 shader_hash = Common::CityHash64(reinterpret_cast<const char*>(unique_hashes.data()),
+                                               sizeof(unique_hashes));
+    const u64 state_hash = Common::CityHash64(reinterpret_cast<const char*>(&state), state.Size());
+    const u64 hash = Common::CityHash64WithSeeds(
+        reinterpret_cast<const char*>(&phase4_prototype_needs_array_variant),
+        sizeof(phase4_prototype_needs_array_variant), shader_hash, state_hash);
     return static_cast<size_t>(hash);
 }
 
 bool GraphicsPipelineCacheKey::operator==(const GraphicsPipelineCacheKey& rhs) const noexcept {
-    return std::memcmp(&rhs, this, Size()) == 0;
+    const size_t state_size = state.Size();
+    return unique_hashes == rhs.unique_hashes &&
+           phase4_prototype_needs_array_variant == rhs.phase4_prototype_needs_array_variant &&
+           state_size == rhs.state.Size() && std::memcmp(&state, &rhs.state, state_size) == 0;
 }
 
 PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
@@ -525,12 +542,12 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .host_info = host_info,
         .gpu_accuracy_mode = static_cast<u8>(Settings::values.gpu_accuracy.GetValue()),
     };
-    speculative_worker.QueueWork([] {
-        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
-    });
-    serialization_thread.QueueWork([] {
-        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
-    });
+    speculative_worker.QueueWork(
+        [] { Common::SetCurrentThreadPriority(Common::ThreadPriority::Low); });
+    serialization_thread.QueueWork(
+        [] { Common::SetCurrentThreadPriority(Common::ThreadPriority::Low); });
+    optimization_workers.QueueWork(
+        [] { Common::SetCurrentThreadPriority(Common::ThreadPriority::Low); });
 
     if (device.GetMaxVertexInputAttributes() <
         Tegra::Engines::Maxwell3D::Regs::NumVertexAttributes) {
@@ -565,6 +582,8 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
 }
 
 PipelineCache::~PipelineCache() {
+    shutting_down.store(true, std::memory_order_release);
+    optimization_workers.WaitForRequests();
     speculative_worker.WaitForRequests();
     serialization_thread.WaitForRequests();
     if (!spirv_cache_filename.empty()) {
@@ -585,14 +604,13 @@ PipelineCache::~PipelineCache() {
         // just re-confirming the same state before persisting it). Saving candidates alone
         // would silently forget every coordinate learned in an EARLIER session the moment
         // this one ends -- ActivePhase4PrototypeSlots() is what carries that forward.
-        std::vector<Shader::Phase4PrototypeSlot> extra{
-            Shader::ActivePhase4PrototypeSlots().begin(),
-            Shader::ActivePhase4PrototypeSlots().end()};
+        std::vector<Shader::Phase4PrototypeSlot> extra{Shader::ActivePhase4PrototypeSlots().begin(),
+                                                       Shader::ActivePhase4PrototypeSlots().end()};
         const std::vector<Shader::Phase4PrototypeSlot> candidates{
             VideoCommon::TakePhase4PrototypeCandidates()};
         extra.insert(extra.end(), candidates.begin(), candidates.end());
         VideoCommon::SavePhase4PrototypeSlots(phase4_prototype_slots_filename,
-                                               Shader::MergePhase4PrototypeSlots(extra));
+                                              Shader::MergePhase4PrototypeSlots(extra));
     }
 
     if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
@@ -708,8 +726,8 @@ u64 PipelineCache::ResolvePhase4PrototypeSpecValue() const {
     // stage_index=4 mapping. CreateGraphicsPipeline's own `stage_index = index - 1` (this same
     // file) is the concrete conversion between the two, and is what pins these two numbers
     // down as correct rather than assumed.
-    constexpr size_t kFragmentHardwareIndex = 5;    // ShaderType::Pixel, for unique_hashes only.
-    constexpr size_t kFragmentSoftwareIndex = 4;    // Shader::Stage::Fragment, for shader_stages.
+    constexpr size_t kFragmentHardwareIndex = 5; // ShaderType::Pixel, for unique_hashes only.
+    constexpr size_t kFragmentSoftwareIndex = 4; // Shader::Stage::Fragment, for shader_stages.
     const u64 fragment_hash{graphics_key.unique_hashes[kFragmentHardwareIndex]};
     if (fragment_hash == 0) {
         return 0; // No fragment shader bound at all.
@@ -749,14 +767,16 @@ u64 PipelineCache::ResolvePhase4PrototypeSpecValue() const {
             continue; // This shader doesn't have this particular known slot.
         }
         const Shader::Phase4PrototypeSlot& slot{active_slots[slot_id]};
-        const auto& cbuf{maxwell3d->state.shader_stages[kFragmentSoftwareIndex]
-                              .const_buffers[slot.cbuf_index]};
+        const auto& cbuf{
+            maxwell3d->state.shader_stages[kFragmentSoftwareIndex].const_buffers[slot.cbuf_index]};
         if (!cbuf.enabled || slot.cbuf_offset >= cbuf.size) {
             continue;
         }
         const u32 handle{gpu_memory->Read<u32>(cbuf.address + slot.cbuf_offset)};
         const auto& regs{maxwell3d->regs};
-        const bool via_header_index{regs.sampler_binding == Tegra::Engines::Maxwell3D::Regs::SamplerBinding::ViaHeaderBinding};
+        const bool via_header_index{
+            regs.sampler_binding ==
+            Tegra::Engines::Maxwell3D::Regs::SamplerBinding::ViaHeaderBinding};
         const Shader::TextureType resolved{VideoCommon::ResolveTextureTypeFromRawHandle(
             *gpu_memory, regs.tex_header.Address(), regs.tex_header.limit, via_header_index,
             handle)};
@@ -772,7 +792,7 @@ u64 PipelineCache::ResolvePhase4PrototypeSpecValue() const {
 // served — this purely observes the real, already-computed values CreateGraphicsPipeline()
 // passes it and reports on their shape.
 void PipelineCache::RecordPhase3RuntimeVariantDiagnostic(u64 unique_hash,
-                                                          u64 diag_base_runtime_hash) const {
+                                                         u64 diag_base_runtime_hash) const {
     // Capped exactly like SpirvCache's own keys_by_hash_ (spirv_cache.cpp) and for the same
     // reason: hitting the cap IS the answer for a hash that hits it ("too high-cardinality
     // for a small scan-time guess to plausibly cover"), not a gap in the measurement.
@@ -823,16 +843,17 @@ void PipelineCache::RecordPhase3RuntimeVariantDiagnostic(u64 unique_hash,
             }
         }
     }
-    LOG_INFO(Render_Vulkan,
-             "Runtime-variant diagnostic: of {} graphics shaders seen with a real, cbuf_key==0 draw "
-             "so far, {} showed exactly 1 distinct core-RuntimeInfo state, {} showed 2-3, {} "
-             "showed 4-7, {} showed 8+ (capped — true count may be higher). Diagnostic only, "
-             "nothing currently acts on this. Low cardinality across most hashes would say "
-             "scan-time multi-variant guessing could plausibly help now that texture "
-             "1 narrowed cbuf_key; a lot of 8+ hashes would say this hits the same structural "
-             "ceiling the removed second viewport-transform-state guess already found once, "
-             "just now confirmed with cbuf's blocking accounted for.",
-             total_hashes, buckets[0], buckets[1], buckets[2], buckets[3]);
+    LOG_INFO(
+        Render_Vulkan,
+        "Runtime-variant diagnostic: of {} graphics shaders seen with a real, cbuf_key==0 draw "
+        "so far, {} showed exactly 1 distinct core-RuntimeInfo state, {} showed 2-3, {} "
+        "showed 4-7, {} showed 8+ (capped — true count may be higher). Diagnostic only, "
+        "nothing currently acts on this. Low cardinality across most hashes would say "
+        "scan-time multi-variant guessing could plausibly help now that texture "
+        "1 narrowed cbuf_key; a lot of 8+ hashes would say this hits the same structural "
+        "ceiling the removed second viewport-transform-state guess already found once, "
+        "just now confirmed with cbuf's blocking accounted for.",
+        total_hashes, buckets[0], buckets[1], buckets[2], buckets[3]);
 }
 
 void PipelineCache::FlushSpirvCache() {
@@ -894,8 +915,8 @@ void PipelineCache::InsertCfgTemplate(CfgTemplateKey key,
     }
 }
 
-void PipelineCache::ValidateAndPersistCfgTemplate(
-    CfgTemplateKey key, Shader::Environment& env, const Shader::Maxwell::Flow::CFG& cfg) {
+void PipelineCache::ValidateAndPersistCfgTemplate(CfgTemplateKey key, Shader::Environment& env,
+                                                  const Shader::Maxwell::Flow::CFG& cfg) {
     const Shader::Maxwell::Flow::CFG::Template fresh{cfg.MakeTemplate()};
     Shader::ObjectPool<Shader::Maxwell::Flow::Block> shadow_pool(16);
     try {
@@ -948,11 +969,9 @@ bool PipelineCache::ClaimCfgTemplateModuleValidation(
 
 void PipelineCache::ValidateCfgTemplateGraphicsModule(
     CfgTemplateKey key, Shader::Environment& env,
-    const Shader::Maxwell::Flow::CFG::Template& source,
-    u32 cfg_request_address,
+    const Shader::Maxwell::Flow::CFG::Template& source, u32 cfg_request_address,
     const Shader::RuntimeInfo& runtime_info, const Shader::IR::Program& expected_program,
-    const std::vector<u32>& expected_spirv,
-    const Shader::Backend::Bindings& starting_binding,
+    const std::vector<u32>& expected_spirv, const Shader::Backend::Bindings& starting_binding,
     const Shader::Backend::Bindings& expected_end_binding,
     const VideoCommon::PrecacheCfgArtifactKey* scanner_artifact) {
     if (!ClaimCfgTemplateModuleValidation(key, scanner_artifact)) {
@@ -964,13 +983,13 @@ void PipelineCache::ValidateCfgTemplateGraphicsModule(
         if (scanner_artifact) {
             const auto validation_cfg_start = std::chrono::steady_clock::now();
             ShaderPools fresh_pools;
-            Shader::Maxwell::Flow::CFG fresh_cfg{env, fresh_pools.flow_block,
-                                                  cfg_request_address,
-                                                  key.exits_to_dispatcher};
+            Shader::Maxwell::Flow::CFG fresh_cfg{env, fresh_pools.flow_block, cfg_request_address,
+                                                 key.exits_to_dispatcher};
             validation_source = fresh_cfg.MakeTemplate();
             precache_cfg_artifact_validation_cfg_us.fetch_add(
                 static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - validation_cfg_start).count()),
+                                     std::chrono::steady_clock::now() - validation_cfg_start)
+                                     .count()),
                 std::memory_order_relaxed);
         }
         ShaderPools shadow_pools;
@@ -1024,10 +1043,8 @@ void PipelineCache::ValidateCfgTemplateGraphicsModule(
 
 void PipelineCache::ValidateCfgTemplateComputeModule(
     CfgTemplateKey key, Shader::Environment& env,
-    const Shader::Maxwell::Flow::CFG::Template& source,
-    u32 cfg_request_address,
-    const Shader::IR::Program& expected_program,
-    const std::vector<u32>& expected_spirv,
+    const Shader::Maxwell::Flow::CFG::Template& source, u32 cfg_request_address,
+    const Shader::IR::Program& expected_program, const std::vector<u32>& expected_spirv,
     const VideoCommon::PrecacheCfgArtifactKey* scanner_artifact) {
     if (!ClaimCfgTemplateModuleValidation(key, scanner_artifact)) {
         return;
@@ -1038,12 +1055,12 @@ void PipelineCache::ValidateCfgTemplateComputeModule(
         if (scanner_artifact) {
             const auto validation_cfg_start = std::chrono::steady_clock::now();
             ShaderPools fresh_pools;
-            Shader::Maxwell::Flow::CFG fresh_cfg{env, fresh_pools.flow_block,
-                                                  cfg_request_address};
+            Shader::Maxwell::Flow::CFG fresh_cfg{env, fresh_pools.flow_block, cfg_request_address};
             validation_source = fresh_cfg.MakeTemplate();
             precache_cfg_artifact_validation_cfg_us.fetch_add(
                 static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - validation_cfg_start).count()),
+                                     std::chrono::steady_clock::now() - validation_cfg_start)
+                                     .count()),
                 std::memory_order_relaxed);
         }
         ShaderPools shadow_pools;
@@ -1052,7 +1069,8 @@ void PipelineCache::ValidateCfgTemplateComputeModule(
             shadow_pools.inst, shadow_pools.block, env, shadow_cfg, host_info)};
         Shader::Maxwell::FinalizeProgramTemplate(shadow_program, env, host_info);
         const auto shadow_spirv{EmitSPIRV(profile, shadow_program)};
-        if (shadow_spirv == expected_spirv && ProgramMetadataEqual(shadow_program, expected_program)) {
+        if (shadow_spirv == expected_spirv &&
+            ProgramMetadataEqual(shadow_program, expected_program)) {
             ++cfg_template_module_verified;
             ++cfg_template_module_compute_verified;
             if (scanner_artifact) {
@@ -1088,17 +1106,15 @@ void PipelineCache::ValidateCfgTemplateComputeModule(
 
 void PipelineCache::ValidateCfgTemplateMergedVertexModule(
     CfgTemplateKey key, Shader::Environment& vertex_a_env,
-    const Shader::Maxwell::Flow::CFG::Template& vertex_a_source,
-    Shader::Environment& vertex_b_env,
+    const Shader::Maxwell::Flow::CFG::Template& vertex_a_source, Shader::Environment& vertex_b_env,
     const Shader::Maxwell::Flow::CFG::Template& vertex_b_source,
     const Shader::RuntimeInfo& runtime_info, const Shader::IR::Program& expected_program,
-    const std::vector<u32>& expected_spirv,
-    const Shader::Backend::Bindings& starting_binding,
+    const std::vector<u32>& expected_spirv, const Shader::Backend::Bindings& starting_binding,
     const Shader::Backend::Bindings& expected_end_binding,
     const VideoCommon::PrecacheCfgArtifactKey* vertex_a_artifact,
     const VideoCommon::PrecacheCfgArtifactKey* vertex_b_artifact) {
-    if (!ClaimCfgTemplateModuleValidation(
-            key, vertex_a_artifact ? vertex_a_artifact : vertex_b_artifact)) {
+    if (!ClaimCfgTemplateModuleValidation(key, vertex_a_artifact ? vertex_a_artifact
+                                                                 : vertex_b_artifact)) {
         return;
     }
     const auto start = std::chrono::steady_clock::now();
@@ -1110,11 +1126,13 @@ void PipelineCache::ValidateCfgTemplateMergedVertexModule(
             ShaderPools fresh_pools;
             Shader::Maxwell::Flow::CFG fresh_cfg{
                 vertex_a_env, fresh_pools.flow_block,
-                static_cast<u32>(vertex_a_env.StartAddress() + sizeof(Shader::ProgramHeader)), true};
+                static_cast<u32>(vertex_a_env.StartAddress() + sizeof(Shader::ProgramHeader)),
+                true};
             validation_source_a = fresh_cfg.MakeTemplate();
             precache_cfg_artifact_validation_cfg_us.fetch_add(
                 static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - validation_cfg_start).count()),
+                                     std::chrono::steady_clock::now() - validation_cfg_start)
+                                     .count()),
                 std::memory_order_relaxed);
         }
         if (vertex_b_artifact) {
@@ -1122,18 +1140,20 @@ void PipelineCache::ValidateCfgTemplateMergedVertexModule(
             ShaderPools fresh_pools;
             Shader::Maxwell::Flow::CFG fresh_cfg{
                 vertex_b_env, fresh_pools.flow_block,
-                static_cast<u32>(vertex_b_env.StartAddress() + sizeof(Shader::ProgramHeader)), false};
+                static_cast<u32>(vertex_b_env.StartAddress() + sizeof(Shader::ProgramHeader)),
+                false};
             validation_source_b = fresh_cfg.MakeTemplate();
             precache_cfg_artifact_validation_cfg_us.fetch_add(
                 static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - validation_cfg_start).count()),
+                                     std::chrono::steady_clock::now() - validation_cfg_start)
+                                     .count()),
                 std::memory_order_relaxed);
         }
         ShaderPools shadow_pools;
         Shader::Maxwell::Flow::CFG shadow_cfg_a{vertex_a_env, shadow_pools.flow_block,
-                                                 validation_source_a};
+                                                validation_source_a};
         Shader::Maxwell::Flow::CFG shadow_cfg_b{vertex_b_env, shadow_pools.flow_block,
-                                                 validation_source_b};
+                                                validation_source_b};
         auto shadow_vertex_a{Shader::Maxwell::BuildProgramTemplate(
             shadow_pools.inst, shadow_pools.block, vertex_a_env, shadow_cfg_a, host_info)};
         auto shadow_vertex_b{Shader::Maxwell::BuildProgramTemplate(
@@ -1157,8 +1177,10 @@ void PipelineCache::ValidateCfgTemplateMergedVertexModule(
             ++cfg_template_module_rejected;
             if (vertex_a_artifact || vertex_b_artifact) {
                 ++precache_cfg_artifact_module_rejected;
-                if (vertex_a_artifact) QuarantinePrecacheCfgArtifact(*vertex_a_artifact);
-                if (vertex_b_artifact) QuarantinePrecacheCfgArtifact(*vertex_b_artifact);
+                if (vertex_a_artifact)
+                    QuarantinePrecacheCfgArtifact(*vertex_a_artifact);
+                if (vertex_b_artifact)
+                    QuarantinePrecacheCfgArtifact(*vertex_b_artifact);
             }
             RejectCfgTemplateModule(key);
             LOG_WARNING(Render_Vulkan,
@@ -1172,8 +1194,10 @@ void PipelineCache::ValidateCfgTemplateMergedVertexModule(
         ++cfg_template_module_rejected;
         if (vertex_a_artifact || vertex_b_artifact) {
             ++precache_cfg_artifact_module_rejected;
-            if (vertex_a_artifact) QuarantinePrecacheCfgArtifact(*vertex_a_artifact);
-            if (vertex_b_artifact) QuarantinePrecacheCfgArtifact(*vertex_b_artifact);
+            if (vertex_a_artifact)
+                QuarantinePrecacheCfgArtifact(*vertex_a_artifact);
+            if (vertex_b_artifact)
+                QuarantinePrecacheCfgArtifact(*vertex_b_artifact);
         }
         RejectCfgTemplateModule(key);
         LOG_WARNING(Render_Vulkan, "CFG template merged-vertex shadow threw for 0x{:016x}",
@@ -1271,15 +1295,19 @@ void PipelineCache::LoadCfgTemplates(const std::filesystem::path& path) {
                 file.read(reinterpret_cast<char*>(&function_call), sizeof(function_call));
                 file.read(reinterpret_cast<char*>(&return_block), sizeof(return_block));
                 file.read(reinterpret_cast<char*>(&branch_reg), sizeof(branch_reg));
-                file.read(reinterpret_cast<char*>(&block.branch_offset), sizeof(block.branch_offset));
+                file.read(reinterpret_cast<char*>(&block.branch_offset),
+                          sizeof(block.branch_offset));
                 file.read(reinterpret_cast<char*>(&stack_count), sizeof(stack_count));
-                if (end_class > static_cast<u8>(Shader::Maxwell::Flow::EndClass::Kill) || negated > 1 ||
-                    stack_count > MAX_CFG_TEMPLATE_STACK_ENTRIES || function_call >= function_count) {
+                if (end_class > static_cast<u8>(Shader::Maxwell::Flow::EndClass::Kill) ||
+                    negated > 1 || stack_count > MAX_CFG_TEMPLATE_STACK_ENTRIES ||
+                    function_call >= function_count) {
                     throw std::ios_base::failure{"invalid CFG template block"};
                 }
                 const auto decode_id = [block_count](u32 id) -> size_t {
-                    if (id == std::numeric_limits<u32>::max()) return Shader::Maxwell::Flow::CFG::NoTemplateBlock;
-                    if (id >= block_count) throw std::ios_base::failure{"invalid CFG block reference"};
+                    if (id == std::numeric_limits<u32>::max())
+                        return Shader::Maxwell::Flow::CFG::NoTemplateBlock;
+                    if (id >= block_count)
+                        throw std::ios_base::failure{"invalid CFG block reference"};
                     return id;
                 };
                 if (!Shader::Maxwell::Location::IsRawOffset(begin) ||
@@ -1289,8 +1317,9 @@ void PipelineCache::LoadCfgTemplates(const std::filesystem::path& path) {
                 block.begin = Shader::Maxwell::Location::FromRawOffset(begin);
                 block.end = Shader::Maxwell::Location::FromRawOffset(end);
                 block.end_class = static_cast<Shader::Maxwell::Flow::EndClass>(end_class);
-                block.cond = Shader::IR::Condition{static_cast<Shader::IR::FlowTest>(flow_test),
-                                                    static_cast<Shader::IR::Pred>(pred), negated != 0};
+                block.cond =
+                    Shader::IR::Condition{static_cast<Shader::IR::FlowTest>(flow_test),
+                                          static_cast<Shader::IR::Pred>(pred), negated != 0};
                 block.branch_true = decode_id(branch_true);
                 block.branch_false = decode_id(branch_false);
                 block.function_call = function_call;
@@ -1364,7 +1393,8 @@ void PipelineCache::SaveCfgTemplates(const std::filesystem::path& path) const {
         return std::tie(lhs_key.unique_hash, lhs_key.start_address, lhs_key.exits_to_dispatcher) <
                std::tie(rhs_key.unique_hash, rhs_key.start_address, rhs_key.exits_to_dispatcher);
     });
-    if (snapshot.empty()) return;
+    if (snapshot.empty())
+        return;
     const auto tmp_path = path.parent_path() / (path.filename().string() + ".tmp");
     try {
         std::ofstream file(tmp_path, std::ios::binary | std::ios::trunc);
@@ -1373,7 +1403,9 @@ void PipelineCache::SaveCfgTemplates(const std::filesystem::path& path) const {
         file.write(CFG_TEMPLATE_CACHE_MAGIC.data(), CFG_TEMPLATE_CACHE_MAGIC.size());
         file.write(reinterpret_cast<const char*>(&CFG_TEMPLATE_CACHE_VERSION), sizeof(u32));
         file.write(reinterpret_cast<const char*>(&count), sizeof(count));
-        const auto write_u32 = [&file](u32 value) { file.write(reinterpret_cast<const char*>(&value), sizeof(value)); };
+        const auto write_u32 = [&file](u32 value) {
+            file.write(reinterpret_cast<const char*>(&value), sizeof(value));
+        };
         for (const auto& [key, source] : snapshot) {
             file.write(reinterpret_cast<const char*>(&key.unique_hash), sizeof(key.unique_hash));
             write_u32(key.start_address);
@@ -1384,11 +1416,17 @@ void PipelineCache::SaveCfgTemplates(const std::filesystem::path& path) const {
             for (const auto& function : source.functions) {
                 write_u32(function.entrypoint.Offset());
                 write_u32(static_cast<u32>(function.blocks.size()));
-                for (const size_t id : function.blocks) write_u32(static_cast<u32>(id));
+                for (const size_t id : function.blocks)
+                    write_u32(static_cast<u32>(id));
             }
-            const auto encode_id = [](size_t id) { return id == Shader::Maxwell::Flow::CFG::NoTemplateBlock ? std::numeric_limits<u32>::max() : static_cast<u32>(id); };
+            const auto encode_id = [](size_t id) {
+                return id == Shader::Maxwell::Flow::CFG::NoTemplateBlock
+                           ? std::numeric_limits<u32>::max()
+                           : static_cast<u32>(id);
+            };
             for (const auto& block : source.blocks) {
-                write_u32(block.begin.Offset()); write_u32(block.end.Offset());
+                write_u32(block.begin.Offset());
+                write_u32(block.end.Offset());
                 const u8 end_class = static_cast<u8>(block.end_class);
                 const auto [pred, negated] = block.cond.GetPred();
                 const u16 flow_test = static_cast<u16>(block.cond.GetFlowTest());
@@ -1397,26 +1435,34 @@ void PipelineCache::SaveCfgTemplates(const std::filesystem::path& path) const {
                 file.write(reinterpret_cast<const char*>(&flow_test), sizeof(flow_test));
                 file.write(reinterpret_cast<const char*>(&pred_value), sizeof(pred_value));
                 file.write(reinterpret_cast<const char*>(&negated_value), sizeof(negated_value));
-                write_u32(encode_id(block.branch_true)); write_u32(encode_id(block.branch_false));
-                write_u32(static_cast<u32>(block.function_call)); write_u32(encode_id(block.return_block));
+                write_u32(encode_id(block.branch_true));
+                write_u32(encode_id(block.branch_false));
+                write_u32(static_cast<u32>(block.function_call));
+                write_u32(encode_id(block.return_block));
                 const u64 branch_reg = static_cast<u64>(block.branch_reg);
                 file.write(reinterpret_cast<const char*>(&branch_reg), sizeof(branch_reg));
-                file.write(reinterpret_cast<const char*>(&block.branch_offset), sizeof(block.branch_offset));
+                file.write(reinterpret_cast<const char*>(&block.branch_offset),
+                           sizeof(block.branch_offset));
                 const auto& stack = block.stack.Entries();
                 const u32 stack_count = static_cast<u32>(stack.size());
                 file.write(reinterpret_cast<const char*>(&stack_count), sizeof(stack_count));
                 for (const auto& entry : stack) {
                     const u8 token = static_cast<u8>(entry.token);
-                    file.write(reinterpret_cast<const char*>(&token), sizeof(token)); write_u32(entry.target.Offset());
+                    file.write(reinterpret_cast<const char*>(&token), sizeof(token));
+                    write_u32(entry.target.Offset());
                 }
                 write_u32(static_cast<u32>(block.indirect_branches.size()));
-                for (const auto& [target, address] : block.indirect_branches) { write_u32(encode_id(target)); write_u32(address); }
+                for (const auto& [target, address] : block.indirect_branches) {
+                    write_u32(encode_id(target));
+                    write_u32(address);
+                }
             }
         }
         file.close();
     } catch (...) {
         LOG_WARNING(Render_Vulkan, "Failed to save CFG templates");
-        std::error_code ignored; std::filesystem::remove(tmp_path, ignored);
+        std::error_code ignored;
+        std::filesystem::remove(tmp_path, ignored);
         return;
     }
     std::error_code ec;
@@ -1438,7 +1484,8 @@ void PipelineCache::LoadPrecacheCfgArtifactCache(const std::filesystem::path& pa
     validated.reserve(loaded->size());
     for (auto& artifact : *loaded) {
         const auto stage = artifact.key.stage;
-        if (!artifact.IsValid() || !validated.try_emplace(artifact.key, std::move(artifact)).second) {
+        if (!artifact.IsValid() ||
+            !validated.try_emplace(artifact.key, std::move(artifact)).second) {
             LOG_WARNING(Render_Vulkan, "Discarding invalid scanner CFG artifact cache");
             return;
         }
@@ -1453,14 +1500,15 @@ void PipelineCache::LoadPrecacheCfgArtifactCache(const std::filesystem::path& pa
     precache_cfg_artifact_loaded.store(loaded->size(), std::memory_order_relaxed);
     for (size_t index = 0; index < stage_counts.size(); ++index) {
         precache_cfg_artifact_loaded_stages[index].store(stage_counts[index],
-                                                          std::memory_order_relaxed);
+                                                         std::memory_order_relaxed);
     }
     LOG_INFO(Render_Vulkan, "Loaded {} scanner CFG artifacts", loaded->size());
 }
 
 void PipelineCache::LoadPrecacheFrontendArtifactCache(const std::filesystem::path& path) {
     auto loaded = VideoCommon::LoadPrecacheFrontendArtifacts(path);
-    if (!loaded) return;
+    if (!loaded)
+        return;
     decltype(precache_frontend_artifacts) validated;
     validated.reserve(loaded->size());
     for (auto& record : *loaded) {
@@ -1480,8 +1528,7 @@ void PipelineCache::LoadPrecacheFrontendArtifactCache(const std::filesystem::pat
     LOG_INFO(Render_Vulkan, "Loaded {} scanner frontend artifacts", loaded->size());
 }
 
-std::optional<VideoCommon::PrecacheFrontendArtifact>
-PipelineCache::LookupPrecacheFrontendArtifact(
+std::optional<VideoCommon::PrecacheFrontendArtifact> PipelineCache::LookupPrecacheFrontendArtifact(
     const VideoCommon::PrecacheFrontendArtifactKey& key) const {
     precache_frontend_artifact_lookups.fetch_add(1, std::memory_order_relaxed);
     try {
@@ -1509,7 +1556,8 @@ void PipelineCache::QuarantinePrecacheFrontendArtifact(
         std::unique_lock lock{precache_frontend_artifacts_mutex};
         if (precache_frontend_artifact_quarantine.insert(key).second) {
             precache_frontend_artifact_quarantined.fetch_add(1, std::memory_order_relaxed);
-            LOG_WARNING(Render_Vulkan, "Quarantined scanner frontend replay artifact for this session");
+            LOG_WARNING(Render_Vulkan,
+                        "Quarantined scanner frontend replay artifact for this session");
         }
     } catch (...) {
     }
@@ -1527,10 +1575,9 @@ void PipelineCache::QuarantinePrecacheCfgArtifact(
     }
 }
 
-std::optional<PipelineCache::PrecacheCfgReplay>
-PipelineCache::LookupPrecacheCfgArtifact(u64 program_identity, Shader::Stage stage,
-                                         u32 cfg_request_address,
-                                         bool exits_to_dispatcher) const {
+std::optional<PipelineCache::PrecacheCfgReplay> PipelineCache::LookupPrecacheCfgArtifact(
+    u64 program_identity, Shader::Stage stage, u32 cfg_request_address,
+    bool exits_to_dispatcher) const {
     try {
         const Shader::Maxwell::Location entry{cfg_request_address};
         const auto key = VideoCommon::MakePrecacheCfgArtifactKey(
@@ -1556,8 +1603,9 @@ PipelineCache::LookupPrecacheCfgArtifact(u64 program_identity, Shader::Stage sta
         auto rebased = artifact.RebaseFor(program_identity, stage, entry, exits_to_dispatcher);
         if (rebased) {
             auto decoded_instructions{artifact.decoded_instructions};
-            const s64 relocation = static_cast<s64>(entry.Offset()) -
-                                   static_cast<s64>(artifact.cfg.functions.front().entrypoint.Offset());
+            const s64 relocation =
+                static_cast<s64>(entry.Offset()) -
+                static_cast<s64>(artifact.cfg.functions.front().entrypoint.Offset());
             for (auto& instruction : decoded_instructions) {
                 const s64 relocated = static_cast<s64>(instruction.location) + relocation;
                 if (relocated < 0 || relocated > std::numeric_limits<u32>::max()) {
@@ -1567,8 +1615,7 @@ PipelineCache::LookupPrecacheCfgArtifact(u64 program_identity, Shader::Stage sta
                 }
                 instruction.location = static_cast<u32>(relocated);
             }
-            if (!VideoCommon::PredecodedInstructionsMatchTemplate(*rebased,
-                                                                    decoded_instructions)) {
+            if (!VideoCommon::PredecodedInstructionsMatchTemplate(*rebased, decoded_instructions)) {
                 ++precache_cfg_artifact_replay_fallbacks;
                 QuarantinePrecacheCfgArtifact(*key);
                 return std::nullopt;
@@ -1613,7 +1660,8 @@ void PipelineCache::ShadowValidatePrecacheCfgArtifact(
     {
         std::shared_lock lock{precache_cfg_artifacts_mutex};
         const auto it = precache_cfg_artifacts.find(*key);
-        if (it == precache_cfg_artifacts.end()) return;
+        if (it == precache_cfg_artifacts.end())
+            return;
         artifact = it->second;
     }
     precache_cfg_artifact_lookups.fetch_add(1, std::memory_order_relaxed);
@@ -1641,9 +1689,9 @@ void PipelineCache::RecordShaderCompilerWork(std::chrono::microseconds cfg_time,
                                              bool exact_module_hit) const {
     shader_cfg_us.fetch_add(static_cast<u64>(cfg_time.count()), std::memory_order_relaxed);
     shader_template_us.fetch_add(static_cast<u64>(template_time.count()),
-                                  std::memory_order_relaxed);
+                                 std::memory_order_relaxed);
     shader_finalize_us.fetch_add(static_cast<u64>(finalize_time.count()),
-                                  std::memory_order_relaxed);
+                                 std::memory_order_relaxed);
     shader_emit_us.fetch_add(static_cast<u64>(emit_time.count()), std::memory_order_relaxed);
     shader_stage_count.fetch_add(1, std::memory_order_relaxed);
     if (exact_module_hit) {
@@ -1657,7 +1705,8 @@ void PipelineCache::RecordShaderCompilerWork(std::chrono::microseconds cfg_time,
     }
     shader_compiler_stats_last_log = now;
     LOG_INFO(Render_Vulkan,
-             "Shader compiler work: stages={} exact-module-hits={} compute-prefrontend(disk-hits/live-candidates/live-hits)={}/{}/{} cfg-template "
+             "Shader compiler work: stages={} exact-module-hits={} "
+             "compute-prefrontend(disk-hits/live-candidates/live-hits)={}/{}/{} cfg-template "
              "(learned/hits)={}/{} shadow-roundtrip(ok/rejected)={}/{} "
              "cached-form(ok/rejected)={}/{} module-shadow(ok/rejected/ms)={}/{}/{} "
              "module-kind(graphics/compute/merged)={}/{}/{} "
@@ -1667,7 +1716,9 @@ void PipelineCache::RecordShaderCompilerWork(std::chrono::microseconds cfg_time,
              "scanner-cfg-replay(attempts/hits/fallbacks)={}/{}/{} "
              "scanner-predecoded(hits/instructions)={}/{} "
              "scanner-cfg-replay-quarantined={} "
-             "scanner-frontend(full graphics loaded/pipeline-candidates/full-hits/lookups/found/stages-restored/restore-failures/fallbacks/quarantined/restore-ms)={}/{}/{}/{}/{}/{}/{}/{}/{}/{} "
+             "scanner-frontend(full graphics "
+             "loaded/pipeline-candidates/full-hits/lookups/found/stages-restored/restore-failures/"
+             "fallbacks/quarantined/restore-ms)={}/{}/{}/{}/{}/{}/{}/{}/{}/{} "
              "scanner-frontend-nonlive-skipped={} "
              "scanner-frontend-shadow(stages-ok/pipelines-rejected/ms)={}/{}/{} "
              "scanner-cfg-cfg-ms(replay/fresh-fallback/fresh-reference)={}/{}/{} "
@@ -1768,6 +1819,95 @@ void PipelineCache::RecordShaderCompilerWork(std::chrono::microseconds cfg_time,
              compute_pipeline_wait_count.load(std::memory_order_relaxed),
              compute_pipeline_wait_us.load(std::memory_order_relaxed) / 1000,
              compute_pipeline_wait_max_us.load(std::memory_order_relaxed) / 1000);
+    size_t recipe_bytes{};
+    size_t recipe_variants{};
+    {
+        std::scoped_lock recipe_lock{graphics_recipe_spirv_mutex};
+        recipe_bytes = graphics_recipe_spirv_bytes;
+        recipe_variants = graphics_recipe_spirv_variants;
+    }
+    LOG_INFO(Render_Vulkan,
+             "GPL recipe capture: enabled={} final-SPIR-V(intern-hits/inserts/capacity-rejects)="
+             "{}/{}/{} owned(variants/bytes)={}/{} libraries(hits/misses/inflight/failures/"
+             "capacity-rejects)={}/{}/{}/{}/{} by-kind(VI hits/misses, shaders hits/misses, "
+             "FO hits/misses)={}/{}/{}/{}/{}/{} ineligible(recipe/stage-shape/xfb)={}/{}/{}",
+             ShouldCaptureGraphicsPipelineRecipe(),
+             graphics_recipe_spirv_hits.load(std::memory_order_relaxed),
+             graphics_recipe_spirv_inserts.load(std::memory_order_relaxed),
+             graphics_recipe_spirv_capacity_rejects.load(std::memory_order_relaxed),
+             recipe_variants, recipe_bytes, graphics_library_hits.load(std::memory_order_relaxed),
+             graphics_library_misses.load(std::memory_order_relaxed),
+             graphics_library_inflight_waits.load(std::memory_order_relaxed),
+             graphics_library_failures.load(std::memory_order_relaxed),
+             graphics_library_capacity_rejects.load(std::memory_order_relaxed),
+             graphics_library_hits_by_kind[0].load(std::memory_order_relaxed),
+             graphics_library_misses_by_kind[0].load(std::memory_order_relaxed),
+             graphics_library_hits_by_kind[1].load(std::memory_order_relaxed),
+             graphics_library_misses_by_kind[1].load(std::memory_order_relaxed),
+             graphics_library_hits_by_kind[2].load(std::memory_order_relaxed),
+             graphics_library_misses_by_kind[2].load(std::memory_order_relaxed),
+             graphics_gpl_ineligible_missing_recipe.load(std::memory_order_relaxed),
+             graphics_gpl_ineligible_stage_shape.load(std::memory_order_relaxed),
+             graphics_gpl_ineligible_xfb.load(std::memory_order_relaxed));
+    LOG_INFO(Render_Vulkan,
+             "GPL driver create(VI/shaders/FO/link count/ms/max-ms)={}/{}/{} {}/{}/{} {}/{}/{} "
+             "{}/{}/{}",
+             graphics_gpl_driver_create_count[0].load(std::memory_order_relaxed),
+             graphics_gpl_driver_create_us[0].load(std::memory_order_relaxed) / 1000,
+             graphics_gpl_driver_create_max_us[0].load(std::memory_order_relaxed) / 1000,
+             graphics_gpl_driver_create_count[1].load(std::memory_order_relaxed),
+             graphics_gpl_driver_create_us[1].load(std::memory_order_relaxed) / 1000,
+             graphics_gpl_driver_create_max_us[1].load(std::memory_order_relaxed) / 1000,
+             graphics_gpl_driver_create_count[2].load(std::memory_order_relaxed),
+             graphics_gpl_driver_create_us[2].load(std::memory_order_relaxed) / 1000,
+             graphics_gpl_driver_create_max_us[2].load(std::memory_order_relaxed) / 1000,
+             graphics_gpl_driver_create_count[3].load(std::memory_order_relaxed),
+             graphics_gpl_driver_create_us[3].load(std::memory_order_relaxed) / 1000,
+             graphics_gpl_driver_create_max_us[3].load(std::memory_order_relaxed) / 1000);
+    LOG_INFO(Render_Vulkan,
+             "Graphics disable-optimization experiment: enabled={} driver boot(count/ms/max)={}/{}/{} "
+             "live={}/{}/{}",
+             ShouldUseGraphicsPipelineDisableOptimization(),
+             graphics_disable_optimization_driver_count[0].load(std::memory_order_relaxed),
+             graphics_disable_optimization_driver_us[0].load(std::memory_order_relaxed) / 1000,
+             graphics_disable_optimization_driver_max_us[0].load(std::memory_order_relaxed) / 1000,
+             graphics_disable_optimization_driver_count[1].load(std::memory_order_relaxed),
+             graphics_disable_optimization_driver_us[1].load(std::memory_order_relaxed) / 1000,
+             graphics_disable_optimization_driver_max_us[1].load(std::memory_order_relaxed) / 1000);
+    LOG_INFO(Render_Vulkan,
+             "Graphics C2 optimized rebuild: queued/published/failed/capacity-rejects={}/{}/{}/{} "
+             "driver(count/ms/max)={}/{}/{} pending={}",
+             graphics_optimization_queued.load(std::memory_order_relaxed),
+             graphics_optimization_published.load(std::memory_order_relaxed),
+             graphics_optimization_failures.load(std::memory_order_relaxed),
+             graphics_optimization_capacity_rejects.load(std::memory_order_relaxed),
+             graphics_optimization_driver_count.load(std::memory_order_relaxed),
+             graphics_optimization_driver_us.load(std::memory_order_relaxed) / 1000,
+             graphics_optimization_driver_max_us.load(std::memory_order_relaxed) / 1000,
+             graphics_optimization_pending.load(std::memory_order_relaxed));
+    LOG_INFO(Render_Vulkan,
+             "Graphics B1 YDirection: runtime push uploads(+/-)={}/{} (exact captured origin "
+             "values; no specialization/pipeline variant)",
+             graphics_y_direction_push_positive.load(std::memory_order_relaxed),
+             graphics_y_direction_push_negative.load(std::memory_order_relaxed));
+    LOG_INFO(Render_Vulkan,
+             "Graphics D0 first-draw lead: ready(count/total/max/avg-ms)={}/{}/{}/{} "
+             "waited(count/total/max/avg-ms)={}/{}/{}/{} "
+             "(exact request to first recorded draw; diagnostic only)",
+             graphics_first_draw_lead_count[0].load(std::memory_order_relaxed),
+             graphics_first_draw_lead_us[0].load(std::memory_order_relaxed) / 1000,
+             graphics_first_draw_lead_max_us[0].load(std::memory_order_relaxed) / 1000,
+             graphics_first_draw_lead_count[0].load(std::memory_order_relaxed) == 0
+                 ? 0
+                 : graphics_first_draw_lead_us[0].load(std::memory_order_relaxed) / 1000 /
+                       graphics_first_draw_lead_count[0].load(std::memory_order_relaxed),
+             graphics_first_draw_lead_count[1].load(std::memory_order_relaxed),
+             graphics_first_draw_lead_us[1].load(std::memory_order_relaxed) / 1000,
+             graphics_first_draw_lead_max_us[1].load(std::memory_order_relaxed) / 1000,
+             graphics_first_draw_lead_count[1].load(std::memory_order_relaxed) == 0
+                 ? 0
+                 : graphics_first_draw_lead_us[1].load(std::memory_order_relaxed) / 1000 /
+                       graphics_first_draw_lead_count[1].load(std::memory_order_relaxed));
     LOG_INFO(Render_Vulkan,
              "Pipeline actual timing: G-driver boot(count/ms/max)={}/{}/{} live={}/{}/{} "
              "G-wait boot(count/ms/max)={}/{}/{} live={}/{}/{} "
@@ -1836,10 +1976,10 @@ void PipelineCache::RecordPipelineDriverCreate(bool compute, bool boot_preload,
                                                  : compute_pipeline_driver_live_count)
                                  : (boot_preload ? graphics_pipeline_driver_boot_count
                                                  : graphics_pipeline_driver_live_count);
-    auto& origin_total = compute ? (boot_preload ? compute_pipeline_driver_boot_us
-                                                 : compute_pipeline_driver_live_us)
-                                 : (boot_preload ? graphics_pipeline_driver_boot_us
-                                                 : graphics_pipeline_driver_live_us);
+    auto& origin_total =
+        compute
+            ? (boot_preload ? compute_pipeline_driver_boot_us : compute_pipeline_driver_live_us)
+            : (boot_preload ? graphics_pipeline_driver_boot_us : graphics_pipeline_driver_live_us);
     auto& origin_maximum = compute ? (boot_preload ? compute_pipeline_driver_boot_max_us
                                                    : compute_pipeline_driver_live_max_us)
                                    : (boot_preload ? graphics_pipeline_driver_boot_max_us
@@ -1861,6 +2001,22 @@ void PipelineCache::RecordPipelineDriverCreate(bool compute, bool boot_preload,
     }
 }
 
+void PipelineCache::RecordGraphicsGplDriverCreate(u8 part,
+                                                  std::chrono::microseconds duration) const {
+    ASSERT(part < graphics_gpl_driver_create_count.size());
+    const u64 elapsed{static_cast<u64>(duration.count())};
+    auto& count = graphics_gpl_driver_create_count[part];
+    auto& total = graphics_gpl_driver_create_us[part];
+    auto& maximum = graphics_gpl_driver_create_max_us[part];
+    count.fetch_add(1, std::memory_order_relaxed);
+    total.fetch_add(elapsed, std::memory_order_relaxed);
+    u64 observed{maximum.load(std::memory_order_relaxed)};
+    while (observed < elapsed &&
+           !maximum.compare_exchange_weak(observed, elapsed, std::memory_order_relaxed,
+                                          std::memory_order_relaxed)) {
+    }
+}
+
 void PipelineCache::RecordPipelineBuildWait(bool compute, bool boot_preload,
                                             std::chrono::microseconds duration) const {
     auto& count = compute ? compute_pipeline_wait_count : graphics_pipeline_wait_count;
@@ -1870,10 +2026,9 @@ void PipelineCache::RecordPipelineBuildWait(bool compute, bool boot_preload,
                                                  : compute_pipeline_wait_live_count)
                                  : (boot_preload ? graphics_pipeline_wait_boot_count
                                                  : graphics_pipeline_wait_live_count);
-    auto& origin_total = compute ? (boot_preload ? compute_pipeline_wait_boot_us
-                                                 : compute_pipeline_wait_live_us)
-                                 : (boot_preload ? graphics_pipeline_wait_boot_us
-                                                 : graphics_pipeline_wait_live_us);
+    auto& origin_total =
+        compute ? (boot_preload ? compute_pipeline_wait_boot_us : compute_pipeline_wait_live_us)
+                : (boot_preload ? graphics_pipeline_wait_boot_us : graphics_pipeline_wait_live_us);
     auto& origin_maximum = compute ? (boot_preload ? compute_pipeline_wait_boot_max_us
                                                    : compute_pipeline_wait_live_max_us)
                                    : (boot_preload ? graphics_pipeline_wait_boot_max_us
@@ -1895,10 +2050,366 @@ void PipelineCache::RecordPipelineBuildWait(bool compute, bool boot_preload,
     }
 }
 
+void PipelineCache::RecordGraphicsGplIneligible(bool complete_recipe, bool supported_stage_shape,
+                                                bool transform_feedback) const noexcept {
+    if (!complete_recipe)
+        graphics_gpl_ineligible_missing_recipe.fetch_add(1, std::memory_order_relaxed);
+    if (!supported_stage_shape)
+        graphics_gpl_ineligible_stage_shape.fetch_add(1, std::memory_order_relaxed);
+    if (transform_feedback)
+        graphics_gpl_ineligible_xfb.fetch_add(1, std::memory_order_relaxed);
+}
+
+void PipelineCache::RecordGraphicsDisableOptimizationDriverCreate(
+    bool boot_preload, std::chrono::microseconds duration) const {
+    const u64 elapsed{static_cast<u64>(duration.count())};
+    const size_t origin{boot_preload ? 0 : 1};
+    graphics_disable_optimization_driver_count[origin].fetch_add(1, std::memory_order_relaxed);
+    graphics_disable_optimization_driver_us[origin].fetch_add(elapsed, std::memory_order_relaxed);
+    auto& maximum = graphics_disable_optimization_driver_max_us[origin];
+    u64 observed{maximum.load(std::memory_order_relaxed)};
+    while (observed < elapsed &&
+           !maximum.compare_exchange_weak(observed, elapsed, std::memory_order_relaxed,
+                                          std::memory_order_relaxed)) {
+    }
+}
+
+void PipelineCache::RecordGraphicsOptimizationDriverCreate(
+    std::chrono::microseconds duration) const {
+    const u64 elapsed{static_cast<u64>(duration.count())};
+    graphics_optimization_driver_count.fetch_add(1, std::memory_order_relaxed);
+    graphics_optimization_driver_us.fetch_add(elapsed, std::memory_order_relaxed);
+    auto& maximum = graphics_optimization_driver_max_us;
+    u64 observed{maximum.load(std::memory_order_relaxed)};
+    while (observed < elapsed &&
+           !maximum.compare_exchange_weak(observed, elapsed, std::memory_order_relaxed,
+                                          std::memory_order_relaxed)) {
+    }
+}
+
+void PipelineCache::RecordGraphicsOptimizationPublished() const {
+    graphics_optimization_published.fetch_add(1, std::memory_order_relaxed);
+}
+
+void PipelineCache::RecordGraphicsOptimizationFailure() const {
+    graphics_optimization_failures.fetch_add(1, std::memory_order_relaxed);
+}
+
+void PipelineCache::RecordGraphicsYDirectionPush(bool negative) const noexcept {
+    auto& count = negative ? graphics_y_direction_push_negative : graphics_y_direction_push_positive;
+    count.fetch_add(1, std::memory_order_relaxed);
+}
+
+void PipelineCache::RecordGraphicsFirstDrawLead(bool ready_before_first_draw,
+                                                std::chrono::microseconds duration) const noexcept {
+    const size_t index{ready_before_first_draw ? 0 : 1};
+    const u64 elapsed{static_cast<u64>(duration.count())};
+    graphics_first_draw_lead_count[index].fetch_add(1, std::memory_order_relaxed);
+    graphics_first_draw_lead_us[index].fetch_add(elapsed, std::memory_order_relaxed);
+    auto& maximum = graphics_first_draw_lead_max_us[index];
+    u64 observed{maximum.load(std::memory_order_relaxed)};
+    while (observed < elapsed &&
+           !maximum.compare_exchange_weak(observed, elapsed, std::memory_order_relaxed,
+                                          std::memory_order_relaxed)) {
+    }
+}
+
+
+bool PipelineCache::IsShuttingDown() const noexcept {
+    return shutting_down.load(std::memory_order_acquire);
+}
+
+bool PipelineCache::QueueGraphicsPipelineOptimization(GraphicsPipeline& pipeline) {
+    if (!ShouldUseGraphicsPipelineOptimization()) {
+        return false;
+    }
+    if (IsShuttingDown()) {
+        return false;
+    }
+    u32 admitted{graphics_optimization_admitted.load(std::memory_order_relaxed)};
+    while (admitted < GRAPHICS_OPTIMIZATION_MAX_ADMITTED &&
+           !graphics_optimization_admitted.compare_exchange_weak(
+               admitted, admitted + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+    }
+    if (admitted >= GRAPHICS_OPTIMIZATION_MAX_ADMITTED) {
+        graphics_optimization_capacity_rejects.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    u32 pending{graphics_optimization_pending.load(std::memory_order_relaxed)};
+    while (pending < GRAPHICS_OPTIMIZATION_MAX_PENDING &&
+           !graphics_optimization_pending.compare_exchange_weak(
+               pending, pending + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+    }
+    if (pending >= GRAPHICS_OPTIMIZATION_MAX_PENDING) {
+        graphics_optimization_admitted.fetch_sub(1, std::memory_order_release);
+        graphics_optimization_capacity_rejects.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    graphics_optimization_queued.fetch_add(1, std::memory_order_relaxed);
+    optimization_workers.QueueWork([this, &pipeline] {
+        if (!IsShuttingDown()) {
+            pipeline.BuildOptimizedPipeline();
+        }
+        graphics_optimization_pending.fetch_sub(1, std::memory_order_release);
+    });
+    return true;
+}
+
+bool PipelineCache::ShouldCaptureGraphicsPipelineRecipe() const noexcept {
+    return false;
+}
+
+bool PipelineCache::ShouldUseGraphicsPipelineDisableOptimization() const noexcept {
+    return Settings::values.graphics_pipeline_disable_optimization_experiment.GetValue();
+}
+
+bool PipelineCache::ShouldUseGraphicsPipelineOptimization() const noexcept {
+    // C2 measured worse in extended gameplay. No setting may re-enable it accidentally.
+    return false;
+}
+
+std::shared_ptr<const std::vector<u32>> PipelineCache::InternGraphicsPipelineSpirv(
+    std::vector<u32>&& words) {
+    const u64 hash = words.empty() ? 0
+                                   : Common::CityHash64(reinterpret_cast<const char*>(words.data()),
+                                                        words.size() * sizeof(u32));
+    std::scoped_lock lock{graphics_recipe_spirv_mutex};
+    auto& candidates = graphics_recipe_spirv[hash];
+    for (const auto& candidate : candidates) {
+        if (*candidate == words) {
+            graphics_recipe_spirv_hits.fetch_add(1, std::memory_order_relaxed);
+            return candidate;
+        }
+    }
+    const size_t bytes = words.size() * sizeof(u32);
+    if (graphics_recipe_spirv_variants >= GRAPHICS_RECIPE_MAX_SPIRV_VARIANTS ||
+        bytes > GRAPHICS_RECIPE_MAX_SPIRV_BYTES - graphics_recipe_spirv_bytes) {
+        // Do not leave an empty bucket behind after a rejected first collision.
+        if (candidates.empty()) {
+            graphics_recipe_spirv.erase(hash);
+        }
+        graphics_recipe_spirv_capacity_rejects.fetch_add(1, std::memory_order_relaxed);
+        return {};
+    }
+    auto owned = std::make_shared<const std::vector<u32>>(std::move(words));
+    candidates.push_back(owned);
+    graphics_recipe_spirv_bytes += bytes;
+    ++graphics_recipe_spirv_variants;
+    graphics_recipe_spirv_inserts.fetch_add(1, std::memory_order_relaxed);
+    return owned;
+}
+
+size_t PipelineCache::GraphicsPipelineLibraryKeyHash::operator()(
+    const GraphicsPipelineLibraryKey& key) const noexcept {
+    const u64 words_hash = key.words.empty()
+                               ? 0
+                               : Common::CityHash64(reinterpret_cast<const char*>(key.words.data()),
+                                                    key.words.size() * sizeof(u64));
+    return static_cast<size_t>(words_hash ^ static_cast<u64>(key.kind));
+}
+
+std::optional<VkPipeline> PipelineCache::AcquireGraphicsPipelineLibrary(
+    const GraphicsPipelineLibraryKey& key, const std::function<vk::Pipeline()>& create) {
+    std::shared_ptr<GraphicsPipelineLibraryEntry> entry;
+    bool owner{};
+    {
+        std::scoped_lock lock{graphics_library_mutex};
+        if (const auto it = graphics_library_cache.find(key); it != graphics_library_cache.end()) {
+            entry = it->second;
+        } else {
+            if (graphics_library_cache.size() >= GRAPHICS_LIBRARY_MAX_ENTRIES) {
+                graphics_library_capacity_rejects.fetch_add(1, std::memory_order_relaxed);
+                return std::nullopt;
+            }
+            entry = std::make_shared<GraphicsPipelineLibraryEntry>();
+            graphics_library_cache.emplace(key, entry);
+            owner = true;
+        }
+    }
+    if (!owner) {
+        std::unique_lock lock{entry->mutex};
+        if (entry->state == GraphicsPipelineLibraryEntry::State::Building) {
+            graphics_library_inflight_waits.fetch_add(1, std::memory_order_relaxed);
+            entry->ready.wait(lock, [&] {
+                return entry->state != GraphicsPipelineLibraryEntry::State::Building;
+            });
+        }
+        if (entry->state == GraphicsPipelineLibraryEntry::State::Ready) {
+            graphics_library_hits.fetch_add(1, std::memory_order_relaxed);
+            graphics_library_hits_by_kind[static_cast<size_t>(key.kind)].fetch_add(
+                1, std::memory_order_relaxed);
+            return **entry->pipeline;
+        }
+        return std::nullopt;
+    }
+
+    graphics_library_misses.fetch_add(1, std::memory_order_relaxed);
+    graphics_library_misses_by_kind[static_cast<size_t>(key.kind)].fetch_add(
+        1, std::memory_order_relaxed);
+    try {
+        vk::Pipeline pipeline = create();
+        const VkPipeline raw = *pipeline;
+        {
+            std::scoped_lock lock{entry->mutex};
+            entry->pipeline.emplace(std::move(pipeline));
+            entry->state = GraphicsPipelineLibraryEntry::State::Ready;
+        }
+        entry->ready.notify_all();
+        return raw;
+    } catch (const vk::Exception& exception) {
+        {
+            std::scoped_lock lock{entry->mutex};
+            entry->state = GraphicsPipelineLibraryEntry::State::Failed;
+        }
+        entry->ready.notify_all();
+        graphics_library_failures.fetch_add(1, std::memory_order_relaxed);
+        if (exception.GetResult() == VK_ERROR_DEVICE_LOST ||
+            exception.GetResult() == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+            throw;
+        }
+        return std::nullopt;
+    } catch (...) {
+        {
+            std::scoped_lock lock{entry->mutex};
+            entry->state = GraphicsPipelineLibraryEntry::State::Failed;
+        }
+        entry->ready.notify_all();
+        graphics_library_failures.fetch_add(1, std::memory_order_relaxed);
+        return std::nullopt;
+    }
+}
+
+PipelineCache::GraphicsPipelineLibraryKey PipelineCache::MakeGraphicsPipelineLibraryKey(
+    GraphicsPipelineLibraryKey::Kind kind, const GraphicsPipelineRecipe& recipe) const {
+    GraphicsPipelineLibraryKey result{.kind = kind};
+    auto add = [&](u64 value) { result.words.push_back(value); };
+    const auto& state = recipe.pipeline_key.state;
+
+    // A GPL key identifies one library, not final pipeline. Whole final-key state
+    // here made every library unique: three library creates plus link per pipeline.
+    // Add only scalar recipe fields used by each library's create-info below.
+    const auto add_dynamic_states = [&] {
+        add(recipe.dynamic_states.size());
+        for (const VkDynamicState dynamic_state : recipe.dynamic_states) {
+            add(dynamic_state);
+        }
+    };
+    const auto add_layout = [&] {
+        add(recipe.layout.split_mode);
+        add(recipe.layout.uses_push_descriptor);
+        add(recipe.layout.uniform_set_flags);
+        add(recipe.layout.resource_set_flags);
+        add(recipe.layout.pipeline_layout_flags);
+        add(recipe.layout.push_constant_stages);
+        add(recipe.layout.push_constant_offset);
+        add(recipe.layout.push_constant_size);
+        add(recipe.layout.bindings.size());
+        for (const auto& binding : recipe.layout.bindings) {
+            add(binding.set);
+            add(binding.binding);
+            add(binding.type);
+            add(binding.count);
+            add(binding.stages);
+            add(binding.flags);
+        }
+    };
+    const auto add_render_pass = [&] {
+        add(recipe.render_pass.color_formats.size());
+        for (const auto format : recipe.render_pass.color_formats) {
+            add(static_cast<u64>(format));
+        }
+        add(static_cast<u64>(recipe.render_pass.depth_format));
+        add(static_cast<u64>(recipe.render_pass.samples));
+        add(recipe.subpass);
+    };
+    const auto add_specialization = [&] {
+        add(recipe.pipeline_key.phase4_prototype_needs_array_variant);
+        add(recipe.runtime_specialization.entries.size());
+        for (const auto& entry : recipe.runtime_specialization.entries) {
+            add(entry.constantID);
+            add(entry.offset);
+            add(entry.size);
+        }
+        add(recipe.runtime_specialization.values.size());
+        for (const u32 value : recipe.runtime_specialization.values) {
+            add(value);
+        }
+        for (const bool uses : recipe.runtime_specialization.stage_uses) {
+            add(uses);
+        }
+    };
+
+    switch (kind) {
+    case GraphicsPipelineLibraryKey::Kind::VertexInput:
+        // Dynamic vertex input moves attributes/bindings to command-buffer state.
+        add(static_cast<u64>(state.topology.Value()));
+        add(state.extended_dynamic_state_2.Value());
+        if (!state.extended_dynamic_state_2) {
+            add(state.dynamic_state.primitive_restart_enable.Value());
+        }
+        add(state.dynamic_vertex_input.Value());
+        if (!state.dynamic_vertex_input) {
+            for (const auto attribute : state.attributes) {
+                add(attribute.raw);
+            }
+            for (const u32 divisor : state.binding_divisors) {
+                add(divisor);
+            }
+            for (const u16 stride : state.vertex_strides) {
+                add(stride);
+            }
+        }
+        break;
+
+    case GraphicsPipelineLibraryKey::Kind::CompleteShaderGroup:
+        // Current safe shape combines pre-raster + fragment shader groups.
+        add(state.raw1);
+        add(state.raw2);
+        add(state.dynamic_state.raw1);
+        add(state.dynamic_state.raw2);
+        for (const u16 swizzle : state.viewport_swizzles) {
+            add(swizzle);
+        }
+        add_dynamic_states();
+        add_layout();
+        add_specialization();
+        for (const auto& stage : recipe.final_spirv) {
+            add(stage ? stage->size() : 0);
+            if (stage) {
+                for (const u32 word : *stage) {
+                    add(word);
+                }
+            }
+        }
+        break;
+
+    case GraphicsPipelineLibraryKey::Kind::FragmentOutput:
+        // Dynamic blend/logic values are supplied by commands, not library state.
+        add(static_cast<u64>(state.msaa_mode.Value()));
+        add(state.alpha_to_coverage_enabled.Value());
+        add(state.alpha_to_one_enabled.Value());
+        add(state.extended_dynamic_state_2_extra.Value());
+        if (!state.extended_dynamic_state_2_extra) {
+            add(state.dynamic_state.logic_op.Value());
+            add(state.dynamic_state.logic_op_enable.Value());
+        }
+        add(state.extended_dynamic_state_3_blend.Value());
+        if (!state.extended_dynamic_state_3_blend) {
+            for (const auto attachment : state.attachments) {
+                add(attachment.raw);
+            }
+        }
+        add_dynamic_states();
+        add_render_pass();
+        break;
+    }
+    return result;
+}
+
 // Runtime-state diagnostic — see the header for what it is measuring. Diagnostic only: nothing
 // here changes what gets cached, guessed, or served.
-void PipelineCache::RecordGenericInputTypesCardinalityDiagnostic(u64 unique_hash,
-                                                                   u64 generic_input_types_hash) const {
+void PipelineCache::RecordGenericInputTypesCardinalityDiagnostic(
+    u64 unique_hash, u64 generic_input_types_hash) const {
     constexpr size_t kMaxTrackedVariantsForDiagnostics = 8;
     bool should_log = false;
     {
@@ -1977,17 +2488,17 @@ void PipelineCache::RecordConvertDepthModeDiagnostic(bool convert_depth_mode) co
              "measured -- a real majority true confirms it, a real majority false means it "
              "should flip.",
              total_count, true_count,
-             total_count > 0 ? 100.0 * static_cast<double>(true_count) /
-                                   static_cast<double>(total_count)
-                             : 0.0);
+             total_count > 0
+                 ? 100.0 * static_cast<double>(true_count) / static_cast<double>(total_count)
+                 : 0.0);
 }
 
 // Tessellation-state diagnostic confirms or corrects the
 // defaults, the lowest-confidence guesses in that pass (runtime_info.h's
 // ApplySpeculativeDefaults). Diagnostic only.
 void PipelineCache::RecordTessellationStateDiagnostic(Shader::TessPrimitive primitive,
-                                                        Shader::TessSpacing spacing,
-                                                        bool clockwise) const {
+                                                      Shader::TessSpacing spacing,
+                                                      bool clockwise) const {
     bool should_log = false;
     decltype(phase5_diag_tess_primitive_counts) primitive_counts;
     decltype(phase5_diag_tess_spacing_counts) spacing_counts;
@@ -2024,7 +2535,7 @@ void PipelineCache::RecordTessellationStateDiagnostic(Shader::TessPrimitive prim
              "Triangles); tess_spacing: {} Equal, {} FractionalOdd, {} FractionalEven "
              "(default guess: Equal); tess_clockwise: {} true, {} false (default guess: "
              "false). All three defaults were picked for internal consistency (each enum's "
-            "own value-0 entry), not measured -- the lowest-confidence runtime-state "
+             "own value-0 entry), not measured -- the lowest-confidence runtime-state "
              "preset. Real gameplay data on any of these should replace the guess it "
              "disagrees with.",
              total_count, get(primitive_counts, Shader::TessPrimitive::Isolines),
@@ -2034,6 +2545,66 @@ void PipelineCache::RecordTessellationStateDiagnostic(Shader::TessPrimitive prim
              get(spacing_counts, Shader::TessSpacing::FractionalOdd),
              get(spacing_counts, Shader::TessSpacing::FractionalEven), clockwise_true_count,
              total_count - clockwise_true_count);
+}
+
+void PipelineCache::RecordFixedStateVariantDiagnostic(const GraphicsPipelineCacheKey& key) const {
+    // Compare candidates against a fully semantic base key. Do not substitute a hash-only key:
+    // attribution must remain collision-safe because it drives future state-removal decisions.
+    GraphicsPipelineCacheKey base_key{key};
+    base_key.state.polygon_mode.Assign(0);
+    base_key.state.alpha_to_coverage_enabled.Assign(0);
+    base_key.state.alpha_to_one_enabled.Assign(0);
+    const u8 polygon_bit{static_cast<u8>(1U << key.state.polygon_mode.Value())};
+    const u8 coverage_bit{static_cast<u8>(1U << key.state.alpha_to_coverage_enabled.Value())};
+    const u8 alpha_one_bit{static_cast<u8>(1U << key.state.alpha_to_one_enabled.Value())};
+
+    bool should_log = false;
+    size_t base_key_count = 0;
+    size_t polygon_collapsible = 0;
+    size_t coverage_collapsible = 0;
+    size_t alpha_one_collapsible = 0;
+    u64 capacity_rejects = 0;
+    {
+        std::unique_lock lock{fixed_state_variant_diagnostic_mutex};
+        auto it = fixed_state_variant_diagnostic_by_base_key.find(base_key);
+        if (it == fixed_state_variant_diagnostic_by_base_key.end()) {
+            if (fixed_state_variant_diagnostic_by_base_key.size() ==
+                FIXED_STATE_VARIANT_DIAGNOSTIC_MAX_BASE_KEYS) {
+                ++fixed_state_variant_diagnostic_capacity_rejects;
+            } else {
+                it = fixed_state_variant_diagnostic_by_base_key.emplace(base_key,
+                                                                         FixedStateVariantDiagnostic{}).first;
+            }
+        }
+        if (it != fixed_state_variant_diagnostic_by_base_key.end()) {
+            it->second.polygon_mode_mask |= polygon_bit;
+            it->second.alpha_to_coverage_mask |= coverage_bit;
+            it->second.alpha_to_one_mask |= alpha_one_bit;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now - fixed_state_variant_diagnostic_last_log_time < std::chrono::seconds{30}) {
+            return;
+        }
+        fixed_state_variant_diagnostic_last_log_time = now;
+        base_key_count = fixed_state_variant_diagnostic_by_base_key.size();
+        capacity_rejects = fixed_state_variant_diagnostic_capacity_rejects;
+        for (const auto& [ignored, variants] : fixed_state_variant_diagnostic_by_base_key) {
+            polygon_collapsible += std::popcount(variants.polygon_mode_mask) - 1;
+            coverage_collapsible += std::popcount(variants.alpha_to_coverage_mask) - 1;
+            alpha_one_collapsible += std::popcount(variants.alpha_to_one_mask) - 1;
+        }
+        should_log = true;
+    }
+    if (should_log) {
+        LOG_INFO(Render_Vulkan,
+                 "Fixed-state variant diagnostic: {} exact base families; removable new-pipeline "
+                 "variants if one family alone became dynamic (polygon/alpha-coverage/alpha-one)="
+                 "{}/{}/{}; capacity-rejects={}. Exact base means same shader chain and every "
+                 "other active fixed-state field. Diagnostic only.",
+                 base_key_count, polygon_collapsible, coverage_collapsible, alpha_one_collapsible,
+                 capacity_rejects);
+    }
 }
 
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
@@ -2114,6 +2685,53 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                  precache_compiler_target.gpu_accuracy_mode);
     }
 
+    // This is only the scanner's exact source catalog. Loading validates that
+    // scanner teardown did not discard its owned VertexB+Fragment inputs; no
+    // source entry is treated as a graphics recipe or submitted to Vulkan here.
+    const auto d1_source_catalog_path = base_dir / fmt::format(
+        "precache_d1_sources_{:016x}.bin",
+        VideoCommon::CompilerTargetFingerprint(precache_compiler_target));
+    std::vector<std::pair<u64, u64>> d1_source_catalog_pairs;
+    if (Common::FS::Exists(d1_source_catalog_path)) {
+        const auto d1_source_catalog = VideoCommon::LoadPrecacheSourceCatalog(d1_source_catalog_path);
+        if (!d1_source_catalog.catalog) {
+            LOG_WARNING(Render_Vulkan,
+                        "Graphics D1 source catalog rejected before use: reason={} (normal fallback)",
+                        static_cast<u32>(d1_source_catalog.rejection));
+        } else if (d1_source_catalog.catalog->title_id != title_id ||
+                   d1_source_catalog.catalog->compiler_target_fingerprint !=
+                       VideoCommon::CompilerTargetFingerprint(precache_compiler_target)) {
+            LOG_WARNING(Render_Vulkan,
+                        "Graphics D1 source catalog has incompatible title or compiler target "
+                        "(normal fallback)");
+        } else {
+            size_t d1_source_catalog_bytes{};
+            for (const auto& group : d1_source_catalog.catalog->groups) {
+                for (const auto& stage : group.stages) {
+                    d1_source_catalog_bytes += stage.bytes.size();
+                }
+                // The scanner only retains this narrow declared shape. Recheck
+                // it here before using identities as a diagnostic join key.
+                if (group.stages.size() == 2 &&
+                    group.stages[0].stage == Shader::Stage::VertexB &&
+                    group.stages[1].stage == Shader::Stage::Fragment &&
+                    group.stages[0].program_identity && group.stages[1].program_identity) {
+                    d1_source_catalog_pairs.emplace_back(*group.stages[0].program_identity,
+                                                         *group.stages[1].program_identity);
+                }
+            }
+            std::ranges::sort(d1_source_catalog_pairs);
+            d1_source_catalog_pairs.erase(
+                std::unique(d1_source_catalog_pairs.begin(), d1_source_catalog_pairs.end()),
+                d1_source_catalog_pairs.end());
+            LOG_INFO(Render_Vulkan,
+                     "Graphics D1 source catalog loaded: groups={} pairs={} bytes={} "
+                     "(exact source only; no recipe or pipeline serving)",
+                     d1_source_catalog.catalog->groups.size(), d1_source_catalog_pairs.size(),
+                     d1_source_catalog_bytes);
+        }
+    }
+
     // Adaptive slot learning must run before the SPIR-V
     // cache load below and before any shader translation this session, since
     // IsPhase4PrototypeSlot (environment.h), which texture_key computation depends on, reads
@@ -2128,19 +2746,18 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     // Load SPIR-V cache — feeds the GPL speculative path and AOT scanner results.
     spirv_cache_filename = base_dir / "spirv_cache.bin";
     spirv_cache.Load(spirv_cache_filename);
-    precache_cfg_artifacts_filename = base_dir / fmt::format(
-        "precache_cfg_artifacts_{:016x}.bin",
-        VideoCommon::CompilerTargetFingerprint(precache_compiler_target));
+    precache_cfg_artifacts_filename =
+        base_dir / fmt::format("precache_cfg_artifacts_{:016x}.bin",
+                               VideoCommon::CompilerTargetFingerprint(precache_compiler_target));
     LoadPrecacheCfgArtifactCache(precache_cfg_artifacts_filename);
-    precache_frontend_artifacts_filename = base_dir / fmt::format(
-        "precache_frontend_artifacts_{:016x}.bin",
-        VideoCommon::CompilerTargetFingerprint(precache_compiler_target));
+    precache_frontend_artifacts_filename =
+        base_dir / fmt::format("precache_frontend_artifacts_{:016x}.bin",
+                               VideoCommon::CompilerTargetFingerprint(precache_compiler_target));
     LoadPrecacheFrontendArtifactCache(precache_frontend_artifacts_filename);
     if constexpr (CFG_TEMPLATE_PERSISTENCE_ENABLED) {
         cfg_templates_filename = base_dir / "cfg_templates.bin";
         LoadCfgTemplates(cfg_templates_filename);
     }
-
 
     if (use_vulkan_pipeline_cache) {
         vulkan_pipeline_cache_filename = base_dir / "vulkan_pipelines.bin";
@@ -2159,6 +2776,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         size_t skipped_graphics{};
         size_t invalid{};
         size_t feature_mismatch{};
+        size_t d1_captured_graphics_eligible{};
+        size_t d1_captured_graphics_rejected{};
+        size_t d1_source_pair_matching_captured_records{};
+        std::vector<std::pair<u64, u64>> d1_source_pair_observed{};
     } state;
 
     if (device.IsKhrPipelineExecutablePropertiesEnabled()) {
@@ -2226,8 +2847,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         const bool valid_contract = std::ranges::all_of(envs, [&](const FileEnvironment& env) {
             const auto identity = env.ProgramIdentity();
             const auto index = program_index(env.ShaderStage());
-            if (!env.HasValidEntryInstruction() || !identity || !index ||
-                seen_stages[*index] || key.unique_hashes[*index] != *identity) {
+            if (!env.HasValidEntryInstruction() || !identity || !index || seen_stages[*index] ||
+                key.unique_hashes[*index] != *identity) {
                 return false;
             }
             seen_stages[*index] = true;
@@ -2264,6 +2885,61 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             // does not support it
             ++state.feature_mismatch;
             return;
+        }
+        // This is D's source-agnostic producer: the record was captured from a
+        // real live graphics request, and the existing checks above establish its
+        // complete stage chain, identities, feature compatibility and owned
+        // FileEnvironment inputs. Classify it explicitly so boot reconstruction
+        // is measured separately from scanner-derived, still-incomplete sources.
+        VideoCommon::PrecacheDependencyLedger captured_ledger;
+        for (u8 dependency = 0;
+             dependency < static_cast<u8>(VideoCommon::PrecacheDependency::Count); ++dependency) {
+            captured_ledger.Set(static_cast<VideoCommon::PrecacheDependency>(dependency),
+                                VideoCommon::PrecacheDependencyProvenance::CapturedExact);
+        }
+        std::vector<VideoCommon::PrecacheCapturedGraphicsStage> captured_stages;
+        captured_stages.reserve(envs.size());
+        bool missing_captured_identity{};
+        for (const FileEnvironment& env : envs) {
+            const auto identity = env.ProgramIdentity();
+            if (!identity) {
+                missing_captured_identity = true;
+                captured_stages.clear();
+                break;
+            }
+            captured_stages.push_back({env.ShaderStage(), *identity});
+        }
+        const bool captured_eligible = !missing_captured_identity && !captured_stages.empty() &&
+                                      VideoCommon::ClassifyPrecacheCapturedGraphicsPipeline(
+                                          captured_stages, captured_ledger)
+                                          .eligible;
+        if (captured_eligible) {
+            ++state.d1_captured_graphics_eligible;
+        } else {
+            ++state.d1_captured_graphics_rejected;
+        }
+        // A source-pair identity is only a collision-tolerant coverage probe
+        // into exact captured records. It never authorizes reuse: a future
+        // recipe path must also compare canonical bytes and every runtime
+        // dependency before it can adopt any captured request.
+        constexpr size_t VERTEX_B_PROGRAM_INDEX = 1;
+        constexpr size_t FRAGMENT_PROGRAM_INDEX = 5;
+        const bool source_pair_shape = key.unique_hashes[VERTEX_B_PROGRAM_INDEX] != 0 &&
+                                       key.unique_hashes[FRAGMENT_PROGRAM_INDEX] != 0 &&
+                                       std::ranges::all_of(
+                                           std::views::iota(size_t{0}, key.unique_hashes.size()),
+                                           [&](size_t index) {
+                                               return index == VERTEX_B_PROGRAM_INDEX ||
+                                                      index == FRAGMENT_PROGRAM_INDEX ||
+                                                      key.unique_hashes[index] == 0;
+                                           });
+        const std::pair source_pair{key.unique_hashes[VERTEX_B_PROGRAM_INDEX],
+                                    key.unique_hashes[FRAGMENT_PROGRAM_INDEX]};
+        if (captured_eligible && source_pair_shape &&
+            std::binary_search(d1_source_catalog_pairs.begin(), d1_source_catalog_pairs.end(),
+                               source_pair)) {
+            ++state.d1_source_pair_matching_captured_records;
+            state.d1_source_pair_observed.push_back(source_pair);
         }
         workers.QueueWork([this, key, envs_ = std::move(envs), &state, &callback]() mutable {
             CITRON_PROFILE_SCOPE("Vulkan::PipelineCacheWorker");
@@ -2313,6 +2989,22 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     }
 
     LOG_INFO(Render_Vulkan, "Total Pipeline Count: {}", state.total);
+    LOG_INFO(Render_Vulkan,
+             "Graphics D1 captured-exact boot requests: eligible={} rejected={} "
+             "(existing FileEnvironment reconstruction; scanner sources are separate)",
+             state.d1_captured_graphics_eligible, state.d1_captured_graphics_rejected);
+    std::ranges::sort(state.d1_source_pair_observed);
+    const auto d1_observed_end =
+        std::unique(state.d1_source_pair_observed.begin(), state.d1_source_pair_observed.end());
+    const size_t d1_source_pair_observed =
+        static_cast<size_t>(d1_observed_end - state.d1_source_pair_observed.begin());
+    LOG_INFO(Render_Vulkan,
+             "Graphics D1 source/captured identity overlap: catalog_pairs={} matching_records={} "
+             "distinct_pairs={} catalog_pairs_without_captured_request={} "
+             "(hash-index diagnostic only; no source-derived recipe or reuse)",
+             d1_source_catalog_pairs.size(), state.d1_source_pair_matching_captured_records,
+             d1_source_pair_observed,
+             d1_source_catalog_pairs.size() - d1_source_pair_observed);
 
     // Pre-reserve space in caches to reduce rehashing during async builds
     {
@@ -2331,8 +3023,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
 
     workers.WaitForRequests(stop_loading);
 
-    LOG_INFO(Render_Vulkan,
-             "Scanner frontend replay boot scope: {} non-live requests skipped",
+    LOG_INFO(Render_Vulkan, "Scanner frontend replay boot scope: {} non-live requests skipped",
              precache_frontend_nonlive_skipped.load(std::memory_order_relaxed));
 
     // Boot-time disk-cache replay above can throw dozens of no-context field-mismatch
@@ -2343,7 +3034,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     spirv_cache.ResetFieldMismatchLogBudget();
 
     // Log SPIR-V cache effectiveness.
-    const size_t hits   = spirv_cache.HitCount();
+    const size_t hits = spirv_cache.HitCount();
     const size_t probes = spirv_cache.LookupCount();
     if (probes == 0) {
         const size_t loaded = spirv_cache.Size();
@@ -2358,10 +3049,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     } else {
         const int pct = static_cast<int>(hits * 100 / probes);
         LOG_INFO(Render_Vulkan,
-                 "SPIR-V cache: {}/{} stage hits ({}% -- {} EmitSPIRV calls avoided).",
-                 hits, probes, pct, hits);
+                 "SPIR-V cache: {}/{} stage hits ({}% -- {} EmitSPIRV calls avoided).", hits,
+                 probes, pct, hits);
     }
-
 
     if (use_vulkan_pipeline_cache) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
@@ -2378,6 +3068,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     auto& pipeline{pair->second};
     GraphicsPipeline* transition_source = current_pipeline;
     if (is_new) {
+        RecordFixedStateVariantDiagnostic(graphics_key);
         pipeline = CreateGraphicsPipeline();
     }
     if (!pipeline) {
@@ -2424,7 +3115,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     std::array<std::chrono::microseconds, Tegra::Engines::Maxwell3D::Regs::MaxShaderProgram>
         finalize_times{};
     // Track env pointer per shader index so the emit loop can compute cbuf keys.
-    std::array<Shader::Environment*, Tegra::Engines::Maxwell3D::Regs::MaxShaderProgram> stage_envs{};
+    std::array<Shader::Environment*, Tegra::Engines::Maxwell3D::Regs::MaxShaderProgram>
+        stage_envs{};
     std::array<std::optional<Shader::Maxwell::Flow::CFG::Template>,
                Tegra::Engines::Maxwell3D::Regs::MaxShaderProgram>
         cfg_shadow_templates{};
@@ -2469,7 +3161,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     size_t frontend_env_index{};
     if (frontend_pipeline_candidate) {
         for (size_t index = 0; index < key.unique_hashes.size(); ++index) {
-            if (key.unique_hashes[index] == 0) continue;
+            if (key.unique_hashes[index] == 0)
+                continue;
             if (frontend_env_index >= envs.size()) {
                 frontend_pipeline_candidate = false;
                 break;
@@ -2478,8 +3171,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             const VideoCommon::PrecacheFrontendArtifactKey artifact_key{
                 .program_identity = key.unique_hashes[index],
                 .compiler_target_fingerprint = compiler_target_key,
-                .source_header = Common::CityHash64(
-                    reinterpret_cast<const char*>(&env.SPH()), sizeof(Shader::ProgramHeader)),
+                .source_header = Common::CityHash64(reinterpret_cast<const char*>(&env.SPH()),
+                                                    sizeof(Shader::ProgramHeader)),
                 .local_memory_size = env.LocalMemorySize(),
                 .stage = env.ShaderStage(),
                 .scheduler_slot = static_cast<u8>(env.StartAddress() % 32),
@@ -2492,7 +3185,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 break;
             }
         }
-        if (frontend_env_index != envs.size()) frontend_pipeline_candidate = false;
+        if (frontend_env_index != envs.size())
+            frontend_pipeline_candidate = false;
     }
     std::optional<ShaderPools> frontend_replay_pools;
     std::array<Shader::IR::Program, Tegra::Engines::Maxwell3D::Regs::MaxShaderProgram>
@@ -2502,13 +3196,14 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         frontend_replay_pools.emplace();
         const auto restore_begin = std::chrono::steady_clock::now();
         for (size_t index = 0; index < frontend_artifacts.size(); ++index) {
-            if (!frontend_artifacts[index]) continue;
+            if (!frontend_artifacts[index])
+                continue;
             auto restored = VideoCommon::RestorePrecacheFrontendArtifact(
-                *frontend_artifacts[index], frontend_replay_pools->inst, frontend_replay_pools->block);
+                *frontend_artifacts[index], frontend_replay_pools->inst,
+                frontend_replay_pools->block);
             if (!restored) {
                 frontend_pipeline_replay = false;
-                precache_frontend_pipeline_restore_failures.fetch_add(1,
-                                                                       std::memory_order_relaxed);
+                precache_frontend_pipeline_restore_failures.fetch_add(1, std::memory_order_relaxed);
                 break;
             }
             frontend_replay_programs[index] = std::move(*restored);
@@ -2537,7 +3232,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             try {
                 ShaderPools shadow_pools;
                 for (size_t index = 0; index < key.unique_hashes.size(); ++index) {
-                    if (!frontend_artifacts[index]) continue;
+                    if (!frontend_artifacts[index])
+                        continue;
                     if (shadow_env_index >= envs.size()) {
                         shadow_matches = false;
                         break;
@@ -2545,8 +3241,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                     Shader::Environment& shadow_env{*envs[shadow_env_index++]};
                     Shader::Maxwell::Flow::CFG shadow_cfg{
                         shadow_env, shadow_pools.flow_block,
-                        static_cast<u32>(shadow_env.StartAddress() +
-                                         sizeof(Shader::ProgramHeader)),
+                        static_cast<u32>(shadow_env.StartAddress() + sizeof(Shader::ProgramHeader)),
                         index == 0};
                     auto fresh_program{Shader::Maxwell::BuildProgramTemplate(
                         shadow_pools.inst, shadow_pools.block, shadow_env, shadow_cfg, host_info)};
@@ -2562,26 +3257,24 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             } catch (...) {
                 shadow_matches = false;
             }
-            const auto shadow_us = static_cast<u64>(
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - shadow_begin)
-                    .count());
-            precache_frontend_artifact_shadow_us.fetch_add(shadow_us,
-                                                            std::memory_order_relaxed);
+            const auto shadow_us =
+                static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                     std::chrono::steady_clock::now() - shadow_begin)
+                                     .count());
+            precache_frontend_artifact_shadow_us.fetch_add(shadow_us, std::memory_order_relaxed);
             if (shadow_matches) {
                 size_t newly_validated{};
                 std::unique_lock lock{precache_frontend_artifacts_mutex};
                 for (const auto& artifact_key : frontend_artifact_keys) {
                     if (artifact_key) {
-                        newly_validated += precache_frontend_artifact_shadow_validated
-                                               .insert(*artifact_key)
-                                               .second;
+                        newly_validated +=
+                            precache_frontend_artifact_shadow_validated.insert(*artifact_key)
+                                .second;
                     }
                 }
-                const u64 validated_total =
-                    precache_frontend_artifact_shadow_verified.fetch_add(
-                        newly_validated, std::memory_order_relaxed) +
-                    newly_validated;
+                const u64 validated_total = precache_frontend_artifact_shadow_verified.fetch_add(
+                                                newly_validated, std::memory_order_relaxed) +
+                                            newly_validated;
                 if (newly_validated != 0 && validated_total <= 16) {
                     LOG_INFO(Render_Vulkan,
                              "Scanner frontend shadow checked {} graphics stage(s) in {} us for "
@@ -2590,8 +3283,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 }
             } else {
                 frontend_pipeline_replay = false;
-                precache_frontend_artifact_shadow_rejected.fetch_add(1,
-                                                                      std::memory_order_relaxed);
+                precache_frontend_artifact_shadow_rejected.fetch_add(1, std::memory_order_relaxed);
                 LOG_WARNING(Render_Vulkan,
                             "Scanner frontend shadow mismatch; normal frontend fallback for "
                             "pipeline {:016x}",
@@ -2600,21 +3292,20 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         if (!frontend_pipeline_replay) {
             for (const auto& artifact_key : frontend_artifact_keys) {
-                if (artifact_key) QuarantinePrecacheFrontendArtifact(*artifact_key);
+                if (artifact_key)
+                    QuarantinePrecacheFrontendArtifact(*artifact_key);
             }
             frontend_replay_pools.reset();
         } else {
-            const auto restore_us = static_cast<u64>(
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - restore_begin)
-                    .count());
+            const auto restore_us =
+                static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                     std::chrono::steady_clock::now() - restore_begin)
+                                     .count());
             const u64 replay_number =
                 precache_frontend_pipeline_full_hits.fetch_add(1, std::memory_order_relaxed) + 1;
-            precache_frontend_artifact_restore_us.fetch_add(
-                restore_us,
-                std::memory_order_relaxed);
-            precache_frontend_artifact_restored.fetch_add(
-                frontend_env_index, std::memory_order_relaxed);
+            precache_frontend_artifact_restore_us.fetch_add(restore_us, std::memory_order_relaxed);
+            precache_frontend_artifact_restored.fetch_add(frontend_env_index,
+                                                          std::memory_order_relaxed);
             if (replay_number <= 16) {
                 LOG_INFO(Render_Vulkan,
                          "Scanner frontend replay #{} restored {} graphics stage(s) in {} us for "
@@ -2661,7 +3352,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 }
                 precache_cfg_artifact_replay_cfg_us.fetch_add(
                     static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now() - replay_cfg_start).count()),
+                                         std::chrono::steady_clock::now() - replay_cfg_start)
+                                         .count()),
                     std::memory_order_relaxed);
             }
         }
@@ -2679,24 +3371,24 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             if (precache_cfg_artifact_loaded.load(std::memory_order_relaxed) != 0) {
                 precache_cfg_artifact_fresh_cfg_us.fetch_add(
                     static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now() - fresh_cfg_start).count()),
+                                         std::chrono::steady_clock::now() - fresh_cfg_start)
+                                         .count()),
                     std::memory_order_relaxed);
             }
         }
         if (!scanner_cfg_replay) {
-            ShadowValidatePrecacheCfgArtifact(
-                key.unique_hashes[index], env.ShaderStage(), index == 0, *cfg);
+            ShadowValidatePrecacheCfgArtifact(key.unique_hashes[index], env.ShaderStage(),
+                                              index == 0, *cfg);
         }
         // A CFG branch-table read makes reachability dependent on real cbuf
         // data. Shadow/persistence may retain only cbuf-independent graphs.
-        if constexpr (CFG_TEMPLATE_SHADOW_VALIDATION_ENABLED ||
-                      CFG_TEMPLATE_PERSISTENCE_ENABLED) {
-            if (auto* generic_env = env.AsGenericEnvironment(); generic_env != nullptr &&
-                generic_env->CapturedCbufValues().empty()) {
+        if constexpr (CFG_TEMPLATE_SHADOW_VALIDATION_ENABLED || CFG_TEMPLATE_PERSISTENCE_ENABLED) {
+            if (auto* generic_env = env.AsGenericEnvironment();
+                generic_env != nullptr && generic_env->CapturedCbufValues().empty()) {
                 ValidateAndPersistCfgTemplate(cfg_template_key, env, *cfg);
                 if constexpr (CFG_TEMPLATE_MODULE_SHADOW_VALIDATION_ENABLED) {
-                    cfg_shadow_templates[index] = scanner_cfg_replay ? scanner_cfg_replay->cfg
-                                                                       : cfg->MakeTemplate();
+                    cfg_shadow_templates[index] =
+                        scanner_cfg_replay ? scanner_cfg_replay->cfg : cfg->MakeTemplate();
                     if (scanner_cfg_replay) {
                         ++precache_cfg_artifact_module_sources;
                         cfg_shadow_scanner_artifacts[index] = scanner_cfg_replay->key;
@@ -2708,8 +3400,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         if constexpr (CFG_TEMPLATE_MODULE_SHADOW_VALIDATION_ENABLED) {
             if (precache_cfg_artifact_loaded.load(std::memory_order_relaxed) != 0 &&
                 !cfg_shadow_templates[index]) {
-                cfg_shadow_templates[index] = scanner_cfg_replay ? scanner_cfg_replay->cfg
-                                                                   : cfg->MakeTemplate();
+                cfg_shadow_templates[index] =
+                    scanner_cfg_replay ? scanner_cfg_replay->cfg : cfg->MakeTemplate();
                 cfg_shadow_keys[index] = cfg_template_key;
             }
             if (scanner_cfg_replay && !cfg_shadow_scanner_artifacts[index]) {
@@ -2732,21 +3424,24 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 programs[index] = Shader::Maxwell::BuildProgramTemplate(
                     pools.inst, pools.block, env, *cfg, host_info,
                     scanner_cfg_replay
-                        ? std::span<const Shader::Maxwell::PredecodedInstruction>{
-                              scanner_cfg_replay->decoded_instructions}
+                        ? std::span<const Shader::Maxwell::
+                                        PredecodedInstruction>{scanner_cfg_replay
+                                                                   ->decoded_instructions}
                         : std::span<const Shader::Maxwell::PredecodedInstruction>{});
             }
         } else {
             // VertexB path when VertexA is present.
             auto& program_va{programs[0]};
-            auto program_vb = frontend_pipeline_replay && frontend_artifacts[index]
-                                  ? std::move(frontend_replay_programs[index])
-                                  : Shader::Maxwell::BuildProgramTemplate(
-                                        pools.inst, pools.block, env, *cfg, host_info,
-                                        scanner_cfg_replay
-                                            ? std::span<const Shader::Maxwell::PredecodedInstruction>{
-                                                  scanner_cfg_replay->decoded_instructions}
-                                            : std::span<const Shader::Maxwell::PredecodedInstruction>{});
+            auto program_vb =
+                frontend_pipeline_replay && frontend_artifacts[index]
+                    ? std::move(frontend_replay_programs[index])
+                    : Shader::Maxwell::BuildProgramTemplate(
+                          pools.inst, pools.block, env, *cfg, host_info,
+                          scanner_cfg_replay
+                              ? std::span<const Shader::Maxwell::
+                                              PredecodedInstruction>{scanner_cfg_replay
+                                                                         ->decoded_instructions}
+                              : std::span<const Shader::Maxwell::PredecodedInstruction>{});
             template_times[index] = std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - template_start);
             const auto finalize_start = std::chrono::steady_clock::now();
@@ -2778,10 +3473,11 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         if (programs[index].info.requires_layer_emulation) {
             layer_source_program = &programs[index];
         }
-
     }
     std::array<const Shader::Info*, Tegra::Engines::Maxwell3D::Regs::MaxShaderStage> infos{};
     std::array<vk::ShaderModule, Tegra::Engines::Maxwell3D::Regs::MaxShaderStage> modules;
+    FinalGraphicsPipelineSpirv final_spirv{};
+    const bool capture_gpl_recipe = ShouldCaptureGraphicsPipelineRecipe();
 
     const Shader::IR::Program* previous_stage{};
     Shader::Backend::Bindings binding;
@@ -2839,8 +3535,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         if (program.stage == Shader::Stage::TessellationEval) {
             RecordTessellationStateDiagnostic(runtime_info.tess_primitive,
-                                               runtime_info.tess_spacing,
-                                               runtime_info.tess_clockwise);
+                                              runtime_info.tess_spacing,
+                                              runtime_info.tess_clockwise);
         }
         // SPIR-V cache check
         // AsGenericEnvironment() returns nullptr for FileEnvironment (disk-load path)
@@ -2871,45 +3567,44 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         // uses. That's expected, not a bug; left in place rather than removed in the
         // same change that flips production matching behavior, so this diff stays as
         // small and reviewable as possible. Safe to clean up separately later.
-        const u64 cbuf_key =
-            gen_env_stage    ? ComputeCbufKeyExcludingTextureHandles(
-                                   gen_env_stage->CapturedCbufValues(),
-                                   gen_env_stage->CapturedTextureHandleCbufKeys())
-            : file_env_stage ? ComputeCbufKeyExcludingTextureHandles(
-                                   file_env_stage->CapturedCbufValues(),
-                                   file_env_stage->CapturedTextureHandleCbufKeys())
-                             : 0;
+        const u64 cbuf_key = gen_env_stage    ? ComputeCbufKeyExcludingTextureHandles(
+                                                    gen_env_stage->CapturedCbufValues(),
+                                                    gen_env_stage->CapturedTextureHandleCbufKeys())
+                             : file_env_stage ? ComputeCbufKeyExcludingTextureHandles(
+                                                    file_env_stage->CapturedCbufValues(),
+                                                    file_env_stage->CapturedTextureHandleCbufKeys())
+                                              : 0;
         // A resource handle is an allocation detail, not shader input. When every observed
         // texture query is tied to a source cbuf slot, use that logical slot instead so a
         // scanner's synthetic descriptors and a later real draw agree. A shader that actually
         // touches a polymorphic slot still owns its specialised handle exclusion and keeps the
         // established raw-key path; unrelated shaders are not penalized by that global table.
         const bool use_gen_logical_texture_key =
-            gen_env_stage && !HasActivePhase4LogicalTextureSlot(
-                                 gen_env_stage->CapturedLogicalTextureSlots()) &&
+            gen_env_stage &&
+            !HasActivePhase4LogicalTextureSlot(gen_env_stage->CapturedLogicalTextureSlots()) &&
             HasCompleteLogicalTextureCoverage(gen_env_stage->CapturedLogicalTextureSlots(),
                                               gen_env_stage->CapturedLogicalTextureHandles(),
                                               gen_env_stage->CapturedTextureTypes(),
                                               gen_env_stage->CapturedTexturePixelFormats());
         const bool use_file_logical_texture_key =
-            file_env_stage && !HasActivePhase4LogicalTextureSlot(
-                                  file_env_stage->CapturedLogicalTextureSlots()) &&
+            file_env_stage &&
+            !HasActivePhase4LogicalTextureSlot(file_env_stage->CapturedLogicalTextureSlots()) &&
             HasCompleteLogicalTextureCoverage(file_env_stage->CapturedLogicalTextureSlots(),
                                               file_env_stage->CapturedLogicalTextureHandles(),
                                               file_env_stage->CapturedTextureTypes(),
                                               file_env_stage->CapturedTexturePixelFormats());
         const u64 texture_key =
-            use_gen_logical_texture_key    ? ComputeLogicalTextureKey(
-                                                 gen_env_stage->CapturedLogicalTextureSlots())
-            : use_file_logical_texture_key ? ComputeLogicalTextureKey(
-                                                 file_env_stage->CapturedLogicalTextureSlots())
-            : gen_env_stage                ? ComputeTextureKeyExcludingHandles(
-                                                 gen_env_stage->CapturedTextureTypes(),
-                                                 gen_env_stage->CapturedTexturePixelFormats(),
-                                                 gen_env_stage->CapturedPhase4PrototypeHandles())
-            : file_env_stage               ? ComputeTextureKey(file_env_stage->CapturedTextureTypes(),
-                                                                file_env_stage->CapturedTexturePixelFormats())
-                                         : 0;
+            use_gen_logical_texture_key
+                ? ComputeLogicalTextureKey(gen_env_stage->CapturedLogicalTextureSlots())
+            : use_file_logical_texture_key
+                ? ComputeLogicalTextureKey(file_env_stage->CapturedLogicalTextureSlots())
+            : gen_env_stage
+                ? ComputeTextureKeyExcludingHandles(gen_env_stage->CapturedTextureTypes(),
+                                                    gen_env_stage->CapturedTexturePixelFormats(),
+                                                    gen_env_stage->CapturedPhase4PrototypeHandles())
+            : file_env_stage ? ComputeTextureKey(file_env_stage->CapturedTextureTypes(),
+                                                 file_env_stage->CapturedTexturePixelFormats())
+                             : 0;
         spirv_cache.RecordTextureKeyMode(use_gen_logical_texture_key ||
                                          use_file_logical_texture_key);
         // Was a second independent ComputeCbufKeyExcludingTextureHandles(...) call here,
@@ -2977,18 +3672,21 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         const Shader::Backend::Bindings starting_binding{binding};
         const u64 binding_key = ComputeBindingKey(binding);
         runtime_key = FoldBindingKey(runtime_key, binding_key);
-        const SpirvKey spirv_key{key.unique_hashes[index], stage_envs[index]->ShaderStage(),
-                                 compiler_target_key, cbuf_key, runtime_key, texture_key};
+        const SpirvKey spirv_key{key.unique_hashes[index],
+                                 stage_envs[index]->ShaderStage(),
+                                 compiler_target_key,
+                                 cbuf_key,
+                                 runtime_key,
+                                 texture_key};
         std::vector<u32> code;
         std::chrono::microseconds emit_time{};
         const bool is_merged_vertex = uses_vertex_a && uses_vertex_b && index == 1;
         // Since SpirvKey now includes the runtime_key, we can safely serve cached SPIR-V
         // to both the live path and the disk-load path.
         if (!is_merged_vertex) {
-            if (auto cached = spirv_cache.Lookup(spirv_key, has_real_specialization_context,
-                                                 diag_base_runtime_hash, binding_key,
-                                                 diag_cbuf_key_excl_texture_handles,
-                                                 diag_runtime_fields)) {
+            if (auto cached = spirv_cache.Lookup(
+                    spirv_key, has_real_specialization_context, diag_base_runtime_hash, binding_key,
+                    diag_cbuf_key_excl_texture_handles, diag_runtime_fields)) {
                 code = *cached->spirv;
                 if (cached->is_speculative) {
                     // Capped like the field-mismatch diagnostic in spirv_cache.cpp — this
@@ -2997,11 +3695,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                     // per hit is exactly the kind of per-frame synchronous logging cost
                     // worth avoiding once the diagnostic has said what it needs to.
                     static std::atomic<size_t> speculative_hit_logs{0};
-                    if (size_t expected = speculative_hit_logs.load(); expected < 50 &&
+                    if (size_t expected = speculative_hit_logs.load();
+                        expected < 50 &&
                         speculative_hit_logs.compare_exchange_strong(expected, expected + 1)) {
-                        const char* source = cached->source == VideoCommon::SpirvCacheEntrySource::PrecacheScanner
-                                                 ? "scanner"
-                                                 : "live";
+                        const char* source =
+                            cached->source == VideoCommon::SpirvCacheEntrySource::PrecacheScanner
+                                ? "scanner"
+                                : "live";
                         LOG_INFO(Render_Vulkan,
                                  "0x{:016x} stage[{}] served from {} SPECULATIVE entry "
                                  "(unique_hash=0x{:016x})",
@@ -3029,8 +3729,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             // exact stage would miss and re-translate again on every future load.
             if (!is_merged_vertex && has_real_specialization_context) {
                 spirv_cache.Insert(spirv_key, code, binding, /*is_speculative=*/false,
-                                  diag_base_runtime_hash, binding_key,
-                                  diag_cbuf_key_excl_texture_handles, diag_runtime_fields);
+                                   diag_base_runtime_hash, binding_key,
+                                   diag_cbuf_key_excl_texture_handles, diag_runtime_fields);
                 // Runtime-variant diagnostic; see RecordPhase3RuntimeVariantDiagnostic.
                 // comment (vk_pipeline_cache.h) for what this measures. Gated on cbuf_key
                 // == 0 specifically (not just has_real_specialization_context, which the
@@ -3041,7 +3741,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 // diagnostic's outcome, so they're not part of the question being asked.
                 if (cbuf_key == 0) {
                     RecordPhase3RuntimeVariantDiagnostic(key.unique_hashes[index],
-                                                          diag_base_runtime_hash);
+                                                         diag_base_runtime_hash);
                 }
                 // Runtime-state diagnostic; see RecordGenericInputTypesCardinalityDiagnostic.
                 // doc comment (vk_pipeline_cache.h) for what this measures. No cbuf_key
@@ -3056,11 +3756,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                         reinterpret_cast<const char*>(runtime_info.generic_input_types.data()),
                         runtime_info.generic_input_types.size() * sizeof(Shader::AttributeType)));
                 if (!spirv_cache_filename.empty()) {
-                    serialization_thread.QueueWork([this] { spirv_cache.SaveThrottled(spirv_cache_filename); });
+                    serialization_thread.QueueWork(
+                        [this] { spirv_cache.SaveThrottled(spirv_cache_filename); });
                 }
-                // Texture-slot feasibility instrumentation; see LogTextureSlotVarianceReportThrottled.
-                // doc comment in shader_environment.h. Unconditional (not gated on
-                // spirv_cache_filename): unrelated to whether disk persistence is configured.
+                // Texture-slot feasibility instrumentation; see
+                // LogTextureSlotVarianceReportThrottled. doc comment in shader_environment.h.
+                // Unconditional (not gated on spirv_cache_filename): unrelated to whether disk
+                // persistence is configured.
                 VideoCommon::GenericEnvironment::LogTextureSlotVarianceReportThrottled();
             }
             code.reserve(std::max<size_t>(code.size(), 16 * 1024 / sizeof(u32)));
@@ -3068,63 +3770,63 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         // Plain stages use one reconstructed CFG. A merged vertex module needs
         // both source CFGs reconstructed before the normal merge pass.
         if constexpr (CFG_TEMPLATE_MODULE_SHADOW_VALIDATION_ENABLED) {
-            if (is_merged_vertex && !is_emulated_stage &&
-                !program.info.requires_layer_emulation && cfg_shadow_templates[0] &&
-                cfg_shadow_keys[0] && cfg_shadow_templates[index] && cfg_shadow_keys[index] &&
-                stage_envs[0] != nullptr && stage_envs[index] != nullptr &&
-                stage_envs[0]->AsGenericEnvironment() != nullptr &&
+            if (is_merged_vertex && !is_emulated_stage && !program.info.requires_layer_emulation &&
+                cfg_shadow_templates[0] && cfg_shadow_keys[0] && cfg_shadow_templates[index] &&
+                cfg_shadow_keys[index] && stage_envs[0] != nullptr &&
+                stage_envs[index] != nullptr && stage_envs[0]->AsGenericEnvironment() != nullptr &&
                 stage_envs[index]->AsGenericEnvironment() != nullptr &&
                 ((cfg_shadow_scanner_artifacts[0] || cfg_shadow_scanner_artifacts[index]) ||
                  (stage_envs[0]->AsGenericEnvironment()->CapturedCbufValues().empty() &&
                   stage_envs[index]->AsGenericEnvironment()->CapturedCbufValues().empty()))) {
-                const u64 merged_identity = cfg_shadow_keys[0]->unique_hash ^
-                                            (cfg_shadow_keys[index]->unique_hash +
-                                             0x9e3779b97f4a7c15ULL +
-                                             (cfg_shadow_keys[0]->unique_hash << 6) +
-                                             (cfg_shadow_keys[0]->unique_hash >> 2));
+                const u64 merged_identity =
+                    cfg_shadow_keys[0]->unique_hash ^
+                    (cfg_shadow_keys[index]->unique_hash + 0x9e3779b97f4a7c15ULL +
+                     (cfg_shadow_keys[0]->unique_hash << 6) +
+                     (cfg_shadow_keys[0]->unique_hash >> 2));
                 const CfgTemplateKey merged_key{merged_identity,
-                                                 cfg_shadow_keys[index]->start_address, false};
+                                                cfg_shadow_keys[index]->start_address, false};
                 ValidateCfgTemplateMergedVertexModule(
                     merged_key, *stage_envs[0], *cfg_shadow_templates[0], *stage_envs[index],
                     *cfg_shadow_templates[index], runtime_info, program, code, starting_binding,
                     binding,
-                    cfg_shadow_scanner_artifacts[0]
-                        ? &*cfg_shadow_scanner_artifacts[0]
-                        : nullptr,
-                    cfg_shadow_scanner_artifacts[index]
-                        ? &*cfg_shadow_scanner_artifacts[index]
-                        : nullptr);
+                    cfg_shadow_scanner_artifacts[0] ? &*cfg_shadow_scanner_artifacts[0] : nullptr,
+                    cfg_shadow_scanner_artifacts[index] ? &*cfg_shadow_scanner_artifacts[index]
+                                                        : nullptr);
             } else if (!is_merged_vertex && !is_emulated_stage &&
                        !program.info.requires_layer_emulation && cfg_shadow_templates[index] &&
                        cfg_shadow_keys[index] &&
                        stage_envs[index]->AsGenericEnvironment() != nullptr &&
                        (cfg_shadow_scanner_artifacts[index] ||
                         stage_envs[index]->AsGenericEnvironment()->CapturedCbufValues().empty())) {
-                ValidateCfgTemplateGraphicsModule(*cfg_shadow_keys[index], *stage_envs[index],
-                                                  *cfg_shadow_templates[index],
-                                                  static_cast<u32>(stage_envs[index]->StartAddress() +
-                                                                   sizeof(Shader::ProgramHeader)),
-                                                  runtime_info, program,
-                                                  code,
-                                                  starting_binding, binding,
-                                                  cfg_shadow_scanner_artifacts[index]
-                                                      ? &*cfg_shadow_scanner_artifacts[index]
-                                                      : nullptr);
+                ValidateCfgTemplateGraphicsModule(
+                    *cfg_shadow_keys[index], *stage_envs[index], *cfg_shadow_templates[index],
+                    static_cast<u32>(stage_envs[index]->StartAddress() +
+                                     sizeof(Shader::ProgramHeader)),
+                    runtime_info, program, code, starting_binding, binding,
+                    cfg_shadow_scanner_artifacts[index] ? &*cfg_shadow_scanner_artifacts[index]
+                                                        : nullptr);
             }
         }
-        RecordShaderCompilerWork(cfg_times[index], template_times[index], finalize_times[index], emit_time,
-                                 exact_module_hit);
+        RecordShaderCompilerWork(cfg_times[index], template_times[index], finalize_times[index],
+                                 emit_time, exact_module_hit);
         // Keep the state after this stage, not merely its IR output layout. A
         // later speculative translation begins after this stage in the real
         // pipeline and therefore must allocate descriptors from this exact state.
         {
             std::unique_lock real_stage_stores_lock{real_stage_stores_mutex};
             real_stage_stores_by_hash[key.unique_hashes[index]] = RealStageStoresSnapshot{
-                program.info.stores, program.info.legacy_stores_mapping,
-                program.info.passthrough, program.is_geometry_passthrough, binding};
+                program.info.stores, program.info.legacy_stores_mapping, program.info.passthrough,
+                program.is_geometry_passthrough, binding};
         }
-        device.SaveShader(code);
-        modules[stage_index] = BuildShader(device, code);
+        if (capture_gpl_recipe) {
+            final_spirv[stage_index] = InternGraphicsPipelineSpirv(std::move(code));
+        }
+        // Capacity rejection disables GPL only for this request. The normal shader
+        // module/pipeline path still receives the exact same emitted words.
+        const std::vector<u32>& module_words =
+            final_spirv[stage_index] ? *final_spirv[stage_index] : code;
+        device.SaveShader(module_words);
+        modules[stage_index] = BuildShader(device, module_words);
         if (device.HasDebuggingToolAttached()) {
             const std::string name{fmt::format("Shader {:016x}", key.unique_hashes[index])};
             modules[stage_index].SetObjectNameEXT(name.c_str());
@@ -3136,10 +3838,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     auto pipeline = std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, &shader_notify, device,
         descriptor_pool, guest_descriptor_queue, thread_worker, statistics, render_pass_cache, this,
-        !build_in_parallel, key,
-        std::move(modules), infos);
+        !build_in_parallel, key, std::move(modules), infos, std::move(final_spirv));
     RecordPipelineCreateWork(false, std::chrono::duration_cast<std::chrono::microseconds>(
-                                         std::chrono::steady_clock::now() - pipeline_create_start));
+                                        std::chrono::steady_clock::now() - pipeline_create_start));
     return pipeline;
 
 } catch (const vk::Exception& exception) {
@@ -3234,19 +3935,18 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
             file_env->CapturedCbufValues(), file_env->CapturedTextureHandleCbufKeys());
         const bool use_logical_texture_key =
             !HasActivePhase4LogicalTextureSlot(file_env->CapturedLogicalTextureSlots()) &&
-            HasCompleteLogicalTextureCoverage(file_env->CapturedLogicalTextureSlots(),
-                                              file_env->CapturedLogicalTextureHandles(),
-                                              file_env->CapturedTextureTypes(),
-                                              file_env->CapturedTexturePixelFormats());
-        const u64 texture_key = use_logical_texture_key
-                                    ? ComputeLogicalTextureKey(file_env->CapturedLogicalTextureSlots())
-                                    : ComputeTextureKey(file_env->CapturedTextureTypes(),
-                                                        file_env->CapturedTexturePixelFormats());
+            HasCompleteLogicalTextureCoverage(
+                file_env->CapturedLogicalTextureSlots(), file_env->CapturedLogicalTextureHandles(),
+                file_env->CapturedTextureTypes(), file_env->CapturedTexturePixelFormats());
+        const u64 texture_key =
+            use_logical_texture_key
+                ? ComputeLogicalTextureKey(file_env->CapturedLogicalTextureSlots())
+                : ComputeTextureKey(file_env->CapturedTextureTypes(),
+                                    file_env->CapturedTexturePixelFormats());
         spirv_cache.RecordTextureKeyMode(use_logical_texture_key);
-        const u64 workgroup_key =
-            ComputeWorkgroupKey(key.shared_memory_size, key.workgroup_size);
+        const u64 workgroup_key = ComputeWorkgroupKey(key.shared_memory_size, key.workgroup_size);
         const SpirvKey early_key{key.unique_hash, env.ShaderStage(), compiler_target_key,
-                                 cbuf_key, workgroup_key, texture_key};
+                                 cbuf_key,        workgroup_key,     texture_key};
         if (auto cached = spirv_cache.Lookup(early_key, true, workgroup_key, 0, cbuf_key);
             cached && !cached->is_speculative && cached->compute_info) {
             std::vector<u32> code{*cached->spirv};
@@ -3265,21 +3965,19 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
                 device, vulkan_pipeline_cache, descriptor_pool, guest_descriptor_queue,
                 thread_worker, statistics, &shader_notify, *cached->compute_info,
                 std::move(spv_module), this, !build_in_parallel);
-            RecordPipelineCreateWork(
-                true, std::chrono::duration_cast<std::chrono::microseconds>(
-                          std::chrono::steady_clock::now() - pipeline_create_start));
+            RecordPipelineCreateWork(true,
+                                     std::chrono::duration_cast<std::chrono::microseconds>(
+                                         std::chrono::steady_clock::now() - pipeline_create_start));
             LOG_INFO(Render_Vulkan,
                      "0x{:016x} compute served before frontend from persisted exact entry", hash);
             return pipeline;
         }
     }
     if (auto* gen_env = env.AsGenericEnvironment(); gen_env != nullptr) {
-        const u64 workgroup_key =
-            ComputeWorkgroupKey(key.shared_memory_size, key.workgroup_size);
+        const u64 workgroup_key = ComputeWorkgroupKey(key.shared_memory_size, key.workgroup_size);
         const auto candidates =
             spirv_cache.LookupLiveComputeCandidates(key.unique_hash, compiler_target_key);
-        compute_prefrontend_live_candidates.fetch_add(candidates.size(),
-                                                      std::memory_order_relaxed);
+        compute_prefrontend_live_candidates.fetch_add(candidates.size(), std::memory_order_relaxed);
         for (const auto& candidate : candidates) {
             if (candidate.key.runtime_key != workgroup_key) {
                 continue;
@@ -3291,10 +3989,11 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
                 const u32 cbuf_offset = static_cast<u32>(packed_key);
                 cbuf_values.emplace(packed_key, gen_env->ReadCbufValue(cbuf_index, cbuf_offset));
             }
-            const SpirvKey early_key{key.unique_hash, env.ShaderStage(), compiler_target_key,
-                                     ComputeCbufKey(cbuf_values), workgroup_key, 0};
-            if (auto cached = spirv_cache.Lookup(early_key, true, workgroup_key, 0,
-                                                 early_key.cbuf_key);
+            const SpirvKey early_key{key.unique_hash,     env.ShaderStage(),
+                                     compiler_target_key, ComputeCbufKey(cbuf_values),
+                                     workgroup_key,       0};
+            if (auto cached =
+                    spirv_cache.Lookup(early_key, true, workgroup_key, 0, early_key.cbuf_key);
                 cached && !cached->is_speculative && cached->compute_info) {
                 std::vector<u32> code{*cached->spirv};
                 code.reserve(std::max<size_t>(code.size(), 16 * 1024 / sizeof(u32)));
@@ -3309,9 +4008,9 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
                 Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
                 const auto pipeline_create_start = std::chrono::steady_clock::now();
                 auto pipeline = std::make_unique<ComputePipeline>(
-                device, vulkan_pipeline_cache, descriptor_pool, guest_descriptor_queue,
-                thread_worker, statistics, &shader_notify, *cached->compute_info,
-                std::move(spv_module), this, !build_in_parallel);
+                    device, vulkan_pipeline_cache, descriptor_pool, guest_descriptor_queue,
+                    thread_worker, statistics, &shader_notify, *cached->compute_info,
+                    std::move(spv_module), this, !build_in_parallel);
                 RecordPipelineCreateWork(
                     true, std::chrono::duration_cast<std::chrono::microseconds>(
                               std::chrono::steady_clock::now() - pipeline_create_start));
@@ -3328,8 +4027,8 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
     std::optional<Shader::Maxwell::Flow::CFG> cfg;
     std::optional<PrecacheCfgReplay> scanner_cfg_replay;
     if constexpr (SCANNER_CFG_ARTIFACT_REUSE_ENABLED) {
-        scanner_cfg_replay =
-            LookupPrecacheCfgArtifact(key.unique_hash, env.ShaderStage(), env.StartAddress(), false);
+        scanner_cfg_replay = LookupPrecacheCfgArtifact(key.unique_hash, env.ShaderStage(),
+                                                       env.StartAddress(), false);
         if (scanner_cfg_replay) {
             const auto replay_cfg_start = std::chrono::steady_clock::now();
             try {
@@ -3341,7 +4040,8 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
             }
             precache_cfg_artifact_replay_cfg_us.fetch_add(
                 static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - replay_cfg_start).count()),
+                                     std::chrono::steady_clock::now() - replay_cfg_start)
+                                     .count()),
                 std::memory_order_relaxed);
         }
     }
@@ -3359,7 +4059,8 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
         if (precache_cfg_artifact_loaded.load(std::memory_order_relaxed) != 0) {
             precache_cfg_artifact_fresh_cfg_us.fetch_add(
                 static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - fresh_cfg_start).count()),
+                                     std::chrono::steady_clock::now() - fresh_cfg_start)
+                                     .count()),
                 std::memory_order_relaxed);
         }
     }
@@ -3367,12 +4068,12 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
         ShadowValidatePrecacheCfgArtifact(key.unique_hash, env.ShaderStage(), false, *cfg);
     }
     if constexpr (CFG_TEMPLATE_SHADOW_VALIDATION_ENABLED || CFG_TEMPLATE_PERSISTENCE_ENABLED) {
-        if (auto* generic_env = env.AsGenericEnvironment(); generic_env != nullptr &&
-            generic_env->CapturedCbufValues().empty()) {
+        if (auto* generic_env = env.AsGenericEnvironment();
+            generic_env != nullptr && generic_env->CapturedCbufValues().empty()) {
             ValidateAndPersistCfgTemplate(cfg_template_key, env, *cfg);
             if constexpr (CFG_TEMPLATE_MODULE_SHADOW_VALIDATION_ENABLED) {
-                cfg_shadow_template = scanner_cfg_replay ? scanner_cfg_replay->cfg
-                                                          : cfg->MakeTemplate();
+                cfg_shadow_template =
+                    scanner_cfg_replay ? scanner_cfg_replay->cfg : cfg->MakeTemplate();
                 if (scanner_cfg_replay) {
                     ++precache_cfg_artifact_module_sources;
                 }
@@ -3383,7 +4084,8 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
         const bool had_shadow_template = cfg_shadow_template.has_value();
         if (precache_cfg_artifact_loaded.load(std::memory_order_relaxed) != 0 &&
             !had_shadow_template) {
-            cfg_shadow_template = scanner_cfg_replay ? scanner_cfg_replay->cfg : cfg->MakeTemplate();
+            cfg_shadow_template =
+                scanner_cfg_replay ? scanner_cfg_replay->cfg : cfg->MakeTemplate();
         }
         if (scanner_cfg_replay && !had_shadow_template) {
             ++precache_cfg_artifact_module_sources;
@@ -3403,12 +4105,12 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
         precache_decoded_artifact_instructions.fetch_add(
             scanner_cfg_replay->decoded_instructions.size(), std::memory_order_relaxed);
     }
-    auto program{Shader::Maxwell::BuildProgramTemplate(pools.inst, pools.block, env, *cfg,
-                                                        host_info,
-                                                        scanner_cfg_replay
-                                                            ? std::span<const Shader::Maxwell::PredecodedInstruction>{
-                                                                  scanner_cfg_replay->decoded_instructions}
-                                                            : std::span<const Shader::Maxwell::PredecodedInstruction>{})};
+    auto program{Shader::Maxwell::BuildProgramTemplate(
+        pools.inst, pools.block, env, *cfg, host_info,
+        scanner_cfg_replay
+            ? std::span<const Shader::Maxwell::PredecodedInstruction>{scanner_cfg_replay
+                                                                          ->decoded_instructions}
+            : std::span<const Shader::Maxwell::PredecodedInstruction>{})};
     const auto template_time = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - template_start);
     const auto finalize_start = std::chrono::steady_clock::now();
@@ -3434,33 +4136,31 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
     const u64 cbuf_key_c =
         gen_env    ? ComputeCbufKeyExcludingTextureHandles(gen_env->CapturedCbufValues(),
                                                            gen_env->CapturedTextureHandleCbufKeys())
-        : file_env ? ComputeCbufKeyExcludingTextureHandles(file_env->CapturedCbufValues(),
-                                                           file_env->CapturedTextureHandleCbufKeys())
+        : file_env ? ComputeCbufKeyExcludingTextureHandles(
+                         file_env->CapturedCbufValues(), file_env->CapturedTextureHandleCbufKeys())
                    : 0;
     const bool use_gen_logical_texture_key =
         gen_env && !HasActivePhase4LogicalTextureSlot(gen_env->CapturedLogicalTextureSlots()) &&
-        HasCompleteLogicalTextureCoverage(gen_env->CapturedLogicalTextureSlots(),
-                                          gen_env->CapturedLogicalTextureHandles(),
-                                          gen_env->CapturedTextureTypes(),
-                                          gen_env->CapturedTexturePixelFormats());
+        HasCompleteLogicalTextureCoverage(
+            gen_env->CapturedLogicalTextureSlots(), gen_env->CapturedLogicalTextureHandles(),
+            gen_env->CapturedTextureTypes(), gen_env->CapturedTexturePixelFormats());
     const bool use_file_logical_texture_key =
         file_env && !HasActivePhase4LogicalTextureSlot(file_env->CapturedLogicalTextureSlots()) &&
-        HasCompleteLogicalTextureCoverage(file_env->CapturedLogicalTextureSlots(),
-                                          file_env->CapturedLogicalTextureHandles(),
-                                          file_env->CapturedTextureTypes(),
-                                          file_env->CapturedTexturePixelFormats());
+        HasCompleteLogicalTextureCoverage(
+            file_env->CapturedLogicalTextureSlots(), file_env->CapturedLogicalTextureHandles(),
+            file_env->CapturedTextureTypes(), file_env->CapturedTexturePixelFormats());
     const u64 texture_key_c =
-        use_gen_logical_texture_key    ? ComputeLogicalTextureKey(gen_env->CapturedLogicalTextureSlots())
-        : use_file_logical_texture_key ? ComputeLogicalTextureKey(file_env->CapturedLogicalTextureSlots())
-        : gen_env                      ? ComputeTextureKeyExcludingHandles(
-                                             gen_env->CapturedTextureTypes(),
-                                             gen_env->CapturedTexturePixelFormats(),
-                                             gen_env->CapturedPhase4PrototypeHandles())
-        : file_env                     ? ComputeTextureKey(file_env->CapturedTextureTypes(),
-                                                             file_env->CapturedTexturePixelFormats())
-                                     : 0;
-    spirv_cache.RecordTextureKeyMode(use_gen_logical_texture_key ||
-                                     use_file_logical_texture_key);
+        use_gen_logical_texture_key
+            ? ComputeLogicalTextureKey(gen_env->CapturedLogicalTextureSlots())
+        : use_file_logical_texture_key
+            ? ComputeLogicalTextureKey(file_env->CapturedLogicalTextureSlots())
+        : gen_env  ? ComputeTextureKeyExcludingHandles(gen_env->CapturedTextureTypes(),
+                                                       gen_env->CapturedTexturePixelFormats(),
+                                                       gen_env->CapturedPhase4PrototypeHandles())
+        : file_env ? ComputeTextureKey(file_env->CapturedTextureTypes(),
+                                       file_env->CapturedTexturePixelFormats())
+                   : 0;
+    spirv_cache.RecordTextureKeyMode(use_gen_logical_texture_key || use_file_logical_texture_key);
     // Was a second independent ComputeCbufKeyExcludingTextureHandles(...) call here —
     // see the matching comment in CreateGraphicsPipeline() above for why it's gone.
     const u64 diag_cbuf_key_excl_texture_handles_c = cbuf_key_c;
@@ -3482,7 +4182,7 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
     // "matches" against an unrelated real-zero-state graphics entry.
     const u64 workgroup_key = ComputeWorkgroupKey(key.shared_memory_size, key.workgroup_size);
     const SpirvKey spirv_key_c{compute_unique_hash, env.ShaderStage(), compiler_target_key,
-                               cbuf_key_c, workgroup_key, texture_key_c};
+                               cbuf_key_c,          workgroup_key,     texture_key_c};
     std::vector<u32> code;
     std::chrono::microseconds emit_time{};
     bool exact_module_hit = false;
@@ -3493,14 +4193,16 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
         if (cached->is_speculative) {
             // See the matching throttle comment in CreateGraphicsPipeline() above.
             static std::atomic<size_t> speculative_hit_logs_compute{0};
-            if (size_t expected = speculative_hit_logs_compute.load(); expected < 50 &&
+            if (size_t expected = speculative_hit_logs_compute.load();
+                expected < 50 &&
                 speculative_hit_logs_compute.compare_exchange_strong(expected, expected + 1)) {
-                const char* source = cached->source == VideoCommon::SpirvCacheEntrySource::PrecacheScanner
-                                         ? "scanner"
-                                         : "live";
+                const char* source =
+                    cached->source == VideoCommon::SpirvCacheEntrySource::PrecacheScanner
+                        ? "scanner"
+                        : "live";
                 LOG_INFO(Render_Vulkan,
-                         "0x{:016x} served from {} SPECULATIVE entry (unique_hash=0x{:016x})",
-                         hash, source, compute_unique_hash);
+                         "0x{:016x} served from {} SPECULATIVE entry (unique_hash=0x{:016x})", hash,
+                         source, compute_unique_hash);
             }
         }
         // Compute pipelines are self-contained (no preceding stage to misalign),
@@ -3513,17 +4215,17 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
         // Compute's EmitSPIRV overload takes no Bindings parameter (it always
         // starts descriptor allocation at zero), so store a default end_binding.
         spirv_cache.Insert(spirv_key_c, code, {}, /*is_speculative=*/false, workgroup_key, 0,
-                          diag_cbuf_key_excl_texture_handles_c, {}, &program.info,
-                          gen_env ? &gen_env->CapturedCbufValues() : nullptr,
-                          gen_env && gen_env->CapturedTextureTypes().empty() &&
-                              gen_env->CapturedTexturePixelFormats().empty() &&
-                              gen_env->CapturedTextureHandleCbufKeys().empty());
+                           diag_cbuf_key_excl_texture_handles_c, {}, &program.info,
+                           gen_env ? &gen_env->CapturedCbufValues() : nullptr,
+                           gen_env && gen_env->CapturedTextureTypes().empty() &&
+                               gen_env->CapturedTexturePixelFormats().empty() &&
+                               gen_env->CapturedTextureHandleCbufKeys().empty());
         // Reserve extra capacity on the local upload copy only — the stored
         // cache entry was inserted before the reserve so it stays compact.
         code.reserve(std::max<size_t>(code.size(), 16 * 1024 / sizeof(u32)));
         if (!spirv_cache_filename.empty()) {
-            serialization_thread.QueueWork([this] {
-                spirv_cache.SaveThrottled(spirv_cache_filename); });
+            serialization_thread.QueueWork(
+                [this] { spirv_cache.SaveThrottled(spirv_cache_filename); });
         }
         // Texture-slot feasibility instrumentation; see the matching comment at the
         // CreateGraphicsPipeline call site above.
@@ -3532,10 +4234,9 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
     if constexpr (CFG_TEMPLATE_MODULE_SHADOW_VALIDATION_ENABLED) {
         if (cfg_shadow_template && gen_env != nullptr &&
             (scanner_cfg_replay || gen_env->CapturedCbufValues().empty())) {
-            ValidateCfgTemplateComputeModule(cfg_template_key, env, *cfg_shadow_template,
-                                             env.StartAddress(), program, code,
-                                             scanner_cfg_replay ? &scanner_cfg_replay->key
-                                                                    : nullptr);
+            ValidateCfgTemplateComputeModule(
+                cfg_template_key, env, *cfg_shadow_template, env.StartAddress(), program, code,
+                scanner_cfg_replay ? &scanner_cfg_replay->key : nullptr);
         }
     }
     // Ensure the upload copy has enough capacity on the cache-hit path too.
@@ -3551,10 +4252,9 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
     const auto pipeline_create_start = std::chrono::steady_clock::now();
     auto pipeline = std::make_unique<ComputePipeline>(
         device, vulkan_pipeline_cache, descriptor_pool, guest_descriptor_queue, thread_worker,
-        statistics, &shader_notify, program.info, std::move(spv_module), this,
-        !build_in_parallel);
+        statistics, &shader_notify, program.info, std::move(spv_module), this, !build_in_parallel);
     RecordPipelineCreateWork(true, std::chrono::duration_cast<std::chrono::microseconds>(
-                                        std::chrono::steady_clock::now() - pipeline_create_start));
+                                       std::chrono::steady_clock::now() - pipeline_create_start));
     return pipeline;
 
 } catch (const vk::Exception& exception) {
@@ -3649,8 +4349,7 @@ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::
         std::vector<char> cache_data(cache_size);
         file.read(cache_data.data(), cache_size);
 
-        LOG_INFO(Render_Vulkan,
-                 "Loaded Vulkan driver pipeline cache: {}",
+        LOG_INFO(Render_Vulkan, "Loaded Vulkan driver pipeline cache: {}",
                  Common::FS::PathToUTF8String(filename));
 
         return create_pipeline_cache(cache_size, cache_data.data());
@@ -3666,33 +4365,28 @@ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // GPL: speculative Maxwell->SPIR-V translation
 // ---------------------------------------------------------------------------
 
-
-
 void PipelineCache::SubmitSpeculativeShader(
-        u64 unique_hash, std::vector<u64> maxwell_code,
-        Shader::Stage stage, u32 local_memory_size,
-        u32 shared_memory_size, std::array<u32, 3> workgroup_size,
-        u32 start_address, u32 texture_bound,
-        Shader::ProgramHeader sph,
-        std::optional<RealStageStoresSnapshot> previous_stage_snapshot) {
-    speculative_worker.QueueWork(
-        [this, unique_hash, code = std::move(maxwell_code),
-         stage, local_memory_size, shared_memory_size,
-         workgroup_size, start_address, texture_bound, sph,
-         previous_stage_snapshot = std::move(previous_stage_snapshot)]() mutable {
+    u64 unique_hash, std::vector<u64> maxwell_code, Shader::Stage stage, u32 local_memory_size,
+    u32 shared_memory_size, std::array<u32, 3> workgroup_size, u32 start_address, u32 texture_bound,
+    Shader::ProgramHeader sph, std::optional<RealStageStoresSnapshot> previous_stage_snapshot) {
+    speculative_worker.QueueWork([this, unique_hash, code = std::move(maxwell_code), stage,
+                                  local_memory_size, shared_memory_size, workgroup_size,
+                                  start_address, texture_bound, sph,
+                                  previous_stage_snapshot =
+                                      std::move(previous_stage_snapshot)]() mutable {
         const u64 compiler_target_key =
             VideoCommon::CompilerTargetFingerprint(precache_compiler_target);
         // Reuse persistent pools to avoid per-translation VirtualAlloc churn.
         spec_pools.ReleaseContents();
 
-        const u32 cfg_start = start_address +
-            ((stage == Shader::Stage::Compute)
-                 ? 0u : static_cast<u32>(sizeof(Shader::ProgramHeader)));
+        const u32 cfg_start =
+            start_address + ((stage == Shader::Stage::Compute)
+                                 ? 0u
+                                 : static_cast<u32>(sizeof(Shader::ProgramHeader)));
 
         // SpeculativeShaderEnvironment::ReadViewportTransformState() always guesses 1
         // (see speculative_shader_environment.h) since the real value is GPU register
@@ -3708,17 +4402,23 @@ void PipelineCache::SubmitSpeculativeShader(
         // translation. If cbuf specialization coverage improves later, this is the first
         // place to reconsider re-widening.
         try {
-            VideoCommon::SpeculativeShaderEnvironment env{
-                std::move(code), start_address, stage, local_memory_size,
-                shared_memory_size, workgroup_size, texture_bound, sph,
-                /*code_offset_in_program=*/0u};
+            VideoCommon::SpeculativeShaderEnvironment env{std::move(code),
+                                                          start_address,
+                                                          stage,
+                                                          local_memory_size,
+                                                          shared_memory_size,
+                                                          workgroup_size,
+                                                          texture_bound,
+                                                          sph,
+                                                          /*code_offset_in_program=*/0u};
 
             Shader::Maxwell::Flow::CFG cfg(env, spec_pools.flow_block, cfg_start, false);
-            auto program = Shader::Maxwell::TranslateProgram(
-                spec_pools.inst, spec_pools.block, env, cfg, host_info);
+            auto program = Shader::Maxwell::TranslateProgram(spec_pools.inst, spec_pools.block, env,
+                                                             cfg, host_info);
 
-            const Shader::Backend::Bindings starting_binding = previous_stage_snapshot
-                ? previous_stage_snapshot->end_binding : Shader::Backend::Bindings{};
+            const Shader::Backend::Bindings starting_binding =
+                previous_stage_snapshot ? previous_stage_snapshot->end_binding
+                                        : Shader::Backend::Bindings{};
             Shader::Backend::Bindings binding = starting_binding;
             Shader::RuntimeInfo rt{};
             // Scanner runtime-state snapshot, GPL live-speculative path. Real previous-stage
@@ -3757,14 +4457,14 @@ void PipelineCache::SubmitSpeculativeShader(
             }
             const bool use_logical_texture_key =
                 !HasActivePhase4LogicalTextureSlot(env.CapturedLogicalTextureSlots()) &&
-                HasCompleteLogicalTextureCoverage(env.CapturedLogicalTextureSlots(),
-                                                  env.CapturedLogicalTextureHandles(),
-                                                  env.CapturedTextureTypes(),
-                                                  env.CapturedTexturePixelFormats());
-            const u64 texture_key = use_logical_texture_key
-                                        ? ComputeLogicalTextureKey(env.CapturedLogicalTextureSlots())
-                                        : ComputeTextureKey(env.CapturedTextureTypes(),
-                                                            env.CapturedTexturePixelFormats());
+                HasCompleteLogicalTextureCoverage(
+                    env.CapturedLogicalTextureSlots(), env.CapturedLogicalTextureHandles(),
+                    env.CapturedTextureTypes(), env.CapturedTexturePixelFormats());
+            const u64 texture_key =
+                use_logical_texture_key
+                    ? ComputeLogicalTextureKey(env.CapturedLogicalTextureSlots())
+                    : ComputeTextureKey(env.CapturedTextureTypes(),
+                                        env.CapturedTexturePixelFormats());
             spirv_cache.RecordTextureKeyMode(use_logical_texture_key);
             // SpirvRelevantHash(stage), not Hash() — see the same swap and its
             // rationale in CreateGraphicsPipeline() above. Matters doubly here:
@@ -3781,7 +4481,8 @@ void PipelineCache::SubmitSpeculativeShader(
                 // format from every real one and can never match, regardless of
                 // how accurate the guess is (see FoldViewportTransformState's
                 // doc comment in spirv_cache.h).
-                runtime_key = FoldViewportTransformState(runtime_key, env.ReadViewportTransformState());
+                runtime_key =
+                    FoldViewportTransformState(runtime_key, env.ReadViewportTransformState());
             }
             // See the matching diag_base_runtime_hash comment in CreateGraphicsPipeline() —
             // everything folded into runtime_key up to (not including) the binding fold
@@ -3791,40 +4492,37 @@ void PipelineCache::SubmitSpeculativeShader(
             const auto diag_runtime_fields = rt.SpirvRelevantFieldHashes(stage);
             // `binding` is now the post-emit state; the cache key needs the
             // starting state that was baked into this module's descriptor numbers.
-            const u64 binding_key = stage == Shader::Stage::Compute
-                                        ? 0
-                                        : ComputeBindingKey(starting_binding);
+            const u64 binding_key =
+                stage == Shader::Stage::Compute ? 0 : ComputeBindingKey(starting_binding);
             if (stage != Shader::Stage::Compute) {
                 runtime_key = FoldBindingKey(runtime_key, binding_key);
             }
             // A cache entry is only interchangeable when every component of
             // SpirvKey matches. Do not suppress this translation merely because
             // another context for the same raw shader was seen first.
-            const SpirvKey speculative_key{unique_hash, stage, compiler_target_key, 0,
-                                            runtime_key, texture_key};
+            const SpirvKey speculative_key{unique_hash, stage,       compiler_target_key,
+                                           0,           runtime_key, texture_key};
             if (spirv_cache.Contains(speculative_key)) {
                 return;
             }
             auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, rt, program, binding);
             spirv_cache.InsertSpeculative(unique_hash, stage, compiler_target_key, runtime_key,
-                                          texture_key,
-                                          std::move(spirv),
-                                          binding, diag_base_runtime_hash, binding_key,
-                                          diag_runtime_fields);
+                                          texture_key, std::move(spirv), binding,
+                                          diag_base_runtime_hash, binding_key, diag_runtime_fields);
             if (!spirv_cache_filename.empty()) {
-                serialization_thread.QueueWork([this] {
-                    spirv_cache.SaveThrottled(spirv_cache_filename);
-                });
+                serialization_thread.QueueWork(
+                    [this] { spirv_cache.SaveThrottled(spirv_cache_filename); });
             }
             // Texture-slot feasibility instrumentation; see the matching comment at the
             // CreateGraphicsPipeline call site above.
             VideoCommon::GenericEnvironment::LogTextureSlotVarianceReportThrottled();
-        } catch (...) {}
+        } catch (...) {
+        }
     });
 }
 
-std::optional<PipelineCache::RealStageStoresSnapshot>
-PipelineCache::ResolveRealStageStoresSnapshot(u64 previous_stage_unique_hash) const {
+std::optional<PipelineCache::RealStageStoresSnapshot> PipelineCache::ResolveRealStageStoresSnapshot(
+    u64 previous_stage_unique_hash) const {
     if (previous_stage_unique_hash == 0) {
         return std::nullopt;
     }
@@ -3836,10 +4534,12 @@ PipelineCache::ResolveRealStageStoresSnapshot(u64 previous_stage_unique_hash) co
     return it->second;
 }
 
-void PipelineCache::OnNewShaderSeen(VideoCommon::GenericEnvironment& env,
-                                    u64 unique_hash, u64 previous_stage_unique_hash) {
-    if (!Settings::values.use_gpl_speculative_shaders.GetValue()) return;
-    if (env.ShaderStage() == Shader::Stage::VertexA) return;
+void PipelineCache::OnNewShaderSeen(VideoCommon::GenericEnvironment& env, u64 unique_hash,
+                                    u64 previous_stage_unique_hash) {
+    if (!Settings::values.use_gpl_speculative_shaders.GetValue())
+        return;
+    if (env.ShaderStage() == Shader::Stage::VertexA)
+        return;
     // Use CopyCode() rather than CachedSizeBytes() to obtain the shader binary.
     // When GenericEnvironment::Analyze() fails (TryFindSize returns nullopt), the
     // slow CFG path is taken and cached_lowest/cached_highest are left at their
@@ -3851,18 +4551,19 @@ void PipelineCache::OnNewShaderSeen(VideoCommon::GenericEnvironment& env,
     // code vector is empty we have nothing useful to speculatively translate.
     std::vector<u64> maxwell_code;
     env.CopyCode(maxwell_code);
-    if (maxwell_code.empty()) return;
+    if (maxwell_code.empty())
+        return;
 
     // Sanity-check: reject unreasonably large blobs (> 256 KB of Maxwell instructions).
     // A legitimate shader is rarely over 64 KB; 256 KB gives ample headroom.
     constexpr size_t MAX_SPECULATIVE_WORDS = 256 * 1024 / sizeof(u64);
-    if (maxwell_code.size() > MAX_SPECULATIVE_WORDS) return;
+    if (maxwell_code.size() > MAX_SPECULATIVE_WORDS)
+        return;
 
-    SubmitSpeculativeShader(unique_hash, std::move(maxwell_code),
-                            env.ShaderStage(), env.LocalMemorySize(),
-                            env.SharedMemorySize(), env.WorkgroupSize(),
-                            env.StartAddress(), env.TextureBoundBuffer(),
-                            env.SPH(), ResolveRealStageStoresSnapshot(previous_stage_unique_hash));
+    SubmitSpeculativeShader(unique_hash, std::move(maxwell_code), env.ShaderStage(),
+                            env.LocalMemorySize(), env.SharedMemorySize(), env.WorkgroupSize(),
+                            env.StartAddress(), env.TextureBoundBuffer(), env.SPH(),
+                            ResolveRealStageStoresSnapshot(previous_stage_unique_hash));
 }
 
 } // namespace Vulkan

@@ -110,7 +110,7 @@ struct RuntimeInfo {
     bool alpha_to_coverage_enabled{};
     std::array<FragmentOutputType, 8> frag_color_types{};
 
-    /// Static Y negate value
+    /// Legacy frontend field. Vulkan SPIR-V YDirection is draw-time push-constant data.
     bool y_negate{};
     /// Use storage buffers instead of global pointers on GLASM
     bool glasm_use_storage_buffers{};
@@ -174,7 +174,7 @@ struct RuntimeInfo {
     // else, so excluding them here doesn't change what gets hashed today — it just
     // documents the dependency explicitly and removes the latent risk of a future
     // MakeRuntimeInfo change silently adding entropy nothing reads. When a read site
-    // isn't stage-gated at all (y_negate) or is gated on the CURRENT shader's own
+        // isn't stage-gated at all or is gated on the CURRENT shader's own
     // IR/info rather than on `stage` (previous_stage_legacy_stores_mapping is gated on
     // info.loads.Legacy(), not on stage — see translate_program.cpp), it's kept
     // unconditionally rather than guessed at.
@@ -257,17 +257,8 @@ struct RuntimeInfo {
                                             frag_color_types.size() * sizeof(FragmentOutputType)));
         }
 
-        // y_negate: Phase 5 converted this to a real SPIR-V spec constant
-        // (Shader::kYNegateSpecId, spirv_emit_context.cpp's DefineRuntimeStateSpecConstants)
-        // instead of a value baked at translation time -- EmitYDirection
-        // (emit_spirv_context_get_set.cpp) no longer reads this field at all. The emitted
-        // SPIR-V is now identical regardless of the real y_negate value, so it must not stay
-        // in this hash: doing so would still fragment the cache on a field that no longer
-        // makes two entries' SPIR-V different from each other. This is exactly the "changes
-        // what the key means" category (SPIRV_CACHE_VERSION bump required, not just an
-        // ordinary edit) -- see the version history below. The real per-draw value is
-        // resolved separately, at pipeline-creation time (vk_graphics_pipeline.cpp), via a
-        // VkSpecializationMapEntry keyed on the same SpecId.
+        // y_negate is Vulkan draw-time PushConstant data. EmitYDirection does not read this
+        // RuntimeInfo field, so it must not split the exact SPIR-V module key.
 
         // glasm_use_storage_buffers deliberately omitted: not read anywhere under
         // backend/spirv/ or frontend/maxwell/ at all (it's a GLASM-backend-only

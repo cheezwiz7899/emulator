@@ -27,6 +27,7 @@
 #include <array>
 #include <bitset>
 #include <chrono>
+#include <span>
 #include <system_error>
 #include <unordered_set>
 
@@ -82,6 +83,7 @@
 
 #include "video_core/precache_cfg_artifact.h"
 #include "video_core/precache_frontend_artifact.h"
+#include "video_core/precache_program_contract.h"
 #include "video_core/speculative_shader_environment.h"
 #include "video_core/gpu.h"
 #include "video_core/renderer_base.h"
@@ -419,6 +421,21 @@ void GMainWindow::StartPrecacheScan(u64 program_id, const std::string& game_path
         // shader inside them later passed the Maxwell SPH validation and
         // produced a candidate); unrecognized is everything else.
         std::atomic<int>  bnsh_matched{0};
+        // D1 source groups are owned for contract discovery and a separately
+        // versioned source-catalog artifact. They are never a recipe, compiled,
+        // or served by this milestone.
+        std::atomic<int>  d1_source_groups{0};
+        std::atomic<int>  d1_source_standalone_groups{0};
+        std::atomic<int>  d1_source_parse_malformed{0};
+        std::atomic<int>  d1_source_parse_layout{0};
+        std::atomic<int>  d1_source_parse_capacity{0};
+        std::atomic<int>  d1_source_parse_ambiguous{0};
+        std::atomic<int>  d1_contract_unsupported_shape{0};
+        std::atomic<int>  d1_contract_missing_identity{0};
+        std::atomic<int>  d1_contract_missing_dependencies{0};
+        std::mutex        d1_source_mutex;
+        size_t            d1_source_bytes{};
+        std::vector<VideoCommon::PrecacheSourceProgramGroup> d1_source_program_groups;
         // zstd-compressed files (TotK-style shared-dictionary scheme): how many
         // were successfully decompressed (with or without a dictionary) vs.
         // failed (frame claims a Dictionary_ID we don't have loaded, or the
@@ -466,7 +483,7 @@ void GMainWindow::StartPrecacheScan(u64 program_id, const std::string& game_path
     auto local_vfs = std::make_shared<FileSys::RealVfsFilesystem>();
     const auto game_file = local_vfs->OpenFile(game_path, FileSys::OpenMode::Read);
 
-    auto worker = [state, game_path, spirv_path, cache_dir, target_path, game_file,
+    auto worker = [state, program_id, game_path, spirv_path, cache_dir, target_path, game_file,
                    resolved_romfs_roots = std::move(resolved_romfs_roots)]() mutable {
         // Prefer the resolved view captured while the short boot was alive. It
         // contains the same base/update/LayeredFS content the title actually
@@ -2079,10 +2096,101 @@ void GMainWindow::StartPrecacheScan(u64 program_id, const std::string& game_path
                 // via std::search / an SSE-friendly scan), but it hasn't been
                 // measured yet so this stays simple until there's a reason not to.
                 bool any_bnsh = false;
+                const std::string d1_source_name =
+                    fmt::format("{}\n{}", file->GetFullPath(), entry_name);
+                const u64 d1_source_container_identity = Common::CityHash64(
+                    d1_source_name.data(), d1_source_name.size());
                 for (size_t base = 0; base + 4 <= sz; base += 4) {
                     u32 magic4{}; std::memcpy(&magic4, data+base, 4);
                     if (magic4 == BNSH_MAGIC) {
                         any_bnsh = true;
+                        // D1's parser intentionally has no ControlCode fallback or
+                        // guessed scheduler alignment. It owns only an exact declared
+                        // ByteCode grouping for dependency-contract discovery; legacy
+                        // speculative translation below keeps its existing behavior.
+                        constexpr size_t kD1GroupsPerContainer = 128;
+                        constexpr size_t kD1BytesPerContainer = 1024 * 1024;
+                        constexpr size_t kD1TotalGroups = 4096;
+                        constexpr size_t kD1TotalBytes = 64 * 1024 * 1024;
+                        const VideoCommon::PrecacheBNSHParseLimits d1_limits{
+                            .max_groups = kD1GroupsPerContainer,
+                            .max_variations = 16384,
+                            .max_stage_bytes = kD1BytesPerContainer,
+                            .max_total_bytes = kD1BytesPerContainer,
+                        };
+                        auto d1_parsed = VideoCommon::ParsePrecacheBNSHProgramGroups(
+                            std::span<const u8>{data, sz}, base, d1_limits);
+                        for (auto& group : d1_parsed.groups) {
+                            group.source_container_identity = d1_source_container_identity;
+                        }
+                        switch (d1_parsed.rejection) {
+                        case VideoCommon::PrecacheBNSHParseRejection::None:
+                            break;
+                        case VideoCommon::PrecacheBNSHParseRejection::Malformed:
+                            ++state->d1_source_parse_malformed;
+                            break;
+                        case VideoCommon::PrecacheBNSHParseRejection::UnsupportedLayout:
+                            ++state->d1_source_parse_layout;
+                            break;
+                        case VideoCommon::PrecacheBNSHParseRejection::Capacity:
+                            ++state->d1_source_parse_capacity;
+                            break;
+                        case VideoCommon::PrecacheBNSHParseRejection::AmbiguousStage:
+                            ++state->d1_source_parse_ambiguous;
+                            break;
+                        }
+                        // Capacity means later complete groups were deferred. Groups already
+                        // returned are whole owned records, never truncated code, and remain
+                        // useful for the contract inventory. Any structural rejection invalidates
+                        // the container's provenance and retains nothing from it.
+                        if (d1_parsed.rejection == VideoCommon::PrecacheBNSHParseRejection::None ||
+                            d1_parsed.rejection == VideoCommon::PrecacheBNSHParseRejection::Capacity) {
+                            VideoCommon::PrecacheDependencyLedger d1_ledger;
+                            d1_ledger.Set(VideoCommon::PrecacheDependency::ProgramBytes,
+                                          VideoCommon::PrecacheDependencyProvenance::ProgramDerived);
+                            std::vector<VideoCommon::PrecacheSourceProgramGroup> retainable_groups;
+                            for (auto& group : d1_parsed.groups) {
+                                const auto decision = VideoCommon::ClassifyPrecacheSourceProgramGroup(
+                                    group, d1_ledger);
+                                switch (decision.primary_rejection) {
+                                case VideoCommon::PrecacheContractRejection::None:
+                                    retainable_groups.push_back(std::move(group));
+                                    break;
+                                case VideoCommon::PrecacheContractRejection::UnsupportedStageShape:
+                                    ++state->d1_contract_unsupported_shape;
+                                    break;
+                                case VideoCommon::PrecacheContractRejection::MissingProgramIdentity:
+                                    ++state->d1_contract_missing_identity;
+                                    break;
+                                case VideoCommon::PrecacheContractRejection::MissingDependency:
+                                    ++state->d1_contract_missing_dependencies;
+                                    // A complete declared VertexB+Fragment pair is the only
+                                    // current D1 candidate shape. It is useful to retain even
+                                    // though all non-program fields are correctly Unknown.
+                                    retainable_groups.push_back(std::move(group));
+                                    break;
+                                }
+                            }
+                            std::lock_guard lock{state->d1_source_mutex};
+                            bool deferred{};
+                            for (auto& group : retainable_groups) {
+                                size_t group_bytes{};
+                                for (const auto& stage : group.stages) {
+                                    group_bytes += stage.bytes.size();
+                                }
+                                if (state->d1_source_program_groups.size() >= kD1TotalGroups ||
+                                    group_bytes > kD1TotalBytes - state->d1_source_bytes) {
+                                    deferred = true;
+                                    continue;
+                                }
+                                state->d1_source_bytes += group_bytes;
+                                ++state->d1_source_groups;
+                                state->d1_source_program_groups.push_back(std::move(group));
+                            }
+                            if (deferred) {
+                                ++state->d1_source_parse_capacity;
+                            }
+                        }
                         process_bnsh_at(base);
                     }
                 }
@@ -2115,6 +2223,68 @@ void GMainWindow::StartPrecacheScan(u64 program_id, const std::string& game_path
                            sph.common0.sass_version.Value() != 0 && type >= 1 && type <= 5 &&
                            sph.common0.sph_type.Value() == ((type == 5) ? 2u : 1u);
                 };
+                const auto stage_from_sph = [](const Shader::ProgramHeader& sph)
+                    -> std::optional<Shader::Stage> {
+                    switch (sph.common0.shader_type.Value()) {
+                    case 1:
+                        return Shader::Stage::VertexB;
+                    case 2:
+                        return Shader::Stage::TessellationControl;
+                    case 3:
+                        return Shader::Stage::TessellationEval;
+                    case 4:
+                        return Shader::Stage::Geometry;
+                    case 5:
+                        return Shader::Stage::Fragment;
+                    default:
+                        return std::nullopt;
+                    }
+                };
+                const auto retain_d1_standalone = [&](const u8* program_data, size_t program_size,
+                                                       Shader::Stage stage, size_t source_offset) {
+                    constexpr size_t kD1TotalGroups = 4096;
+                    constexpr size_t kD1TotalBytes = 64 * 1024 * 1024;
+                    const VideoCommon::PrecacheBNSHParseLimits limits{
+                        .max_groups = 1,
+                        .max_variations = 1,
+                        .max_stage_bytes = 1024 * 1024,
+                        .max_total_bytes = 1024 * 1024,
+                    };
+                    auto parsed = VideoCommon::ParsePrecacheStandaloneProgram(
+                        std::span<const u8>{program_data, program_size}, stage, source_offset, limits);
+                    switch (parsed.rejection) {
+                    case VideoCommon::PrecacheBNSHParseRejection::None:
+                        break;
+                    case VideoCommon::PrecacheBNSHParseRejection::Malformed:
+                        ++state->d1_source_parse_malformed;
+                        return;
+                    case VideoCommon::PrecacheBNSHParseRejection::UnsupportedLayout:
+                        ++state->d1_source_parse_layout;
+                        return;
+                    case VideoCommon::PrecacheBNSHParseRejection::Capacity:
+                        ++state->d1_source_parse_capacity;
+                        return;
+                    case VideoCommon::PrecacheBNSHParseRejection::AmbiguousStage:
+                        ++state->d1_source_parse_ambiguous;
+                        return;
+                    }
+                    if (!parsed.group) {
+                        return;
+                    }
+                    parsed.group->source_container_identity = d1_source_container_identity;
+                    // A singleton is deliberately unsupported by the graphics contract.
+                    ++state->d1_contract_unsupported_shape;
+                    std::lock_guard lock{state->d1_source_mutex};
+                    if (state->d1_source_program_groups.size() >= kD1TotalGroups ||
+                        state->d1_source_bytes > kD1TotalBytes - parsed.copied_bytes) {
+                        ++state->d1_source_parse_capacity;
+                        return;
+                    }
+                    state->d1_source_bytes += parsed.copied_bytes;
+                    ++state->d1_source_groups;
+                    ++state->d1_source_standalone_groups;
+                    state->d1_source_program_groups.push_back(std::move(*parsed.group));
+                };
                 bool any_raw_nvn = false;
                 if (!any_bnsh) {
                     for (size_t base = 0; base + 4 <= sz; base += 4) {
@@ -2126,6 +2296,9 @@ void GMainWindow::StartPrecacheScan(u64 program_id, const std::string& game_path
                         std::memcpy(&sph, data + sph_off, sizeof(sph));
                         if (has_valid_sph(sph)) {
                             any_raw_nvn = true;
+                            if (const auto stage = stage_from_sph(sph)) {
+                                retain_d1_standalone(data + sph_off, sz - sph_off, *stage, sph_off);
+                            }
                             // No BNSH shader-program grouping for a raw-NVN scan
                             // unit either (same reasoning as the pre-existing
                             // offset-0 raw_matched call site above): nullptr for
@@ -2162,6 +2335,9 @@ void GMainWindow::StartPrecacheScan(u64 program_id, const std::string& game_path
                         std::memcpy(&sph, data + off, sizeof(sph));
                         if (has_valid_sph(sph)) {
                             any_raw_matched = true;
+                            if (const auto stage = stage_from_sph(sph)) {
+                                retain_d1_standalone(data + off, sz - off, *stage, off);
+                            }
                             // Same reasoning as the raw-NVN call site above: no
                             // sibling-stage data for a pairtable-derived scan unit.
                             process_blob(std::vector<u8>(data + off, data + sz),
@@ -2180,6 +2356,9 @@ void GMainWindow::StartPrecacheScan(u64 program_id, const std::string& game_path
                     Shader::ProgramHeader sph{}; std::memcpy(&sph,data,sizeof(sph));
                     if (has_valid_sph(sph)) {
                         ++state->raw_matched;
+                        if (const auto stage = stage_from_sph(sph)) {
+                            retain_d1_standalone(data, sz, *stage, 0);
+                        }
                         // No BNSH shader-program grouping for a standalone raw-matched
                         // file, so no real sibling-stage data exists here -- nullptr for
                         // both fall back to the prior sentinel
@@ -2221,6 +2400,23 @@ void GMainWindow::StartPrecacheScan(u64 program_id, const std::string& game_path
                                                       "precache_frontend_artifacts_{:016x}.bin",
                                                       compiler_target_key),
                                                   frontend_artifact_snapshot);
+        std::vector<VideoCommon::PrecacheSourceProgramGroup> d1_source_snapshot;
+        size_t d1_source_snapshot_bytes{};
+        {
+            std::lock_guard lock{state->d1_source_mutex};
+            d1_source_snapshot = std::move(state->d1_source_program_groups);
+            d1_source_snapshot_bytes = state->d1_source_bytes;
+        }
+        const bool d1_source_catalog_saved = !d1_source_snapshot.empty() &&
+                                            VideoCommon::SavePrecacheSourceCatalog(
+                                                cache_dir / fmt::format(
+                                                    "precache_d1_sources_{:016x}.bin",
+                                                    compiler_target_key),
+                                                {
+                                                    .title_id = program_id,
+                                                    .compiler_target_fingerprint = compiler_target_key,
+                                                    .groups = std::move(d1_source_snapshot),
+                                                });
         cache.Save(spirv_path);
         LOG_INFO(Render_Vulkan,
                  "PreCacheShaders: done. files={} processed={} zstd_decompressed={} "
@@ -2289,6 +2485,20 @@ void GMainWindow::StartPrecacheScan(u64 program_id, const std::string& game_path
                  cache.Size(), cache.LogicalTextureKeyCount(), cache.RawTextureKeyCount(),
                  state->cfg_us.load() / 1000, state->template_us.load() / 1000,
                  state->finalize_us.load() / 1000, state->emit_us.load() / 1000);
+        LOG_INFO(Render_Vulkan,
+                 "PreCacheShaders D1 source contract: retained(groups/standalone/bytes)={}/{}/{} "
+                 "parse_reject(malformed/layout/capacity/ambiguous)={}/{}/{}/{} "
+                 "contract_reject(stage-shape/identity/missing-dependencies)={}/{}/{}; "
+                 "source_catalog(saved/bytes)={}/{}; diagnostic only: no D1 recipe, driver build, "
+                 "or live serving is enabled",
+                 state->d1_source_groups.load(), state->d1_source_standalone_groups.load(),
+                 state->d1_source_bytes,
+                 state->d1_source_parse_malformed.load(), state->d1_source_parse_layout.load(),
+                 state->d1_source_parse_capacity.load(), state->d1_source_parse_ambiguous.load(),
+                 state->d1_contract_unsupported_shape.load(),
+                 state->d1_contract_missing_identity.load(),
+                 state->d1_contract_missing_dependencies.load(), d1_source_catalog_saved ? 1 : 0,
+                 d1_source_snapshot_bytes);
     };
 
     auto future = QtConcurrent::run(std::move(worker));

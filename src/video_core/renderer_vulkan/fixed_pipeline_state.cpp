@@ -58,7 +58,9 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
     early_z.Assign(regs.mandated_early_z != 0 ? 1 : 0);
     depth_enabled.Assign(regs.zeta_enable != 0 ? 1 : 0);
     depth_format.Assign(static_cast<u32>(regs.zeta.format));
-    y_negate.Assign(regs.window_origin.mode != Tegra::Engines::Maxwell3D::Regs::WindowOrigin::Mode::UpperLeft ? 1 : 0);
+    // B1: YDirection is draw-time push-constant data. Keep this padding-stable field zero so
+    // lower/upper window origin no longer creates separate graphics executable identities.
+    y_negate.Assign(0);
     provoking_vertex_last.Assign(regs.provoking_vertex == Tegra::Engines::Maxwell3D::Regs::ProvokingVertex::Last ? 1 : 0);
     conservative_raster_enable.Assign(regs.conservative_raster_enable != 0 ? 1 : 0);
     smooth_lines.Assign(regs.line_anti_alias_enable != 0 ? 1 : 0);

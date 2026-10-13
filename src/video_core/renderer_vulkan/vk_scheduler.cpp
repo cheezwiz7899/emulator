@@ -125,11 +125,12 @@ void Scheduler::RequestOutsideRenderPassOperationContext() {
     EndRenderPass();
 }
 
-bool Scheduler::UpdateGraphicsPipeline(GraphicsPipeline* pipeline) {
-    if (state.graphics_pipeline == pipeline) {
+bool Scheduler::UpdateGraphicsPipeline(GraphicsPipeline* pipeline, u64 generation) {
+    if (state.graphics_pipeline == pipeline && state.graphics_pipeline_generation == generation) {
         return false;
     }
     state.graphics_pipeline = pipeline;
+    state.graphics_pipeline_generation = generation;
     return true;
 }
 
@@ -275,6 +276,7 @@ void Scheduler::AllocateNewContext() {
 
 void Scheduler::InvalidateState() {
     state.graphics_pipeline = nullptr;
+    state.graphics_pipeline_generation = 0;
     state.rescaling_defined = false;
     state_tracker.InvalidateCommandBufferState();
 }

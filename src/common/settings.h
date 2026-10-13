@@ -610,6 +610,11 @@ struct Values {
     Setting<bool> renderer_debug{linkage, false, "debug", Category::RendererDebug};
     Setting<bool> renderer_shader_feedback{linkage, false, "shader_feedback",
                                            Category::RendererDebug};
+    // Cold first-use latency probe. Applies VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT to
+    // ordinary graphics pipeline creation only. Default off: this can trade runtime GPU
+    // performance for faster driver creation and is not a general rendering setting.
+    Setting<bool> graphics_pipeline_disable_optimization_experiment{
+        linkage, false, "graphics_pipeline_disable_optimization_experiment", Category::RendererDebug};
     Setting<bool> enable_nsight_aftermath{linkage, false, "nsight_aftermath",
                                           Category::RendererDebug};
     Setting<bool> disable_shader_loop_safety_checks{

@@ -26,9 +26,26 @@ struct RescalingLayout {
 struct RenderAreaLayout {
     std::array<f32, 4> render_area;
 };
+// Graphics-only ABI. Every graphics shader that reads any of these runtime values uses
+// one PushConstant block with these absolute offsets. Keeping this distinct from
+// RescalingLayout preserves the pre-existing compute ABI.
+struct GraphicsRuntimeStateLayout {
+    RescalingLayout rescaling;
+    RenderAreaLayout render_area;
+    f32 y_direction;
+};
 constexpr u32 RESCALING_LAYOUT_WORDS_OFFSET = offsetof(RescalingLayout, rescaling_textures);
 constexpr u32 RESCALING_LAYOUT_DOWN_FACTOR_OFFSET = offsetof(RescalingLayout, down_factor);
-constexpr u32 RENDERAREA_LAYOUT_OFFSET = offsetof(RenderAreaLayout, render_area);
+constexpr u32 RENDERAREA_LAYOUT_OFFSET = offsetof(GraphicsRuntimeStateLayout, render_area);
+constexpr u32 Y_DIRECTION_LAYOUT_OFFSET = offsetof(GraphicsRuntimeStateLayout, y_direction);
+// Vulkan ranges need only cover bytes actually addressed. The C++ aggregate has tail padding
+// from RescalingLayout's 16-byte alignment; never expose that padding as ABI.
+constexpr u32 GRAPHICS_RUNTIME_STATE_PUSH_CONSTANT_SIZE =
+    Y_DIRECTION_LAYOUT_OFFSET + sizeof(f32);
+static_assert(RESCALING_LAYOUT_WORDS_OFFSET == 0);
+static_assert(RENDERAREA_LAYOUT_OFFSET == sizeof(RescalingLayout));
+static_assert(Y_DIRECTION_LAYOUT_OFFSET == sizeof(RescalingLayout) + sizeof(RenderAreaLayout));
+static_assert(GRAPHICS_RUNTIME_STATE_PUSH_CONSTANT_SIZE <= 128);
 
 [[nodiscard]] std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program, Bindings& bindings);
 

@@ -6,14 +6,19 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <type_traits>
+#include <vector>
 
 #include "common/thread_worker.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+#include "video_core/renderer_vulkan/pipeline_helper.h"
+#include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
@@ -24,6 +29,12 @@ class ShaderNotify;
 }
 
 namespace Vulkan {
+
+// Final module words are kept only while experimental GPL is enabled and device
+// can fast-link GPLs. These are exact emitted SPIR-V, not Shader::Info or frontend IR.
+using FinalGraphicsPipelineSpirv =
+    std::array<std::shared_ptr<const std::vector<u32>>,
+               Tegra::Engines::Maxwell3D::Regs::MaxShaderStage>;
 
 struct GraphicsPipelineCacheKey {
     std::array<u64, 6> unique_hashes;
@@ -49,15 +60,11 @@ struct GraphicsPipelineCacheKey {
     // about); a trailing 1-byte bool needs padding to round the struct back up to this
     // struct's 8-byte alignment (from unique_hashes), and that padding's indeterminate value
     // breaks has_unique_object_representations_v (also confirmed by the same real build, not
-    // assumed). A full u64 needs no padding either side, since unique_hashes + state.Size()
-    // was already a multiple of 8 for the has_unique_object_representations_v assert to have
-    // passed before this field existed at all. Zero-initialized the same way every other field
-    // here already is: via GraphicsPipelineCacheKey key{} at its declaration
-    // (vk_pipeline_cache.h), not a per-member default. That same u64 is exactly why widening
-    // this from one bit's worth of meaning to up to 64 needed no layout change at all: Hash()/
-    // operator==() (vk_pipeline_cache.cpp) already hash/memcmp the raw bytes up to Size()
-    // rather than caring about this field's individual bits, so they pick up the new bits
-    // automatically and correctly, same as any other entropy added to this key.
+    // assumed). Zero-initialized the same way every other field here already is: via
+    // GraphicsPipelineCacheKey key{} at its declaration (vk_pipeline_cache.h), not a
+    // per-member default. Hash()/operator==() compare this trailing field separately from the
+    // variable-length active prefix of state: it is physically after the whole FixedPipelineState,
+    // so treating it as adjacent to a shortened state prefix would hash/compare unrelated bytes.
     //
     // Deliberately part of this key (not stored/tracked separately): this struct IS the
     // pipeline-identity key two draws get compared by (see the has_unique_object_
@@ -75,13 +82,28 @@ struct GraphicsPipelineCacheKey {
         return !operator==(rhs);
     }
 
-    size_t Size() const noexcept {
-        return sizeof(unique_hashes) + state.Size() + sizeof(phase4_prototype_needs_array_variant);
-    }
 };
 static_assert(std::has_unique_object_representations_v<GraphicsPipelineCacheKey>);
 static_assert(std::is_trivially_copyable_v<GraphicsPipelineCacheKey>);
 static_assert(std::is_trivially_constructible_v<GraphicsPipelineCacheKey>);
+
+// Process-local input for GPL selection. This owns only canonical scalar data
+// and immutable emitted words; Shader::Info remains ordinary live metadata.
+struct GraphicsPipelineRecipe {
+    struct RuntimeSpecialization {
+        std::vector<VkSpecializationMapEntry> entries;
+        std::vector<u32> values;
+        std::array<bool, Tegra::Engines::Maxwell3D::Regs::MaxShaderStage> stage_uses{};
+    };
+
+    GraphicsPipelineCacheKey pipeline_key{};
+    FinalGraphicsPipelineSpirv final_spirv{};
+    DescriptorLayoutSignature layout{};
+    RenderPassKey render_pass{};
+    RuntimeSpecialization runtime_specialization{};
+    std::vector<VkDynamicState> dynamic_states{};
+    u32 subpass{};
+};
 
 } // namespace Vulkan
 
@@ -116,7 +138,8 @@ public:
         PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
         PipelineCache* pipeline_cache_owner, bool is_boot_preload,
         const GraphicsPipelineCacheKey& key, std::array<vk::ShaderModule, NUM_STAGES> stages,
-        const std::array<const Shader::Info*, NUM_STAGES>& infos);
+        const std::array<const Shader::Info*, NUM_STAGES>& infos,
+        FinalGraphicsPipelineSpirv final_spirv);
 
     GraphicsPipeline& operator=(GraphicsPipeline&&) noexcept = delete;
     GraphicsPipeline(GraphicsPipeline&&) noexcept = delete;
@@ -147,6 +170,8 @@ public:
         return build_failed.load(std::memory_order::acquire);
     }
 
+    void BuildOptimizedPipeline();
+
     template <typename Spec>
     static auto MakeConfigureSpecFunc() {
         return [](GraphicsPipeline* pl, bool is_indexed) { pl->ConfigureImpl<Spec>(is_indexed); };
@@ -164,7 +189,7 @@ private:
     void ConfigureDraw(const RescalingPushConstant& rescaling,
                        const RenderAreaPushConstant& render_are);
 
-    void MakePipeline(VkRenderPass render_pass);
+    void MakePipeline(VkRenderPass render_pass, bool optimized_rebuild = false);
 
     void Validate();
 
@@ -187,6 +212,9 @@ private:
 
     std::array<vk::ShaderModule, NUM_STAGES> spv_modules;
 
+    // GPL recipe input. No pointer into an emitter or caller-owned vector survives.
+    GraphicsPipelineRecipe recipe;
+
     std::array<Shader::Info, NUM_STAGES> stage_infos;
     std::array<u32, 5> enabled_uniform_buffer_masks{};
     VideoCommon::UniformBufferSizes uniform_buffer_sizes{};
@@ -197,6 +225,24 @@ private:
     vk::PipelineLayout pipeline_layout;
     vk::DescriptorUpdateTemplate descriptor_update_template;
     vk::Pipeline pipeline;
+    // C1 handle is never destroyed/replaced while this cached owner is alive. C2 publishes a
+    // second, optimized handle only after it is complete; this avoids a GPU-lifetime race.
+    vk::Pipeline optimized_pipeline;
+    VkRenderPass pipeline_render_pass{VK_NULL_HANDLE};
+    std::atomic<VkPipeline> active_pipeline{VK_NULL_HANDLE};
+    // Seqlock: even values are stable bindings. Scheduler state includes this generation so a
+    // published optimized handle forces a bind even though GraphicsPipeline* is unchanged.
+    std::atomic<u64> active_pipeline_generation{};
+    std::atomic<u32> configure_count{};
+    std::atomic_bool optimized_rebuild_queued{false};
+    const bool c1_disable_optimization;
+
+    struct PipelineBinding {
+        VkPipeline handle;
+        u64 generation;
+    };
+    [[nodiscard]] PipelineBinding CurrentPipelineBinding() const noexcept;
+    void PublishOptimizedPipeline() noexcept;
 
     // Split-mode set 1 (resources: ssbos / texel buffers / textures / images).
     // Empty in single-set mode; the original descriptor_set_layout above holds
@@ -221,6 +267,10 @@ private:
     std::mutex build_mutex;
     std::atomic_bool is_built{false};
     std::atomic_bool build_failed{false};
+    // Immutable request-time marker. D0 compares this against the first command-recording point;
+    // it never feeds scheduling or cache identity.
+    const std::chrono::steady_clock::time_point request_time{std::chrono::steady_clock::now()};
+    std::atomic_bool first_draw_lead_recorded{false};
     bool uses_push_descriptor{false};
     bool split_descriptor_sets{false};
 };
