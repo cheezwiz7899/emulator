@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -18,11 +19,14 @@
 #include "common/div_ceil.h"
 #include "common/literals.h"
 #include "common/lru_cache.h"
+#include "common/virtual_buffer.h"
 #include "common/range_sets.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/slot_vector.h"
 #include "video_core/buffer_cache/buffer_base.h"
+#include "video_core/buffer_cache/uma.h"
+#include "video_core/cache_memory_pressure.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/delayed_destruction_ring.h"
 #include "video_core/dirty_flags.h"
@@ -45,10 +49,13 @@ constexpr u32 NUM_VERTEX_BUFFERS = 16;
 #else
 constexpr u32 NUM_VERTEX_BUFFERS = 32;
 #endif
+constexpr u64 MAX_PADDED_VERTEX_BUFFER_SIZE = 1_MiB;
 constexpr u32 NUM_TRANSFORM_FEEDBACK_BUFFERS = 4;
 constexpr u32 NUM_GRAPHICS_UNIFORM_BUFFERS = 18;
 constexpr u32 NUM_COMPUTE_UNIFORM_BUFFERS = 8;
-constexpr u32 NUM_STORAGE_BUFFERS = 16;
+// Must hold every storage buffer a shader can declare (Shader::Info::MAX_SSBOS, checked where
+// pipelines bind them). The enabled and written masks are u32, so 32 is also their limit.
+constexpr u32 NUM_STORAGE_BUFFERS = 32;
 constexpr u32 NUM_TEXTURE_BUFFERS = 32;
 constexpr u32 NUM_STAGES = 5;
 
@@ -120,6 +127,10 @@ public:
     std::array<u32, NUM_STAGES> enabled_uniform_buffer_masks{};
     u32 enabled_compute_uniform_buffer_mask = 0;
 
+    /// One bit per vertex stream that is bound to a real buffer
+    u32 enabled_vertex_buffers = 0;
+    static_assert(NUM_VERTEX_BUFFERS <= 32);
+
     const UniformBufferSizes* uniform_buffer_sizes{};
     const ComputeUniformBufferSizes* compute_uniform_buffer_sizes{};
 
@@ -155,7 +166,11 @@ class BufferCache : public VideoCommon::ChannelSetupCaches<BufferCacheChannelInf
     // This is unrelated to the CPU page size and it can be changed as it seems optimal.
     static constexpr u32 CACHING_PAGEBITS = 16;
     static constexpr u64 CACHING_PAGESIZE = u64{1} << CACHING_PAGEBITS;
-
+    // Device addresses are 39-bit. Keep the cache page table aligned with the address space
+    // exposed by MaxwellDeviceMemoryManager instead of silently truncating it to 34 bits.
+    static constexpr u64 CACHING_PAGE_COUNT =
+        1ULL << (Tegra::MaxwellDeviceMemoryManager::AS_BITS - CACHING_PAGEBITS);
+    static constexpr u64 CACHING_ADDRESS_SPACE_SIZE = CACHING_PAGE_COUNT * CACHING_PAGESIZE;
     static constexpr bool IS_OPENGL = P::IS_OPENGL;
     static constexpr bool HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS =
         P::HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS;
@@ -166,10 +181,6 @@ class BufferCache : public VideoCommon::ChannelSetupCaches<BufferCacheChannelInf
     static constexpr bool USE_MEMORY_MAPS = P::USE_MEMORY_MAPS;
     static constexpr bool SEPARATE_IMAGE_BUFFERS_BINDINGS = P::SEPARATE_IMAGE_BUFFER_BINDINGS;
     static constexpr bool USE_MEMORY_MAPS_FOR_UPLOADS = P::USE_MEMORY_MAPS_FOR_UPLOADS;
-
-    static constexpr s64 DEFAULT_EXPECTED_MEMORY = 512_MiB;
-    static constexpr s64 DEFAULT_CRITICAL_MEMORY = 1_GiB;
-    static constexpr s64 TARGET_THRESHOLD = 4_GiB;
 
     // FIXED: VRAM leak prevention - Enhanced buffer eviction constants
     static constexpr u64 DEFAULT_BUFFER_EVICTION_FRAMES = 5;
@@ -200,7 +211,7 @@ public:
 
     ~BufferCache();
 
-    void TickFrame();
+    void TickFrame(u64 cache_usage, u64 cache_target, std::span<const HeapMemoryBudget> heaps);
 
     void WriteMemory(DAddr device_addr, u64 size);
 
@@ -324,9 +335,12 @@ private:
 
     template <typename Func>
     void ForEachBufferInRange(DAddr device_addr, u64 size, Func&& func) {
+        if (!IsRegionPageTableAddressable(device_addr, size)) {
+            return;
+        }
         const u64 page_end = Common::DivCeil(device_addr + size, CACHING_PAGESIZE);
         for (u64 page = device_addr >> CACHING_PAGEBITS; page < page_end;) {
-            const BufferId buffer_id = page_table[page];
+            const BufferId buffer_id = GetPageBufferId(page);
             if (!buffer_id) {
                 ++page;
                 continue;
@@ -344,7 +358,38 @@ private:
                ((device_addr + size) & ~Core::DEVICE_PAGEMASK);
     }
 
-    void RunGarbageCollector();
+    [[nodiscard]] static constexpr bool IsRegionPageTableAddressable(DAddr device_addr,
+                                                                      u64 size) noexcept {
+        return device_addr < CACHING_ADDRESS_SPACE_SIZE &&
+               size <= CACHING_ADDRESS_SPACE_SIZE - device_addr;
+    }
+
+    [[nodiscard]] BufferId GetPageBufferId(u64 page) const noexcept {
+        if (page >= CACHING_PAGE_COUNT) {
+            return BufferId{};
+        }
+        const u32 entry = page_table[page];
+        if (entry == 0) {
+            return BufferId{};
+        }
+        const BufferId buffer_id{entry - 1};
+        // A damaged page-table entry must not become an unchecked SlotVector index.
+        return slot_buffers.contains(buffer_id) ? buffer_id : BufferId{};
+    }
+
+    void SetPageBufferId(u64 page, BufferId buffer_id) {
+        if (page >= CACHING_PAGE_COUNT) {
+            return;
+        }
+        // An entry that already holds the value is not written, so table pages nothing was ever
+        // registered in stay untouched.
+        const u32 entry = buffer_id ? buffer_id.index + 1 : 0;
+        if (page_table[page] != entry) {
+            page_table[page] = entry;
+        }
+    }
+
+    bool RunGarbageCollector(bool aggressive_gc);
 
 public:
     // FIXED: VRAM leak prevention - Enhanced public interface for buffer VRAM management
@@ -419,6 +464,9 @@ public:
 
     void MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size);
 
+    /// Grows a guest write over the pages the guest is likely to write next
+    [[nodiscard]] u64 WidenHotWrite(DAddr device_addr, u64 size);
+
     [[nodiscard]] BufferId FindBuffer(DAddr device_addr, u32 size);
 
     [[nodiscard]] OverlapResult ResolveOverlaps(DAddr device_addr, u32 wanted_size);
@@ -435,6 +483,13 @@ public:
     void ChangeRegister(BufferId buffer_id);
 
     void TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept;
+
+    /// Records that GPU work is about to use [offset, offset + size) of the buffer: marks the
+    /// range for upload reordering and stamps its pages with the current scheduler tick for the
+    /// unified memory rule. Bind, clear, DMA, overlap and download sites use this; staged copies,
+    /// ObtainCPUBuffer and the indirect getters stamp their range with Uma::StampPages, as
+    /// they are not tracked for upload reordering.
+    void MarkGpuUse(Buffer& buffer, u64 offset, u64 size);
 
     bool SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size);
 
@@ -472,7 +527,8 @@ public:
     Tegra::MaxwellDeviceMemoryManager& device_memory;
 
     Common::SlotVector<Buffer> slot_buffers;
-    DelayedDestructionRing<Buffer, 8> delayed_destruction_ring;
+    static constexpr u64 TICKS_TO_DESTROY = 8;
+    DelayedDestructionRing<Buffer, TICKS_TO_DESTROY> delayed_destruction_ring;
 
     const Tegra::Engines::DrawManager::IndirectParams* current_draw_indirect{};
 
@@ -500,9 +556,18 @@ public:
     };
     Common::LeastRecentlyUsedCache<LRUItemParams> lru_cache;
     u64 frame_tick = 0;
+
+    /// How often the guest recently wrote into pages this cache was watching, per caching page:
+    /// frame of the last write in the upper 16 bits, count in the lower 16. One flat table like
+    /// page_table: the host commits its pages when they are first written, so only the parts of
+    /// the address space the guest writes to take memory.
+    static constexpr u16 HOT_WRITE_COUNT = 4;
+    static constexpr u16 WRITE_HEAT_FRAMES = 30;
+    static constexpr u64 MAX_WIDENED_WRITE = 16 * CACHING_PAGESIZE;
+    Common::VirtualBuffer<u32> write_heat;
+
     u64 total_used_memory = 0; // Bytes owned by this cache.
-    u64 minimum_memory = 0;
-    u64 critical_memory = 0;
+    CacheMemoryPressure memory_pressure;
     BufferId inline_buffer_id;
 
     u64 large_buffer_memory = 0;
@@ -510,7 +575,7 @@ public:
     u32 buffer_count = 0;
     u32 large_buffer_count = 0;
 
-    std::array<BufferId, ((1ULL << 34) >> CACHING_PAGEBITS)> page_table;
+    Common::VirtualBuffer<u32> page_table;
     Common::ScratchBuffer<u8> tmp_buffer;
 };
 

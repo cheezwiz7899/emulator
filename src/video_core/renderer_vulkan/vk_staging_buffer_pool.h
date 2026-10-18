@@ -5,6 +5,9 @@
 #pragma once
 
 #include <climits>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <vector>
 
 #include "common/common_types.h"
@@ -26,6 +29,10 @@ struct StagingBufferRef {
     u64 index;
 };
 
+// Keeping this handle alive reserves the shared GC allocation through GPU completion
+// and consumption of its mapped data. The cached allocation itself remains deferred.
+using GCDownloadRef = std::shared_ptr<const StagingBufferRef>;
+
 class StagingBufferPool {
 public:
     static constexpr size_t NUM_SYNCS = 32;
@@ -35,6 +42,9 @@ public:
     ~StagingBufferPool();
 
     StagingBufferRef Request(size_t size, MemoryUsage usage, bool deferred = false);
+    // Shared, bounded readback storage for synchronous GC passes. Keep the handle
+    // through Finish and mapped-data consumption. Busy/OOM leaves dirty resources owned.
+    GCDownloadRef RequestGCDownload(size_t size);
     void FreeDeferred(StagingBufferRef& ref);
 
     [[nodiscard]] VkBuffer StreamBuf() const noexcept {
@@ -120,6 +130,8 @@ public:
     Scheduler& scheduler;
 
     vk::Buffer stream_buffer;
+    std::mutex gc_download_mutex;
+    std::shared_ptr<StagingBufferRef> gc_download;
     std::span<u8> stream_pointer;
     VkDeviceSize stream_buffer_size;
     VkDeviceSize region_size;

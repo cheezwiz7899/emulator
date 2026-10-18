@@ -4,9 +4,14 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cstring>
+#include <ctime>
 #include <exception>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <vector>
 
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 
@@ -18,6 +23,7 @@
 #include "video_core/arm64_register_guard.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/control/channel_state.h"
+#include "video_core/dirty_flags.h"
 #include "video_core/engines/draw_manager.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -81,7 +87,7 @@ CitronGraphicsPipelineConfigureThunk(GraphicsPipeline* pipeline, bool is_indexed
 // registers modified. Isolate GraphicsPipeline::Configure so a damaged RasterizerVulkan
 // pointer cannot be consumed by UpdateDynamicStates before the outer macro guard returns.
 // Bits 0-9 report x19-x28 respectively; bits 10-11 report lower/upper guard damage; bit 12
-// reports x29.
+// reports x29; bits 13-14 report saved-link-register damage/no majority.
 extern "C" __attribute__((naked, noinline)) u32
 CitronGraphicsPipelineConfigurePreservingRegisters(GraphicsPipeline*, bool) {
     CITRON_ARM64_PRESERVE_REGISTERS(CitronGraphicsPipelineConfigureThunk);
@@ -264,10 +270,10 @@ RasterizerVulkan::~RasterizerVulkan() {
 }
 
 template <typename Func>
-void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+GraphicsPipeline* RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     std::shared_lock shared_guard{shutdown_mutex};
     if (is_shutting_down) {
-        return;
+        return nullptr;
     }
 
     SCOPE_EXIT {
@@ -280,7 +286,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
 
     GraphicsPipeline* const pipeline{pipeline_cache.CurrentGraphicsPipeline()};
     if (!pipeline) {
-        return;
+        return nullptr;
     }
     std::exception_ptr configure_exception;
     {
@@ -295,7 +301,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
             configure_exception = pipeline_configure_exception;
             pipeline_configure_exception = {};
             if (configure_corruption != 0 &&
-                VideoCore::IsFirstArm64RegisterCorruption<13, ConfigureCorruptionTag>(
+                VideoCore::IsFirstArm64RegisterCorruption<15, ConfigureCorruptionTag>(
                     configure_corruption)) {
                 LOG_ERROR(
                     Render_Vulkan,
@@ -321,10 +327,129 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     if (configure_exception) {
         std::rethrow_exception(configure_exception);
     }
+    return pipeline;
 }
 
+void RasterizerVulkan::PerformVertexPointerStores(const GraphicsPipeline& pipeline, bool is_indexed,
+                                                  std::optional<u32> instance_count) {
+    // Sanity limit for the pointer table read per draw
+    static constexpr u64 MAX_POINTER_TABLE_SIZE{64ULL << 20};
+
+    const std::span<const Shader::PointerStoreDescriptor> stores{pipeline.VertexPointerStores()};
+    if (stores.empty()) {
+        return;
+    }
+    if (is_indexed || !instance_count) {
+        // The vertex ids of these draws are only known to the GPU
+        static std::once_flag warn_unsupported;
+        std::call_once(warn_unsupported, [] {
+            LOG_WARNING(Render_Vulkan,
+                        "Vertex shader pointer stores are only performed for direct non-indexed "
+                        "draws");
+        });
+        return;
+    }
+    const auto& draw_state{maxwell3d->draw_manager->GetDrawState()};
+    const u32 first_vertex{draw_state.vertex_buffer.first};
+    const u32 num_vertices{draw_state.vertex_buffer.count};
+    if (*instance_count == 0 || num_vertices == 0) {
+        return;
+    }
+    const auto& cbufs{maxwell3d->state.shader_stages[0].const_buffers};
+    std::vector<u8> pointer_table;
+    // Adjacent writes are merged
+    GPUVAddr pending_address{};
+    std::vector<u8> pending;
+    const auto flush_pending{[&] {
+        if (!pending.empty()) {
+            AccelerateInlineToMemory(pending_address, pending.size(), pending);
+            pending.clear();
+        }
+    }};
+    for (auto it{stores.begin()}; it != stores.end();) {
+        // Consecutive stores through the same pointer are performed together
+        const Shader::PointerStoreDescriptor& pointer{*it};
+        const auto group_end{std::find_if(it, stores.end(), [&pointer](const auto& store) {
+            return store.cbuf_index != pointer.cbuf_index ||
+                   store.cbuf_offset != pointer.cbuf_offset ||
+                   store.pointer_stride != pointer.pointer_stride ||
+                   store.pointer_offset != pointer.pointer_offset;
+        })};
+        const std::span group{it, group_end};
+        it = group_end;
+
+        if (pointer.cbuf_index >= cbufs.size()) {
+            continue;
+        }
+        const auto& cbuf{cbufs[pointer.cbuf_index]};
+        const GPUVAddr descriptor_address{cbuf.address + pointer.cbuf_offset};
+        if (!cbuf.enabled || pointer.cbuf_offset + sizeof(u64) > cbuf.size ||
+            !gpu_memory->IsContinuousRange(descriptor_address, sizeof(u64))) {
+            continue;
+        }
+        const GPUVAddr ssbo_address{gpu_memory->Read<u64>(descriptor_address)};
+
+        // The shader computes the pointer offset with 32-bit math
+        const u32 num_pointers{pointer.pointer_stride == 0 ? 1U : num_vertices};
+        const u64 table_offset{u64{pointer.pointer_stride} * first_vertex + pointer.pointer_offset};
+        const u64 table_size{u64{pointer.pointer_stride} * (num_pointers - 1) + sizeof(u64)};
+        if (table_offset + table_size > (u64{1} << 32) || table_size > MAX_POINTER_TABLE_SIZE ||
+            !gpu_memory->IsFullyMappedRange(ssbo_address + table_offset, table_size)) {
+            continue;
+        }
+        pointer_table.resize(table_size);
+        gpu_memory->ReadBlock(ssbo_address + table_offset, pointer_table.data(), table_size);
+
+        // Lay out the stored words relative to the pointer, later stores win as in the shader
+        std::map<s32, u32> words;
+        for (const Shader::PointerStoreDescriptor& store : group) {
+            words[store.store_offset] = store.value;
+        }
+        std::vector<std::pair<s32, std::vector<u8>>> runs;
+        for (const auto& [offset, value] : words) {
+            if (runs.empty() ||
+                offset != runs.back().first + static_cast<s32>(runs.back().second.size())) {
+                runs.emplace_back(offset, std::vector<u8>{});
+            }
+            const auto bytes{std::bit_cast<std::array<u8, sizeof(u32)>>(value)};
+            runs.back().second.insert(runs.back().second.end(), bytes.begin(), bytes.end());
+        }
+
+        for (u32 index = 0; index < num_pointers; ++index) {
+            u64 target;
+            std::memcpy(&target, pointer_table.data() + u64{pointer.pointer_stride} * index,
+                        sizeof(target));
+            // The GPU faults on null and misaligned pointers
+            if (target == 0 || target % sizeof(u32) != 0) {
+                continue;
+            }
+            for (const auto& [offset, data] : runs) {
+                const GPUVAddr address{target + static_cast<u64>(static_cast<s64>(offset))};
+                if (!gpu_memory->IsContinuousRange(address, data.size())) {
+                    continue;
+                }
+                const GPUVAddr pending_end{pending_address + pending.size()};
+                if (!pending.empty() && address == pending_end &&
+                    gpu_memory->IsContinuousRange(pending_end - 1, data.size() + 1)) {
+                    pending.insert(pending.end(), data.begin(), data.end());
+                    continue;
+                }
+                flush_pending();
+                pending_address = address;
+                pending.assign(data.begin(), data.end());
+            }
+        }
+    }
+    flush_pending();
+}
+
+#if CITRON_ARM64_REGISTER_GUARD_SUPPORTED
+// The complete draw boundary restores driver-corrupted x29. The inner Configure guard cannot
+// repair a caller canary that was already overwritten while x29 held the invalid value.
+__attribute__((no_stack_protector))
+#endif
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
-    PrepareDraw(is_indexed, [this, is_indexed, instance_count] {
+    const auto* const pipeline = PrepareDraw(is_indexed, [this, is_indexed, instance_count] {
         const auto& draw_state = maxwell3d->draw_manager->GetDrawState();
         const u32 num_instances{instance_count};
         const DrawParams draw_params{MakeDrawParams(draw_state, num_instances, is_indexed)};
@@ -339,12 +464,19 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
             }
         });
     });
+    if (pipeline) {
+        PerformVertexPointerStores(*pipeline, is_indexed, instance_count);
+    }
 }
 
+#if CITRON_ARM64_REGISTER_GUARD_SUPPORTED
+// Indirect draws share PrepareDraw and are enclosed by the same complete register guard.
+__attribute__((no_stack_protector))
+#endif
 void RasterizerVulkan::DrawIndirect() {
     const auto& params = maxwell3d->draw_manager->GetIndirectParams();
     buffer_cache.SetDrawIndirect(&params);
-    PrepareDraw(params.is_indexed, [this, &params] {
+    const auto* const pipeline = PrepareDraw(params.is_indexed, [this, &params] {
         const auto indirect_buffer = buffer_cache.GetDrawIndirectBuffer();
         const auto& buffer = indirect_buffer.first;
         const auto& offset = indirect_buffer.second;
@@ -387,6 +519,9 @@ void RasterizerVulkan::DrawIndirect() {
         });
     });
     buffer_cache.SetDrawIndirect(nullptr);
+    if (pipeline) {
+        PerformVertexPointerStores(*pipeline, params.is_indexed, std::nullopt);
+    }
 }
 
 void RasterizerVulkan::DrawTexture() {
@@ -881,23 +1016,66 @@ void RasterizerVulkan::FlushCommands() {
     scheduler.Flush();
 }
 
+void RasterizerVulkan::UpdatePassEndSubmit() {
+#ifdef ANDROID
+    // Submitting finished passes early only pays when somebody is waiting for the host GPU. If
+    // this thread is itself what the frame waits for, the extra submissions are pure cost: Red
+    // Dead Redemption, 4,700 draws a frame, lost 6% with them. So the share of time this thread
+    // spends running decides: on while it has idle time to win back, off once it is saturated.
+    static constexpr s64 BUSY_TO_TURN_ON = 819;  // 80% of 1024
+    static constexpr s64 BUSY_TO_TURN_OFF = 922; // 90% of 1024
+    static constexpr u32 FRAMES_TO_FORGET = 600;
+    timespec wall{};
+    timespec cpu{};
+    clock_gettime(CLOCK_MONOTONIC, &wall);
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu);
+    const s64 wall_ns = static_cast<s64>(wall.tv_sec) * 1'000'000'000 + wall.tv_nsec;
+    const s64 cpu_ns = static_cast<s64>(cpu.tv_sec) * 1'000'000'000 + cpu.tv_nsec;
+    if (last_frame_wall_ns != 0 && wall_ns > last_frame_wall_ns) {
+        const s64 share = std::clamp<s64>(
+            (cpu_ns - last_frame_cpu_ns) * 1024 / (wall_ns - last_frame_wall_ns), 0, 1024);
+        gpu_thread_busy = (gpu_thread_busy * 15 + share) / 16;
+        if (submit_at_pass_end && gpu_thread_busy > BUSY_TO_TURN_OFF) {
+            submit_at_pass_end = false;
+            frames_off = 0;
+            // Being on may be what saturated the thread. Ask for clearly more idle time before
+            // trying again, so a game near the line settles instead of swinging.
+            busy_to_turn_on = busy_to_turn_on * 2 / 3;
+        } else if (!submit_at_pass_end && gpu_thread_busy < busy_to_turn_on) {
+            submit_at_pass_end = true;
+        } else if (!submit_at_pass_end && ++frames_off == FRAMES_TO_FORGET) {
+            // A saturated loading screen must not decide for the rest of the session.
+            busy_to_turn_on = BUSY_TO_TURN_ON;
+        }
+    }
+    last_frame_wall_ns = wall_ns;
+    last_frame_cpu_ns = cpu_ns;
+#endif
+}
+
 void RasterizerVulkan::TickFrame() {
     memory_allocator.TickFrame();
     draw_counter = 0;
+    UpdatePassEndSubmit();
     guest_descriptor_queue.TickFrame();
     compute_pass_descriptor_queue.TickFrame();
     fence_manager.TickFrame();
     staging_pool.TickFrame();
+    // Cache capacity is shared by textures and buffers; Vulkan heap estimates
+    // include other process resources and must remain a separate pressure signal.
+    const u64 cache_usage = GetTextureMemoryUsage() + GetBufferMemoryUsage();
+    const u64 cache_target = device.GetDeviceLocalMemory();
+    const auto heap_budgets = device.GetHeapMemoryBudgets();
     {
         std::scoped_lock lock{texture_cache.mutex};
-        texture_cache.TickFrame();
+        texture_cache.TickFrame(cache_usage, cache_target, heap_budgets);
 
         // Perform VRAM leak prevention cleanup for Insane mode
         texture_cache_runtime.CleanupUnusedBuffers();
     }
     {
         std::scoped_lock lock{buffer_cache.mutex};
-        buffer_cache.TickFrame();
+        buffer_cache.TickFrame(cache_usage, cache_target, heap_budgets);
 
         // Perform VRAM leak prevention cleanup for Insane mode
         buffer_cache_runtime.CleanupUnusedBuffers();
@@ -1028,13 +1206,43 @@ void RasterizerVulkan::LoadDiskResources(u64 title_id, std::stop_token stop_load
 void RasterizerVulkan::FlushWork() {
 #ifdef ANDROID
     static constexpr u32 DRAWS_TO_DISPATCH = 1024;
+    // Handing work over wakes the worker thread, and the worker is asleep most of the time. A full
+    // chunk is handed over on its own, so this only has to cover runs of small draws.
+    static constexpr u32 DRAWS_TO_HAND_OVER = 64;
+    // A render pass the guest has left is submitted once this many draws have been recorded
+    // since the last submission. 32 draws and a 0.4 ms or 1 ms timer measured the same.
+    static constexpr u32 DRAWS_TO_SUBMIT_AT_PASS_END = 96;
 #else
     static constexpr u32 DRAWS_TO_DISPATCH = 4096;
+    static constexpr u32 DRAWS_TO_HAND_OVER = 8;
+    // Only measured on Android so far. 0 turns the pass-end submission off.
+    static constexpr u32 DRAWS_TO_SUBMIT_AT_PASS_END = 0;
 #endif // ANDROID
 
-    // Only check multiples of 8 draws
-    static_assert(DRAWS_TO_DISPATCH % 8 == 0);
-    if ((++draw_counter & 7) != 7) {
+    // The host GPU only starts on what has been submitted to it, and a frame used to be
+    // submitted when the guest asked for a fence, every DRAWS_TO_DISPATCH draws, or at its end.
+    // A game that waits for the GPU before it presents then sits idle while the GPU renders
+    // most of the frame after the game's own work is done. When the guest moves to another
+    // render target the pass it leaves is complete: submit it, so the GPU renders it while the
+    // guest builds the rest of the frame. Only at a pass boundary, never inside a pass:
+    // splitting a pass costs a tile-based GPU a store and a reload of every attachment.
+    if (DRAWS_TO_SUBMIT_AT_PASS_END != 0 && submit_at_pass_end) {
+        if (const u64 tick = scheduler.CurrentTick(); tick != last_submit_tick) {
+            last_submit_tick = tick;
+            draws_since_submit = 0;
+        }
+        if (++draws_since_submit > DRAWS_TO_SUBMIT_AT_PASS_END &&
+            maxwell3d->dirty.flags[VideoCommon::Dirty::RenderTargets]) {
+            scheduler.Flush();
+            draw_counter = 0;
+            return;
+        }
+    }
+
+    // Only check every few draws
+    static_assert(DRAWS_TO_DISPATCH % DRAWS_TO_HAND_OVER == 0);
+    static_assert((DRAWS_TO_HAND_OVER & (DRAWS_TO_HAND_OVER - 1)) == 0);
+    if ((++draw_counter & (DRAWS_TO_HAND_OVER - 1)) != DRAWS_TO_HAND_OVER - 1) {
         return;
     }
     if (draw_counter < DRAWS_TO_DISPATCH) {

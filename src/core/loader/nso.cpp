@@ -43,8 +43,8 @@ std::vector<u8> DecompressSegment(const std::vector<u8>& compressed_data,
     std::vector<u8> uncompressed_data =
         Common::Compression::DecompressDataLZ4(compressed_data, header.size);
 
-    ASSERT_MSG(uncompressed_data.size() == header.size, "{} != {}", header.size,
-               uncompressed_data.size());
+    assert(uncompressed_data.size() == header.size && "{} != {}" &&
+           (void(header.size), void(uncompressed_data.size()), true));
 
     return uncompressed_data;
 }
@@ -55,7 +55,7 @@ constexpr u32 PageAlignSizeNSO(u32 size) {
 } // Anonymous namespace
 
 bool NSOHeader::IsSegmentCompressed(size_t segment_num) const {
-    ASSERT_MSG(segment_num < 3, "Invalid segment {}", segment_num);
+    assert(segment_num < 3 && "Invalid segment {}" && (void(segment_num), true));
     return ((flags >> segment_num) & 1) != 0;
 }
 
@@ -238,9 +238,14 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         return load_base + image_size;
     }
 
+    // The application build ID belongs to main, not the last loaded SDK module.
+    // Keep it available independently of whether a patch manager was supplied.
+    if (name == "main") {
+        system.SetApplicationProcessBuildID(nso_header.build_id);
+    }
+
     // Apply cheats if they exist and the program has a valid title ID
     if (pm) {
-        system.SetApplicationProcessBuildID(nso_header.build_id);
         const auto cheats = pm->CreateCheatList(nso_header.build_id);
         if (!cheats.empty()) {
             system.RegisterCheatList(cheats, nso_header.build_id, load_base, image_size);

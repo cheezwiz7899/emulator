@@ -1042,7 +1042,7 @@ bool Device::GetSuitability(bool requires_swapchain) {
     instance_version = properties.properties.apiVersion;
 
     // Minimum of API version 1.1 is required. (This is well-supported.)
-    ASSERT(instance_version >= VK_API_VERSION_1_1);
+    assert(instance_version >= VK_API_VERSION_1_1);
 
     // Get available extensions.
     auto extension_properties = physical.EnumerateDeviceExtensionProperties();
@@ -1174,6 +1174,12 @@ bool Device::GetSuitability(bool requires_swapchain) {
     properties.subgroup_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
     SetNext(next, properties.subgroup_properties);
 
+    if (instance_version >= VK_API_VERSION_1_2 || extensions.descriptor_indexing) {
+        properties.descriptor_indexing.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES;
+        SetNext(next, properties.descriptor_indexing);
+    }
+
     // Retrieve relevant extension properties.
     if (extensions.shader_float_controls) {
         properties.float_controls.sType =
@@ -1194,6 +1200,11 @@ bool Device::GetSuitability(bool requires_swapchain) {
         properties.transform_feedback.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT;
         SetNext(next, properties.transform_feedback);
+    }
+    if (extensions.robustness_2) {
+        properties.robustness2.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_PROPERTIES_EXT;
+        SetNext(next, properties.robustness2);
     }
 
     // Perform the property fetch.
@@ -1395,12 +1406,19 @@ void Device::RefreshDeviceMemoryUsage(VmaAllocator vma_allocator) const {
     vmaGetHeapBudgets(vma_allocator, budgets.data());
     u64 usage{};
     u64 budget{};
+    std::scoped_lock lock{heap_budget_mutex};
     for (const size_t heap : valid_heap_memory) {
+        heap_budgets[heap] = {budgets[heap].usage, budgets[heap].budget};
         usage += budgets[heap].usage;
         budget += budgets[heap].budget;
     }
     device_memory_usage.store(usage, std::memory_order_relaxed);
     device_memory_budget.store(budget, std::memory_order_relaxed);
+}
+
+std::array<VideoCommon::HeapMemoryBudget, VK_MAX_MEMORY_HEAPS> Device::GetHeapMemoryBudgets() const {
+    std::scoped_lock lock{heap_budget_mutex};
+    return heap_budgets;
 }
 
 u64 Device::GetDeviceMemoryBudget() const {

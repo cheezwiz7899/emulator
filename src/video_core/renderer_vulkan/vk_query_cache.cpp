@@ -56,7 +56,7 @@ public:
     ~SamplesQueryBank() = default;
 
     void Reset() override {
-        ASSERT(references == 0);
+        assert(references == 0);
         VideoCommon::BankBase::Reset();
         const auto& dev = device.GetLogical();
         dev.ResetQueryPool(*query_pool, 0, BANK_SIZE);
@@ -124,6 +124,14 @@ public:
         current_query = nullptr;
         amend_value = 0;
         accumulation_value = 0;
+        // Host occlusion queries are already not used for anything on these drivers:
+        // PresyncWrites drops the GPU side copy and conditional rendering always draws. What is
+        // left is one host query per report and a blocking read of its result, which stalls
+        // tile based GPUs badly. Keep the counter on the CPU instead. See WriteCounter.
+        const auto driver_id = device.GetDriverID();
+        use_cpu_counter = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
+                          driver_id == VK_DRIVER_ID_ARM_PROPRIETARY ||
+                          driver_id == VK_DRIVER_ID_MESA_TURNIP;
         queries_prefix_scan_pass = std::make_unique<QueriesPrefixScanPass>(
             device, scheduler, descriptor_pool, compute_pass_descriptor_queue);
 
@@ -151,6 +159,11 @@ public:
         if (has_started) {
             return;
         }
+        if (use_cpu_counter) {
+            has_started = true;
+            cpu_counter_drew = true;
+            return;
+        }
         ReserveHostQuery();
         scheduler.Record([query_pool = current_query_pool,
                           query_index = current_bank_slot](vk::CommandBuffer cmdbuf) {
@@ -163,6 +176,10 @@ public:
 
     void PauseCounter() override {
         if (!has_started) {
+            return;
+        }
+        if (use_cpu_counter) {
+            has_started = false;
             return;
         }
         // Enhanced query ending with better error handling
@@ -180,6 +197,14 @@ public:
     }
 
     void ResetCounter() override {
+        if (use_cpu_counter) {
+            // Reports are written when the game asks for them, so the reset applies now and
+            // not at the next sync.
+            has_started = false;
+            cpu_counter_total = 0;
+            cpu_counter_drew = false;
+            return;
+        }
         if (has_started) {
             PauseCounter();
         }
@@ -342,6 +367,23 @@ public:
         if (has_timestamp) {
             new_query->flags |= VideoCommon::QueryFlagBits::HasTimestamp;
         }
+        if (use_cpu_counter) {
+            // The Z-pass counter runs until the game resets it. Some games reset it before
+            // every object. Others never reset it and compare the report taken before an
+            // object with the one taken after it, in guest memory or with RenderEnable
+            // IfNotEqual. Red Dead Redemption does that for every object in the frame.
+            //
+            // So this has to behave like a counter: every stretch of draws made with the
+            // counter enabled adds samples, which reads as "all of it was visible", and two
+            // reports with no draw between them stay equal, as they would on hardware.
+            if (cpu_counter_drew) {
+                cpu_counter_total += CPU_COUNTER_SAMPLES;
+                cpu_counter_drew = false;
+            }
+            new_query->value = cpu_counter_total;
+            new_query->flags |= VideoCommon::QueryFlagBits::IsFinalValueSynced;
+            return index;
+        }
         if (!current_query) {
             new_query->flags |= VideoCommon::QueryFlagBits::IsFinalValueSynced;
             return index;
@@ -356,6 +398,10 @@ public:
         pending_sync.push_back(index);
         pending_flush_queries.push_back(index);
         return index;
+    }
+
+    bool HasImmediateResults() const override {
+        return use_cpu_counter;
     }
 
     bool HasUnsyncedQueries() const override {
@@ -597,6 +643,11 @@ private:
     bool accumulation_since_last_sync{};
     VideoCommon::HostQueryBase* current_query;
     bool has_started{};
+    bool use_cpu_counter{};
+    /// Samples added for each stretch of counted draws while the counter is kept on the CPU.
+    static constexpr u64 CPU_COUNTER_SAMPLES = 0x10000;
+    u64 cpu_counter_total{};
+    bool cpu_counter_drew{};
     std::mutex flush_guard;
 
     std::unique_ptr<QueriesPrefixScanPass> queries_prefix_scan_pass;
@@ -626,7 +677,7 @@ public:
     ~TFBQueryBank() = default;
 
     void Reset() override {
-        ASSERT(references == 0);
+        assert(references == 0);
         VideoCommon::BankBase::Reset();
     }
 
@@ -1478,11 +1529,6 @@ VideoCommon::StreamerInterface* QueryCacheRuntime::GetStreamerInterface(QueryTyp
     case QueryType::Payload:
         return &impl->guest_streamer;
     case QueryType::ZPassPixelCount64:
-        if (impl->device.GetDriverID() == VK_DRIVER_ID_MOLTENVK) {
-            // MoltenVK maps occlusion queries to Metal visibility results. On Apple GPUs this can
-            // fault inside the driver for some titles, so prefer the guest fallback over crashing.
-            return &impl->guest_streamer;
-        }
         return &impl->sample_streamer;
     case QueryType::StreamingByteCount:
         return &impl->tfb_streamer;

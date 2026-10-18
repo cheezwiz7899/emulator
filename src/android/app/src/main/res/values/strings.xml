@@ -641,6 +641,8 @@
     <string name="loader_error_encrypted_roms_description">Please ensure your game files are properly dumped. For support, visit discord.gg/axqZFEyzPQ</string>
     <string name="loader_error_encrypted_keys_description">Please ensure your prod.keys file is installed so that games can be decrypted. For support, visit discord.gg/axqZFEyzPQ</string>
     <string name="loader_error_video_core">An error occurred initializing the video core</string>
+    <string name="emulation_graphics_error">Graphics emulation stopped</string>
+    <string name="emulation_graphics_error_description">An image size is unsupported or graphics memory could not be allocated. See the emulation log for details.</string>
     <string name="loader_error_video_core_description">This is usually caused by an incompatible GPU driver. Installing a custom GPU driver may resolve this problem.</string>
     <string name="loader_error_invalid_format">Unable to load ROM</string>
     <string name="loader_error_file_not_found">ROM file does not exist</string>

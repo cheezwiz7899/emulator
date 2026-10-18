@@ -146,6 +146,11 @@ void Swapchain::Create(VkSurfaceKHR surface_, u32 width_, u32 height_) {
         return;
     }
 
+    {
+        std::scoped_lock lock{scheduler.submit_mutex};
+        device.GetLogical().WaitIdle();
+    }
+
     Destroy();
 
     CreateSwapchain(capabilities);
@@ -179,7 +184,7 @@ bool Swapchain::AcquireNextImage() {
     scheduler.Wait(resource_ticks[image_index]);
     resource_ticks[image_index] = scheduler.CurrentTick();
 
-    return is_suboptimal || is_outdated;
+    return is_outdated;
 }
 
 void Swapchain::Present(VkSemaphore render_semaphore) {

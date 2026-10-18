@@ -8,6 +8,8 @@
 
 #include "common/literals.h"
 #include "common/logging.h"
+#include "common/polyfill_thread.h"
+#include "common/thread.h"
 #include "video_core/host_shaders/vulkan_turbo_mode_comp_spv.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -236,6 +238,8 @@ void TurboMode::Run(std::stop_token stop_token) {
     u32 total_timeout_cycles = 0;
     bool auto_disabled = false;
 
+    Common::SetCurrentThreadName("TurboMode");
+
     while (!stop_token.stop_requested()) {
         if (!turbo_enabled.load(std::memory_order_relaxed)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -252,6 +256,14 @@ void TurboMode::Run(std::stop_token stop_token) {
 #ifdef ARCHITECTURE_arm64
         adrenotools_set_turbo(true);
 #endif
+        // KGSL_PROP_PWRCTRL is set on the device and stays as it is until it is put back
+        // after this loop, so there is no need to set it again on every pass. The submission
+        // wait at the bottom of this loop returns at once while frames are being submitted,
+        // which left this thread opening, setting and closing /dev/kgsl-3d0 as fast as it
+        // could, at the cost of a whole core.
+        if (!Common::StoppableTimedWait(stop_token, std::chrono::seconds{1})) {
+            break;
+        }
 #else
         if (!resources_initialized.load(std::memory_order_acquire)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));

@@ -5,6 +5,7 @@ package org.citron.citron_emu.overlay
 
 import android.app.Activity
 import android.content.Context
+import android.content.ContextWrapper
 import android.content.SharedPreferences
 import android.graphics.Bitmap
 import android.graphics.Canvas
@@ -899,13 +900,40 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
          * @return A pair of points, the first being the top left corner of the safe area,
          *                  the second being the bottom right corner of the safe area
          */
+        /**
+         * Recursively unwrap the Context until we find the Activity.
+         */
+        private fun getActivityFromContext(context: Context): Activity? {
+            var ctx = context
+            while (ctx is ContextWrapper) {
+                if (ctx is Activity) {
+                    return ctx
+                }
+                ctx = ctx.baseContext
+            }
+            return null
+        }
+
+        /**
+         * Gets the safe screen size for drawing the overlay
+         *
+         * @param context   Context for getting the window metrics
+         * @return A pair of points, the first being the top left corner of the safe area,
+         *                  the second being the bottom right corner of the safe area
+         */
         private fun getSafeScreenSize(
             context: Context,
             screenSize: Pair<Int, Int>
         ): Pair<Point, Point> {
+            val activity = getActivityFromContext(context)
+            // If we can't find an activity, just return the full screen size
+            if (activity == null) {
+                return Pair(Point(0, 0), Point(screenSize.first, screenSize.second))
+            }
+
             // Get screen size
             val windowMetrics = WindowMetricsCalculator.getOrCreate()
-                .computeCurrentWindowMetrics(context as Activity)
+                .computeCurrentWindowMetrics(activity)
             var maxX = screenSize.first.toFloat()
             var maxY = screenSize.second.toFloat()
             var minX = 0
@@ -915,7 +943,7 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
             var cutoutLeft = 0
             var cutoutBottom = 0
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                val insets = context.windowManager.currentWindowMetrics.windowInsets.displayCutout
+                val insets = activity.windowManager.currentWindowMetrics.windowInsets.displayCutout
                 if (insets != null) {
                     if (insets.boundingRectTop.bottom != 0 &&
                         insets.boundingRectTop.bottom > maxY / 2

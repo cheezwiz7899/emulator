@@ -5,6 +5,7 @@
 #include <QFileDialog>
 #include <QHeaderView>
 #include <QMessageBox>
+#include <QShowEvent>
 #include <QVBoxLayout>
 #include <algorithm>
 #include <fstream>
@@ -145,6 +146,7 @@ void FunctionBrowserWidget::SetupUI() {
 }
 
 void FunctionBrowserWidget::RefreshFunctions() {
+    needs_refresh = false;
     LoadFromModules();
 }
 
@@ -294,7 +296,18 @@ void FunctionBrowserWidget::GotoAddress(u64 address) {
 void FunctionBrowserWidget::OnEmulationStarting() {
     setEnabled(true);
     ghidra_import_overrides.clear();
-    RefreshFunctions();
+    if (isVisible()) {
+        RefreshFunctions();
+    } else {
+        needs_refresh = true;
+    }
+}
+
+void FunctionBrowserWidget::showEvent(QShowEvent* event) {
+    QDockWidget::showEvent(event);
+    if (needs_refresh) {
+        RefreshFunctions();
+    }
 }
 
 void FunctionBrowserWidget::OnEmulationStopping() {

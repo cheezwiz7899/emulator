@@ -59,7 +59,7 @@ struct GPU::Impl {
             return;
         }
         auto it = channels.find(channel_id);
-        ASSERT(it != channels.end());
+        assert(it != channels.end());
         bound_channel = channel_id;
         current_channel = it->second.get();
 
@@ -126,7 +126,10 @@ struct GPU::Impl {
 
     void WaitForSyncOperation(const u64 fence) {
         std::unique_lock lck{sync_request_mutex};
-        sync_request_cv.wait(lck, [this, fence] { return CurrentSyncRequestFence() >= fence; });
+        sync_request_cv.wait(lck, [this, fence] {
+            return shutting_down.load(std::memory_order_relaxed) ||
+                   CurrentSyncRequestFence() >= fence;
+        });
     }
 
     /// Tick pending requests within the GPU.
@@ -135,10 +138,10 @@ struct GPU::Impl {
         while (!sync_requests.empty()) {
             auto request = std::move(sync_requests.front());
             sync_requests.pop_front();
-            sync_request_mutex.unlock();
+            lck.unlock();
             request();
             current_sync_fence.fetch_add(1, std::memory_order_release);
-            sync_request_mutex.lock();
+            lck.lock();
             sync_request_cv.notify_all();
         }
     }
@@ -149,37 +152,37 @@ struct GPU::Impl {
 
     /// Returns a reference to the Maxwell3D GPU engine.
     [[nodiscard]] Engines::Maxwell3D& Maxwell3D() {
-        ASSERT(current_channel);
+        assert(current_channel);
         return *current_channel->maxwell_3d;
     }
 
     /// Returns a const reference to the Maxwell3D GPU engine.
     [[nodiscard]] const Engines::Maxwell3D& Maxwell3D() const {
-        ASSERT(current_channel);
+        assert(current_channel);
         return *current_channel->maxwell_3d;
     }
 
     /// Returns a reference to the KeplerCompute GPU engine.
     [[nodiscard]] Engines::KeplerCompute& KeplerCompute() {
-        ASSERT(current_channel);
+        assert(current_channel);
         return *current_channel->kepler_compute;
     }
 
     /// Returns a reference to the KeplerCompute GPU engine.
     [[nodiscard]] const Engines::KeplerCompute& KeplerCompute() const {
-        ASSERT(current_channel);
+        assert(current_channel);
         return *current_channel->kepler_compute;
     }
 
     /// Returns a reference to the GPU DMA pusher.
     [[nodiscard]] Tegra::DmaPusher& DmaPusher() {
-        ASSERT(current_channel);
+        assert(current_channel);
         return *current_channel->dma_pusher;
     }
 
     /// Returns a const reference to the GPU DMA pusher.
     [[nodiscard]] const Tegra::DmaPusher& DmaPusher() const {
-        ASSERT(current_channel);
+        assert(current_channel);
         return *current_channel->dma_pusher;
     }
 
@@ -234,9 +237,13 @@ struct GPU::Impl {
     }
 
     void NotifyShutdown() {
-        std::unique_lock lk{sync_mutex};
-        shutting_down.store(true, std::memory_order::relaxed);
+        {
+            // Both kinds of CPU waiters must be released if GPU execution has failed.
+            std::scoped_lock lk{sync_mutex, sync_request_mutex};
+            shutting_down.store(true, std::memory_order::relaxed);
+        }
         sync_cv.notify_all();
+        sync_request_cv.notify_all();
     }
 
     /// Obtain the CPU Context

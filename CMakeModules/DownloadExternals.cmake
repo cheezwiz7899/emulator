@@ -65,24 +65,35 @@ set(${prefix_var} "${prefix}" PARENT_SCOPE)
 endfunction()
 
 function(download_moltenvk_external platform version)
-    set(MOLTENVK_DIR "${CMAKE_BINARY_DIR}/externals/MoltenVK")
-    set(MOLTENVK_TAR "${CMAKE_BINARY_DIR}/externals/MoltenVK.tar")
-    # Use Ryujinx MoltenVK build which is compiled with an older Metal SDK
-    # This avoids MSL 3.2 bugs with thread_scope_subgroup and fixes text rendering issues
+    set(MOLTENVK_DIR "${CMAKE_BINARY_DIR}/externals/MoltenVK-${version}")
+    set(MOLTENVK_TAR "${CMAKE_BINARY_DIR}/externals/MoltenVK-${version}.tar")
     string(TOLOWER "${platform}" MOLTENVK_ASSET_PLATFORM)
     if (NOT EXISTS ${MOLTENVK_DIR})
         if (NOT EXISTS ${MOLTENVK_TAR})
-            file(DOWNLOAD https://github.com/V380-Ori/Ryujinx.MoltenVK/releases/download/${version}-ryujinx/MoltenVK-${MOLTENVK_ASSET_PLATFORM}.tar
-                ${MOLTENVK_TAR} SHOW_PROGRESS)
+            file(DOWNLOAD https://github.com/KhronosGroup/MoltenVK/releases/download/${version}/MoltenVK-${MOLTENVK_ASSET_PLATFORM}.tar
+                ${MOLTENVK_TAR} SHOW_PROGRESS STATUS download_status)
+            list(GET download_status 0 download_code)
+            if (NOT download_code EQUAL 0)
+                file(REMOVE ${MOLTENVK_TAR})
+                message(FATAL_ERROR "Failed to download MoltenVK: ${download_status}")
+            endif()
         endif()
 
+        set(MOLTENVK_STAGING_DIR "${MOLTENVK_DIR}.tmp")
+        file(REMOVE_RECURSE ${MOLTENVK_STAGING_DIR})
+        file(MAKE_DIRECTORY ${MOLTENVK_STAGING_DIR})
         execute_process(COMMAND ${CMAKE_COMMAND} -E tar xf "${MOLTENVK_TAR}"
-            WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/externals")
+            WORKING_DIRECTORY ${MOLTENVK_STAGING_DIR}
+            RESULT_VARIABLE extract_result)
+        if (NOT extract_result EQUAL 0)
+            file(REMOVE_RECURSE ${MOLTENVK_STAGING_DIR})
+            file(REMOVE ${MOLTENVK_TAR})
+            message(FATAL_ERROR "Failed to extract MoltenVK: ${extract_result}")
+        endif()
+        file(RENAME ${MOLTENVK_STAGING_DIR} ${MOLTENVK_DIR})
     endif()
 
-    # Add the MoltenVK library path to the prefix so find_library can locate it.
-    list(APPEND CMAKE_PREFIX_PATH "${MOLTENVK_DIR}/MoltenVK/dylib/${platform}")
-    set(CMAKE_PREFIX_PATH ${CMAKE_PREFIX_PATH} PARENT_SCOPE)
+    set(MOLTENVK_LIBRARY_DIR "${MOLTENVK_DIR}/MoltenVK/MoltenVK/dylib/${platform}" PARENT_SCOPE)
 endfunction()
 
 # Determine installation parameters for OS, architecture, and compiler
@@ -160,19 +171,19 @@ function(determine_qt_parameters target host_out type_out arch_out arch_path_out
     set(${type_out} "${type}" PARENT_SCOPE)
     set(${arch_out} "${arch}" PARENT_SCOPE)
     set(${arch_path_out} "${arch_path}" PARENT_SCOPE)
-    
+
     if (DEFINED host_type)
         set(${host_type_out} "${host_type}" PARENT_SCOPE)
     else()
         set(${host_type_out} "${type}" PARENT_SCOPE)
     endif()
-    
+
     if (DEFINED host_arch)
         set(${host_arch_out} "${host_arch}" PARENT_SCOPE)
     else()
         set(${host_arch_out} "${arch}" PARENT_SCOPE)
     endif()
-    
+
     if (DEFINED host_arch_path)
         set(${host_arch_path_out} "${host_arch_path}" PARENT_SCOPE)
     else()

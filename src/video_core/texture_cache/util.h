@@ -27,19 +27,19 @@ struct OverlapResult {
     SubresourceExtent resources;
 };
 
-[[nodiscard]] u32 CalculateGuestSizeInBytes(const ImageInfo& info) noexcept;
+[[nodiscard]] u32 CalculateGuestSizeInBytes(const ImageInfo& info);
 
-[[nodiscard]] u32 CalculateUnswizzledSizeBytes(const ImageInfo& info) noexcept;
+[[nodiscard]] u32 CalculateUnswizzledSizeBytes(const ImageInfo& info);
 
-[[nodiscard]] u32 CalculateConvertedSizeBytes(const ImageInfo& info) noexcept;
+[[nodiscard]] u32 CalculateConvertedSizeBytes(const ImageInfo& info);
 
-[[nodiscard]] u32 CalculateLayerStride(const ImageInfo& info) noexcept;
+[[nodiscard]] u32 CalculateLayerStride(const ImageInfo& info);
 
-[[nodiscard]] u32 CalculateLayerSize(const ImageInfo& info) noexcept;
+[[nodiscard]] u32 CalculateLayerSize(const ImageInfo& info);
 
-[[nodiscard]] LevelArray CalculateMipLevelOffsets(const ImageInfo& info) noexcept;
+[[nodiscard]] LevelArray CalculateMipLevelOffsets(const ImageInfo& info);
 
-[[nodiscard]] LevelArray CalculateMipLevelSizes(const ImageInfo& info) noexcept;
+[[nodiscard]] LevelArray CalculateMipLevelSizes(const ImageInfo& info);
 
 [[nodiscard]] boost::container::small_vector<u32, 16> CalculateSliceOffsets(const ImageInfo& info);
 
@@ -85,13 +85,13 @@ void SwizzleImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const Ima
 
 [[nodiscard]] bool IsBlockLinearSizeCompatible(const ImageInfo& new_info,
                                                const ImageInfo& overlap_info, u32 new_level,
-                                               u32 overlap_level, bool strict_size) noexcept;
+                                               u32 overlap_level, bool strict_size);
 
 [[nodiscard]] bool IsPitchLinearSameSize(const ImageInfo& lhs, const ImageInfo& rhs,
-                                         bool strict_size) noexcept;
+                                         bool strict_size);
 
 [[nodiscard]] bool IsBlockLinearSizeCompatibleBPPRelaxed(const ImageInfo& lhs, const ImageInfo& rhs,
-                                                         u32 lhs_level, u32 rhs_level) noexcept;
+                                                         u32 lhs_level, u32 rhs_level);
 
 [[nodiscard]] std::optional<OverlapResult> ResolveOverlap(const ImageInfo& new_info,
                                                           GPUVAddr gpu_addr, VAddr cpu_addr,

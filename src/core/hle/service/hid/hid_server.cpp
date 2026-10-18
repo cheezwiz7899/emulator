@@ -928,7 +928,7 @@ Result IHidServer::SetNpadJoyHoldType(ClientAppletResourceUserId aruid, NpadJoyH
 
     if (hold_type != NpadJoyHoldType::Horizontal && hold_type != NpadJoyHoldType::Vertical) {
         // This should crash console
-        ASSERT_MSG(false, "Invalid npad joy hold type");
+        assert(false && "Invalid npad joy hold type");
     }
 
     R_RETURN(GetResourceManager()->GetNpad()->SetNpadJoyHoldType(aruid.pid, hold_type));
@@ -1004,7 +1004,7 @@ Result IHidServer::SetNpadHandheldActivationMode(ClientAppletResourceUserId arui
 
     if (activation_mode >= NpadHandheldActivationMode::MaxActivationMode) {
         // Console should crash here
-        ASSERT_MSG(false, "Activation mode should be always None, Single or Dual");
+        assert(false && "Activation mode should be always None, Single or Dual");
         R_SUCCEED();
     }
 
@@ -1350,11 +1350,11 @@ Result IHidServer::InitializeSevenSixAxisSensor(ClientAppletResourceUserId aruid
                 "applet_resource_user_id={}",
                 t_mem_1_size, t_mem_2_size, aruid.pid);
 
-    ASSERT_MSG(t_mem_1_size == 0x1000, "t_mem_1_size is not 0x1000 bytes");
-    ASSERT_MSG(t_mem_2_size == 0x7F000, "t_mem_2_size is not 0x7F000 bytes");
+    assert(t_mem_1_size == 0x1000 && "t_mem_1_size is not 0x1000 bytes");
+    assert(t_mem_2_size == 0x7F000 && "t_mem_2_size is not 0x7F000 bytes");
 
-    ASSERT_MSG(t_mem_1->GetSize() == 0x1000, "t_mem_1 has incorrect size");
-    ASSERT_MSG(t_mem_2->GetSize() == 0x7F000, "t_mem_2 has incorrect size");
+    assert(t_mem_1->GetSize() == 0x1000 && "t_mem_1 has incorrect size");
+    assert(t_mem_2->GetSize() == 0x7F000 && "t_mem_2 has incorrect size");
 
     // Activate console six axis controller
     GetResourceManager()->GetConsoleSixAxis()->Activate();
@@ -1505,7 +1505,7 @@ Result IHidServer::WritePalmaRgbLedPatternEntry(Palma::PalmaConnectionHandle con
 Result IHidServer::WritePalmaWaveEntry(Palma::PalmaConnectionHandle connection_handle,
                                        Palma::PalmaWaveSet wave_set, u64 unknown, u64 t_mem_size,
                                        u64 size, InCopyHandle<Kernel::KTransferMemory> t_mem) {
-    ASSERT_MSG(t_mem->GetSize() == t_mem_size, "t_mem has incorrect size");
+    assert(t_mem->GetSize() == t_mem_size && "t_mem has incorrect size");
 
     LOG_WARNING(
         Service_HID,
@@ -1744,8 +1744,8 @@ Result IHidServer::StoreSixAxisSensorCalibrationParameter(
                 "(STUBBED) called, npad_type={}, npad_id={}, device_index={}, applet_resource_user_id={}",
                 sixaxis_handle.npad_type, sixaxis_handle.npad_id, sixaxis_handle.device_index, aruid.pid);
 
-    // This function would store calibration data to system storage
-    R_SUCCEED();
+    R_RETURN(GetResourceManager()->GetSixAxis()->StoreSixAxisSensorCalibrationParameter(
+        sixaxis_handle, *calibration_data));
 }
 
 // Seven six-axis sensor fusion strength functions

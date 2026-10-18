@@ -3,13 +3,17 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <fstream>
+#include <limits>
 #include <memory>
+#include <span>
 #include <thread>
 #include <vector>
 
-#include "common/bit_cast.h"
+#include <boost/container/small_vector.hpp>
+
 #include "common/cityhash.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
@@ -18,9 +22,11 @@
 #include "common/thread_worker.h"
 #include "core/core.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/descriptor_limits.h"
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
+#include "shader_recompiler/ir_opt/passes.h"
 #include "shader_recompiler/program_header.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -55,9 +61,20 @@ using VideoCommon::FileEnvironment;
 using VideoCommon::GenericEnvironment;
 using VideoCommon::GraphicsEnvironment;
 
-constexpr u32 TRANSFERABLE_CACHE_VERSION = 15;
+constexpr u32 TRANSFERABLE_CACHE_VERSION = 18;
 constexpr u32 VULKAN_PIPELINE_CACHE_VERSION = 14;
 constexpr std::array<char, 8> VULKAN_CACHE_MAGIC_NUMBER{'y', 'u', 'z', 'u', 'v', 'k', 'c', 'h'};
+
+using Shader::AggregateDynamicDescriptorCap;
+
+static_assert([] {
+    constexpr std::array counts{2U, 10U};
+    return AggregateDynamicDescriptorCap(counts, 3, 20) == 10;
+}(), "Unequal dynamic arrays within the limit must remain unchanged");
+static_assert([] {
+    constexpr std::array counts{2U, 10U};
+    return AggregateDynamicDescriptorCap(counts, 3, 10) == 5;
+}(), "Unequal dynamic arrays above the limit must use the largest valid cap");
 
 template <typename Container>
 auto MakeSpan(Container& container) {
@@ -115,7 +132,7 @@ Shader::AttributeType CastAttributeType(const FixedPipelineState::VertexAttribut
     switch (attr.Type()) {
     case Tegra::Engines::Maxwell3D::Regs::VertexAttribute::Type::
         UnusedEnumDoNotUseBecauseItWillGoAway:
-        ASSERT_MSG(false, "Invalid vertex attribute type!");
+        assert(false && "Invalid vertex attribute type!");
         return Shader::AttributeType::Disabled;
     case Tegra::Engines::Maxwell3D::Regs::VertexAttribute::Type::SNorm:
     case Tegra::Engines::Maxwell3D::Regs::VertexAttribute::Type::UNorm:
@@ -178,7 +195,7 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
     const Shader::Stage stage{program.stage};
     const bool has_geometry{key.unique_hashes[4] != 0 && !programs[4].is_geometry_passthrough};
     const bool gl_ndc{key.state.ndc_minus_one_to_one != 0};
-    const float point_size{Common::BitCast<float>(key.state.point_size)};
+    const float point_size{std::bit_cast<float>(key.state.point_size)};
     switch (stage) {
     case Shader::Stage::VertexB:
         if (!has_geometry) {
@@ -215,7 +232,7 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
             case Tegra::Engines::Maxwell3D::Regs::Tessellation::DomainType::Quads:
                 return Shader::TessPrimitive::Quads;
             }
-            ASSERT(false);
+            assert(false);
             return Shader::TessPrimitive::Triangles;
         }();
         info.tess_spacing = [&] {
@@ -228,7 +245,7 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
             case Tegra::Engines::Maxwell3D::Regs::Tessellation::Spacing::FractionalEven:
                 return Shader::TessSpacing::FractionalEven;
             }
-            ASSERT(false);
+            assert(false);
             return Shader::TessSpacing::Equal;
         }();
         break;
@@ -251,7 +268,7 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
         if (!Settings::IsGPULevelLow()) {
             info.alpha_test_func = MaxwellToCompareFunction(
                 key.state.UnpackComparisonOp(key.state.alpha_test_func.Value()));
-            info.alpha_test_reference = Common::BitCast<float>(key.state.alpha_test_ref);
+            info.alpha_test_reference = std::bit_cast<float>(key.state.alpha_test_ref);
         }
         break;
     }
@@ -429,6 +446,24 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .support_snorm_render_buffer = true,
         .support_viewport_index_layer = device.IsExtShaderViewportIndexLayerSupported(),
         .min_ssbo_alignment = static_cast<u32>(device.GetStorageBufferAlignment()),
+        .max_per_stage_descriptor_sampled_images =
+            device.IsDescriptorIndexingSupported()
+                ? std::min(device.GetMaxPerStageDescriptorSampledImages(),
+                           device.GetMaxPerStageDescriptorUpdateAfterBindSampledImages())
+                : device.GetMaxPerStageDescriptorSampledImages(),
+        .max_per_stage_descriptor_storage_images =
+            device.IsDescriptorIndexingSupported()
+                ? device.GetMaxPerStageDescriptorUpdateAfterBindStorageImages()
+                : device.GetMaxPerStageDescriptorStorageImages(),
+        .max_per_stage_resources = device.GetMaxPerStageResources(),
+        .max_descriptor_set_sampled_images =
+            device.IsDescriptorIndexingSupported()
+                ? device.GetMaxDescriptorSetUpdateAfterBindSampledImages()
+                : device.GetMaxDescriptorSetSampledImages(),
+        .max_descriptor_set_storage_images =
+            device.IsDescriptorIndexingSupported()
+                ? device.GetMaxDescriptorSetUpdateAfterBindStorageImages()
+                : device.GetMaxDescriptorSetStorageImages(),
         .support_geometry_shader_passthrough = device.IsNvGeometryShaderPassthroughSupported(),
         .support_conditional_barrier = device.SupportsConditionalBarriers(),
     };
@@ -513,10 +548,12 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
     };
     const auto [pair, is_new]{compute_cache.try_emplace(key)};
     auto& pipeline{pair->second};
-    if (!is_new && pipeline) {
-        return pipeline.get();
+    if (is_new) {
+        // Built once per key, as in CurrentGraphicsPipelineSlowPath: a failed build (a
+        // Shader::Exception, a vk::Exception or HasBrokenCompute) stays cached as null instead of
+        // costing a full shader translation on every dispatch.
+        pipeline = CreateComputePipeline(key, shader);
     }
-    pipeline = CreateComputePipeline(key, shader);
     return pipeline.get();
 }
 
@@ -716,6 +753,11 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     std::array<Shader::IR::Program, Tegra::Engines::Maxwell3D::Regs::MaxShaderProgram> programs;
     const bool uses_vertex_a{key.unique_hashes[0] != 0};
     const bool uses_vertex_b{key.unique_hashes[1] != 0};
+    Shader::HostTranslateInfo graphics_host_info{host_info};
+    // maxDescriptorSetSampledImages applies to all graphics stages combined. Defer that limit
+    // until every stage has been translated; per-stage limits remain active here.
+    graphics_host_info.max_descriptor_set_sampled_images = std::numeric_limits<u32>::max();
+    graphics_host_info.max_descriptor_set_storage_images = std::numeric_limits<u32>::max();
 
     // Layer passthrough generation for devices without VK_EXT_shader_viewport_index_layer
     Shader::IR::Program* layer_source_program{};
@@ -726,7 +768,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             index == static_cast<u32>(Tegra::Engines::Maxwell3D::Regs::ShaderType::Geometry);
         if (key.unique_hashes[index] == 0 && is_emulated_stage) {
             auto topology = MaxwellToOutputTopology(key.state.topology);
-            programs[index] = GenerateGeometryPassthrough(pools.inst, pools.block, host_info,
+            programs[index] = GenerateGeometryPassthrough(pools.inst, pools.block,
+                                                          graphics_host_info,
                                                           *layer_source_program, topology);
             continue;
         }
@@ -740,11 +783,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
         if (!uses_vertex_a || index != 1) {
             // Normal path
-            programs[index] = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+            programs[index] =
+                TranslateProgram(pools.inst, pools.block, env, cfg, graphics_host_info);
         } else {
             // VertexB path when VertexA is present.
             auto& program_va{programs[0]};
-            auto program_vb{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
+            auto program_vb{
+                TranslateProgram(pools.inst, pools.block, env, cfg, graphics_host_info)};
             programs[index] = MergeDualVertexPrograms(program_va, program_vb, env);
         }
 
@@ -754,6 +799,102 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
 
         if (programs[index].info.requires_layer_emulation) {
             layer_source_program = &programs[index];
+        }
+    }
+    boost::container::small_vector<Shader::IR::Program*, 5> active_programs;
+    boost::container::small_vector<u32, 12> dynamic_sampled_counts;
+    u64 fixed_sampled_descriptors{};
+    boost::container::small_vector<u32, 12> dynamic_storage_counts;
+    u64 fixed_storage_descriptors{};
+    for (size_t index = uses_vertex_a && uses_vertex_b ? 1 : 0;
+         index < Tegra::Engines::Maxwell3D::Regs::MaxShaderProgram; ++index) {
+        const bool is_emulated_stage =
+            layer_source_program != nullptr &&
+            index == static_cast<u32>(Tegra::Engines::Maxwell3D::Regs::ShaderType::Geometry);
+        if (key.unique_hashes[index] == 0 && !is_emulated_stage) {
+            continue;
+        }
+        Shader::IR::Program& program{programs[index]};
+        active_programs.push_back(&program);
+        const auto account_sampled = [&](const auto& descriptors) {
+            for (const auto& desc : descriptors) {
+                if (desc.count > 1) {
+                    dynamic_sampled_counts.push_back(desc.count);
+                } else {
+                    fixed_sampled_descriptors += desc.count;
+                }
+            }
+        };
+        account_sampled(program.info.texture_buffer_descriptors);
+        account_sampled(program.info.texture_descriptors);
+        const auto account_storage = [&](const auto& descriptors) {
+            for (const auto& desc : descriptors) {
+                if (desc.count > 1) {
+                    dynamic_storage_counts.push_back(desc.count);
+                } else {
+                    fixed_storage_descriptors += desc.count;
+                }
+            }
+        };
+        account_storage(program.info.image_buffer_descriptors);
+        account_storage(program.info.image_descriptors);
+    }
+    const u64 sampled_set_limit{host_info.max_descriptor_set_sampled_images};
+    const u64 minimum_sampled_descriptors{fixed_sampled_descriptors +
+                                          dynamic_sampled_counts.size()};
+    if (minimum_sampled_descriptors > sampled_set_limit) {
+        LOG_ERROR(Render_Vulkan,
+                  "Graphics pipeline requires at least {} sampled image descriptors, limit is {}",
+                  minimum_sampled_descriptors, sampled_set_limit);
+        return nullptr;
+    }
+    u64 actual_sampled_descriptors{fixed_sampled_descriptors};
+    for (const u32 count : dynamic_sampled_counts) {
+        actual_sampled_descriptors += count;
+    }
+    if (actual_sampled_descriptors > sampled_set_limit) {
+        const u32 aggregate_dynamic_cap{AggregateDynamicDescriptorCap(
+            dynamic_sampled_counts, fixed_sampled_descriptors, sampled_set_limit)};
+        for (Shader::IR::Program* const program : active_programs) {
+            Shader::Optimization::ClampDynamicSampledTextureDescriptors(
+                *program, aggregate_dynamic_cap);
+        }
+    }
+    const u64 storage_set_limit{host_info.max_descriptor_set_storage_images};
+    const u64 minimum_storage_descriptors{fixed_storage_descriptors +
+                                          dynamic_storage_counts.size()};
+    if (minimum_storage_descriptors > storage_set_limit) {
+        LOG_ERROR(Render_Vulkan,
+                  "Graphics pipeline requires at least {} storage image descriptors, limit is {}",
+                  minimum_storage_descriptors, storage_set_limit);
+        return nullptr;
+    }
+    u64 actual_storage_descriptors{fixed_storage_descriptors};
+    for (const u32 count : dynamic_storage_counts) {
+        actual_storage_descriptors += count;
+    }
+    if (actual_storage_descriptors > storage_set_limit) {
+        const u32 aggregate_dynamic_cap{AggregateDynamicDescriptorCap(
+            dynamic_storage_counts, fixed_storage_descriptors, storage_set_limit)};
+        for (Shader::IR::Program* const program : active_programs) {
+            Shader::Optimization::ClampDynamicStorageTextureDescriptors(
+                *program, aggregate_dynamic_cap);
+        }
+    }
+    for (const Shader::IR::Program* const program : active_programs) {
+        const auto& info{program->info};
+        const u64 sampled_count{static_cast<u64>(Shader::NumDescriptors(info.texture_descriptors)) +
+                                Shader::NumDescriptors(info.texture_buffer_descriptors)};
+        const u64 storage_count{static_cast<u64>(Shader::NumDescriptors(info.image_descriptors)) +
+                                Shader::NumDescriptors(info.image_buffer_descriptors)};
+        if (sampled_count > host_info.max_per_stage_descriptor_sampled_images ||
+            storage_count > host_info.max_per_stage_descriptor_storage_images) {
+            LOG_ERROR(Render_Vulkan,
+                      "Graphics stage {} exceeds descriptor limits: sampled {} / {}, storage {} / {}",
+                      static_cast<u32>(program->stage), sampled_count,
+                      host_info.max_per_stage_descriptor_sampled_images, storage_count,
+                      host_info.max_per_stage_descriptor_storage_images);
+            return nullptr;
         }
     }
     std::array<const Shader::Info*, Tegra::Engines::Maxwell3D::Regs::MaxShaderStage> infos{};

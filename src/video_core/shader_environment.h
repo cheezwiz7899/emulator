@@ -120,6 +120,7 @@ public:
     Shader::TexturePixelFormat ReadTexturePixelFormat(u32 handle) override;
 
     bool IsTexturePixelFormatInteger(u32 handle) override;
+    bool IsTexturePixelFormatSignedInteger(u32 handle) override;
 
     u32 ReadViewportTransformState() override;
 
@@ -148,6 +149,7 @@ public:
     Shader::TexturePixelFormat ReadTexturePixelFormat(u32 handle) override;
 
     bool IsTexturePixelFormatInteger(u32 handle) override;
+    bool IsTexturePixelFormatSignedInteger(u32 handle) override;
 
     u32 ReadViewportTransformState() override;
 
@@ -186,6 +188,7 @@ public:
     [[nodiscard]] Shader::TexturePixelFormat ReadTexturePixelFormat(u32 handle) override;
 
     [[nodiscard]] bool IsTexturePixelFormatInteger(u32 handle) override;
+    [[nodiscard]] bool IsTexturePixelFormatSignedInteger(u32 handle) override;
 
     [[nodiscard]] u32 ReadViewportTransformState() override;
 

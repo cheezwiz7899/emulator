@@ -67,6 +67,7 @@
 #include "citron/main.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
+#include "core/frontend/framebuffer_layout.h"
 #include "hid_core/frontend/input_interpreter.h"
 #include "hid_core/hid_types.h"
 
@@ -343,7 +344,7 @@ WebKitGTKView::WebKitGTKView(GMainWindow& main_window_, Core::System& system_,
     webkit_web_context_register_uri_scheme(
         web_context, "citron-applet", ServeCitronAppletResource,
         new std::filesystem::path(cache_root),
-        [](gpointer data) { delete static_cast<std::filesystem::path*>(data); });
+        [](gpointer path_ptr) { delete static_cast<std::filesystem::path*>(path_ptr); });
     WebKitSecurityManager* security_manager = webkit_web_context_get_security_manager(web_context);
     webkit_security_manager_register_uri_scheme_as_secure(security_manager, "citron-applet");
     webkit_security_manager_register_uri_scheme_as_cors_enabled(security_manager,

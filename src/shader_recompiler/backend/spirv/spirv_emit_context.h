@@ -37,12 +37,17 @@ struct TextureDefinition {
     Id image_type;
     u32 count;
     bool is_multisample;
+    bool is_integer;
+    bool is_signed;
 };
 
 struct TextureBufferDefinition {
     Id id;
+    Id image_type;
     Id pointer_type;
     u32 count;
+    bool is_integer;
+    bool is_signed;
 };
 
 struct ImageBufferDefinition {
@@ -96,7 +101,7 @@ struct UniformDefinitions {
         if (member_ptr == &UniformDefinitions::U32x4) {
             return 4;
         }
-        ASSERT(false);
+        assert(false);
         return 1;
     }
 
@@ -163,6 +168,8 @@ public:
                          IR::Program& program, Bindings& binding);
     ~EmitContext();
 
+    /// The instruction a value refers to, looking through Identity instructions, or nullptr
+    [[nodiscard]] IR::Inst* Inst(const IR::Value& value) const;
     [[nodiscard]] Id Def(const IR::Value& value);
 
     [[nodiscard]] Id BitOffset8(const IR::Value& offset);
@@ -214,10 +221,9 @@ public:
     const Profile& profile;
     const RuntimeInfo& runtime_info;
     Stage stage{};
+    IR::InstStorage* inst_storage{};
 
-    // Maps an id to its NonUniform-decorated copy, so decoration never
-    // mutates the original id.
-    ankerl::unordered_dense::map<u32, Id> non_uniform_ids;
+    ankerl::unordered_dense::set<u32> non_uniform_ids;
 
     Id void_id{};
     Id U1{};
@@ -257,7 +263,6 @@ public:
     Id output_u32{};
     Id output_s32{};
 
-    Id image_buffer_type{};
     Id image_u32{};
 
     std::array<UniformDefinitions, Info::MAX_CBUFS> cbufs{};

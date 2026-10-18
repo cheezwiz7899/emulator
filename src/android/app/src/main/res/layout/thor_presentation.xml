@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@android:color/black">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:gravity="center"
+        android:padding="16dp">
+
+        <TextView
+            android:id="@+id/thor_fps_text"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="FPS: --"
+            android:textSize="48sp"
+            android:textStyle="bold"
+            android:textColor="#00FF00" />
+
+        <TextView
+            android:id="@+id/thor_speed_text"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Speed: --%"
+            android:textSize="24sp"
+            android:textColor="#FFFFFF"
+            android:layout_marginTop="8dp" />
+
+        <TextView
+            android:id="@+id/thor_gpu_text"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="GPU Driver"
+            android:textSize="14sp"
+            android:textColor="#AAAAAA"
+            android:layout_marginTop="24dp" />
+
+        <TextView
+            android:id="@+id/thor_shaders_text"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Shaders Building: 0"
+            android:textSize="14sp"
+            android:textColor="#FFAA00"
+            android:layout_marginTop="8dp"
+            android:visibility="invisible"/>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center"
+            android:layout_marginTop="32dp">
+
+            <TextView
+                android:id="@+id/thor_setting_res"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="1X"
+                android:textSize="18sp"
+                android:textColor="#DDDDDD" />
+
+            <View
+                android:layout_width="1dp"
+                android:layout_height="20dp"
+                android:background="#555555"
+                android:layout_marginStart="12dp"
+                android:layout_marginEnd="12dp"/>
+
+            <TextView
+                android:id="@+id/thor_setting_dock"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Handheld"
+                android:textSize="18sp"
+                android:textColor="#DDDDDD" />
+
+            <View
+                android:layout_width="1dp"
+                android:layout_height="20dp"
+                android:background="#555555"
+                android:layout_marginStart="12dp"
+                android:layout_marginEnd="12dp"/>
+
+            <TextView
+                android:id="@+id/thor_setting_acc"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Acc: Auto"
+                android:textSize="18sp"
+                android:textColor="#DDDDDD" />
+
+        </LinearLayout>
+
+    </LinearLayout>
+
+    <!-- InputOverlay removed as per user request -->
+
+</FrameLayout>

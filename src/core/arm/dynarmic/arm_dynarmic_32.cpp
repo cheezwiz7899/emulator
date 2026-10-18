@@ -115,7 +115,7 @@ public:
     }
 
     void AddTicks(u64 ticks) override {
-        ASSERT_MSG(!m_parent.m_uses_wall_clock, "Dynarmic ticking disabled");
+        assert(!m_parent.m_uses_wall_clock && "Dynarmic ticking disabled");
 
         // Divide the number of ticks by the amount of CPU cores. TODO(Subv): This yields only a
         // rough approximation of the amount of executed ticks in the system, it may be thrown off
@@ -130,7 +130,7 @@ public:
     }
 
     u64 GetTicksRemaining() override {
-        ASSERT_MSG(!m_parent.m_uses_wall_clock, "Dynarmic ticking disabled");
+        assert(!m_parent.m_uses_wall_clock && "Dynarmic ticking disabled");
 
         return std::max<s64>(m_parent.m_system.CoreTiming().GetDowncount(), 0);
     }
@@ -196,7 +196,10 @@ std::shared_ptr<Dynarmic::A32::Jit> ArmDynarmic32::MakeJit(Common::PageTable* pa
         config.detect_misaligned_access_via_page_table = 16 | 32 | 64 | 128;
         config.only_detect_misalignment_via_page_table_on_page_boundary = true;
 
-        config.fastmem_pointer = reinterpret_cast<uintptr_t>(page_table->fastmem_arena);
+        config.fastmem_pointer = page_table->fastmem_arena
+                                     ? std::optional<uintptr_t>{reinterpret_cast<uintptr_t>(
+                                           page_table->fastmem_arena)}
+                                     : std::nullopt;
 
         config.fastmem_exclusive_access = config.fastmem_pointer.has_value();
         config.recompile_on_exclusive_fastmem_failure = true;

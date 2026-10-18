@@ -7,6 +7,7 @@
 #include <array>
 #include <bitset>
 #include <map>
+#include <vector>
 
 #include "common/common_types.h"
 #include "shader_recompiler/frontend/ir/type.h"
@@ -180,7 +181,23 @@ struct StorageBufferDescriptor {
     auto operator<=>(const StorageBufferDescriptor&) const = default;
 };
 
+/// Constant store of value to (pointer + store_offset), with the pointer read from the storage
+/// buffer at cbuf_index/cbuf_offset, at byte (pointer_stride * VertexId + pointer_offset).
+/// Removed from vertex shaders and performed by the rasterizer.
+struct PointerStoreDescriptor {
+    u32 cbuf_index;
+    u32 cbuf_offset;
+    u32 pointer_stride;
+    u32 pointer_offset;
+    s32 store_offset;
+    u32 value;
+
+    auto operator<=>(const PointerStoreDescriptor&) const = default;
+};
+
 struct TextureBufferDescriptor {
+    bool is_integer;
+    bool is_signed;
     bool has_secondary;
     u32 cbuf_index;
     u32 cbuf_offset;
@@ -190,6 +207,16 @@ struct TextureBufferDescriptor {
     u32 secondary_shift_left;
     u32 count;
     u32 size_shift;
+    // The handle is ((word >> shift_right) & mask) << shift_left.
+    u32 shift_right{0};
+    u32 mask{0xFFFFFFFF};
+    u32 secondary_shift_right{0};
+    u32 secondary_mask{0xFFFFFFFF};
+    // The number is a 16-bit entry of a table in another constant buffer, see texture_pass.cpp.
+    bool indirect{false};
+    u32 table_cbuf_index{0};
+    u32 table_shift{0};
+    u32 table_base{0};
 
     auto operator<=>(const TextureBufferDescriptor&) const = default;
 };
@@ -213,6 +240,8 @@ struct TextureDescriptor {
     TextureType type;
     bool is_depth;
     bool is_multisample;
+    bool is_integer;
+    bool is_signed;
     bool has_secondary;
     u32 cbuf_index;
     u32 cbuf_offset;
@@ -222,6 +251,16 @@ struct TextureDescriptor {
     u32 secondary_shift_left;
     u32 count;
     u32 size_shift;
+    // The handle is ((word >> shift_right) & mask) << shift_left.
+    u32 shift_right{0};
+    u32 mask{0xFFFFFFFF};
+    u32 secondary_shift_right{0};
+    u32 secondary_mask{0xFFFFFFFF};
+    // The number is a 16-bit entry of a table in another constant buffer, see texture_pass.cpp.
+    bool indirect{false};
+    u32 table_cbuf_index{0};
+    u32 table_shift{0};
+    u32 table_base{0};
 
     auto operator<=>(const TextureDescriptor&) const = default;
 };
@@ -341,6 +380,7 @@ struct Info {
     ImageBufferDescriptors image_buffer_descriptors;
     TextureDescriptors texture_descriptors;
     ImageDescriptors image_descriptors;
+    std::vector<PointerStoreDescriptor> pointer_store_descriptors;
 };
 
 template <typename Descriptors>

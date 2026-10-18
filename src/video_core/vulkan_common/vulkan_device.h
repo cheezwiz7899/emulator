@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
+#include <mutex>
 #include <set>
 #include <span>
 #include <string>
@@ -13,6 +15,7 @@
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "common/settings.h"
+#include "video_core/cache_memory_pressure.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 VK_DEFINE_HANDLE(VmaAllocator)
@@ -78,6 +81,7 @@ VK_DEFINE_HANDLE(VmaAllocator)
     EXTENSION(EXT, VERTEX_ATTRIBUTE_DIVISOR, vertex_attribute_divisor)                             \
     EXTENSION(KHR, DRAW_INDIRECT_COUNT, draw_indirect_count)                                       \
     EXTENSION(KHR, DRIVER_PROPERTIES, driver_properties)                                           \
+    EXTENSION(KHR, FORMAT_FEATURE_FLAGS_2, format_feature_flags2)                                  \
     EXTENSION(KHR, PUSH_DESCRIPTOR, push_descriptor)                                               \
     EXTENSION(KHR, SAMPLER_MIRROR_CLAMP_TO_EDGE, sampler_mirror_clamp_to_edge)                     \
     EXTENSION(KHR, SHADER_FLOAT_CONTROLS, shader_float_controls)                                   \
@@ -304,6 +308,42 @@ public:
         return properties.properties.limits.maxPushConstantsSize;
     }
 
+    u32 GetMaxPerStageDescriptorSampledImages() const {
+        return properties.properties.limits.maxPerStageDescriptorSampledImages;
+    }
+
+    u32 GetMaxPerStageDescriptorStorageImages() const {
+        return properties.properties.limits.maxPerStageDescriptorStorageImages;
+    }
+
+    u32 GetMaxPerStageDescriptorUpdateAfterBindSampledImages() const {
+        return properties.descriptor_indexing.maxPerStageDescriptorUpdateAfterBindSampledImages;
+    }
+
+    u32 GetMaxPerStageDescriptorUpdateAfterBindStorageImages() const {
+        return properties.descriptor_indexing.maxPerStageDescriptorUpdateAfterBindStorageImages;
+    }
+
+    u32 GetMaxPerStageResources() const {
+        return properties.properties.limits.maxPerStageResources;
+    }
+
+    u32 GetMaxDescriptorSetSampledImages() const {
+        return properties.properties.limits.maxDescriptorSetSampledImages;
+    }
+
+    u32 GetMaxDescriptorSetStorageImages() const {
+        return properties.properties.limits.maxDescriptorSetStorageImages;
+    }
+
+    u32 GetMaxDescriptorSetUpdateAfterBindSampledImages() const {
+        return properties.descriptor_indexing.maxDescriptorSetUpdateAfterBindSampledImages;
+    }
+
+    u32 GetMaxDescriptorSetUpdateAfterBindStorageImages() const {
+        return properties.descriptor_indexing.maxDescriptorSetUpdateAfterBindStorageImages;
+    }
+
     /// Returns the maximum size for shared memory.
     u32 GetMaxComputeSharedMemorySize() const {
         return properties.properties.limits.maxComputeSharedMemorySize;
@@ -434,12 +474,20 @@ public:
         return extensions.push_descriptor;
     }
 
-    /// Returns true if descriptor-indexing partial-bind + update-after-bind is usable for
-    /// sampled images and storage images on this device.
+    /// Returns true if descriptor-indexing partial-bind + update-after-bind is usable for every
+    /// descriptor class placed in an update-after-bind resource layout.
     bool IsDescriptorIndexingSupported() const {
         return features.descriptor_indexing.descriptorBindingPartiallyBound &&
+               features.descriptor_indexing.descriptorBindingUniformBufferUpdateAfterBind &&
+               features.descriptor_indexing.descriptorBindingStorageBufferUpdateAfterBind &&
                features.descriptor_indexing.descriptorBindingSampledImageUpdateAfterBind &&
-               features.descriptor_indexing.descriptorBindingStorageImageUpdateAfterBind;
+               features.descriptor_indexing.descriptorBindingStorageImageUpdateAfterBind &&
+               features.descriptor_indexing.descriptorBindingUniformTexelBufferUpdateAfterBind &&
+               features.descriptor_indexing.descriptorBindingStorageTexelBufferUpdateAfterBind;
+    }
+
+    bool IsKhrFormatFeatureFlags2Supported() const {
+        return ApiVersion() >= VK_API_VERSION_1_3 || extensions.format_feature_flags2;
     }
 
     /// True if the device supports non-uniform indexing for sampled image arrays.
@@ -643,6 +691,11 @@ public:
         return 0x00010300U;
     }
 
+    /// Returns true when the physical device reports VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU.
+    bool IsIntegrated() const {
+        return is_integrated;
+    }
+
     /// Returns true when a known debugging tool is attached.
     bool HasDebuggingToolAttached() const {
         return has_renderdoc || has_nsight_graphics;
@@ -685,6 +738,8 @@ public:
     /// reporting rather than actual zero usage.
     u64 GetDeviceMemoryUsage() const;
 
+    std::array<VideoCommon::HeapMemoryBudget, VK_MAX_MEMORY_HEAPS> GetHeapMemoryBudgets() const;
+
     /// Refreshes reported heap usage and budget; no-ops when CanReportMemoryUsage() is false.
     void RefreshDeviceMemoryUsage(VmaAllocator vma_allocator) const;
 
@@ -714,6 +769,19 @@ public:
 
     bool HasNullDescriptor() const {
         return features.robustness2.nullDescriptor;
+    }
+
+    /// Returns true when buffer reads outside a descriptor's range are guaranteed to return zero
+    bool HasRobustBufferAccess2() const {
+        return features.robustness2.robustBufferAccess2;
+    }
+
+    /// Granularity of the bounds check behind robustBufferAccess2 for uniform buffers. Bytes past
+    /// the descriptor range but inside the rounded-up range can read the buffer, not zero.
+    u64 GetRobustUniformBufferAccessSizeAlignment() const {
+        const u64 alignment = properties.robustness2.robustUniformBufferAccessSizeAlignment;
+        // The extension allows up to 256. Assume the worst when the driver reported nothing.
+        return alignment != 0 ? alignment : 256;
     }
 
     bool HasExactDepthBiasControl() const {
@@ -849,11 +917,13 @@ private:
 
     struct Properties {
         VkPhysicalDeviceDriverProperties driver{};
+        VkPhysicalDeviceDescriptorIndexingProperties descriptor_indexing{};
         VkPhysicalDeviceSubgroupProperties subgroup_properties{};
         VkPhysicalDeviceFloatControlsProperties float_controls{};
         VkPhysicalDevicePushDescriptorPropertiesKHR push_descriptor{};
         VkPhysicalDeviceSubgroupSizeControlProperties subgroup_size_control{};
         VkPhysicalDeviceTransformFeedbackPropertiesEXT transform_feedback{};
+        VkPhysicalDeviceRobustness2PropertiesEXT robustness2{};
 
         VkPhysicalDeviceProperties properties{};
     };
@@ -886,6 +956,8 @@ private:
     bool dynamic_state3_enables{};             ///< Has all enables features of dynamic_state3.
     bool supports_conditional_barriers{};      ///< Allows barriers in conditional control flow.
     mutable std::atomic<u64> device_memory_usage{};
+    mutable std::mutex heap_budget_mutex;
+    mutable std::array<VideoCommon::HeapMemoryBudget, VK_MAX_MEMORY_HEAPS> heap_budgets{};
     mutable std::atomic<u64> device_memory_budget{};
     u64 device_access_memory{};                ///< Total size of device local memory in bytes.
     u32 sets_per_pool{};                       ///< Sets per Description Pool

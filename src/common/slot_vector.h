@@ -154,6 +154,11 @@ public:
         return values_capacity - free_list.size();
     }
 
+    [[nodiscard]] bool contains(SlotId id) const noexcept {
+        return id && id.index / 64 < stored_bitset.size() &&
+               ((stored_bitset[id.index / 64] >> (id.index % 64)) & 1) != 0;
+    }
+
 private:
     struct NonTrivialDummy {
         NonTrivialDummy() noexcept {}
@@ -180,9 +185,9 @@ private:
     }
 
     void ValidateIndex(SlotId id) const noexcept {
-        DEBUG_ASSERT(id);
-        DEBUG_ASSERT(id.index / 64 < stored_bitset.size());
-        DEBUG_ASSERT(((stored_bitset[id.index / 64] >> (id.index % 64)) & 1) != 0);
+        assert(id);
+        assert(id.index / 64 < stored_bitset.size());
+        assert(((stored_bitset[id.index / 64] >> (id.index % 64)) & 1) != 0);
     }
 
     [[nodiscard]] u32 FreeValueIndex() noexcept {

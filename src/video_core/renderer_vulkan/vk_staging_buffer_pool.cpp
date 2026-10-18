@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <new>
 #include <utility>
 #include <vector>
 
@@ -47,7 +48,8 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
         .flags = 0,
         .size = stream_buffer_size,
         .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
-                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
@@ -60,7 +62,7 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
         stream_buffer.SetObjectNameEXT("Stream Buffer");
     }
     stream_pointer = stream_buffer.Mapped();
-    ASSERT_MSG(!stream_pointer.empty(), "Stream buffer must be host visible!");
+    assert(!stream_pointer.empty() && "Stream buffer must be host visible!");
 }
 
 StagingBufferPool::~StagingBufferPool() = default;
@@ -78,10 +80,43 @@ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
         return entry.index == ref.index;
     };
     auto it = std::find_if(entries.begin(), entries.end(), is_this_one);
-    ASSERT(it != entries.end());
-    ASSERT(it->deferred);
+    assert(it != entries.end());
+    assert(it->deferred);
     it->tick = scheduler.CurrentTick();
     it->deferred = false;
+}
+
+GCDownloadRef StagingBufferPool::RequestGCDownload(size_t size) {
+    if (size == 0 || size > 32_MiB) {
+        return {};
+    }
+    std::scoped_lock lock{gc_download_mutex};
+    if (gc_download && gc_download.use_count() != 1) {
+        // Another collector still owns the allocation: it may be recording copies,
+        // waiting in Finish, or consuming mapped data after GPU completion.
+        return {};
+    }
+    if (gc_download && gc_download->mapped_span.size() >= size) {
+        return gc_download;
+    }
+    try {
+        // Allocate the handle before reserving a buffer. A host allocation failure
+        // must not strand a newly deferred staging entry without an owner.
+        auto replacement = std::make_shared<StagingBufferRef>();
+        *replacement = Request(size, MemoryUsage::Download, true);
+        if (gc_download) {
+            FreeDeferred(*gc_download);
+        }
+        gc_download = std::move(replacement);
+        return gc_download;
+    } catch (const vk::Exception& error) {
+        if (error.GetResult() != VK_ERROR_OUT_OF_DEVICE_MEMORY &&
+            error.GetResult() != VK_ERROR_OUT_OF_HOST_MEMORY) {
+            throw;
+        }
+    } catch (const std::bad_alloc&) {
+    }
+    return {};
 }
 
 void StagingBufferPool::TickFrame() {
@@ -202,7 +237,7 @@ std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t s
     }
     cache_level.iterate_index = std::distance(entries.begin(), it) + 1;
     it->tick = deferred ? std::numeric_limits<u64>::max() : scheduler.CurrentTick();
-    ASSERT(!it->deferred);
+    assert(!it->deferred);
     it->deferred = deferred;
     return it->Ref();
 }
@@ -260,7 +295,7 @@ StagingBufferPool::StagingBuffersCache& StagingBufferPool::GetCache(MemoryUsage 
     case MemoryUsage::Download:
         return download_cache;
     default:
-        ASSERT_MSG(false, "Invalid memory usage={}", usage);
+        assert(false && "Invalid memory usage={}" && (void(usage), true));
         return upload_cache;
     }
 }
@@ -313,6 +348,7 @@ void StagingBufferPool::ReleaseAllFreeBuffers() {
 }
 
 void StagingBufferPool::Nuke() {
+    gc_download.reset();
     auto nuke_cache = [](StagingBuffersCache& cache) {
         for (auto& level : cache) {
             level.entries.clear();

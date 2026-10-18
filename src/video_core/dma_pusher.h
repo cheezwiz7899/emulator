@@ -4,10 +4,9 @@
 #pragma once
 
 #include <array>
+#include <queue>
 #include <span>
 #include <vector>
-#include <boost/container/small_vector.hpp>
-#include <queue>
 
 #include "common/bit_field.h"
 #include "common/common_types.h"
@@ -103,12 +102,11 @@ inline CommandHeader BuildCommandHeader(BufferMethods method, u32 arg_count, Sub
 struct CommandList final {
     CommandList() = default;
     explicit CommandList(std::size_t size) : command_lists(size) {}
-    explicit CommandList(
-        boost::container::small_vector<CommandHeader, 512>&& prefetch_command_list_)
+    explicit CommandList(std::vector<CommandHeader>&& prefetch_command_list_)
         : prefetch_command_list{std::move(prefetch_command_list_)} {}
 
-    boost::container::small_vector<CommandListHeader, 512> command_lists;
-    boost::container::small_vector<CommandHeader, 512> prefetch_command_list;
+    std::vector<CommandListHeader> command_lists;
+    std::vector<CommandHeader> prefetch_command_list;
 };
 
 /**
@@ -138,6 +136,17 @@ public:
 
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
 
+    /// True while the channel is stopped at a semaphore acquire. Its queued work waits.
+    [[nodiscard]] bool IsSuspended() const {
+        return puller.HasPendingAcquire();
+    }
+
+    /// Re-checks the acquire the channel is stopped at. Returns true once the channel may run
+    /// again; the caller then runs DispatchCalls. With allow_flush, writes held back for a host
+    /// fence are made first, once per new work_generation, so polling does not create a host
+    /// fence on every call.
+    [[nodiscard]] bool RetryAcquire(u64 work_generation, bool allow_flush);
+
 private:
     static constexpr u32 non_puller_methods = 0x40;
     static constexpr u32 max_subchannels = 8;
@@ -154,6 +163,11 @@ private:
 
     std::queue<CommandList> dma_pushbuffer; ///< Queue of command lists to be processed
     std::size_t dma_pushbuffer_subindex{};  ///< Index within a command list within the pushbuffer
+
+    /// Words after a semaphore acquire the channel stopped at, run once it passes.
+    std::vector<CommandHeader> resume_commands;
+    GPUVAddr resume_dma_get{}; ///< Address of the first word in resume_commands
+    u64 acquire_flush_generation{};
 
     struct DmaState {
         u32 method;            ///< Current method

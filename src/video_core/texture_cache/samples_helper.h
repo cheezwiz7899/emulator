@@ -3,21 +3,12 @@
 
 #pragma once
 
-#include <atomic>
 #include <utility>
 
 #include "common/assert.h"
-#include "common/logging.h"
 #include "video_core/textures/texture.h"
 
 namespace VideoCommon {
-
-inline void ReportInvalidMsaaMode(Tegra::Texture::MsaaMode msaa_mode) {
-    static std::atomic_flag reported = ATOMIC_FLAG_INIT;
-    if (!reported.test_and_set(std::memory_order_relaxed)) {
-        LOG_WARNING(HW_GPU, "Unsupported MSAA mode={} treated as 1x1", static_cast<int>(msaa_mode));
-    }
-}
 
 [[nodiscard]] inline std::pair<int, int> SamplesLog2(int num_samples) {
     switch (num_samples) {
@@ -32,7 +23,7 @@ inline void ReportInvalidMsaaMode(Tegra::Texture::MsaaMode msaa_mode) {
     case 16:
         return {2, 2};
     }
-    ASSERT_MSG(false, "Invalid number of samples={}", num_samples);
+    assert(false && "Invalid number of samples={}" && (void(num_samples), true));
     return {0, 0};
 }
 
@@ -56,7 +47,7 @@ inline void ReportInvalidMsaaMode(Tegra::Texture::MsaaMode msaa_mode) {
     case MsaaMode::Msaa4x4:
         return 16;
     }
-    ReportInvalidMsaaMode(msaa_mode);
+    assert(false && "Invalid MSAA mode={}" && (void(static_cast<int>(msaa_mode)), true));
     return 1;
 }
 
@@ -78,7 +69,7 @@ inline void ReportInvalidMsaaMode(Tegra::Texture::MsaaMode msaa_mode) {
     case MsaaMode::Msaa4x4:
         return 4;
     }
-    ReportInvalidMsaaMode(msaa_mode);
+    assert(false && "Invalid MSAA mode={}" && (void(static_cast<int>(msaa_mode)), true));
     return 1;
 }
 
@@ -100,7 +91,7 @@ inline void ReportInvalidMsaaMode(Tegra::Texture::MsaaMode msaa_mode) {
     case MsaaMode::Msaa4x4:
         return 4;
     }
-    ReportInvalidMsaaMode(msaa_mode);
+    assert(false && "Invalid MSAA mode={}" && (void(static_cast<int>(msaa_mode)), true));
     return 1;
 }
 

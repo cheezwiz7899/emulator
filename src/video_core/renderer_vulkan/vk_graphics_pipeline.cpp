@@ -3,9 +3,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
-#include <cstring>
 #include <span>
-#include <vector>
 
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
@@ -13,6 +11,9 @@
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 
 #include "common/bit_field.h"
+#include "common/logging.h"
+#include "common/settings.h"
+#include "video_core/arm64_register_guard.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -33,6 +34,10 @@
 
 namespace Vulkan {
 namespace {
+#if CITRON_ARM64_REGISTER_GUARD_SUPPORTED
+struct DescriptorTemplateUpdateCorruptionTag;
+#endif
+
 using Shader::ImageBufferDescriptor;
 using Shader::Backend::SPIRV::RENDERAREA_LAYOUT_OFFSET;
 using Shader::Backend::SPIRV::RESCALING_LAYOUT_DOWN_FACTOR_OFFSET;
@@ -350,9 +355,6 @@ void GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     // per draw; small_vector lets the span size match the actual write count.
     thread_local boost::container::small_vector<VideoCommon::ImageViewInOut, 64> views;
     thread_local boost::container::small_vector<VideoCommon::SamplerId, 64> samplers;
-    thread_local BindlessCache bindless_cache;
-    thread_local size_t bindless_cache_rr{0};
-    thread_local std::vector<u8> bindless_scratch;
     views.clear();
     samplers.clear();
 
@@ -362,16 +364,16 @@ void GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 
     const auto& regs{maxwell3d->regs};
     const bool via_header_index{regs.sampler_binding == Tegra::Engines::Maxwell3D::Regs::SamplerBinding::ViaHeaderBinding};
-    // Single texture-cache-wide counter; read once here rather than once per
-    // qualifying bindless descriptor per shader stage
-    const u64 image_table_generation = texture_cache.GraphicsImageTableGeneration();
     const auto config_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         const Shader::Info& info{stage_infos[stage]};
         buffer_cache.UnbindGraphicsStorageBuffers(stage);
         if constexpr (Spec::has_storage_buffers) {
+            // Every descriptor below needs a binding slot; a missing slot shifts the descriptor
+            // payload and writes past the binding array.
+            static_assert(Shader::Info::MAX_SSBOS <= VideoCommon::NUM_STORAGE_BUFFERS);
             size_t ssbo_index{};
             for (const auto& desc : info.storage_buffers_descriptors) {
-                ASSERT(desc.count == 1);
+                assert(desc.count == 1);
                 buffer_cache.BindGraphicsStorageBuffer(stage, ssbo_index, desc.cbuf_index,
                                                        desc.cbuf_offset, desc.is_written);
                 ++ssbo_index;
@@ -379,23 +381,35 @@ void GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
         const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
         const auto read_handle{[&](const auto& desc, u32 index) {
-            ASSERT(cbufs[desc.cbuf_index].enabled);
+            assert(cbufs[desc.cbuf_index].enabled);
             const u32 index_offset{index << desc.size_shift};
             const u32 offset{desc.cbuf_offset + index_offset};
             const GPUVAddr addr{cbufs[desc.cbuf_index].address + offset};
             if constexpr (std::is_same_v<decltype(desc), const Shader::TextureDescriptor&> ||
                           std::is_same_v<decltype(desc), const Shader::TextureBufferDescriptor&>) {
+                u32 word{(gpu_memory->Read<u32>(addr) >> desc.shift_right) & desc.mask};
+                if (desc.indirect) {
+                    // The word is an index. The texture number is the 16-bit table entry.
+                    const auto& table{cbufs[desc.table_cbuf_index]};
+                    const u32 entry{(word << desc.table_shift) + desc.table_base};
+                    word = table.enabled && entry + sizeof(u16) <= table.size
+                               ? gpu_memory->Read<u16>(table.address + entry)
+                               : 0;
+                }
                 if (desc.has_secondary) {
-                    ASSERT(cbufs[desc.secondary_cbuf_index].enabled);
+                    assert(cbufs[desc.secondary_cbuf_index].enabled);
                     const u32 second_offset{desc.secondary_cbuf_offset + index_offset};
                     const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].address +
                                                  second_offset};
-                    const u32 lhs_raw{gpu_memory->Read<u32>(addr) << desc.shift_left};
-                    const u32 rhs_raw{gpu_memory->Read<u32>(separate_addr)
+                    const u32 lhs_raw{word << desc.shift_left};
+                    const u32 rhs_raw{((gpu_memory->Read<u32>(separate_addr) >>
+                                        desc.secondary_shift_right) &
+                                       desc.secondary_mask)
                                       << desc.secondary_shift_left};
                     const u32 raw{lhs_raw | rhs_raw};
                     return TexturePair(raw, via_header_index);
                 }
+                return TexturePair(word, via_header_index);
             }
             return TexturePair(gpu_memory->Read<u32>(addr), via_header_index);
         }};
@@ -420,66 +434,10 @@ void GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             }
         }
         for (const auto& desc : info.texture_descriptors) {
-            if (desc.count > 1 && !desc.has_secondary) {
-                const GPUVAddr cbuf_addr =
-                    cbufs[desc.cbuf_index].address + desc.cbuf_offset;
-
-                const size_t byte_size =
-                    static_cast<size_t>(desc.count) << desc.size_shift;
-                // Single scan: (addr, count, image_table_generation) match returns
-                // the existing valid entry (hit); otherwise an invalid slot claimed
-                // for filling below (miss).
-                // image_table_generation increments on every TIC table invalidation,
-                // a generation hit implies the cached views are still valid and
-                // no ReadBlockUnsafe is needed.
-                BindlessCacheEntry& entry = FindOrAcquireBindlessEntry(
-                    bindless_cache, bindless_cache_rr, cbuf_addr, desc.count,
-                    image_table_generation);
-                if (entry.valid) {
-                    views.insert(views.end(), entry.cached_views.begin(),
-                                 entry.cached_views.end());
-                    samplers.insert(samplers.end(), entry.cached_samplers.begin(),
-                                    entry.cached_samplers.end());
-                    continue;
-                }
-
-                // Miss: read cbuf, resolve views, populate cache entry.
-                bindless_scratch.resize(byte_size);
-                gpu_memory->ReadBlockUnsafe(cbuf_addr, bindless_scratch.data(), byte_size,
-                                            "Vulkan.GraphicsPipeline.bindless_cbuf");
-                const size_t views_start = views.size();
-                const size_t samplers_start = samplers.size();
-                for (u32 index = 0; index < desc.count; ++index) {
-                    const size_t slot_offset =
-                        static_cast<size_t>(index) << desc.size_shift;
-                    u32 raw;
-                    std::memcpy(&raw, bindless_scratch.data() + slot_offset,
-                                sizeof(u32));
-                    const auto handle = TexturePair(raw, via_header_index);
-                    views.push_back({handle.first});
-                    samplers.push_back(handle.first == 0
-                                           ? VideoCommon::NULL_SAMPLER_ID
-                                           : texture_cache.GetGraphicsSamplerId(handle.second));
-                }
-                auto resolved_views =
-                    std::span(views.data() + views_start, views.size() - views_start);
-                texture_cache.FillGraphicsImageViews<false>(resolved_views);
-                for (auto& view : resolved_views) {
-                    view.id_cached = true;
-                }
-                entry.cached_views.assign(views.data() + views_start,
-                                          views.data() + views.size());
-                entry.cached_samplers.assign(samplers.data() + samplers_start,
-                                             samplers.data() + samplers.size());
-                entry.valid = true;
-                continue;
-            }
             for (u32 index = 0; index < desc.count; ++index) {
                 const auto handle{read_handle(desc, index)};
                 views.push_back({handle.first});
-                samplers.push_back(handle.first == 0
-                                       ? VideoCommon::NULL_SAMPLER_ID
-                                       : texture_cache.GetGraphicsSamplerId(handle.second));
+                samplers.push_back(texture_cache.GetGraphicsSamplerId(handle.second));
             }
         }
         if constexpr (Spec::has_images) {
@@ -659,7 +617,25 @@ void GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                 }
             }
             const VkDescriptorSet fresh = alloc.Commit();
+#if CITRON_ARM64_REGISTER_GUARD_SUPPORTED
+            if (Settings::values.android_arm64_register_guards.GetValue()) {
+                const u32 update_corruption{
+                    dev.UpdateDescriptorSetGuarded(fresh, *tpl, descriptor_data)};
+                if (update_corruption != 0 &&
+                    VideoCore::IsFirstArm64RegisterCorruption<15,
+                                                              DescriptorTemplateUpdateCorruptionTag>(
+                        update_corruption)) {
+                    LOG_ERROR(Render_Vulkan,
+                              "ARM64 vkUpdateDescriptorSetWithTemplate corrupted callee-saved "
+                              "state mask={:#x}",
+                              update_corruption);
+                }
+            } else {
+                dev.UpdateDescriptorSet(fresh, *tpl, descriptor_data);
+            }
+#else
             dev.UpdateDescriptorSet(fresh, *tpl, descriptor_data);
+#endif
             for (auto& e : descriptor_set_cache) {
                 if (e.set == fresh) {
                     e.set = VK_NULL_HANDLE;
@@ -732,7 +708,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
             });
         }
     }
-    ASSERT(vertex_attributes.size() <= device.GetMaxVertexInputAttributes());
+    assert(vertex_attributes.size() <= device.GetMaxVertexInputAttributes());
 
     VkPipelineVertexInputStateCreateInfo vertex_input_ci{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,

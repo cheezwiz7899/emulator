@@ -28,7 +28,7 @@ enum class Operation {
 
 Id ImageType(EmitContext& ctx, const TextureDescriptor& desc) {
     const spv::ImageFormat format{spv::ImageFormat::Unknown};
-    const Id type{ctx.F32[1]};
+    const Id type{desc.is_integer ? (desc.is_signed ? ctx.S32[1] : ctx.U32[1]) : ctx.F32[1]};
     const bool depth{desc.is_depth};
     const bool ms{desc.is_multisample};
     switch (desc.type) {
@@ -489,7 +489,8 @@ void VectorTypes::Define(Sirit::Module& sirit_ctx, Id base_type, std::string_vie
 EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_info_,
                          IR::Program& program, Bindings& bindings)
     : Sirit::Module(profile_.supported_spirv), profile{profile_}, runtime_info{runtime_info_},
-      stage{program.stage}, texture_rescaling_index{bindings.texture_scaling_index},
+      stage{program.stage}, inst_storage{program.inst_storage},
+      texture_rescaling_index{bindings.texture_scaling_index},
       image_rescaling_index{bindings.image_scaling_index} {
     const bool is_unified{profile.unified_descriptor_binding};
     const bool is_split{profile.has_split_descriptor_sets};
@@ -526,9 +527,15 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
 
 EmitContext::~EmitContext() = default;
 
-Id EmitContext::Def(const IR::Value& value) {
-    if (!value.IsImmediate()) {
-        return value.InstRecursive()->Definition<Id>();
+IR::Inst* EmitContext::Inst(const IR::Value& value) const {
+    return inst_storage->Get(value);
+}
+
+Id EmitContext::Def(const IR::Value& raw_value) {
+    // An Identity chain may end in an immediate; read the immediate the chain resolves to
+    const IR::Value value{inst_storage->Resolve(raw_value)};
+    if (value.IsInst()) {
+        return inst_storage->At(value.InstIndex()).Definition<Id>();
     }
     switch (value.Type()) {
     case IR::Type::Void:
@@ -1341,21 +1348,24 @@ void EmitContext::DefineTextureBuffers(const Info& info, u32& binding) {
         return;
     }
     const spv::ImageFormat format{spv::ImageFormat::Unknown};
-    image_buffer_type = TypeImage(F32[1], spv::Dim::Buffer, 0U, false, false, 1, format);
-
-    const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, image_buffer_type)};
     texture_buffers.reserve(info.texture_buffer_descriptors.size());
     for (const TextureBufferDescriptor& desc : info.texture_buffer_descriptors) {
+        const Id sampled_type{desc.is_integer ? (desc.is_signed ? S32[1] : U32[1]) : F32[1]};
+        const Id image_type{TypeImage(sampled_type, spv::Dim::Buffer, 0U, false, false, 1, format)};
+        const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, image_type)};
         const Id id{AddGlobalVariable(
-            DescType(*this, image_buffer_type, pointer_type, desc.count),
+            DescType(*this, image_type, pointer_type, desc.count),
             spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
         Decorate(id, spv::Decoration::DescriptorSet, ResourceSet(profile));
         Name(id, NameOf(stage, desc, "texbuf"));
         texture_buffers.push_back({
             .id = id,
+            .image_type = image_type,
             .pointer_type = pointer_type,
             .count = desc.count,
+            .is_integer = desc.is_integer,
+            .is_signed = desc.is_signed,
         });
         if (desc.count > 1 && profile.support_uniform_texel_buffer_array_non_uniform_indexing) {
             AddExtension("SPV_EXT_descriptor_indexing");
@@ -1420,6 +1430,8 @@ void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_in
             .image_type = image_type,
             .count = desc.count,
             .is_multisample = desc.is_multisample,
+            .is_integer = desc.is_integer,
+            .is_signed = desc.is_signed,
         });
         if (desc.count > 1 && profile.support_sampled_image_array_non_uniform_indexing) {
             AddExtension("SPV_EXT_descriptor_indexing");

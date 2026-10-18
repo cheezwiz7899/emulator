@@ -463,10 +463,14 @@ if (APPLE)
 
     if (NOT USE_SYSTEM_MOLTENVK)
         set(MOLTENVK_PLATFORM "macOS")
-        set(MOLTENVK_VERSION "v1.4.0")
+        set(MOLTENVK_VERSION "v1.4.2")
         download_moltenvk_external(${MOLTENVK_PLATFORM} ${MOLTENVK_VERSION})
+        unset(MOLTENVK_LIBRARY CACHE)
+        find_library(MOLTENVK_LIBRARY MoltenVK REQUIRED NO_CACHE
+            PATHS ${MOLTENVK_LIBRARY_DIR} NO_DEFAULT_PATH)
+    else()
+        find_library(MOLTENVK_LIBRARY MoltenVK REQUIRED)
     endif()
-    find_library(MOLTENVK_LIBRARY MoltenVK REQUIRED)
     message(STATUS "Using MoltenVK at ${MOLTENVK_LIBRARY}.")
     set_source_files_properties(${MOLTENVK_LIBRARY} PROPERTIES MACOSX_PACKAGE_LOCATION Frameworks
                                     XCODE_FILE_ATTRIBUTES "CodeSignOnCopy")
@@ -564,7 +568,11 @@ endif()
 target_link_libraries(citron PRIVATE Boost::headers glad nlohmann_json::nlohmann_json Qt6::Widgets Qt6::Network Qt6::Svg)
 target_link_libraries(citron PRIVATE ${PLATFORM_LIBRARIES} Threads::Threads)
 
-# Add libarchive for updater functionality
+# In-process ZIP extract. Without this, firmware install shells out to
+# PowerShell and the UI pauses until that process starts and finishes.
+if (NOT TARGET LibArchive::LibArchive)
+    find_package(LibArchive QUIET)
+endif()
 if (TARGET LibArchive::LibArchive)
     target_link_libraries(citron PRIVATE LibArchive::LibArchive)
     target_compile_definitions(citron PRIVATE CITRON_ENABLE_LIBARCHIVE)

@@ -17,6 +17,7 @@ public:
     static constexpr u64 FinalFantasyTactics = 0x010038B015560000ULL;
     static constexpr u64 LittleNightmares3Base = 0x010066101A55A000ULL;
     static constexpr u64 MarvelCosmicInvasion = 0x010059D020C26000ULL;
+    static constexpr u64 ZeroKaiHK = 0x01005E5013862000ULL;
 };
 
 } // namespace UICommon

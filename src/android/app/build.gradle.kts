@@ -9,6 +9,27 @@ plugins {
     id("org.jlleitschuh.gradle.ktlint") version "14.2.0"
 }
 
+// Safe Args emits both Parcelable and Serializable branches without inspecting the
+// argument class. Kotlin 2.4 reports nullable impossible casts with a new diagnostic
+// that the generator's CAST_NEVER_SUCCEEDS suppression does not cover.
+tasks.configureEach {
+    if (name.startsWith("generateSafeArgs")) {
+        inputs.property("safeArgsNullableCastSuppression", 1)
+        doLast {
+            outputs.files.asFileTree.matching { include("**/*.kt") }.forEach { source ->
+                val original = source.readText()
+                val patched = original.replace(
+                    "@Suppress(\"CAST_NEVER_SUCCEEDS\")",
+                    "@Suppress(\"CAST_NEVER_SUCCEEDS\", \"UNSAFE_CAST_RELYING_ON_NULL\")"
+                )
+                if (patched != original) {
+                    source.writeText(patched)
+                }
+            }
+        }
+    }
+}
+
 /**
  * Use the number of seconds/10 since Jan 1 2016 as the versionCode.
  * This lets us upload a new build at most every 10 seconds for the

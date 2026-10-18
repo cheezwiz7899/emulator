@@ -61,6 +61,8 @@ public:
 
     u64 GetDeviceMemoryUsage() const;
 
+    GCDownloadRef TryGCDownloadStagingBuffer(size_t size);
+
     bool CanReportMemoryUsage() const;
 
     void BlitImage(Framebuffer* dst_framebuffer, ImageView& dst, ImageView& src,
@@ -178,10 +180,11 @@ public:
 
     bool ScaleDown(bool ignore = false);
 
+    // Allows cache GC to defer readbacks that may allocate scaling helper resources.
+    bool NeedsScaleHelper() const;
+
 private:
     bool BlitScaleHelper(bool scale_up);
-
-    bool NeedsScaleHelper() const;
 
     Scheduler* scheduler{};
     TextureCacheRuntime* runtime{};
@@ -232,6 +235,8 @@ public:
         return *image_views[static_cast<size_t>(texture_type)];
     }
 
+    [[nodiscard]] VkImageView HandleNonSrgb(Shader::TextureType texture_type);
+
     [[nodiscard]] VkImage ImageHandle() const noexcept {
         return image_handle;
     }
@@ -242,6 +247,10 @@ public:
 
     [[nodiscard]] VkSampleCountFlagBits Samples() const noexcept {
         return samples;
+    }
+
+    [[nodiscard]] bool SupportsDepthComparison() const noexcept {
+        return supports_depth_comparison;
     }
 
     [[nodiscard]] GPUVAddr GpuAddr() const noexcept {
@@ -263,12 +272,13 @@ private:
         std::array<vk::ImageView, Shader::NUM_TEXTURE_TYPES> unsigneds;
     };
 
-    [[nodiscard]] vk::ImageView MakeView(VkFormat vk_format, VkImageAspectFlags aspect_mask);
+    [[nodiscard]] vk::ImageView MakeView(VkFormat view_format, VkImageAspectFlags aspect);
 
     const Device* device = nullptr;
     const SlotVector<Image>* slot_images = nullptr;
 
     std::array<vk::ImageView, Shader::NUM_TEXTURE_TYPES> image_views;
+    std::array<vk::ImageView, Shader::NUM_TEXTURE_TYPES> non_srgb_image_views;
     std::unique_ptr<StorageViews> storage_views;
     vk::ImageView depth_view;
     vk::ImageView stencil_view;
@@ -277,8 +287,12 @@ private:
     VkImage image_handle = VK_NULL_HANDLE;
     VkImageView render_target = VK_NULL_HANDLE;
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+    VkFormat vk_format = VK_FORMAT_UNDEFINED;
+    VkComponentMapping stored_components{};
+    VkImageAspectFlags view_aspect_mask = 0;
     u32 buffer_size = 0;
     VideoCommon::ImageType physical_image_type = VideoCommon::ImageType::e2D;
+    bool supports_depth_comparison = false;
 };
 
 class ImageAlloc : public VideoCommon::ImageAllocBase {};
@@ -299,9 +313,32 @@ public:
         return static_cast<bool>(sampler_default_anisotropy);
     }
 
+    [[nodiscard]] VkSampler HandleWithNearestFilter() const noexcept {
+        return *sampler_nearest;
+    }
+
+    [[nodiscard]] bool HasLinearFiltering() const noexcept {
+        return static_cast<bool>(sampler_nearest);
+    }
+
+    [[nodiscard]] VkSampler HandleWithoutDepthComparison() const noexcept {
+        return *sampler_noncompare;
+    }
+
+    [[nodiscard]] bool HasDepthComparison() const noexcept {
+        return static_cast<bool>(sampler_noncompare);
+    }
+
+    [[nodiscard]] bool IsSrgbConversion() const noexcept {
+        return srgb_conversion;
+    }
+
 private:
     vk::Sampler sampler;
     vk::Sampler sampler_default_anisotropy;
+    vk::Sampler sampler_nearest;
+    vk::Sampler sampler_noncompare;
+    bool srgb_conversion = true;
 };
 
 class Framebuffer {

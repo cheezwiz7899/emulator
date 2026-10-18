@@ -446,11 +446,6 @@ Core::SystemResultStatus EmulationSession::InitializeEmulation(const std::string
 
     system.GPU().Start();
     system.GetCpuManager().OnGpuReady();
-    system.RegisterExitCallback([this] {
-        std::scoped_lock callback_lock{mutex};
-        is_running = false;
-        cv.notify_one();
-    });
     return Core::SystemResultStatus::Success;
 }
 
@@ -470,6 +465,12 @@ Core::SystemResultStatus EmulationSession::Launch(const std::string& filepath,
         is_running = true;
         is_paused = false;
     }
+    // A worker may have requested exit during initialization. Register only after
+    // is_running is set so a pending exit cannot be overwritten by startup.
+    system.RegisterExitCallback([this] {
+        is_running = false;
+        cv.notify_one();
+    });
     emulation_thread = std::thread{[this] { RunEmulation(); }};
     return result;
 }
@@ -518,16 +519,18 @@ void EmulationSession::Shutdown() {
 }
 
 void EmulationSession::RunEmulation() {
-    if (Settings::values.use_disk_shader_cache.GetValue()) {
+    if (is_running && Settings::values.use_disk_shader_cache.GetValue()) {
         LoadDiskCacheProgress(VideoCore::LoadCallbackStage::Prepare, 0, 0);
         system.Renderer().ReadRasterizer()->LoadDiskResources(
             system.GetApplicationProcessProgramID(), std::stop_token{}, LoadDiskCacheProgress);
         LoadDiskCacheProgress(VideoCore::LoadCallbackStage::Complete, 0, 0);
     }
 
-    void(system.Run());
+    if (is_running) {
+        void(system.Run());
+    }
 
-    if (system.DebuggerEnabled()) {
+    if (is_running && system.DebuggerEnabled()) {
         system.InitializeDebugger();
     }
 
@@ -538,7 +541,7 @@ void EmulationSession::RunEmulation() {
         }
     }
 
-    ShutdownEmulation(Core::SystemResultStatus::Success);
+    ShutdownEmulation(system.GetExitResult());
 }
 
 void EmulationSession::ShutdownEmulation(Core::SystemResultStatus result) {

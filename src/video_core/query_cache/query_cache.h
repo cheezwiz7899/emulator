@@ -185,7 +185,7 @@ void QueryCacheBase<Traits>::CounterEnable(QueryType counter_type, bool is_enabl
     size_t index = static_cast<size_t>(counter_type);
     StreamerInterface* streamer = impl->streamers[index];
     if (!streamer) [[unlikely]] {
-        UNREACHABLE();
+        std::unreachable();
         return;
     }
     if (is_enabled) {
@@ -200,7 +200,7 @@ void QueryCacheBase<Traits>::CounterClose(QueryType counter_type) {
     size_t index = static_cast<size_t>(counter_type);
     StreamerInterface* streamer = impl->streamers[index];
     if (!streamer) [[unlikely]] {
-        UNREACHABLE();
+        std::unreachable();
         return;
     }
     streamer->CloseCounter();
@@ -255,6 +255,20 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     };
     u8* pointer = impl->device_memory.template GetPointer<u8>(cpu_addr);
     u8* pointer_timestamp = impl->device_memory.template GetPointer<u8>(cpu_addr + 8);
+    if (streamer->HasImmediateResults()) {
+        // The value is already final. Holding it back until the next host fence would leave the
+        // previous report in guest memory for a game that reads it straight away.
+        if (has_timestamp) {
+            const u64 timestamp = impl->gpu.GetTicks();
+            if (pointer_timestamp) std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
+            if (pointer) std::memcpy(pointer, &query->value, sizeof(query->value));
+        } else {
+            const u32 value = static_cast<u32>(query->value);
+            if (pointer) std::memcpy(pointer, &value, sizeof(value));
+        }
+        streamer->Free(new_query_id);
+        return;
+    }
     bool is_synced = !Settings::IsGPULevelNormal() && is_fence;
     std::function<void()> operation([this, is_synced, streamer, query_base = query, query_location,
                                      pointer, pointer_timestamp] {
@@ -265,7 +279,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             return;
         }
         if (False(query_base->flags & QueryFlagBits::IsFinalValueSynced)) [[unlikely]] {
-            ASSERT(false);
+            assert(false);
             return;
         }
         query_base->value += streamer->GetAmendValue();

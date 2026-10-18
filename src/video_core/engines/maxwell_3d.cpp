@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <cstring>
 #include <optional>
+#include <span>
+#include "citron/util/title_ids.h"
 #include "common/assert.h"
 #include "common/bit_util.h"
 #include "common/scope_exit.h"
@@ -19,6 +22,55 @@
 #include "video_core/textures/texture.h"
 
 namespace Tegra::Engines {
+
+namespace {
+
+constexpr std::array<u8, 32> ZeroKai101BuildId{
+    0xec, 0xde, 0xeb, 0xa2, 0x66, 0x13, 0x03, 0xb1, 0x1b, 0x0d,
+    0x3e, 0x24, 0x6c, 0x86, 0xc9, 0x94, 0x07, 0xc5, 0x08, 0x73,
+};
+
+// Zero Kai HK 1.01 indexes a 0xff queue sentinel without checking it. The resulting
+// out-of-bounds byte store changes its temporary NVN view's layer count from 1 to
+// 0x101. Match only the captured render target, never ordinary 257-layer images.
+[[nodiscard]] constexpr bool IsZeroKaiCorruptedLayerCount(u64 title_id,
+                                                          const std::array<u8, 32>& build_id,
+                                                          u32 dimension,
+                                                          std::span<const u32, 10> rt) {
+    return title_id == UICommon::TitleID::ZeroKaiHK && build_id == ZeroKai101BuildId &&
+           dimension == 0x101 && rt[2] == 1920 && rt[3] == 1080 && rt[4] == 0xc6 && rt[5] == 0x40 &&
+           rt[7] == 0x438000 && rt[8] == 0;
+}
+
+// Preserve the matching/exclusion regression checks without exposing this private helper.
+static_assert([] {
+    constexpr auto title_id = UICommon::TitleID::ZeroKaiHK;
+    constexpr std::array<u32, 10> rt{5, 0x6c680000, 1920, 1080, 0xc6, 0x40, 0x101, 0x438000, 0, 0};
+    if (!IsZeroKaiCorruptedLayerCount(title_id, ZeroKai101BuildId, rt[6], rt) ||
+        IsZeroKaiCorruptedLayerCount(title_id + 1, ZeroKai101BuildId, rt[6], rt)) {
+        return false;
+    }
+    auto different_build = ZeroKai101BuildId;
+    different_build[0] ^= 1;
+    if (IsZeroKaiCorruptedLayerCount(title_id, different_build, rt[6], rt)) {
+        return false;
+    }
+    for (u32 layers : {1U, 16U, 32U, 256U, 258U, 512U}) {
+        if (IsZeroKaiCorruptedLayerCount(title_id, ZeroKai101BuildId, layers, rt)) {
+            return false;
+        }
+    }
+    for (size_t word : {2U, 3U, 4U, 5U, 7U, 8U}) {
+        auto different_rt = rt;
+        different_rt[word] ^= 1;
+        if (IsZeroKaiCorruptedLayerCount(title_id, ZeroKai101BuildId, rt[6], different_rt)) {
+            return false;
+        }
+    }
+    return true;
+}());
+
+} // namespace
 
 /// First register id that is actually a Macro call.
 constexpr u32 MacroRegistersStart = 0xE00;
@@ -203,7 +255,7 @@ bool Maxwell3D::IsMethodExecutable(u32 method) {
 void Maxwell3D::ProcessMacro(u32 method, const u32* base_start, u32 amount, bool is_last_call) {
     if (executing_macro == 0) {
         // A macro call must begin by writing the macro method's register, not its argument.
-        ASSERT((method % 2) == 0 && "Can't start macro execution by writing to the ARGS register");
+        assert((method % 2) == 0 && "Can't start macro execution by writing to the ARGS register");
         executing_macro = method;
     }
 
@@ -307,7 +359,51 @@ void Maxwell3D::ConsumeSinkImpl() {
 }
 
 void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
+    constexpr u32 rt_start = MAXWELL3D_REG_INDEX(rt);
+    constexpr u32 rt_words = sizeof(Regs::RenderTargetConfig) / sizeof(u32);
+    constexpr u32 dimension_word =
+        offsetof(Regs::RenderTargetConfig, array_pitch) / sizeof(u32) - 1;
+    // Games rewrite most of their state before every draw. A write that changes nothing must not
+    // mark the state dirty, or every draw pays for rebinding all of it. Render target words still
+    // go through the check below: the memory behind a target can be mapped after its registers
+    // were written, and the next identical write is the first chance to see that.
+    const bool changed{regs.reg_array[method] != argument};
+    const bool is_rt_word{method >= rt_start &&
+                          method < rt_start + Regs::NumRenderTargets * rt_words};
+    if (!changed && !is_rt_word) {
+        return;
+    }
     regs.reg_array[method] = argument;
+    if (is_rt_word) {
+        const u32 index = (method - rt_start) / rt_words;
+        const u32 first_word = rt_start + index * rt_words;
+        const std::span<const u32, 10> rt{regs.reg_array.data() + first_word, 10};
+        // Check after each RT write: ArrayPitch can arrive after the corrupted layer count.
+        // Fix the live registers so clear/macro execution and resource creation agree.
+        if (IsZeroKaiCorruptedLayerCount(system.GetApplicationProcessProgramID(),
+                                         system.GetApplicationProcessBuildID(), rt[dimension_word],
+                                         rt)) {
+            const GPUVAddr address = regs.rt[index].Address();
+            const u64 layer_bytes = u64{rt[7]} * 4;
+            if (memory_manager.IsFullyMappedRange(address, layer_bytes) &&
+                !memory_manager.IsFullyMappedRange(address, layer_bytes * 257)) {
+                regs.reg_array[first_word + dimension_word] = 1;
+                for (const auto& table : dirty.tables) {
+                    dirty.flags[table[first_word + dimension_word]] = true;
+                }
+                if (!zero_kai_layer_fix_logged) {
+                    LOG_WARNING(HW_GPU,
+                                "Zero Kai HK 1.01 RT workaround: rt={}, gpu=0x{:x}, "
+                                "restoring corrupted layers=0x101 to 1, layer_bytes={}",
+                                index, address, layer_bytes);
+                    zero_kai_layer_fix_logged = true;
+                }
+            }
+        }
+    }
+    if (!changed) {
+        return;
+    }
     for (const auto& table : dirty.tables)
         dirty.flags[table[method]] = true;
 }
@@ -403,7 +499,7 @@ void Maxwell3D::CallMethod(u32 method, u32 method_argument, bool is_last_call) {
     // It is an error to write to a register other than the current macro's ARG register before
     // it has finished execution.
     if (executing_macro != 0) {
-        ASSERT(method == executing_macro + 1);
+        assert(method == executing_macro + 1);
     }
 
     // Methods after 0xE00 are special, they're actually triggers for some microcode that was
@@ -413,7 +509,7 @@ void Maxwell3D::CallMethod(u32 method, u32 method_argument, bool is_last_call) {
         return;
     }
 
-    ASSERT(method < Regs::NUM_REGS && "Invalid Maxwell3D register, increase the size of the Regs structure");
+    assert(method < Regs::NUM_REGS && "Invalid Maxwell3D register, increase the size of the Regs structure");
 
     const u32 argument = ProcessShadowRam(method, method_argument);
     ProcessDirtyRegisters(method, argument);
@@ -448,7 +544,7 @@ void Maxwell3D::CallMultiMethod(u32 method, const u32* base_start, u32 amount,
         ProcessCBMultiData(base_start, amount);
         break;
     case MAXWELL3D_REG_INDEX(inline_data): {
-        ASSERT(methods_pending == amount);
+        assert(methods_pending == amount);
         upload_state.ProcessData(base_start, amount);
         return;
     }
@@ -623,10 +719,10 @@ void Maxwell3D::ProcessCBBind(size_t stage_index) {
 void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
     // Write the input value to the current const buffer at the current position.
     const GPUVAddr buffer_address = regs.const_buffer.Address();
-    ASSERT(buffer_address != 0);
+    assert(buffer_address != 0);
 
     // Don't allow writing past the end of the buffer.
-    ASSERT(regs.const_buffer.offset <= regs.const_buffer.size);
+    assert(regs.const_buffer.offset <= regs.const_buffer.size);
 
     const GPUVAddr address{buffer_address + regs.const_buffer.offset};
     const size_t copy_size = amount * sizeof(u32);
@@ -659,7 +755,7 @@ Texture::TSCEntry Maxwell3D::GetTSCEntry(u32 tsc_index) const {
 }
 
 u32 Maxwell3D::GetRegisterValue(u32 method) const {
-    ASSERT_MSG(method < Regs::NUM_REGS, "Invalid Maxwell3D register");
+    assert(method < Regs::NUM_REGS && "Invalid Maxwell3D register");
     return regs.reg_array[method];
 }
 

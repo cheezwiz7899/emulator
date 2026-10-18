@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <mutex>
+
 #include "core/hle/service/cmif_types.h"
 #include "core/hle/service/service.h"
 #include "core/hle/service/set/settings_types.h"
@@ -96,6 +98,9 @@ private:
     KernelHelpers::ServiceContext service_context;
 
     Kernel::KEvent* notification_event;
+    std::shared_ptr<Service::Set::ISystemSettingsServer> GetSetSys();
+
+    std::once_flag m_set_sys_once;
     std::shared_ptr<Service::Set::ISystemSettingsServer> m_set_sys;
 };
 

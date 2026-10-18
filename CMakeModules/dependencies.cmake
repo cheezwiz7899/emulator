@@ -101,7 +101,8 @@ if (NOT TARGET fmt::fmt)
         NAME fmt
         GITHUB_REPOSITORY fmtlib/fmt
         GIT_TAG e8244777ee1c32df8233c215ac9ff626b2dd2c38
-        OPTIONS "FMT_INSTALL OFF"
+        # Citron uses fmt headers/library; the optional module fails with Clang 21.
+        OPTIONS "FMT_INSTALL OFF" "FMT_MODULE OFF"
     )
 endif()
 
@@ -149,6 +150,47 @@ if (NOT TARGET ZLIB::ZLIB)
     if (CITRON_CLANGCL AND TARGET zlib)
         # Only zlibstatic is used.
         set_target_properties(zlib PROPERTIES EXCLUDE_FROM_ALL TRUE)
+    endif()
+endif()
+
+# ── libarchive (in-process firmware ZIP extract; avoids a PowerShell pause) ──
+if (NOT TARGET LibArchive::LibArchive)
+    CPMAddPackage(
+        NAME LibArchive
+        GITHUB_REPOSITORY libarchive/libarchive
+        GIT_TAG v3.7.7
+        OPTIONS
+            "ENABLE_TEST OFF"
+            "ENABLE_INSTALL OFF"
+            "ENABLE_TAR OFF"
+            "ENABLE_CPIO OFF"
+            "ENABLE_CAT OFF"
+            "ENABLE_UNZIP OFF"
+            "ENABLE_XATTR OFF"
+            "ENABLE_ACL OFF"
+            "ENABLE_ICONV OFF"
+            "ENABLE_LIBB2 OFF"
+            "ENABLE_LZ4 OFF"
+            "ENABLE_LZMA OFF"
+            "ENABLE_ZSTD OFF"
+            "ENABLE_BZip2 OFF"
+            "ENABLE_OPENSSL OFF"
+            "ENABLE_LIBXML2 OFF"
+            "ENABLE_EXPAT OFF"
+            "ENABLE_PCREPOSIX OFF"
+            "ENABLE_NETTLE OFF"
+            "ENABLE_CNG OFF"
+            "ENABLE_ZLIB ON"
+            "ENABLE_WERROR OFF"
+    )
+    if (TARGET archive_static AND NOT TARGET LibArchive::LibArchive)
+        # archive.h marks every function dllimport unless consumers define this.
+        # clang-cl links the static library, so without it the link fails with
+        # undefined __declspec(dllimport) archive_* symbols.
+        target_compile_definitions(archive_static PUBLIC LIBARCHIVE_STATIC)
+        add_library(LibArchive::LibArchive ALIAS archive_static)
+    elseif (TARGET archive AND NOT TARGET LibArchive::LibArchive)
+        add_library(LibArchive::LibArchive ALIAS archive)
     endif()
 endif()
 
@@ -436,30 +478,13 @@ if (NOT TARGET sirit)
     endif()
 endif()
 
-# ── dynarmic (xinitrcn1 fork) ─────────────────────────────────────────────────
+# ── dynarmic (part of this tree: externals/dynarmic) ─────────────────────────
 if ((ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64) AND NOT (MSVC AND ARCHITECTURE_arm64))
     if (NOT TARGET dynarmic::dynarmic)
-        CPMAddPackage(
-            NAME dynarmic
-            GITHUB_REPOSITORY xinitrcn1/dynarmic
-            GIT_TAG 7bec834bcadbb8b7def7c552a08ad4ac189d4397
-            OPTIONS
-                "DYNARMIC_USE_PRECOMPILED_HEADERS ${CITRON_USE_PRECOMPILED_HEADERS}"
-                "DYNARMIC_IGNORE_ASSERTS ON"
-                "DYNARMIC_TESTS OFF"
-        )
-        if (TARGET dynarmic AND NOT TARGET dynarmic::dynarmic)
-            add_library(dynarmic::dynarmic ALIAS dynarmic)
-        endif()
-        if (CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND dynarmic_ADDED)
-            execute_process(
-                COMMAND git apply --ignore-whitespace
-                        "${CMAKE_SOURCE_DIR}/patches/mcl_clang_template_fix.patch"
-                WORKING_DIRECTORY "${dynarmic_SOURCE_DIR}/externals/mcl"
-                RESULT_VARIABLE _mcl_patch
-                OUTPUT_QUIET ERROR_QUIET
-            )
-        endif()
+        set(DYNARMIC_USE_PRECOMPILED_HEADERS ${CITRON_USE_PRECOMPILED_HEADERS})
+        set(DYNARMIC_TESTS OFF)
+        add_subdirectory("${CMAKE_SOURCE_DIR}/externals/dynarmic" "${CMAKE_BINARY_DIR}/dynarmic")
+        add_library(dynarmic::dynarmic ALIAS dynarmic)
     endif()
 endif()
 

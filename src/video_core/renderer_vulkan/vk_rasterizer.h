@@ -5,6 +5,7 @@
 
 #include <array>
 #include <atomic>
+#include <optional>
 #include <shared_mutex>
 
 #include <boost/container/static_vector.hpp>
@@ -157,10 +158,18 @@ private:
 
     static constexpr VkDeviceSize DEFAULT_BUFFER_SIZE = 4 * sizeof(float);
 
+    /// Returns the pipeline the draw was recorded with, or nullptr when it was skipped
     template <typename Func>
-    void PrepareDraw(bool is_indexed, Func&&);
+    GraphicsPipeline* PrepareDraw(bool is_indexed, Func&&);
+
+    /// Performs the pipeline's vertex pointer stores, instance_count is empty for indirect draws
+    void PerformVertexPointerStores(const GraphicsPipeline& pipeline, bool is_indexed,
+                                    std::optional<u32> instance_count);
 
     void FlushWork();
+
+    /// Once a frame: decides whether finished passes are submitted to the host GPU early.
+    void UpdatePassEndSubmit();
 
     void UpdateDynamicStates();
 
@@ -224,6 +233,18 @@ private:
     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
 
     u32 draw_counter = 0;
+    /// Draws recorded since the last submission to the host GPU, and the tick of that submission.
+    u32 draws_since_submit = 0;
+    u64 last_submit_tick = 0;
+    /// Whether finished passes are submitted early, and what decides it: the share of the last
+    /// frames this thread spent running (in 1/1024, starts saturated so the answer is "no"
+    /// until it has been measured) and the share below which it is switched on.
+    bool submit_at_pass_end = false;
+    [[maybe_unused]] s64 gpu_thread_busy = 1024;
+    [[maybe_unused]] s64 busy_to_turn_on = 819; // 80% of 1024
+    [[maybe_unused]] u32 frames_off = 0;
+    [[maybe_unused]] s64 last_frame_wall_ns = 0;
+    [[maybe_unused]] s64 last_frame_cpu_ns = 0;
 
     std::shared_mutex shutdown_mutex;
     std::atomic_bool is_shutting_down{false};

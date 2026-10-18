@@ -78,6 +78,25 @@ public:
         }
     }
 
+    // Resume bounded scans after protected entries rather than restarting at the head.
+    template <typename Func>
+    void ForEachItemBelow(TickType tick, size_t max_scans, Func&& func) {
+        if (!scan_cursor) {
+            scan_cursor = first_item;
+        }
+        while (scan_cursor && max_scans-- != 0) {
+            Item* item = scan_cursor;
+            if (static_cast<s64>(tick) - static_cast<s64>(item->tick) < 0) {
+                scan_cursor = nullptr;
+                return;
+            }
+            scan_cursor = item->next;
+            if (func(item->obj)) {
+                return;
+            }
+        }
+    }
+
 private:
     size_t Build() {
         if (free_items.empty()) {
@@ -110,6 +129,9 @@ private:
     }
 
     void Detach(Item& item) {
+        if (scan_cursor == &item) {
+            scan_cursor = item.next;
+        }
         if (item.prev) {
             item.prev->next = item.next;
         }
@@ -134,6 +156,7 @@ private:
     std::deque<size_t> free_items;
     Item* first_item{};
     Item* last_item{};
+    Item* scan_cursor{};
 };
 
 } // namespace Common

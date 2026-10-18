@@ -50,6 +50,9 @@ public:
 signals:
     void AddressSelected(u64 address);
 
+protected:
+    void showEvent(QShowEvent* event) override;
+
 private:
     void SetupUI();
     void OnTableDoubleClicked(int row, int column);
@@ -69,6 +72,8 @@ private:
     std::map<u64, std::string> ghidra_import_overrides;  // Address -> name from imported CSV
 
     Core::System& system;
+
+    bool needs_refresh = false;
 
     QTableWidget* table;
     QLineEdit* filter_input;
