@@ -6,6 +6,7 @@
 #include <array>
 #include <bitset>
 #include <cmath>
+#include <functional>
 #include <limits>
 #include <optional>
 #include <type_traits>
@@ -58,6 +59,12 @@ public:
 
     /// Binds a rasterizer to this engine.
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
+
+    /// Stops this engine's channel at a semaphore acquire: (address, payload, greater_or_equal).
+    using SemaphoreAcquireCallback = std::function<void(GPUVAddr, u32, bool)>;
+    void SetSemaphoreAcquire(SemaphoreAcquireCallback callback) {
+        semaphore_acquire = std::move(callback);
+    }
 
     /// Register structure of the Maxwell3D engine.
     struct Regs {
@@ -2407,8 +2414,9 @@ public:
                 All = 15,
             };
 
+            // NVB197_SET_REPORT_SEMAPHORE_D_COMPARISON (clb197.h): _EQ 0, _GE 1
             enum class Comparison : u32 {
-                NotEqual = 0,
+                Equal = 0,
                 GreaterOrEqual = 1,
             };
 
@@ -3191,6 +3199,8 @@ private:
     bool zero_kai_layer_fix_logged = false;
 
     VideoCore::RasterizerInterface* rasterizer = nullptr;
+
+    SemaphoreAcquireCallback semaphore_acquire;
 
     /// Start offsets of each macro in macro_memory
     std::array<u32, 0x80> macro_positions{};

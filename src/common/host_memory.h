@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <memory>
 #include <span>
+#include <string_view>
 #include "common/common_funcs.h"
 #include "common/common_types.h"
 #include "common/virtual_buffer.h"
@@ -36,6 +37,29 @@ struct BackingChunkRange {
                                                           size_t chunk_size) noexcept {
     const size_t offset = host_offset % chunk_size;
     return {host_offset / chunk_size, offset, std::min(length, chunk_size - offset)};
+}
+
+/// One line of /proc/self/maps, reduced to what merging mappings needs.
+struct HostMapping {
+    u64 start;
+    u64 end;
+    u64 offset; ///< Offset of `start` in the mapped file
+    u64 device; ///< (major << 32) | minor of the mapped file
+    u64 inode;  ///< 0 for anonymous memory
+    MemoryPermission perms;
+    bool shared;
+};
+
+/// Reads one /proc/self/maps line. Returns false if the line does not parse.
+[[nodiscard]] bool ParseHostMapping(std::string_view line, HostMapping& out) noexcept;
+
+/// True when the kernel would merge `b` into `a` for an ordinary shared file mapping: the same
+/// file, next to each other in memory and in the file, the same permissions. The kernel does not
+/// merge mappings of the dma_bufs Turnip exports on the AYN Thor (smaps VmFlags "pf io", that is
+/// VM_PFNMAP | VM_IO), so HostMemory merges those itself with this rule.
+[[nodiscard]] constexpr bool ContinuesMapping(const HostMapping& a, const HostMapping& b) noexcept {
+    return a.inode != 0 && a.end == b.start && a.device == b.device && a.inode == b.inode &&
+           a.perms == b.perms && a.shared == b.shared && b.offset == a.offset + (a.end - a.start);
 }
 
 /**

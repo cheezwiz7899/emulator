@@ -215,7 +215,7 @@ struct TextureBufferDescriptor {
     // The number is a 16-bit entry of a table in another constant buffer, see texture_pass.cpp.
     bool indirect{false};
     u32 table_cbuf_index{0};
-    u32 table_shift{0};
+    u32 table_scale{1};
     u32 table_base{0};
 
     auto operator<=>(const TextureBufferDescriptor&) const = default;
@@ -259,7 +259,7 @@ struct TextureDescriptor {
     // The number is a 16-bit entry of a table in another constant buffer, see texture_pass.cpp.
     bool indirect{false};
     u32 table_cbuf_index{0};
-    u32 table_shift{0};
+    u32 table_scale{1};
     u32 table_base{0};
 
     auto operator<=>(const TextureDescriptor&) const = default;

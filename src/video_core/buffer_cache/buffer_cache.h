@@ -119,7 +119,7 @@ bool BufferCache<P>::RunGarbageCollector(bool aggressive_gc) {
                 std::span{copies}.subspan(download.first_copy, download.num_copies);
             for (auto& copy : buffer_copies) {
                 copy.dst_offset += staging->offset;
-                buffer.MarkUsage(copy.src_offset, copy.size);
+                buffer.MarkUsage(copy.src_offset, copy.size, runtime.CurrentTick());
             }
             if (!buffer_copies.empty()) {
                 runtime.CopyBuffer(staging->buffer, buffer, buffer_copies, true);
@@ -131,9 +131,9 @@ bool BufferCache<P>::RunGarbageCollector(bool aggressive_gc) {
             const auto& buffer = slot_buffers[download.id];
             for (const auto& copy : std::span{copies}.subspan(download.first_copy,
                                                             download.num_copies)) {
-                device_memory.WriteBlockUnsafe(
-                    buffer.CpuAddr() + copy.src_offset,
-                    staging->mapped_span.data() + copy.dst_offset - staging->offset, copy.size);
+                WriteBackDownload(buffer.CpuAddr() + copy.src_offset,
+                                  staging->mapped_span.data() + copy.dst_offset - staging->offset,
+                                  copy.size);
             }
         }
     }
@@ -771,8 +771,7 @@ void BufferCache<P>::PopAsyncBuffers() {
         const u64 dst_offset = copy.dst_offset - base_offset;
         const u8* read_mapped_memory = base + dst_offset;
         async_downloads.ForEachInRange(device_addr, copy.size, [&](DAddr start, DAddr end, s32) {
-            device_memory.WriteBlockUnsafe(start, &read_mapped_memory[start - device_addr],
-                                           end - start);
+            WriteBackDownload(start, &read_mapped_memory[start - device_addr], end - start);
         });
         async_downloads.Subtract(device_addr, copy.size, [&](DAddr start, DAddr end) {
             gpu_modified_ranges.Subtract(start, end - start);
@@ -975,9 +974,16 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         std::memset(span.data() + size, 0, shader_size - size);
         return;
     }
-    const bool use_fast_buffer = binding.buffer_id != NULL_BUFFER_ID &&
-                                 size <= channel_state->uniform_buffer_skip_cache_size &&
-                                 !memory_tracker.IsRegionGpuModified(device_addr, size);
+    // The stream path also takes a uniform buffer the guest rewrote while draws earlier in this
+    // frame still use the cached copy. Uploading it would take a copy in submission order, and a
+    // copy cannot run inside a render pass: the pass would end before the draw and start again
+    // after it, which on a tiled GPU stores and reloads every attachment. Galaxy's gameplay did
+    // this on every draw. The cached copy stays marked as modified for its other users.
+    const bool use_fast_buffer =
+        binding.buffer_id != NULL_BUFFER_ID &&
+        !memory_tracker.IsRegionGpuModified(device_addr, size) &&
+        (size <= channel_state->uniform_buffer_skip_cache_size ||
+         UploadNeedsOrderedCopy(buffer, device_addr, size));
     if (use_fast_buffer) {
         if constexpr (IS_OPENGL) {
             if (runtime.HasFastBufferSubData()) {
@@ -1678,8 +1684,9 @@ void BufferCache<P>::TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept {
 
 template <class P>
 void BufferCache<P>::MarkGpuUse(Buffer& buffer, u64 offset, u64 size) {
-    buffer.MarkUsage(offset, size);
-    Uma::StampPages(buffer.page_gpu_tick, offset, size, runtime.CurrentTick());
+    const u64 tick = runtime.CurrentTick();
+    buffer.MarkUsage(offset, size, tick);
+    Uma::StampPages(buffer.page_gpu_tick, offset, size, tick);
 }
 
 template <class P>
@@ -1703,6 +1710,33 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
     const std::span<BufferCopy> copies_span(copies.data(), copies.size());
     UploadMemory(buffer, total_size_bytes, largest_copy, copies_span);
     return false;
+}
+
+template <class P>
+bool BufferCache<P>::UploadNeedsOrderedCopy([[maybe_unused]] Buffer& buffer,
+                                            [[maybe_unused]] DAddr device_addr,
+                                            [[maybe_unused]] u32 size) {
+    if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
+        // Outside a render pass an ordered copy costs nothing extra, and it brings the cached
+        // copy up to date.
+        if (size == 0 || !runtime.IsRenderPassActive() ||
+            !memory_tracker.IsRegionCpuModified(device_addr, size)) {
+            return false;
+        }
+        // The same tests MappedUploadMemory makes, over the whole range: the uploaded ranges are
+        // inside it, so this can only answer yes more often than the upload would need.
+        const u64 offset = buffer.Offset(device_addr);
+        const std::span<u8> mapped = buffer.Mapped();
+        if (offset <= mapped.size() && size <= mapped.size() - offset &&
+            Uma::CanWriteDirectly(!mapped.empty(), buffer.page_gpu_tick, offset, size,
+                                  runtime.KnownGpuTick())) {
+            return false;
+        }
+        const std::array copies{BufferCopy{.src_offset = 0, .dst_offset = offset, .size = size}};
+        return !runtime.CanReorderUpload(buffer, copies);
+    } else {
+        return false;
+    }
 }
 
 template <class P>
@@ -1939,15 +1973,35 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
             // Undo the modified offset
             const u64 dst_offset = copy.dst_offset - download_staging.offset;
             const u8* copy_mapped_memory = mapped_memory + dst_offset;
-            device_memory.WriteBlockUnsafe(copy_device_addr, copy_mapped_memory, copy.size);
+            WriteBackDownload(copy_device_addr, copy_mapped_memory, copy.size);
         }
     } else {
         const std::span<u8> immediate_buffer = ImmediateBuffer(largest_copy);
         for (const BufferCopy& copy : copies) {
             buffer.ImmediateDownload(copy.src_offset, immediate_buffer.subspan(0, copy.size));
             const DAddr copy_device_addr = buffer.CpuAddr() + copy.src_offset;
-            device_memory.WriteBlockUnsafe(copy_device_addr, immediate_buffer.data(), copy.size);
+            WriteBackDownload(copy_device_addr, immediate_buffer.data(), copy.size);
         }
+    }
+}
+
+template <class P>
+void BufferCache<P>::WriteBackDownload(DAddr device_addr, const u8* data, u64 size) {
+    // A buffer can cover device pages no guest memory backs (a storage buffer bound without a
+    // size spans its whole GPU mapping, see StorageBufferBinding). The GPU's writes there have
+    // nowhere to go; skip them, as the upload zero-fills them, and say so now and then instead
+    // of once per page per flush.
+    const auto result = device_memory.WriteBlockUnsafe(device_addr, data, size, false);
+    if (result.fully_mapped) {
+        return;
+    }
+    const u64 count = ++unbacked_write_back_count;
+    if (count <= 8 || (count % 256) == 0) {
+        LOG_WARNING(HW_Memory,
+                    "BufferCache download skips unmapped pages: d_address=0x{:016X} size={} "
+                    "first_unmapped=0x{:016X} unmapped_bytes={} sample_count={}",
+                    device_addr, size, result.first_unmapped_address, result.unmapped_bytes,
+                    count);
     }
 }
 

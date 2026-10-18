@@ -80,6 +80,9 @@ void InvalidateInstructionCache(KernelCore& kernel, KPageTableBase* table, Addre
             continue;
         }
 
+        // The host cache, for guest code run in place; the interfaces below drop recompiled code.
+        process->GetMemory().SyncInstructionCache(addr, size);
+
         for (size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; i++) {
             auto* interface = process->GetArmInterface(i);
             if (interface) {

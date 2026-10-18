@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <limits>
 #include <span>
 
 #include <boost/container/small_vector.hpp>
@@ -145,6 +146,18 @@ RenderPassKey MakeRenderPassKey(const FixedPipelineState& state) {
     return key;
 }
 
+/// Whether the stage writes memory other than its render targets. Global memory counts even when
+/// only read, as its accesses are not tracked per descriptor.
+bool ShaderWritesMemory(const Shader::Info& info) {
+    const auto any_written = [](const auto& descriptors) {
+        return std::ranges::any_of(descriptors, [](const auto& desc) { return desc.is_written; });
+    };
+    return info.stores_global_memory || info.uses_global_memory ||
+           !info.pointer_store_descriptors.empty() ||
+           any_written(info.storage_buffers_descriptors) ||
+           any_written(info.image_buffer_descriptors) || any_written(info.image_descriptors);
+}
+
 size_t NumAttachments(const FixedPipelineState& state) {
     size_t num{};
     for (size_t index = 0; index < Tegra::Engines::Maxwell3D::Regs::NumRenderTargets; ++index) {
@@ -268,6 +281,7 @@ GraphicsPipeline::GraphicsPipeline(
             continue;
         }
         stage_infos[stage] = *info;
+        writes_memory |= ShaderWritesMemory(*info);
         enabled_uniform_buffer_masks[stage] = info->constant_buffer_mask;
         std::ranges::copy(info->constant_buffer_used_sizes, uniform_buffer_sizes[stage].begin());
         num_textures += Shader::NumDescriptors(info->texture_descriptors);
@@ -391,7 +405,7 @@ void GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 if (desc.indirect) {
                     // The word is an index. The texture number is the 16-bit table entry.
                     const auto& table{cbufs[desc.table_cbuf_index]};
-                    const u32 entry{(word << desc.table_shift) + desc.table_base};
+                    const u32 entry{word * desc.table_scale + desc.table_base};
                     word = table.enabled && entry + sizeof(u16) <= table.size
                                ? gpu_memory->Read<u16>(table.address + entry)
                                : 0;
@@ -413,24 +427,26 @@ void GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             }
             return TexturePair(gpu_memory->Read<u32>(addr), via_header_index);
         }};
-        const auto add_image{[&](const auto& desc, bool blacklist) LAMBDA_FORCEINLINE {
+        const auto add_image{[&](const auto& desc, bool blacklist,
+                                 Shader::ImageFormat storage_format) LAMBDA_FORCEINLINE {
             for (u32 index = 0; index < desc.count; ++index) {
                 const auto handle{read_handle(desc, index)};
                 views.push_back({
                     .index = handle.first,
                     .blacklist = blacklist,
                     .id = {},
+                    .storage_format = static_cast<u32>(storage_format),
                 });
             }
         }};
         if constexpr (Spec::has_texture_buffers) {
             for (const auto& desc : info.texture_buffer_descriptors) {
-                add_image(desc, false);
+                add_image(desc, false, Shader::ImageFormat::Typeless);
             }
         }
         if constexpr (Spec::has_image_buffers) {
             for (const auto& desc : info.image_buffer_descriptors) {
-                add_image(desc, false);
+                add_image(desc, false, Shader::ImageFormat::Typeless);
             }
         }
         for (const auto& desc : info.texture_descriptors) {
@@ -442,7 +458,7 @@ void GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
         if constexpr (Spec::has_images) {
             for (const auto& desc : info.image_descriptors) {
-                add_image(desc, desc.is_written);
+                add_image(desc, desc.is_written, desc.format);
             }
         }
     }};
@@ -700,10 +716,16 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
             if (!attribute.enabled || !stage_infos[0].loads.Generic(index)) {
                 continue;
             }
+            // An attribute that runs past its binding's stride is narrowed to fit, as the
+            // dynamic vertex input path does (VUID-vkCmdBindVertexBuffers2-pStrides-06209)
+            const u32 stride{key.state.vertex_strides[attribute.buffer]};
+            const u32 bytes_available{stride > attribute.offset ? stride - attribute.offset
+                                                                : std::numeric_limits<u32>::max()};
             vertex_attributes.push_back({
                 .location = static_cast<u32>(index),
                 .binding = attribute.buffer,
-                .format = MaxwellToVK::VertexFormat(device, attribute.Type(), attribute.Size()),
+                .format = MaxwellToVK::VertexFormat(device, attribute.Type(), attribute.Size(),
+                                                    bytes_available),
                 .offset = attribute.offset,
             });
         }

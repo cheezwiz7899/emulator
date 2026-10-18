@@ -227,9 +227,15 @@ void LowerGeometryPassthrough(const IR::Program& program, const HostTranslateInf
         for (IR::Inst& inst : *block) {
             if (inst.GetOpcode() == IR::Opcode::Epilogue) {
                 IR::IREmitter ir{*block, block->IteratorTo(inst)};
+                // A passed-through layer comes from the generic the previous stage was made to
+                // write it to (PipelineCache); without one the layer stays 0.
+                const std::optional<IR::Attribute> layer_source{
+                    program.info.passthrough[IR::Attribute::Layer]
+                        ? host_info.passthrough_layer_source
+                        : std::nullopt};
                 EmitGeometryPassthrough(
                     ir, program, program.info.passthrough,
-                    program.info.passthrough.AnyComponent(IR::Attribute::PositionX), {});
+                    program.info.passthrough.AnyComponent(IR::Attribute::PositionX), layer_source);
             }
         }
     }

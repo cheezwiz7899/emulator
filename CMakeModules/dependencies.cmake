@@ -147,14 +147,19 @@ if (NOT TARGET ZLIB::ZLIB)
         set(ZLIB_FOUND TRUE CACHE BOOL "" FORCE)
         set(ZLIB_INCLUDE_DIRS "${ZLIB_SOURCE_DIR};${ZLIB_BINARY_DIR}" CACHE PATH "" FORCE)
     endif()
-    if (CITRON_CLANGCL AND TARGET zlib)
-        # Only zlibstatic is used.
+    if ((CITRON_CLANGCL OR CITRON_CLANGTRON) AND TARGET zlib)
+        # Exclude the shared zlib target; only zlibstatic is used.
+        # Prevents MSYS2's libz.dll.a from leaking into the link.
         set_target_properties(zlib PROPERTIES EXCLUDE_FROM_ALL TRUE)
     endif()
 endif()
 
 # ── libarchive (in-process firmware ZIP extract; avoids a PowerShell pause) ──
 if (NOT TARGET LibArchive::LibArchive)
+    # ENABLE_ZLIB OFF: prevents libarchive's FIND_PACKAGE(ZLIB) from picking up
+    # a stale ZLIB_LIBRARY_RELEASE (e.g. MSYS2's libz.dll.a) and landing it
+    # alongside libzlibstatic.a on the link line — LLD "crc32 was replaced".
+    # We set HAVE_ZLIB_H=1 and link ZLIB::ZLIB ourselves below instead.
     CPMAddPackage(
         NAME LibArchive
         GITHUB_REPOSITORY libarchive/libarchive
@@ -180,17 +185,21 @@ if (NOT TARGET LibArchive::LibArchive)
             "ENABLE_PCREPOSIX OFF"
             "ENABLE_NETTLE OFF"
             "ENABLE_CNG OFF"
-            "ENABLE_ZLIB ON"
+            "ENABLE_ZLIB OFF"
             "ENABLE_WERROR OFF"
     )
     if (TARGET archive_static AND NOT TARGET LibArchive::LibArchive)
-        # archive.h marks every function dllimport unless consumers define this.
-        # clang-cl links the static library, so without it the link fails with
-        # undefined __declspec(dllimport) archive_* symbols.
+        # archive.h marks functions dllimport unless consumers define this.
         target_compile_definitions(archive_static PUBLIC LIBARCHIVE_STATIC)
         add_library(LibArchive::LibArchive ALIAS archive_static)
     elseif (TARGET archive AND NOT TARGET LibArchive::LibArchive)
         add_library(LibArchive::LibArchive ALIAS archive)
+    endif()
+    # HAVE_ZLIB_H=1 activates libarchive's zlib backend (guarded by that define in its source).
+    # Plain signature required: libarchive's CMakeLists already used non-keyword TARGET_LINK_LIBRARIES.
+    if (TARGET archive_static AND TARGET ZLIB::ZLIB)
+        target_compile_definitions(archive_static PRIVATE HAVE_ZLIB_H=1)
+        target_link_libraries(archive_static ZLIB::ZLIB)
     endif()
 endif()
 

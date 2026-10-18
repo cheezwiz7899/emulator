@@ -511,9 +511,11 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     CollectPhysicalMemoryInfo();
     CollectToolingInfo();
 
-    if (is_qualcomm || is_turnip) {
-        LOG_WARNING(Render_Vulkan,
-                    "Qualcomm and Turnip drivers have broken VK_EXT_custom_border_color");
+    // Turnip keeps it: samplers only take a custom colour slot for a colour that is not one of the
+    // standard ones, and never more than maxCustomBorderColorSamplers (Mesa tu_sampler.cc takes
+    // the first free slot without a bounds check in release builds).
+    if (is_qualcomm) {
+        LOG_WARNING(Render_Vulkan, "Qualcomm drivers have broken VK_EXT_custom_border_color");
         RemoveExtensionFeature(extensions.custom_border_color, features.custom_border_color,
                                VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
     }
@@ -1205,6 +1207,11 @@ bool Device::GetSuitability(bool requires_swapchain) {
         properties.robustness2.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_PROPERTIES_EXT;
         SetNext(next, properties.robustness2);
+    }
+    if (extensions.custom_border_color) {
+        properties.custom_border_color.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_PROPERTIES_EXT;
+        SetNext(next, properties.custom_border_color);
     }
 
     // Perform the property fetch.

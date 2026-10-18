@@ -827,6 +827,31 @@ boost::container::small_vector<ImageCopy, 16> MakeShrinkImageCopies(const ImageI
         if (is_dst_3d) {
             copy.extent.depth = src.size.depth;
         }
+        if (src.num_samples == dst.num_samples) {
+            // The overlap was found by address alone, so its mip can be smaller or larger than the
+            // slot it lands in. Copy what both have.
+            const Extent3D src_size =
+                AdjustSamplesSize(AdjustMipSize(src.size, level), src.num_samples);
+            copy.extent.width = std::min(copy.extent.width, src_size.width);
+            copy.extent.height = std::min(copy.extent.height, src_size.height);
+            // A block-compressed region must be whole blocks or reach the end of the subresource,
+            // on both images (vkCmdCopyImage srcImage-01728/01729, dstImage-01732/01733). When the
+            // two mips differ in a way no extent satisfies, the region holds less than one block
+            // of one of them; skip it rather than record an invalid copy.
+            const Extent3D dst_size = AdjustSamplesSize(mip_size, dst.num_samples);
+            const auto fits = [&copy](PixelFormat format, const Extent3D& subresource) {
+                const Extent2D block = DefaultBlockSize(format);
+                const bool width_ok = copy.extent.width % block.width == 0 ||
+                                      copy.extent.width == subresource.width;
+                const bool height_ok = copy.extent.height % block.height == 0 ||
+                                       copy.extent.height == subresource.height;
+                return width_ok && height_ok;
+            };
+            if (!fits(src.format, src_size) || !fits(dst.format, dst_size)) {
+                copies.pop_back();
+                continue;
+            }
+        }
         copy.extent.width = std::max<u32>(
             ImageSize::Narrow(ImageSize::Multiply(copy.extent.width, up_scale) >> down_shift), 1);
         if (both_2d) {

@@ -131,13 +131,10 @@ Status BufferQueueProducer::WaitForFreeSlotThenRelock(bool async, s32* found, St
             return Status::NoInit;
         }
 
+        // The async flag must not fail a dequeue: HOS has no async buffer mode (use_async_buffer).
+        // Android's async check returned BadValue whenever SetBufferCount lowered the count while
+        // a higher slot was still queued, and NVN takes a failed dequeue as a failed acquire.
         const s32 max_buffer_count = core->GetMaxBufferCountLocked(async);
-        if (async && core->override_max_buffer_count) {
-            if (core->override_max_buffer_count < max_buffer_count) {
-                *found = BufferQueueCore::INVALID_BUFFER_SLOT;
-                return Status::BadValue;
-            }
-        }
 
         // Free up any buffers that are in slots beyond the max buffer count
         for (s32 s = max_buffer_count; s < BufferQueueDefs::NUM_BUFFER_SLOTS; ++s) {

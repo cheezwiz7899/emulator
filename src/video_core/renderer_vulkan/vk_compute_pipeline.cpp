@@ -158,7 +158,7 @@ void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                 const auto& table{cbufs[desc.table_cbuf_index]};
                 const bool enabled{((qmd.const_buffer_enable_mask >> desc.table_cbuf_index) & 1) !=
                                    0};
-                const u32 entry{(word << desc.table_shift) + desc.table_base};
+                const u32 entry{word * desc.table_scale + desc.table_base};
                 word = enabled && entry + sizeof(u16) <= table.size
                            ? gpu_memory.Read<u16>(table.Address() + entry)
                            : 0;
@@ -179,21 +179,22 @@ void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         }
         return TexturePair(gpu_memory.Read<u32>(addr), via_header_index);
     }};
-    const auto add_image{[&](const auto& desc, bool blacklist) {
+    const auto add_image{[&](const auto& desc, bool blacklist, Shader::ImageFormat storage_format) {
         for (u32 index = 0; index < desc.count; ++index) {
             const auto handle{read_handle(desc, index)};
             views.push_back({
                 .index = handle.first,
                 .blacklist = blacklist,
                 .id = {},
+                .storage_format = static_cast<u32>(storage_format),
             });
         }
     }};
     for (const auto& desc : info.texture_buffer_descriptors) {
-        add_image(desc, false);
+        add_image(desc, false, Shader::ImageFormat::Typeless);
     }
     for (const auto& desc : info.image_buffer_descriptors) {
-        add_image(desc, false);
+        add_image(desc, false, Shader::ImageFormat::Typeless);
     }
     for (const auto& desc : info.texture_descriptors) {
         for (u32 index = 0; index < desc.count; ++index) {
@@ -203,7 +204,7 @@ void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         }
     }
     for (const auto& desc : info.image_descriptors) {
-        add_image(desc, desc.is_written);
+        add_image(desc, desc.is_written, desc.format);
     }
     texture_cache.FillComputeImageViews(std::span(views.data(), views.size()));
 

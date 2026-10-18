@@ -8,6 +8,7 @@
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
 #include "core/core.h"
+#include "core/gpu_dirty_memory_manager.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_scoped_resource_reservation.h"
 #include "core/hle/kernel/k_shared_memory.h"
@@ -1268,15 +1269,23 @@ void KProcess::LoadModule(CodeSet code_set, KProcessAddress base_addr) {
     ReprotectSegment(code_set.DataSegment(), Svc::MemoryPermission::ReadWrite);
 
 #ifdef HAS_NCE
-    const auto& patch = code_set.PatchSegment();
-    if (this->IsApplication() && Settings::IsNceEnabled() && patch.size != 0) {
-        auto& buffer = m_kernel.System().DeviceMemory().buffer;
-        const auto& code = code_set.CodeSegment();
-        buffer.Protect(GetInteger(base_addr + code.addr), code.size,
-                       Common::MemoryPermission::Read | Common::MemoryPermission::Execute);
-        buffer.Protect(GetInteger(base_addr + patch.addr), patch.size,
-                       Common::MemoryPermission::Read | Common::MemoryPermission::Execute);
-        ReprotectSegment(code_set.PatchSegment(), Svc::MemoryPermission::None);
+    if (this->IsApplication() && Settings::IsNceEnabled()) {
+        const auto& patch = code_set.PatchSegment();
+        if (patch.size != 0) {
+            auto& buffer = m_kernel.System().DeviceMemory().buffer;
+            const auto& code = code_set.CodeSegment();
+            buffer.Protect(GetInteger(base_addr + code.addr), code.size,
+                           Common::MemoryPermission::Read | Common::MemoryPermission::Execute);
+            buffer.Protect(GetInteger(base_addr + patch.addr), patch.size,
+                           Common::MemoryPermission::Read | Common::MemoryPermission::Execute);
+            ReprotectSegment(code_set.PatchSegment(), Svc::MemoryPermission::None);
+        }
+        // Guest code runs in place under NCE, so the instruction cache must not hold old lines
+        // for the module just written. The permission changes above do not maintain it:
+        // KPageTableBase's InvalidateInstructionCache only reaches processes in the kernel's
+        // process list, and Service::Process::Initialize adds this one after the loader returns.
+        // The patch segment also never becomes executable in the guest page table.
+        this->GetMemory().SyncInstructionCache(base_addr, code_set.memory.size());
     }
 #endif
 }

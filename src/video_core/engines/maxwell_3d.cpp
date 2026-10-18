@@ -602,9 +602,14 @@ void Maxwell3D::ProcessQueryGet() {
         rasterizer->Query(sequence_address, query_type, flags, payload, subreport);
         break;
     case Regs::ReportSemaphore::Operation::Acquire:
-        // TODO(Blinkhawk): Under this operation, the GPU waits for the CPU to write a value that
-        // matches the current payload.
-        UNIMPLEMENTED_MSG("Unimplemented query operation ACQUIRE");
+        // NVB197_SET_REPORT_SEMAPHORE_D_OPERATION_ACQUIRE: the following work waits until the
+        // word at the address equals the payload (COMPARISON_EQ) or is at least it (_GE). Running
+        // past it, as before, let the GPU read commands the guest had not finished writing.
+        if (semaphore_acquire) {
+            semaphore_acquire(sequence_address, payload,
+                              regs.report_semaphore.query.comparison ==
+                                  Regs::ReportSemaphore::Comparison::GreaterOrEqual);
+        }
         break;
     case Regs::ReportSemaphore::Operation::ReportOnly:
         rasterizer->Query(sequence_address, query_type, flags, payload, subreport);

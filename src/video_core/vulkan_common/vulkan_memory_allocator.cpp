@@ -292,10 +292,18 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo& ci) const {
 }
 
 vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo& ci, MemoryUsage usage) const {
+    // Host-visible buffers must be coherent: the staging pool writes and reads its mappings
+    // without vmaFlush/vmaInvalidate. Every implementation has a HOST_VISIBLE |
+    // HOST_COHERENT type (Vulkan spec, memory heaps), so this never leaves a buffer without one.
+    const VkMemoryPropertyFlags required_flags =
+        usage == MemoryUsage::DeviceLocal
+            ? VkMemoryPropertyFlags{0}
+            : VkMemoryPropertyFlags{VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
     const VmaAllocationCreateInfo alloc_ci = {
         .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | MemoryUsageVmaFlags(usage),
         .usage = MemoryUsageVma(usage),
-        .requiredFlags = 0,
+        .requiredFlags = required_flags,
         .preferredFlags = MemoryUsagePreferredVmaFlags(usage),
         .memoryTypeBits = usage == MemoryUsage::Stream ? 0u : valid_memory_types,
         .pool = VK_NULL_HANDLE,

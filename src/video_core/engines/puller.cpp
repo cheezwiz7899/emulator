@@ -104,23 +104,33 @@ void Puller::ProcessSemaphoreTriggerMethod() {
             regs.acquire_active = true;
             regs.acquire_mode = op == GpuSemaphoreOperation::AcquireGequal;
         }
-        if (AcquirePasses(op, memory_manager.Read<u32>(address), payload)) {
-            return;
-        }
-        // The release may be one this or another channel made earlier that still waits for a
-        // host fence; make those writes first.
-        rasterizer->ReleaseFences();
-        if (AcquirePasses(op, memory_manager.Read<u32>(address), payload)) {
-            return;
-        }
-        // dev_pbdma.ref.txt (Volta, NV_UDMA_SEM_EXECUTE; open-gpu-doc has no Maxwell host
-        // manual): after a failed acquire Host processes no further methods of the channel,
-        // switches to another channel and polls the semaphore when it comes back. The pusher stops
-        // this channel here and the GPU thread retries it (RetryPendingAcquire).
-        pending_acquire = PendingAcquire{address, payload, op, std::chrono::steady_clock::now()};
+        StartAcquire(address, payload, op);
     } else {
         LOG_ERROR(HW_GPU, "Invalid semaphore operation {:#x}", static_cast<u32>(op));
     }
+}
+
+void Puller::StartAcquire(GPUVAddr address, u32 payload, GpuSemaphoreOperation op) {
+    if (AcquirePasses(op, memory_manager.Read<u32>(address), payload)) {
+        return;
+    }
+    // The release may be one this or another channel made earlier that still waits for a
+    // host fence; make those writes first.
+    rasterizer->ReleaseFences();
+    if (AcquirePasses(op, memory_manager.Read<u32>(address), payload)) {
+        return;
+    }
+    // dev_pbdma.ref.txt (Volta, NV_UDMA_SEM_EXECUTE; open-gpu-doc has no Maxwell host
+    // manual): after a failed acquire Host processes no further methods of the channel,
+    // switches to another channel and polls the semaphore when it comes back. The pusher stops
+    // this channel here and the GPU thread retries it (RetryPendingAcquire).
+    pending_acquire = PendingAcquire{address, payload, op, std::chrono::steady_clock::now()};
+}
+
+void Puller::AcquireSemaphore(GPUVAddr address, u32 payload, bool greater_or_equal) {
+    StartAcquire(address, payload,
+                 greater_or_equal ? GpuSemaphoreOperation::AcquireGequal
+                                  : GpuSemaphoreOperation::AcquireEqual);
 }
 
 constexpr bool Puller::AcquirePasses(GpuSemaphoreOperation op, u32 word, u32 payload) {
@@ -235,18 +245,24 @@ void Puller::CallPullerMethod(const MethodCall& method_call) {
         LOG_ERROR(HW_GPU, "Special puller engine method NonStallInterrupt not implemented");
         break;
     }
-    case BufferMethods::MemOpA: {
-        LOG_ERROR(HW_GPU, "Memory Operation A");
+    case BufferMethods::MemOpA:
+    case BufferMethods::MemOpC:
+        // Operands only; the operation is triggered by MEM_OP_B or MEM_OP_D.
         break;
-    }
-    case BufferMethods::MemOpB: {
-        // Implement this better.
+    case BufferMethods::MemOpB:
+        // The pre-gm20x trigger, kept as it was for a guest that still sends it.
         rasterizer->InvalidateGPUCache();
         break;
-    }
-    case BufferMethods::MemOpC:
     case BufferMethods::MemOpD: {
-        LOG_ERROR(HW_GPU, "Memory Operation C,D");
+        // MEM_OP_D OPERATION (bits 31:27, clb06f.h; on gm20x MEM_OP_C/D replace MEM_OP_A/B).
+        // An L2 sysmem invalidate makes the GPU read what the CPU wrote, which is what
+        // InvalidateGPUCache does. MEMBAR, TLB invalidates, L2 flushes and comptag cleans need
+        // nothing here: GPU writes reach guest memory through the caches' own downloads, and the
+        // GPU page table is read directly.
+        constexpr u32 L2_SYSMEM_INVALIDATE = 0xe;
+        if ((method_call.argument >> 27) == L2_SYSMEM_INVALIDATE) {
+            rasterizer->InvalidateGPUCache();
+        }
         break;
     }
     case BufferMethods::SemaphoreAcquire: {

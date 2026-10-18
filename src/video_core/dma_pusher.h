@@ -147,6 +147,11 @@ public:
     /// fence on every call.
     [[nodiscard]] bool RetryAcquire(u64 work_generation, bool allow_flush);
 
+    /// A semaphore acquire from an engine method; stops the channel until it passes.
+    void AcquireSemaphore(GPUVAddr address, u32 payload, bool greater_or_equal) {
+        puller.AcquireSemaphore(address, payload, greater_or_equal);
+    }
+
 private:
     static constexpr u32 non_puller_methods = 0x40;
     static constexpr u32 max_subchannels = 8;

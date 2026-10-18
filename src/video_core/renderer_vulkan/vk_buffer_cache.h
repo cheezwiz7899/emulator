@@ -39,11 +39,18 @@ public:
         return buffer.Mapped();
     }
 
-    [[nodiscard]] bool IsRegionUsed(u64 offset, u64 size) const noexcept {
-        return tracker.IsUsed(offset, size);
+    /// Whether work recorded for the submission `tick` uses the range. Work of earlier
+    /// submissions is ahead of anything recorded now in queue order, so it does not count.
+    [[nodiscard]] bool IsRegionUsed(u64 offset, u64 size, u64 tick) const noexcept {
+        return tick == usage_tick && tracker.IsUsed(offset, size);
     }
 
-    void MarkUsage(u64 offset, u64 size) noexcept {
+    /// Records that work of the submission `tick` uses the range.
+    void MarkUsage(u64 offset, u64 size, u64 tick) noexcept {
+        if (tick != usage_tick) {
+            tracker.Reset();
+            usage_tick = tick;
+        }
         tracker.Track(offset, size);
     }
 
@@ -67,6 +74,8 @@ private:
     vk::Buffer buffer;
     std::vector<BufferView> views;
     VideoCommon::UsageTracker tracker;
+    /// Submission the usage in tracker belongs to.
+    u64 usage_tick{};
     bool is_null{};
 };
 
@@ -114,6 +123,9 @@ public:
     [[nodiscard]] StagingBufferRef DownloadStagingBuffer(size_t size, bool deferred = false);
 
     bool CanReorderUpload(const Buffer& buffer, std::span<const VideoCommon::BufferCopy> copies);
+
+    /// An upload copy that cannot be reordered would end the render pass that is open now.
+    [[nodiscard]] bool IsRenderPassActive() const noexcept;
 
     void FreeDeferredStagingBuffer(StagingBufferRef& ref);
 

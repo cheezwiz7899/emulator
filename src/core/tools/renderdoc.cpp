@@ -20,7 +20,8 @@ RenderdocAPI::RenderdocAPI() {
     if (HMODULE mod = GetModuleHandleA("renderdoc.dll")) {
         const auto RENDERDOC_GetAPI =
             reinterpret_cast<pRENDERDOC_GetAPI>(GetProcAddress(mod, "RENDERDOC_GetAPI"));
-        const s32 ret = RENDERDOC_GetAPI(eRENDERDOC_API_Version_1_6_0, (void**)&rdoc_api);
+        [[maybe_unused]] const s32 ret =
+            RENDERDOC_GetAPI(eRENDERDOC_API_Version_1_6_0, (void**)&rdoc_api);
         assert(ret == 1);
     }
 #else

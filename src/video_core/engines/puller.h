@@ -96,6 +96,11 @@ public:
     /// host fence are made first. Returns true once the channel may continue.
     [[nodiscard]] bool RetryPendingAcquire(bool flush);
 
+    /// A semaphore acquire made by an engine method (the 3D engine's report semaphore): stops
+    /// the channel like the host's own acquire until the word at address equals the payload, or
+    /// with greater_or_equal is at least the payload.
+    void AcquireSemaphore(GPUVAddr address, u32 payload, bool greater_or_equal);
+
 private:
     Tegra::GPU& gpu;
 
@@ -176,6 +181,9 @@ private:
 
     [[nodiscard]] static constexpr bool AcquirePasses(GpuSemaphoreOperation op, u32 word,
                                                       u32 payload);
+
+    /// Passes the acquire now or stops the channel at it (pending_acquire).
+    void StartAcquire(GPUVAddr address, u32 payload, GpuSemaphoreOperation op);
 
 #define ASSERT_REG_POSITION(field_name, position)                                                  \
     static_assert(offsetof(Regs, field_name) == position * 4,                                      \

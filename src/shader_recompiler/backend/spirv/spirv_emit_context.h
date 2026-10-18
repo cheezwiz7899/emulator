@@ -18,6 +18,9 @@ namespace Shader::Backend::SPIRV {
 
 using Sirit::Id;
 
+/// The 32-bit global memory atomics that map to one SPIR-V atomic instruction.
+enum class GlobalAtomicOp : size_t { IAdd, SMin, UMin, SMax, UMax, And, Or, Xor, Exchange, Count };
+
 class VectorTypes {
 public:
     void Define(Sirit::Module& sirit_ctx, Id base_type, std::string_view name);
@@ -352,6 +355,9 @@ public:
     Id write_global_func_u32{};
     Id write_global_func_u32x2{};
     Id write_global_func_u32x4{};
+    /// 32-bit global memory atomics whose address was not tracked to a storage buffer, by
+    /// GlobalAtomicOp. Defined when the shader writes global memory.
+    std::array<Id, static_cast<size_t>(GlobalAtomicOp::Count)> global_atomic_func_u32{};
 
     bool need_input_position_indirect{};
     Id input_position{};

@@ -506,15 +506,25 @@ DeviceMemoryReadResult DeviceMemoryManager<Traits>::ReadBlockUnsafe(
 }
 
 template <typename Traits>
-void DeviceMemoryManager<Traits>::WriteBlockUnsafe(DAddr address, const void* src_pointer,
-                                                   size_t size) {
+DeviceMemoryReadResult DeviceMemoryManager<Traits>::WriteBlockUnsafe(DAddr address,
+                                                                     const void* src_pointer,
+                                                                     size_t size,
+                                                                     bool report_unmapped) {
+    DeviceMemoryReadResult result;
     WalkBlock(
         address, size,
         [&](size_t copy_amount, DAddr current_vaddr) {
-            LOG_ERROR(
-                HW_Memory,
-                "Unmapped Device WriteBlock @ 0x{:016X} (start address = 0x{:016X}, size = {})",
-                current_vaddr, address, size);
+            if (result.fully_mapped) {
+                result.first_unmapped_address = current_vaddr;
+            }
+            result.fully_mapped = false;
+            result.unmapped_bytes += copy_amount;
+            if (report_unmapped) {
+                LOG_ERROR(
+                    HW_Memory,
+                    "Unmapped Device WriteBlock @ 0x{:016X} (start address = 0x{:016X}, size = {})",
+                    current_vaddr, address, size);
+            }
         },
         [&](size_t copy_amount, u8* const dst_ptr) {
             std::memcpy(dst_ptr, src_pointer, copy_amount);
@@ -522,6 +532,7 @@ void DeviceMemoryManager<Traits>::WriteBlockUnsafe(DAddr address, const void* sr
         [&](const std::size_t copy_amount) {
             src_pointer = static_cast<const u8*>(src_pointer) + copy_amount;
         });
+    return result;
 }
 
 template <typename Traits>

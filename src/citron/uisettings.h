@@ -175,6 +175,7 @@ namespace UISettings {
                                         std::string theme;
                                         Setting<std::string> ui_positioning{linkage, "Vertical", "ui_positioning", Category::Ui};
                                         Setting<std::string> steam_grid_db_api_key{linkage, "", "steam_grid_db_api_key", Category::Ui};
+                                        Setting<std::string> scarletnx_path{linkage, "", "scarletnx_path", Category::Ui};
 
                                         Setting<std::string> accent_color{linkage, "#4a9eff", "accent_color", Category::Ui};
                                         Setting<bool> enable_rainbow_mode{linkage, false, "enable_rainbow_mode", Category::Ui};

@@ -424,6 +424,26 @@ public:
         return features.features.shaderInt64;
     }
 
+    /// 8/16-bit access to storage buffers, and to uniform buffers (the "uniformAndStorage"
+    /// features). Turnip reports the uniform ones as false (Mesa tu_device.cc).
+    bool IsStorageBuffer8BitAccessSupported() const {
+        return features.bit8_storage.storageBuffer8BitAccess;
+    }
+    bool IsStorageBuffer16BitAccessSupported() const {
+        return features.bit16_storage.storageBuffer16BitAccess;
+    }
+    bool IsUniformBuffer8BitAccessSupported() const {
+        return features.bit8_storage.uniformAndStorageBuffer8BitAccess;
+    }
+    bool IsUniformBuffer16BitAccessSupported() const {
+        return features.bit16_storage.uniformAndStorageBuffer16BitAccess;
+    }
+
+    /// Returns true if storage images can use the R8, R16 and two-component formats.
+    bool IsStorageImageExtendedFormatsSupported() const {
+        return features.features.shaderStorageImageExtendedFormats;
+    }
+
     /// Returns true if shader int16 is supported.
     bool IsShaderInt16Supported() const {
         return features.features.shaderInt16;
@@ -598,6 +618,11 @@ public:
     /// Returns true if the device supports VK_EXT_custom_border_color.
     bool IsExtCustomBorderColorSupported() const {
         return extensions.custom_border_color;
+    }
+
+    /// Returns how many samplers with a custom border colour can exist at once.
+    u32 GetMaxCustomBorderColorSamplers() const {
+        return properties.custom_border_color.maxCustomBorderColorSamplers;
     }
 
     /// Returns true if the device supports VK_EXT_extended_dynamic_state.
@@ -804,6 +829,11 @@ public:
         return properties.properties.limits.maxClipDistances;
     }
 
+    /// Input locations a geometry shader may use (VUID-RuntimeSpirv-Location-06272)
+    u32 GetMaxGeometryInputLocations() const {
+        return properties.properties.limits.maxGeometryInputComponents / 4;
+    }
+
     bool SupportsConditionalBarriers() const {
         return supports_conditional_barriers;
     }
@@ -924,6 +954,7 @@ private:
         VkPhysicalDeviceSubgroupSizeControlProperties subgroup_size_control{};
         VkPhysicalDeviceTransformFeedbackPropertiesEXT transform_feedback{};
         VkPhysicalDeviceRobustness2PropertiesEXT robustness2{};
+        VkPhysicalDeviceCustomBorderColorPropertiesEXT custom_border_color{};
 
         VkPhysicalDeviceProperties properties{};
     };

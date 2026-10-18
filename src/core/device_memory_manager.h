@@ -122,7 +122,10 @@ public:
         std::string_view call_site = "DeviceMemoryManager::ReadBlockUnsafe",
         bool report_unmapped = true);
     void WriteBlock(DAddr address, const void* src_pointer, size_t size);
-    void WriteBlockUnsafe(DAddr address, const void* src_pointer, size_t size);
+    /// Writes a device range, skipping unmapped portions. The result describes the skipped holes;
+    /// callers which deliberately handle holes may disable the generic unmapped-write log.
+    DeviceMemoryReadResult WriteBlockUnsafe(DAddr address, const void* src_pointer, size_t size,
+                                            bool report_unmapped = true);
 
     Asid RegisterProcess(Memory::Memory* memory);
     void UnregisterProcess(Asid id);

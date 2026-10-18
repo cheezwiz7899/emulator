@@ -36,10 +36,10 @@ struct ConstBufferAddr {
     u32 secondary_mask{0xFFFFFFFF};
     // Set when the texture number is not in the word itself. The word holds an index, and the
     // number is the 16-bit entry of a table kept in another constant buffer:
-    // number = table[(field << table_shift) + table_base].
+    // number = table[field * table_scale + table_base].
     bool indirect{false};
     u32 table_index{0};
-    u32 table_shift{0};
+    u32 table_scale{1};
     u32 table_base{0};
 };
 
@@ -137,10 +137,10 @@ std::optional<ConstBufferAddr> StrictWordField(const IR::InstStorage& storage,
     }
 }
 
-/// Where in a table an entry is read: (field of a word << shift) + base, in bytes.
+/// Where in a table an entry is read: field of a word * scale + base, in bytes.
 struct TableOffset {
     ConstBufferAddr word;
-    u32 shift;
+    u32 scale;
     u32 base;
 };
 
@@ -173,8 +173,25 @@ std::optional<TableOffset> TrackTableOffset(const IR::InstStorage& storage,
         }
         std::optional inner{TrackTableOffset(storage, inst->Arg(0))};
         if (inner) {
-            inner->shift += shift.U32();
+            inner->scale <<= shift.U32();
             inner->base <<= shift.U32();
+        }
+        return inner;
+    }
+    case IR::Opcode::IMul32: {
+        // XMAD by a constant: an array of records whose size is not a power of two.
+        IR::Value lhs{inst->Arg(0)};
+        IR::Value rhs{inst->Arg(1)};
+        if (lhs.IsImmediate()) {
+            std::swap(lhs, rhs);
+        }
+        if (!rhs.IsImmediate()) {
+            return std::nullopt;
+        }
+        std::optional inner{TrackTableOffset(storage, lhs)};
+        if (inner) {
+            inner->scale *= rhs.U32();
+            inner->base *= rhs.U32();
         }
         return inner;
     }
@@ -189,12 +206,16 @@ std::optional<TableOffset> TrackTableOffset(const IR::InstStorage& storage,
             return std::nullopt;
         }
         std::optional inner{TrackTableOffset(storage, inst->Arg(1))};
-        if (!inner || inner->base != 0 || inner->shift >= 32) {
+        if (!inner || inner->base != 0 || !std::has_single_bit(inner->scale)) {
+            return std::nullopt;
+        }
+        const u32 field_shift{static_cast<u32>(std::countr_zero(inner->scale))};
+        if (field_shift + offset.U32() >= 32) {
             return std::nullopt;
         }
         const u32 field_mask{count.U32() < 32 ? ((1U << count.U32()) - 1) : 0xFFFFFFFF};
-        inner->word.mask &= field_mask >> inner->shift;
-        inner->shift += offset.U32();
+        inner->word.mask &= field_mask >> field_shift;
+        inner->scale <<= offset.U32();
         inner->base = base.U32() & ~(field_mask << offset.U32());
         return inner;
     }
@@ -205,7 +226,7 @@ std::optional<TableOffset> TrackTableOffset(const IR::InstStorage& storage,
     if (!word) {
         return std::nullopt;
     }
-    return TableOffset{.word = *word, .shift = 0, .base = 0};
+    return TableOffset{.word = *word, .scale = 1, .base = 0};
 }
 
 struct TextureInst {
@@ -639,7 +660,7 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
             .secondary_mask = rhs->mask,
             .indirect = lhs->indirect,
             .table_index = lhs->table_index,
-            .table_shift = lhs->table_shift,
+            .table_scale = lhs->table_scale,
             .table_base = lhs->table_base,
         };
     }
@@ -761,7 +782,7 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
         ConstBufferAddr addr{entry->word};
         addr.indirect = true;
         addr.table_index = table.U32();
-        addr.table_shift = entry->shift;
+        addr.table_scale = entry->scale;
         addr.table_base = entry->base;
         return addr;
     }
@@ -878,7 +899,7 @@ u32 GetTextureHandle(Environment& env, const ConstBufferAddr& cbuf) {
     u32 lhs_word{(env.ReadCbufValue(cbuf.index, cbuf.offset) >> cbuf.shift_right) & cbuf.mask};
     if (cbuf.indirect) {
         lhs_word = env.ReadCbufValue(cbuf.table_index,
-                                     (lhs_word << cbuf.table_shift) + cbuf.table_base) &
+                                     lhs_word * cbuf.table_scale + cbuf.table_base) &
                    0xFFFF;
     }
     if (!cbuf.has_secondary) {
@@ -900,6 +921,22 @@ TexturePixelFormat ReadTexturePixelFormat(Environment& env, const ConstBufferAdd
 
 bool IsTexturePixelFormatInteger(Environment& env, const ConstBufferAddr& cbuf) {
     return env.IsTexturePixelFormatInteger(GetTextureHandle(env, cbuf));
+}
+
+// A storage image accessed with a sized format (SULD.D, SUST.D, SUATOM) is bound through a view
+// of that format (ImageView::StorageView), so the format decides whether it is integer. A typeless
+// access, and every image buffer, uses a view in the texture's own format.
+bool IsImageInteger(Environment& env, const ConstBufferAddr& cbuf, ImageFormat format) {
+    switch (format) {
+    case ImageFormat::Typeless:
+        return IsTexturePixelFormatInteger(env, cbuf);
+    case ImageFormat::R32_SFLOAT:
+    case ImageFormat::R32G32_SFLOAT:
+    case ImageFormat::R32G32B32A32_SFLOAT:
+        return false;
+    default:
+        return true;
+    }
 }
 
 class Descriptors {
@@ -925,7 +962,7 @@ public:
                    desc.secondary_mask == existing.secondary_mask &&
                    desc.indirect == existing.indirect &&
                    desc.table_cbuf_index == existing.table_cbuf_index &&
-                   desc.table_shift == existing.table_shift &&
+                   desc.table_scale == existing.table_scale &&
                    desc.table_base == existing.table_base &&
                    desc.count == existing.count && desc.size_shift == existing.size_shift &&
                    desc.has_secondary == existing.has_secondary;
@@ -962,7 +999,7 @@ public:
                    desc.secondary_mask == existing.secondary_mask &&
                    desc.indirect == existing.indirect &&
                    desc.table_cbuf_index == existing.table_cbuf_index &&
-                   desc.table_shift == existing.table_shift &&
+                   desc.table_scale == existing.table_scale &&
                    desc.table_base == existing.table_base &&
                    desc.count == existing.count && desc.size_shift == existing.size_shift;
         })};
@@ -1156,13 +1193,12 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
             }
             const bool is_written{inst->GetOpcode() != IR::Opcode::ImageRead};
             const bool is_read{inst->GetOpcode() != IR::Opcode::ImageWrite};
-            const bool is_integer{IsTexturePixelFormatInteger(env, cbuf)};
             if (flags.type == TextureType::Buffer) {
                 index = descriptors.Add(ImageBufferDescriptor{
                     .format = flags.image_format,
                     .is_written = is_written,
                     .is_read = is_read,
-                    .is_integer = is_integer,
+                    .is_integer = IsTexturePixelFormatInteger(env, cbuf),
                     .cbuf_index = cbuf.index,
                     .cbuf_offset = cbuf.offset,
                     .count = count,
@@ -1174,7 +1210,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                     .format = flags.image_format,
                     .is_written = is_written,
                     .is_read = is_read,
-                    .is_integer = is_integer,
+                    .is_integer = IsImageInteger(env, cbuf, flags.image_format),
                     .cbuf_index = cbuf.index,
                     .cbuf_offset = cbuf.offset,
                     .count = count,
@@ -1204,7 +1240,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                     .secondary_mask = cbuf.secondary_mask,
                     .indirect = cbuf.indirect,
                     .table_cbuf_index = cbuf.table_index,
-                    .table_shift = cbuf.table_shift,
+                    .table_scale = cbuf.table_scale,
                     .table_base = cbuf.table_base,
                 });
             } else {
@@ -1230,7 +1266,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                     .secondary_mask = cbuf.secondary_mask,
                     .indirect = cbuf.indirect,
                     .table_cbuf_index = cbuf.table_index,
-                    .table_shift = cbuf.table_shift,
+                    .table_scale = cbuf.table_scale,
                     .table_base = cbuf.table_base,
                 });
                 flags.is_integer.Assign(is_integer ? 1 : 0);

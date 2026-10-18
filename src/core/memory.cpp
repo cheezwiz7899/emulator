@@ -949,6 +949,37 @@ u8* Memory::GetPointerSilent(Common::ProcessAddress vaddr) {
     return impl->GetPointerSilent(vaddr);
 }
 
+// On the AYN Thor CTR_EL0 reads DIC = 0, IDC = 1, L1Ip = PIPT (read on its Cortex-A510 cores):
+// the instruction cache must be invalidated after code is written. The Linux kernel does it
+// implicitly only when it maps an executable page whose entry is not special (arm64 set_pte_at),
+// and guest memory on a dma_buf backing is mapped with special entries (remap_pfn_range), so
+// for guest code run in place nothing else does it.
+//
+// Maintenance goes through each page's backing pointer, which the backing view always maps
+// read-write, instead of the guest address, which may already be unmapped
+// (KPageTableBase::UnmapCodeMemory asks after unmapping; such pages are skipped). With a PIPT
+// instruction cache any alias of a physical page reaches its lines. __builtin___clear_cache
+// cleans the data cache to the point of unification when IDC is 0 and invalidates the
+// instruction cache when DIC is 0 (compiler-rt clear_cache.c). Without NCE guest code is
+// recompiled, not run in place, so there is nothing to do.
+void Memory::SyncInstructionCache([[maybe_unused]] Common::ProcessAddress vaddr,
+                                  [[maybe_unused]] std::size_t size) {
+#ifdef HAS_NCE
+    const u64 begin = GetInteger(vaddr);
+    const u64 end = begin + size;
+    for (u64 page = begin & ~CITRON_PAGEMASK; page < end; page += CITRON_PAGESIZE) {
+        u8* const backing = impl->GetPointerSilent(page);
+        if (!backing) {
+            continue;
+        }
+        const u64 first = std::max(begin, page);
+        const u64 last = std::min(end, page + CITRON_PAGESIZE);
+        __builtin___clear_cache(reinterpret_cast<char*>(backing + (first - page)),
+                                reinterpret_cast<char*>(backing + (last - page)));
+    }
+#endif
+}
+
 const u8* Memory::GetPointer(Common::ProcessAddress vaddr) const {
     return impl->GetPointer(vaddr);
 }

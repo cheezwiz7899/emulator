@@ -9,7 +9,9 @@
 using Common::HostMemory;
 using namespace Common::Literals;
 
-static constexpr size_t VIRTUAL_SIZE = 1ULL << 39;
+// On arm64 ChooseVirtualBase places the arena between 2^36 and 2^39 minus its size, so a 2^39
+// arena never fits there and every test failed with bad_alloc on the device. 2^38 fits.
+static constexpr size_t VIRTUAL_SIZE = 1ULL << 38;
 static constexpr size_t BACKING_SIZE = 4_GiB;
 static constexpr auto PERMS = Common::MemoryPermission::ReadWrite;
 static constexpr auto HEAP = false;
@@ -306,3 +308,70 @@ TEST_CASE("HostMemory: Map across three chunks", "[common]") {
     FreeViews(chunks);
 }
 #endif
+
+// HostMemory merges mappings of a dma_buf backing by hand, from /proc/self/maps (the kernel
+// never merges them). The rule, and the parser fed with lines as the Thor printed them.
+namespace {
+
+using Common::ContinuesMapping;
+using Common::HostMapping;
+using Common::MemoryPermission;
+
+constexpr HostMapping MapsPage(u64 start, u64 offset, MemoryPermission perms = PERMS,
+                               u64 inode = 4600) {
+    return {start, start + 0x1000, offset, 9, inode, perms, true};
+}
+// Neighbours in memory and in the file, same file and permissions: one mapping.
+static_assert(ContinuesMapping(MapsPage(0x7000, 0x3000), MapsPage(0x8000, 0x4000)));
+// A gap in memory or in the file keeps them apart.
+static_assert(!ContinuesMapping(MapsPage(0x7000, 0x3000), MapsPage(0x9000, 0x4000)));
+static_assert(!ContinuesMapping(MapsPage(0x7000, 0x3000), MapsPage(0x8000, 0x5000)));
+// So do different permissions (a memtrap) and a different file.
+static_assert(!ContinuesMapping(MapsPage(0x7000, 0x3000),
+                                MapsPage(0x8000, 0x4000, MemoryPermission::Read)));
+static_assert(!ContinuesMapping(MapsPage(0x7000, 0x3000), MapsPage(0x8000, 0x4000, PERMS, 4601)));
+// Anonymous memory (inode 0) is never merged by hand.
+static_assert(
+    !ContinuesMapping(MapsPage(0x7000, 0x3000, PERMS, 0), MapsPage(0x8000, 0x4000, PERMS, 0)));
+
+} // Anonymous namespace
+
+TEST_CASE("HostMemory: Parse /proc/self/maps lines", "[common]") {
+    HostMapping m{};
+    REQUIRE(Common::ParseHostMapping("7387f04000-7387f05000 rw-s 00000000 00:09 4600          "
+                                     "                 /dmabuf:\n",
+                                     m));
+    REQUIRE(m.start == 0x7387f04000);
+    REQUIRE(m.end == 0x7387f05000);
+    REQUIRE(m.offset == 0);
+    REQUIRE(m.device == 9);
+    REQUIRE(m.inode == 4600);
+    REQUIRE(m.perms == MemoryPermission::ReadWrite);
+    REQUIRE(m.shared);
+
+    REQUIRE(Common::ParseHostMapping("738d844000-7391844000 rw-s 00001000 00:01 6144          "
+                                     "                 /memfd:vma_probe (deleted)",
+                                     m));
+    REQUIRE(m.offset == 0x1000);
+    REQUIRE(m.device == 1);
+    REQUIRE(m.inode == 6144);
+
+    // Private, executable, a device with a major number, no path.
+    REQUIRE(Common::ParseHostMapping("5f0000-5f1000 r-xp 0002a000 fd:05 123", m));
+    REQUIRE(m.perms == (MemoryPermission::Read | MemoryPermission::Execute));
+    REQUIRE_FALSE(m.shared);
+    REQUIRE(m.device == ((u64{0xfd} << 32) | 5));
+    REQUIRE(m.inode == 123);
+    REQUIRE(m.offset == 0x2a000);
+
+    // Anonymous, no access.
+    REQUIRE(Common::ParseHostMapping("7ffd0000-7ffd1000 ---p 00000000 00:00 0 ", m));
+    REQUIRE(m.inode == 0);
+    REQUIRE(m.perms == MemoryPermission{});
+
+    // Not maps lines.
+    REQUIRE_FALSE(Common::ParseHostMapping("", m));
+    REQUIRE_FALSE(Common::ParseHostMapping("hello", m));
+    REQUIRE_FALSE(Common::ParseHostMapping("7000-8000 rw-s", m));
+    REQUIRE_FALSE(Common::ParseHostMapping("7000-8000 rw-s 0 00:09", m));
+}
