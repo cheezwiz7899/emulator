@@ -5,7 +5,6 @@
 #include <algorithm>
 #include <cstddef>
 #include <filesystem>
-#include <system_error>
 #include <utility>
 #include "common/assert.h"
 #include "common/fs/file.h"
@@ -44,34 +43,13 @@ namespace {
 
 constexpr size_t MaxOpenFiles = 512;
 
-bool HasSkylinePlugin(const std::filesystem::path& ultimate_dir) {
-    const auto mods_dir = ultimate_dir / "mods";
-    std::error_code error;
-    for (std::filesystem::directory_iterator mod{mods_dir, error}, end; !error && mod != end;
-         mod.increment(error)) {
-        if (!mod->is_directory(error) || error) {
-            continue;
-        }
-
-        const auto& mod_dir = mod->path();
-        if (FS::IsFile(mod_dir / "plugin.nro")) {
-            return true;
-        }
-
-        // Also recognize the standard Atmosphere/LayeredFS layout used to ship Skyline plugins.
-        const auto plugins_dir = mod_dir / "romfs" / "skyline" / "plugins";
-        std::error_code plugin_error;
-        for (std::filesystem::directory_iterator plugin{plugins_dir, plugin_error}, plugin_end;
-             !plugin_error && plugin != plugin_end; plugin.increment(plugin_error)) {
-            if (plugin->is_regular_file(plugin_error) && !plugin_error &&
-                plugin->path().extension() == ".nro") {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
+// Ultimate S (https://github.com/chrispo-git/ult-s) is a Super Smash Bros. Ultimate overhaul mod.
+// It disables its web menus on anything it fingerprints as an emulator, unless the file
+// sd:/ultimate/ult-s/web_menus.flag exists: its readme documents that file as the opt-in for
+// emulators that implement the WebApplet protocol. The mod ships, and requires, its own
+// sd:/ultimate/ult-s/config.toml, so that file is used to detect an Ultimate S install. The
+// capability is then exposed as a read-only virtual entry that is never written to the host SD
+// card, and nothing is exposed for any other game or mod.
 bool IsWebMenuCapabilityFile(std::string_view path) {
     const auto components = FS::SplitPathComponentsCopy(path);
     const size_t count = components.size();
@@ -80,30 +58,8 @@ bool IsWebMenuCapabilityFile(std::string_view path) {
         return false;
     }
 
-    // Expose the emulator's web-menu capability to the Skyline/LayeredFS consumer whenever a
-    // Skyline plugin is installed, without coupling support to a particular mod package. This is
-    // a virtual VFS entry: it never writes into the user's shared SD card.
-    const auto ultimate_dir =
-        std::filesystem::path{std::string{path}}.parent_path().parent_path();
-    return HasSkylinePlugin(ultimate_dir);
-}
-
-bool IsWebMenuCapabilityDirectory(std::string_view path) {
-    const auto components = FS::SplitPathComponentsCopy(path);
-    const size_t count = components.size();
-    if (count < 2 || components[count - 1] != "ult-s" ||
-        components[count - 2] != "ultimate") {
-        return false;
-    }
-
-    // If the host has not created this directory yet, expose it as a read-only VFS directory so
-    // the synthetic capability file is reachable through normal directory traversal.
-    const auto directory = std::filesystem::path{std::string{path}};
-    if (FS::Exists(directory)) {
-        return false;
-    }
-    const auto ultimate_dir = directory.parent_path();
-    return HasSkylinePlugin(ultimate_dir);
+    const auto ult_s_dir = std::filesystem::path{FS::ToU8String(path)}.parent_path();
+    return FS::IsFile(ult_s_dir / "config.toml");
 }
 
 constexpr FS::FileAccessMode ModeFlagsToFileAccessMode(OpenMode mode) {
@@ -139,9 +95,6 @@ bool RealVfsFilesystem::IsWritable() const {
 
 VfsEntryType RealVfsFilesystem::GetEntryType(std::string_view path_) const {
     const auto path = FS::SanitizePath(path_, FS::DirectorySeparator::PlatformDefault);
-    if (IsWebMenuCapabilityDirectory(path)) {
-        return VfsEntryType::Directory;
-    }
     if (IsWebMenuCapabilityFile(path)) {
         return VfsEntryType::File;
     }
@@ -484,8 +437,7 @@ RealVfsDirectory::RealVfsDirectory(RealVfsFilesystem& base_, const std::string& 
                                    OpenMode perms_)
     : base(base_), path(FS::RemoveTrailingSlash(path_)), parent_path(FS::GetParentPath(path)),
       path_components(FS::SplitPathComponentsCopy(path)), perms(perms_) {
-    if (!FS::Exists(path) && True(perms & OpenMode::Write) &&
-        !IsWebMenuCapabilityDirectory(path)) {
+    if (!FS::Exists(path) && True(perms & OpenMode::Write)) {
         void(FS::CreateDirs(path));
     }
 }
@@ -505,9 +457,6 @@ VirtualFile RealVfsDirectory::GetFileRelative(std::string_view relative_path) co
 
 VirtualDir RealVfsDirectory::GetDirectoryRelative(std::string_view relative_path) const {
     const auto full_path = FS::SanitizePath(path + '/' + std::string(relative_path));
-    if (IsWebMenuCapabilityDirectory(full_path)) {
-        return base.OpenDirectory(full_path, OpenMode::Read);
-    }
     if (!FS::Exists(full_path) || !FS::IsDir(full_path)) {
         return nullptr;
     }
@@ -527,9 +476,6 @@ VirtualFile RealVfsDirectory::CreateFileRelative(std::string_view relative_path)
     if (IsWebMenuCapabilityFile(full_path)) {
         return nullptr;
     }
-    if (IsWebMenuCapabilityDirectory(path)) {
-        return nullptr;
-    }
     if (!FS::CreateParentDirs(full_path)) {
         return nullptr;
     }
@@ -537,9 +483,6 @@ VirtualFile RealVfsDirectory::CreateFileRelative(std::string_view relative_path)
 }
 
 VirtualDir RealVfsDirectory::CreateDirectoryRelative(std::string_view relative_path) {
-    if (IsWebMenuCapabilityDirectory(path)) {
-        return nullptr;
-    }
     const auto full_path = FS::SanitizePath(path + '/' + std::string(relative_path));
     return base.CreateDirectory(full_path, perms);
 }
@@ -595,21 +538,11 @@ FileTimeStampRaw RealVfsDirectory::GetFileTimeStamp(std::string_view path_) cons
 }
 
 std::vector<VirtualDir> RealVfsDirectory::GetSubdirectories() const {
-    auto out = IterateEntries<RealVfsDirectory, VfsDirectory>();
-    if (perms != OpenMode::AllowAppend &&
-        IsWebMenuCapabilityDirectory(path + "/ult-s")) {
-        const auto entry = std::find_if(out.begin(), out.end(), [](const VirtualDir& dir) {
-            return dir && dir->GetName() == "ult-s";
-        });
-        if (entry == out.end()) {
-            out.emplace_back(base.OpenDirectory(path + "/ult-s", OpenMode::Read));
-        }
-    }
-    return out;
+    return IterateEntries<RealVfsDirectory, VfsDirectory>();
 }
 
 bool RealVfsDirectory::IsWritable() const {
-    return !IsWebMenuCapabilityDirectory(path) && True(perms & OpenMode::Write);
+    return True(perms & OpenMode::Write);
 }
 
 bool RealVfsDirectory::IsReadable() const {
@@ -629,17 +562,11 @@ VirtualDir RealVfsDirectory::GetParentDirectory() const {
 }
 
 VirtualDir RealVfsDirectory::CreateSubdirectory(std::string_view name) {
-    if (IsWebMenuCapabilityDirectory(path)) {
-        return nullptr;
-    }
     const std::string subdir_path = (path + '/').append(name);
     return base.CreateDirectory(subdir_path, perms);
 }
 
 VirtualFile RealVfsDirectory::CreateFile(std::string_view name) {
-    if (IsWebMenuCapabilityDirectory(path) && name != "web_menus.flag") {
-        return nullptr;
-    }
     const std::string file_path = (path + '/').append(name);
     return base.CreateFile(file_path, perms);
 }
@@ -681,9 +608,6 @@ std::map<std::string, VfsEntryType, std::less<>> RealVfsDirectory::GetEntries() 
 
     FS::IterateDirEntries(path, callback);
 
-    if (IsWebMenuCapabilityDirectory(path + "/ult-s")) {
-        out.insert_or_assign("ult-s", VfsEntryType::Directory);
-    }
     if (IsWebMenuCapabilityFile(path + "/web_menus.flag")) {
         out.insert_or_assign("web_menus.flag", VfsEntryType::File);
     }
