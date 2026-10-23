@@ -147,6 +147,7 @@ private:
     bool local_resource_retry_used = false;
     bool script_registration_failed = false;
     std::atomic<bool> init_failed{false};
+    qreal page_zoom_factor = 1.0;
     int pending_script_registrations = 0;
     UserAgent pending_user_agent = UserAgent::WebApplet;
     std::shared_ptr<bool> alive = std::make_shared<bool>(true);

@@ -959,13 +959,17 @@ void GMainWindow::WebBrowserOpenWebPage(const std::string& main_url,
         }
 
         const auto& layout = render_window->GetFramebufferLayout();
-#if defined(CITRON_USE_WEBKITGTK_WEB_ENGINE)
+#if defined(CITRON_USE_WEBKITGTK_WEB_ENGINE) || defined(CITRON_USE_WEBVIEW2_WEB_ENGINE)
         const qreal reported_pixel_ratio = render_window->windowPixelRatio();
         const qreal pixel_ratio = reported_pixel_ratio > 0.0 ? reported_pixel_ratio : 1.0;
         web_applet->resize(qRound(layout.screen.GetWidth() / pixel_ratio),
                            qRound(layout.screen.GetHeight() / pixel_ratio));
         web_applet->move(qRound(layout.screen.left / pixel_ratio),
                          qRound(layout.screen.top / pixel_ratio) + menuBar()->height());
+#if defined(CITRON_USE_WEBVIEW2_WEB_ENGINE)
+        web_applet->SetPageZoomFactor(static_cast<qreal>(layout.screen.GetWidth()) / pixel_ratio /
+                                      static_cast<qreal>(Layout::ScreenUndocked::Width));
+#endif
 #else
         web_applet->resize(layout.screen.GetWidth(), layout.screen.GetHeight());
         web_applet->move(layout.screen.left, (layout.screen.top) + menuBar()->height());

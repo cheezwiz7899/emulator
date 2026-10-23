@@ -294,6 +294,11 @@ void WebView2View::InitWebView2() {
                                 FailInitialization();
                                 return FAILED(webview_result) ? webview_result : E_FAIL;
                             }
+                            // WebView2 initialization is asynchronous. MainWindow sets the
+                            // applet zoom immediately after creating/showing the widget, which
+                            // can happen before this controller exists; apply the stored value
+                            // now so the first page has the same zoom as later applet opens.
+                            controller->put_ZoomFactor(static_cast<double>(page_zoom_factor));
                             const HRESULT dialog_result = webview->add_ScriptDialogOpening(
                                 Callback<ICoreWebView2ScriptDialogOpeningEventHandler>(
                                     [this, life](ICoreWebView2* sender,
@@ -847,8 +852,9 @@ void WebView2View::EvaluateJavaScript(const QString& script,
 }
 
 void WebView2View::SetPageZoomFactor(qreal factor) {
+    page_zoom_factor = factor;
     if (controller) {
-        controller->put_ZoomFactor(static_cast<double>(factor));
+        controller->put_ZoomFactor(static_cast<double>(page_zoom_factor));
     }
 }
 
