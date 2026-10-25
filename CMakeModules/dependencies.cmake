@@ -37,7 +37,7 @@ if (CITRON_ENABLE_SCARLET_CPU)
         message(FATAL_ERROR "CITRON_ENABLE_SCARLET_CPU CPM integration requires 64-bit Windows llvm-mingw (Clangtron)")
     endif()
 
-    set(CITRON_SCARLETNX_GIT_TAG "785bfa7df4a8ad65780949b1386a3fb6bff57b33" CACHE STRING
+    set(CITRON_SCARLETNX_REVISION "785bfa7df4a8ad65780949b1386a3fb6bff57b33" CACHE STRING
         "ScarletNX revision used by the experimental CPU backend")
     set(CITRON_SCARLETNX_SOURCE_DIR "" CACHE PATH
         "Use an existing ScarletNX checkout instead of CPM's pinned source")
@@ -51,7 +51,7 @@ if (CITRON_ENABLE_SCARLET_CPU)
     else()
         list(APPEND _citron_scarlet_cpm_args
             GITHUB_REPOSITORY cheezwiz7899/ScarletNX
-            GIT_TAG "${CITRON_SCARLETNX_GIT_TAG}")
+            GIT_TAG "${CITRON_SCARLETNX_REVISION}")
     endif()
 
     CPMAddPackage(
@@ -129,7 +129,7 @@ if (CITRON_ENABLE_SCARLET_CPU)
         endif()
 
         string(SHA256 _citron_llvm_sdk_key
-            "${CITRON_SCARLET_LLVM_VERSION};${_citron_scarlet_llvm_target_triple};${CMAKE_C_COMPILER};${CMAKE_CXX_COMPILER};${CMAKE_FIND_ROOT_PATH}")
+            "${CITRON_SCARLET_LLVM_VERSION};${_citron_scarlet_llvm_target_triple};${CMAKE_C_COMPILER};${CMAKE_CXX_COMPILER};${CMAKE_FIND_ROOT_PATH};pic=off;llvm-mingw-chkstk-ms")
         string(SUBSTRING "${_citron_llvm_sdk_key}" 0 16 _citron_llvm_sdk_key)
         if (CPM_SOURCE_CACHE)
             set(_citron_scarlet_cache_root "${CPM_SOURCE_CACHE}")
@@ -213,7 +213,17 @@ if (CITRON_ENABLE_SCARLET_CPU)
                 "-DLLVM_TABLEGEN=${_citron_llvm_host_tblgen}"
                 "-DLLVM_HOST_TRIPLE=${_citron_scarlet_llvm_target_triple}"
                 "-DLLVM_DEFAULT_TARGET_TRIPLE=${_citron_scarlet_llvm_target_triple}"
-                "-DLLVM_ENABLE_PIC=ON"
+                # Clang's builtins make these configure probes report aliases that
+                # llvm-mingw does not actually provide as linkable symbols. Its
+                # x86_64 stack probe is ___chkstk_ms (HAVE____CHKSTK_MS).
+                "-DHAVE__ALLOCA=0"
+                "-DHAVE___ALLOCA=0"
+                "-DHAVE___CHKSTK=0"
+                "-DHAVE___CHKSTK_MS=0"
+                "-DHAVE____CHKSTK=0"
+                # PE/COFF does not need PIC. LLVM's optional shared libLTO
+                # target does not link cleanly with llvm-mingw's MinGW CRT.
+                "-DLLVM_ENABLE_PIC=OFF"
             BUILD_COMMAND "${CMAKE_COMMAND}" --build <BINARY_DIR> ${_citron_scarlet_parallel_args} --target install
             INSTALL_COMMAND ""
             BUILD_BYPRODUCTS "${_citron_llvm_target_prefix}/lib/cmake/llvm/LLVMConfig.cmake"

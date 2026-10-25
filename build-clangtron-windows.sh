@@ -1667,7 +1667,6 @@ build_common_cmake_args() {
         # Clear any previous local-checkout override so the CPM pin is used.
         _CMAKE_ARGS+=("-DCITRON_SCARLETNX_SOURCE_DIR=")
     fi
-    _CMAKE_ARGS+=("-DCITRON_SCARLETNX_GIT_TAG=${CMAKE_SCARLETNX_GIT_TAG:-e22589f60170cc5105b1e86b4594adadd55af34f}")
     [[ -z "${CMAKE_SCARLETNX_LLVM_DIR}" ]] || _CMAKE_ARGS+=("-DLLVM_DIR=${CMAKE_SCARLETNX_LLVM_DIR}")
     # Always return 0 — a trailing [[ ]] that evaluates false would trigger set -e in caller.
     :
