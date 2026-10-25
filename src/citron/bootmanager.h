@@ -144,6 +144,7 @@ signals:
     void DebugModeLeft();
 
     void LoadProgress(VideoCore::LoadCallbackStage stage, std::size_t value, std::size_t total);
+    void ScarletRecompileProgress(bool complete, std::size_t value, std::size_t total);
 };
 
 class GRenderWindow : public QWidget, public Core::Frontend::EmuWindow {

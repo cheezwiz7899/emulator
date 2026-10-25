@@ -623,6 +623,7 @@ struct System::Impl {
     bool extended_memory_layout{};
 
     ExecuteProgramCallback execute_program_callback;
+    ScarletRecompileProgressCallback scarlet_recompile_progress_callback;
     std::mutex exit_callback_mutex;
     ExitCallback exit_callback;
     bool exit_callback_requested = false;
@@ -1080,6 +1081,17 @@ void System::RunServer(std::unique_ptr<Service::ServerManager>&& server_manager)
 
 void System::RegisterExecuteProgramCallback(ExecuteProgramCallback&& callback) {
     impl->execute_program_callback = std::move(callback);
+}
+
+void System::RegisterScarletRecompileProgressCallback(
+    ScarletRecompileProgressCallback&& callback) {
+    impl->scarlet_recompile_progress_callback = std::move(callback);
+}
+
+void System::ReportScarletRecompileProgress(bool complete, std::size_t value, std::size_t total) {
+    if (impl->scarlet_recompile_progress_callback) {
+        impl->scarlet_recompile_progress_callback(complete, value, total);
+    }
 }
 
 void System::ExecuteProgram(std::size_t program_index) {

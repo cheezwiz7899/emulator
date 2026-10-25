@@ -4,6 +4,7 @@
 #pragma once
 
 #include <map>
+#include <vector>
 
 #include "core/arm/arm_interface.h"
 #include "core/file_sys/program_metadata.h"
@@ -61,6 +62,13 @@ public:
     static constexpr u64 ProcessIdMin = InitialProcessIdMax + 1;
     static constexpr u64 ProcessIdMax = std::numeric_limits<u64>::max();
 
+    struct ExecutableModule {
+        u64 image_address{};
+        u64 image_size{};
+        u64 text_offset{};
+        u64 text_size{};
+    };
+
 private:
     using SharedMemoryInfoList = Common::IntrusiveListBaseTraits<KSharedMemoryInfo>::ListType;
     using TLPTree =
@@ -110,6 +118,11 @@ private:
     bool m_is_handle_table_initialized{};
     std::array<std::unique_ptr<Core::ArmInterface>, Core::Hardware::NUM_CPU_CORES>
         m_arm_interfaces{};
+    // Executable segments loaded so far (guest address, size), for the ScarletNX CPU backend.
+    std::vector<std::pair<u64, u64>> m_executable_ranges{};
+    // The mapped module images behind those segments. ScarletNX's native loader parses MOD0,
+    // dynamic symbols, relocations and unwind metadata from the complete image before AOT.
+    std::vector<ExecutableModule> m_executable_modules{};
     std::array<KThread*, Core::Hardware::NUM_CPU_CORES> m_running_threads{};
     std::array<u64, Core::Hardware::NUM_CPU_CORES> m_running_thread_idle_counts{};
     std::array<u64, Core::Hardware::NUM_CPU_CORES> m_running_thread_switch_counts{};
@@ -484,6 +497,14 @@ public:
 
     Core::ArmInterface* GetArmInterface(size_t core_index) const {
         return m_arm_interfaces[core_index].get();
+    }
+
+    const std::vector<std::pair<u64, u64>>& GetExecutableRanges() const {
+        return m_executable_ranges;
+    }
+
+    const std::vector<ExecutableModule>& GetExecutableModules() const {
+        return m_executable_modules;
     }
 
 public:

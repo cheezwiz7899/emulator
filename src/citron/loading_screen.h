@@ -41,6 +41,7 @@ public:
     void HaltTransitions();
     void Clear();
     void OnLoadProgress(VideoCore::LoadCallbackStage stage, std::size_t value, std::size_t total);
+    void OnScarletRecompileProgress(bool complete, std::size_t value, std::size_t total);
     void OnLoadComplete();
     void paintEvent(QPaintEvent* event) override;
 
@@ -66,6 +67,7 @@ private:
 
     std::unordered_map<VideoCore::LoadCallbackStage, QString> stage_translations;
     QString base_loading_text;
+    QString loading_game_title;
 
     bool slow_shader_compile_start = false;
     std::chrono::steady_clock::time_point slow_shader_start;

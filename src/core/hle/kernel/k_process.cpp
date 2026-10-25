@@ -22,6 +22,9 @@
 #ifdef HAS_NCE
 #include "core/arm/nce/arm_nce.h"
 #endif
+#ifdef CITRON_HAS_SCARLET_CPU
+#include "core/arm/scarlet/arm_scarlet_64.h"
+#endif
 
 namespace Kernel {
 
@@ -1264,6 +1267,10 @@ void KProcess::LoadModule(CodeSet code_set, KProcessAddress base_addr) {
     this->GetMemory().WriteBlock(base_addr, code_set.memory.data(), code_set.memory.size());
 
     ReprotectSegment(code_set.CodeSegment(), Svc::MemoryPermission::ReadExecute);
+    m_executable_ranges.emplace_back(GetInteger(base_addr + code_set.CodeSegment().addr),
+                                     code_set.CodeSegment().size);
+    m_executable_modules.push_back({GetInteger(base_addr), code_set.memory.size(),
+                                    code_set.CodeSegment().offset, code_set.CodeSegment().size});
     ReprotectSegment(code_set.RODataSegment(), Svc::MemoryPermission::Read);
     ReprotectSegment(code_set.DataSegment(), Svc::MemoryPermission::ReadWrite);
 
@@ -1284,6 +1291,17 @@ void KProcess::LoadModule(CodeSet code_set, KProcessAddress base_addr) {
 void KProcess::InitializeInterfaces() {
     m_exclusive_monitor =
         Core::MakeExclusiveMonitor(this->GetMemory(), Core::Hardware::NUM_CPU_CORES);
+
+#ifdef CITRON_HAS_SCARLET_CPU
+    if (this->IsApplication() && this->Is64Bit() &&
+        Settings::values.cpu_backend.GetValue() == Settings::CpuBackend::Scarlet) {
+        for (size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; i++) {
+            m_arm_interfaces[i] =
+                std::make_unique<Core::ArmScarlet64>(m_kernel.System(), true, this, i);
+        }
+        return;
+    }
+#endif
 
 #ifdef HAS_NCE
     if (this->IsApplication() && Settings::IsNceEnabled()) {

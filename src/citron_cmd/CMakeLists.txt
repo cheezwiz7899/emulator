@@ -124,7 +124,12 @@ if (MSVC AND CITRON_USE_BUNDLED_SDL2)
     copy_citron_SDL_deps(citron-cmd)
 elseif(MINGW)
     include(CopyMinGWDeps)
-    copy_mingw_deps(citron-cmd SEARCH_PATHS "${FFmpeg_PATH}/bin" "${QT_TARGET_PATH}/bin")
+    if (CITRON_ENABLE_SCARLET_CPU)
+        copy_mingw_deps(citron-cmd SEARCH_PATHS "${FFmpeg_PATH}/bin" "${QT_TARGET_PATH}/bin"
+            EXTRA_DLLS "$<TARGET_FILE:${CITRON_SCARLET_TARGET}>")
+    else()
+        copy_mingw_deps(citron-cmd SEARCH_PATHS "${FFmpeg_PATH}/bin" "${QT_TARGET_PATH}/bin")
+    endif()
 endif()
 
 if(WIN32)

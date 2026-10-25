@@ -32,9 +32,9 @@ combobox_translations(builder.ComboboxTranslations()) {
     connect(backend_combobox, qOverload<int>(&QComboBox::currentIndexChanged), this,
             &ConfigureCpu::UpdateGroup);
 
-    #ifdef HAS_NCE
+#if defined(HAS_NCE) || defined(CITRON_HAS_SCARLET_CPU)
     ui->backend_group->setVisible(true);
-    #endif
+#endif
 }
 
 ConfigureCpu::~ConfigureCpu() = default;

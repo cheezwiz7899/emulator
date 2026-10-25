@@ -125,7 +125,7 @@ ENUM(RendererBackend, Vulkan, Null);
 
 ENUM(GpuAccuracy, Low, Normal, High, Extreme);
 
-ENUM(CpuBackend, Dynarmic, Nce);
+ENUM(CpuBackend, Dynarmic, Nce, Scarlet);
 
 ENUM(CpuAccuracy, Auto, Accurate, Unsafe, Paranoid, UltraLow);
 

@@ -2384,6 +2384,8 @@ void GMainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletP
 
     connect(emu_thread.get(), &EmuThread::LoadProgress, loading_screen,
             &LoadingScreen::OnLoadProgress, Qt::QueuedConnection);
+    connect(emu_thread.get(), &EmuThread::ScarletRecompileProgress, loading_screen,
+            &LoadingScreen::OnScarletRecompileProgress, Qt::QueuedConnection);
 
     // Start the thread AFTER all connections are set up
     emu_thread->start();

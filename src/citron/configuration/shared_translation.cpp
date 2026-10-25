@@ -407,7 +407,12 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QWidget* parent) {
     translations->insert({Settings::EnumMetadata<Settings::CpuBackend>::Index(),
                           {
                               PAIR(CpuBackend, Dynarmic, tr("Dynarmic")),
+#ifdef HAS_NCE
                               PAIR(CpuBackend, Nce, tr("NCE")),
+#endif
+#ifdef CITRON_HAS_SCARLET_CPU
+                              PAIR(CpuBackend, Scarlet, tr("ScarletNX (experimental AOT)")),
+#endif
                           }});
     translations->insert({Settings::EnumMetadata<Settings::FullscreenMode>::Index(),
                           {

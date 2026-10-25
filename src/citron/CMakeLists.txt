@@ -706,7 +706,12 @@ if (MSVC)
     copy_citron_FFmpeg_deps(citron)
 elseif(MINGW)
     include(CopyMinGWDeps)
-    copy_mingw_deps(citron SEARCH_PATHS "${FFmpeg_PATH}/bin" "${QT_TARGET_PATH}/bin")
+    if (CITRON_ENABLE_SCARLET_CPU)
+        copy_mingw_deps(citron SEARCH_PATHS "${FFmpeg_PATH}/bin" "${QT_TARGET_PATH}/bin"
+            EXTRA_DLLS "$<TARGET_FILE:${CITRON_SCARLET_TARGET}>")
+    else()
+        copy_mingw_deps(citron SEARCH_PATHS "${FFmpeg_PATH}/bin" "${QT_TARGET_PATH}/bin")
+    endif()
 endif()
 
 if (ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64)
@@ -723,3 +728,10 @@ if (CITRON_USE_PRECOMPILED_HEADERS)
 endif()
 
 create_target_directory_groups(citron)
+
+if (CITRON_ENABLE_SCARLET_CPU AND WIN32 AND NOT MINGW)
+    # scarletnx-recompiler.dll next to citron.exe
+    add_custom_command(TARGET citron POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:${CITRON_SCARLET_TARGET}> $<TARGET_FILE_DIR:citron>)
+endif()

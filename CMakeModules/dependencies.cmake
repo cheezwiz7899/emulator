@@ -29,6 +29,280 @@ if (NOT COMMAND CPMAddPackage)
     message(FATAL_ERROR "CPM.cmake not loaded — include CMakeModules/CPM.cmake before this file")
 endif()
 
+# ── ScarletNX CPU recompiler ──────────────────────────────────────────────────
+# ScarletNX is configured in a separate CMake process: its top-level project
+# assumes it owns CMAKE_SOURCE_DIR, which is not true when added as a subproject.
+if (CITRON_ENABLE_SCARLET_CPU)
+    if (NOT WIN32 OR NOT CITRON_CLANGTRON OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+        message(FATAL_ERROR "CITRON_ENABLE_SCARLET_CPU CPM integration requires 64-bit Windows llvm-mingw (Clangtron)")
+    endif()
+
+    set(CITRON_SCARLETNX_GIT_TAG "785bfa7df4a8ad65780949b1386a3fb6bff57b33" CACHE STRING
+        "ScarletNX revision used by the experimental CPU backend")
+    set(CITRON_SCARLETNX_SOURCE_DIR "" CACHE PATH
+        "Use an existing ScarletNX checkout instead of CPM's pinned source")
+
+    set(_citron_scarlet_cpm_args)
+    if (CITRON_SCARLETNX_SOURCE_DIR)
+        if (NOT EXISTS "${CITRON_SCARLETNX_SOURCE_DIR}/CMakeLists.txt")
+            message(FATAL_ERROR "CITRON_SCARLETNX_SOURCE_DIR has no CMakeLists.txt: ${CITRON_SCARLETNX_SOURCE_DIR}")
+        endif()
+        list(APPEND _citron_scarlet_cpm_args SOURCE_DIR "${CITRON_SCARLETNX_SOURCE_DIR}")
+    else()
+        list(APPEND _citron_scarlet_cpm_args
+            GITHUB_REPOSITORY cheezwiz7899/ScarletNX
+            GIT_TAG "${CITRON_SCARLETNX_GIT_TAG}")
+    endif()
+
+    CPMAddPackage(
+        NAME ScarletNX
+        DOWNLOAD_ONLY YES
+        ${_citron_scarlet_cpm_args}
+    )
+
+    include(ExternalProject)
+    set(CITRON_SCARLET_BUILD_JOBS "" CACHE STRING
+        "Parallel build jobs for ScarletNX and its auto-built LLVM SDK (empty: use all available jobs)")
+    set(_citron_scarlet_parallel_args --parallel)
+    if (CITRON_SCARLET_BUILD_JOBS)
+        list(APPEND _citron_scarlet_parallel_args "${CITRON_SCARLET_BUILD_JOBS}")
+    endif()
+    set(_citron_scarlet_llvm_dir "${LLVM_DIR}")
+    set(_citron_scarlet_dependency_args)
+
+    # llvm-mingw supplies the Windows-target Clang but no Windows-target LLVM
+    # development package. When cross-building on Linux, build the matching LLVM
+    # release unless the caller explicitly supplies LLVM_DIR.
+    if (CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux" AND NOT _citron_scarlet_llvm_dir)
+        if (NOT CMAKE_TOOLCHAIN_FILE OR NOT CMAKE_RC_COMPILER OR NOT CMAKE_FIND_ROOT_PATH)
+            message(FATAL_ERROR "The automatic ScarletNX LLVM SDK build needs Citron's llvm-mingw toolchain "
+                                "(CMAKE_TOOLCHAIN_FILE, CMAKE_RC_COMPILER and CMAKE_FIND_ROOT_PATH).")
+        endif()
+        set(CITRON_SCARLET_LLVM_VERSION "" CACHE STRING
+            "LLVM release for the ScarletNX cross-build SDK (empty: match the llvm-mingw Clang compiler)")
+        if (NOT CITRON_SCARLET_LLVM_VERSION)
+            execute_process(
+                COMMAND "${CMAKE_C_COMPILER}" --version
+                OUTPUT_VARIABLE _citron_scarlet_clang_version_text
+                ERROR_VARIABLE _citron_scarlet_clang_version_error
+                RESULT_VARIABLE _citron_scarlet_clang_version_result
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+            )
+            if (NOT _citron_scarlet_clang_version_result EQUAL 0)
+                message(FATAL_ERROR "Could not query the llvm-mingw Clang version from ${CMAKE_C_COMPILER}: "
+                                    "${_citron_scarlet_clang_version_error}")
+            endif()
+            string(REGEX MATCH "clang version ([0-9]+\\.[0-9]+\\.[0-9]+)"
+                _citron_scarlet_clang_version_match "${_citron_scarlet_clang_version_text}")
+            if (NOT _citron_scarlet_clang_version_match)
+                message(FATAL_ERROR "Could not derive an LLVM release tag from the cross compiler version:\n"
+                                    "${_citron_scarlet_clang_version_text}\n"
+                                    "Set CITRON_SCARLET_LLVM_VERSION to a matching release (for example 21.1.8), "
+                                    "or provide LLVM_DIR.")
+            endif()
+            set(CITRON_SCARLET_LLVM_VERSION "${CMAKE_MATCH_1}" CACHE STRING
+                "LLVM release for the ScarletNX cross-build SDK (empty: match the llvm-mingw Clang compiler)" FORCE)
+        endif()
+        if (NOT CITRON_SCARLET_LLVM_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$")
+            message(FATAL_ERROR "CITRON_SCARLET_LLVM_VERSION must be a full release version like 21.1.8, got "
+                                "'${CITRON_SCARLET_LLVM_VERSION}'")
+        endif()
+
+        CPMAddPackage(
+            NAME ScarletLLVM
+            GITHUB_REPOSITORY llvm/llvm-project
+            GIT_TAG "llvmorg-${CITRON_SCARLET_LLVM_VERSION}"
+            GIT_SHALLOW TRUE
+            DOWNLOAD_ONLY YES
+        )
+
+        execute_process(
+            COMMAND "${CMAKE_C_COMPILER}" --print-target-triple
+            OUTPUT_VARIABLE _citron_scarlet_llvm_target_triple
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            RESULT_VARIABLE _citron_scarlet_target_triple_result
+        )
+        if (NOT _citron_scarlet_target_triple_result EQUAL 0 OR
+            NOT _citron_scarlet_llvm_target_triple MATCHES "^x86_64-w64-")
+            message(FATAL_ERROR "ScarletNX's automatic LLVM SDK build expects an x86_64 Windows llvm-mingw "
+                                "compiler; got target '${_citron_scarlet_llvm_target_triple}'")
+        endif()
+
+        string(SHA256 _citron_llvm_sdk_key
+            "${CITRON_SCARLET_LLVM_VERSION};${_citron_scarlet_llvm_target_triple};${CMAKE_C_COMPILER};${CMAKE_CXX_COMPILER};${CMAKE_FIND_ROOT_PATH}")
+        string(SUBSTRING "${_citron_llvm_sdk_key}" 0 16 _citron_llvm_sdk_key)
+        if (CPM_SOURCE_CACHE)
+            set(_citron_scarlet_cache_root "${CPM_SOURCE_CACHE}")
+        else()
+            # Keep direct CMake users working even when they did not configure
+            # the helper's shared CPM_SOURCE_CACHE path.
+            set(_citron_scarlet_cache_root "${CMAKE_BINARY_DIR}/_cpm_cache")
+        endif()
+        set(_citron_llvm_sdk_root "${_citron_scarlet_cache_root}/scarletnx-llvm-sdk/${CITRON_SCARLET_LLVM_VERSION}-${_citron_llvm_sdk_key}")
+        file(MAKE_DIRECTORY "${_citron_llvm_sdk_root}")
+        set(_citron_llvm_toolchain "${_citron_llvm_sdk_root}/llvm-mingw-toolchain.cmake")
+        file(WRITE "${_citron_llvm_toolchain}"
+"set(CMAKE_SYSTEM_NAME Windows)\n"
+"set(CMAKE_SYSTEM_PROCESSOR x86_64)\n"
+"set(CMAKE_C_COMPILER [==[${CMAKE_C_COMPILER}]==])\n"
+"set(CMAKE_CXX_COMPILER [==[${CMAKE_CXX_COMPILER}]==])\n"
+"set(CMAKE_RC_COMPILER [==[${CMAKE_RC_COMPILER}]==])\n"
+"set(CMAKE_FIND_ROOT_PATH [==[${CMAKE_FIND_ROOT_PATH}]==])\n"
+"set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)\n"
+"set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)\n"
+"set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)\n"
+"set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH)\n"
+"set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)\n"
+"set(CMAKE_C_FLAGS_INIT \"-D__INTRINSIC_DEFINED___cpuidex -D__USE_MINGW_STAT64 -Wno-unknown-pragmas\")\n"
+"set(CMAKE_CXX_FLAGS_INIT \"-D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -D__INTRINSIC_DEFINED___cpuidex -D__USE_MINGW_STAT64 -U__GLIBCXX__ -Wno-unknown-pragmas\")\n"
+"set(CMAKE_EXE_LINKER_FLAGS_INIT \"-Wl,--allow-multiple-definition\")\n"
+"set(CMAKE_SHARED_LINKER_FLAGS_INIT \"-Wl,--allow-multiple-definition\")\n"
+"set(CMAKE_MODULE_LINKER_FLAGS_INIT \"-Wl,--allow-multiple-definition\")\n")
+
+        set(_citron_llvm_host_build "${_citron_llvm_sdk_root}/host-build")
+        set(_citron_llvm_host_tblgen "${_citron_llvm_host_build}/bin/llvm-tblgen")
+        set(_citron_llvm_target_prefix "${_citron_llvm_sdk_root}/windows-install")
+        set(_citron_llvm_target_build "${_citron_llvm_sdk_root}/windows-build")
+
+        set(_citron_llvm_common_args
+            "-DCMAKE_BUILD_TYPE=Release"
+            "-DLLVM_TARGETS_TO_BUILD=X86"
+            "-DLLVM_INCLUDE_TESTS=OFF"
+            "-DLLVM_INCLUDE_EXAMPLES=OFF"
+            "-DLLVM_INCLUDE_BENCHMARKS=OFF"
+            "-DLLVM_BUILD_TOOLS=OFF"
+            "-DLLVM_ENABLE_ZLIB=OFF"
+            "-DLLVM_ENABLE_ZSTD=OFF"
+            "-DLLVM_ENABLE_LIBXML2=OFF"
+            "-DLLVM_ENABLE_TERMINFO=OFF"
+            "-DLLVM_ENABLE_LIBEDIT=OFF"
+            "-DLLVM_ENABLE_FFI=OFF"
+            "-DLLVM_BUILD_LLVM_DYLIB=OFF"
+            "-DLLVM_LINK_LLVM_DYLIB=OFF"
+            "-DLLVM_BUILD_LLVM_C_DYLIB=OFF"
+        )
+        ExternalProject_Add(citron-scarlet-llvm-host-tools
+            SOURCE_DIR "${ScarletLLVM_SOURCE_DIR}/llvm"
+            BINARY_DIR "${_citron_llvm_host_build}"
+            DOWNLOAD_COMMAND ""
+            UPDATE_COMMAND ""
+            CMAKE_ARGS ${_citron_llvm_common_args}
+                "-DCMAKE_C_COMPILER=cc"
+                "-DCMAKE_CXX_COMPILER=c++"
+                "-DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+            BUILD_COMMAND "${CMAKE_COMMAND}" --build <BINARY_DIR> ${_citron_scarlet_parallel_args} --target llvm-tblgen
+            INSTALL_COMMAND ""
+            BUILD_BYPRODUCTS "${_citron_llvm_host_tblgen}"
+            USES_TERMINAL_CONFIGURE TRUE
+            USES_TERMINAL_BUILD TRUE
+        )
+        ExternalProject_Add(citron-scarlet-llvm-windows-sdk
+            SOURCE_DIR "${ScarletLLVM_SOURCE_DIR}/llvm"
+            BINARY_DIR "${_citron_llvm_target_build}"
+            INSTALL_DIR "${_citron_llvm_target_prefix}"
+            DOWNLOAD_COMMAND ""
+            UPDATE_COMMAND ""
+            DEPENDS citron-scarlet-llvm-host-tools
+            CMAKE_ARGS ${_citron_llvm_common_args}
+                "-DCMAKE_INSTALL_PREFIX=${_citron_llvm_target_prefix}"
+                "-DCMAKE_INSTALL_LIBDIR=lib"
+                "-DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}"
+                "-DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
+                "-DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+                "-DCMAKE_TOOLCHAIN_FILE=${_citron_llvm_toolchain}"
+                "-DLLVM_TABLEGEN=${_citron_llvm_host_tblgen}"
+                "-DLLVM_HOST_TRIPLE=${_citron_scarlet_llvm_target_triple}"
+                "-DLLVM_DEFAULT_TARGET_TRIPLE=${_citron_scarlet_llvm_target_triple}"
+                "-DLLVM_ENABLE_PIC=ON"
+            BUILD_COMMAND "${CMAKE_COMMAND}" --build <BINARY_DIR> ${_citron_scarlet_parallel_args} --target install
+            INSTALL_COMMAND ""
+            BUILD_BYPRODUCTS "${_citron_llvm_target_prefix}/lib/cmake/llvm/LLVMConfig.cmake"
+            USES_TERMINAL_CONFIGURE TRUE
+            USES_TERMINAL_BUILD TRUE
+        )
+        set(_citron_scarlet_llvm_dir "${_citron_llvm_target_prefix}/lib/cmake/llvm")
+        list(APPEND _citron_scarlet_dependency_args DEPENDS citron-scarlet-llvm-windows-sdk)
+        message(STATUS "[ScarletNX] No LLVM_DIR supplied; CPM will build LLVM ${CITRON_SCARLET_LLVM_VERSION} "
+                       "for ${_citron_scarlet_llvm_target_triple}")
+    endif()
+
+    set(_citron_scarlet_prefix "${CMAKE_BINARY_DIR}/_deps/scarletnx-install")
+    set(_citron_scarlet_build "${CMAKE_BINARY_DIR}/_deps/scarletnx-build")
+    if (WIN32 AND CPM_SOURCE_CACHE)
+        cmake_path(GET CMAKE_BINARY_DIR ROOT_NAME _citron_scarlet_build_drive)
+        cmake_path(GET CPM_SOURCE_CACHE ROOT_NAME _citron_scarlet_cache_drive)
+        string(TOLOWER "${_citron_scarlet_build_drive}" _citron_scarlet_build_drive)
+        string(TOLOWER "${_citron_scarlet_cache_drive}" _citron_scarlet_cache_drive)
+        if (_citron_scarlet_build_drive AND _citron_scarlet_cache_drive AND
+            NOT _citron_scarlet_build_drive STREQUAL _citron_scarlet_cache_drive)
+            string(SHA256 _citron_scarlet_build_key
+                "${CMAKE_BINARY_DIR};${CMAKE_C_COMPILER};${CMAKE_CXX_COMPILER};${CMAKE_TOOLCHAIN_FILE};${ScarletNX_SOURCE_DIR}")
+            string(SUBSTRING "${_citron_scarlet_build_key}" 0 16 _citron_scarlet_build_key)
+            set(_citron_scarlet_build "${CPM_SOURCE_CACHE}/scarletnx-builds/${_citron_scarlet_build_key}")
+            message(STATUS "[ScarletNX] Build directory is on CPM cache drive ${_citron_scarlet_cache_drive}")
+        endif()
+    endif()
+    set(_citron_scarlet_cmake_args
+        "-DCMAKE_INSTALL_PREFIX=${_citron_scarlet_prefix}"
+        "-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
+        "-DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+        "-DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}"
+        "-DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
+        "-DCPM_SOURCE_CACHE=${CPM_SOURCE_CACHE}"
+        "-DSNX_TOOLS_ONLY=ON"
+        "-DSNX_RECOMPILER_SHARED=ON"
+        "-DSNX_RECOMPILER_INSTALL=ON"
+        "-DSNX_A64_DISASM=OFF"
+        "-DSNX_BUILD_GNUABI=OFF"
+        "-DSNX_BUILD_3DS=OFF"
+        "-DSNX_BUILD_VITA=OFF"
+        "-DSNX_BUILD_GUI=OFF"
+        "-DBUILD_TESTING=OFF"
+    )
+    if (CMAKE_RC_COMPILER)
+        list(APPEND _citron_scarlet_cmake_args "-DCMAKE_RC_COMPILER=${CMAKE_RC_COMPILER}")
+    endif()
+    if (CMAKE_TOOLCHAIN_FILE)
+        list(APPEND _citron_scarlet_cmake_args "-DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}")
+    endif()
+    if (_citron_scarlet_llvm_dir)
+        list(APPEND _citron_scarlet_cmake_args "-DLLVM_DIR=${_citron_scarlet_llvm_dir}" "-DSNX_LLVM_CONFIG=")
+    endif()
+
+    set(_citron_scarlet_dll "${_citron_scarlet_prefix}/bin/${CMAKE_SHARED_LIBRARY_PREFIX}scarletnx-recompiler${CMAKE_SHARED_LIBRARY_SUFFIX}")
+    set(_citron_scarlet_implib "${_citron_scarlet_prefix}/lib/libscarletnx-recompiler.dll.a")
+    set(_citron_scarlet_static "${_citron_scarlet_prefix}/lib/libscarletnx-recompiler.a")
+    ExternalProject_Add(citron-scarletnx-recompiler-build
+        SOURCE_DIR "${ScarletNX_SOURCE_DIR}"
+        BINARY_DIR "${_citron_scarlet_build}"
+        INSTALL_DIR "${_citron_scarlet_prefix}"
+        DOWNLOAD_COMMAND ""
+        UPDATE_COMMAND ""
+        ${_citron_scarlet_dependency_args}
+        CMAKE_ARGS ${_citron_scarlet_cmake_args}
+        BUILD_COMMAND "${CMAKE_COMMAND}" --build <BINARY_DIR> ${_citron_scarlet_parallel_args}
+            --target scarletnx scarletnx-recompiler scarletnx-recompiler-shared
+        INSTALL_COMMAND "${CMAKE_COMMAND}" --install <BINARY_DIR>
+        BUILD_BYPRODUCTS "${_citron_scarlet_dll}" "${_citron_scarlet_implib}" "${_citron_scarlet_static}"
+        USES_TERMINAL_CONFIGURE TRUE
+        USES_TERMINAL_BUILD TRUE
+        USES_TERMINAL_INSTALL TRUE
+    )
+    add_library(ScarletNX::recompiler-shared SHARED IMPORTED GLOBAL)
+    set_target_properties(ScarletNX::recompiler-shared PROPERTIES
+        IMPORTED_LOCATION "${_citron_scarlet_dll}"
+        IMPORTED_IMPLIB "${_citron_scarlet_implib}"
+        INTERFACE_INCLUDE_DIRECTORIES "${ScarletNX_SOURCE_DIR}/src/common/cpu/recompiler;${ScarletNX_SOURCE_DIR}/src"
+    )
+    add_library(ScarletNX::recompiler UNKNOWN IMPORTED GLOBAL)
+    set_target_properties(ScarletNX::recompiler PROPERTIES
+        IMPORTED_LOCATION "${_citron_scarlet_static}"
+        INTERFACE_INCLUDE_DIRECTORIES "${ScarletNX_SOURCE_DIR}/src/common/cpu/recompiler;${ScarletNX_SOURCE_DIR}/src"
+    )
+    set(CITRON_SCARLETNX_BUILD_TARGET citron-scarletnx-recompiler-build)
+    message(STATUS "[ScarletNX] CPM source: ${ScarletNX_SOURCE_DIR}; build/install: ${_citron_scarlet_prefix}")
+endif()
+
 # ── tzdb host capability check ────────────────────────────────────────────────
 # tzdb_to_nx builds 'zic' from C source using the host compiler.
 # On WIN32 hosts, Windows headers lack POSIX APIs (link, symlink, readlink,

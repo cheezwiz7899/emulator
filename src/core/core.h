@@ -427,6 +427,11 @@ public:
     /// using a specified program index.
     using ExecuteProgramCallback = std::function<void(std::size_t)>;
 
+    using ScarletRecompileProgressCallback =
+        std::function<void(bool, std::size_t, std::size_t)>;
+    void RegisterScarletRecompileProgressCallback(ScarletRecompileProgressCallback&& callback);
+    void ReportScarletRecompileProgress(bool complete, std::size_t value, std::size_t total);
+
     /**
      * Registers a callback from the frontend for System to re-launch the application using a
      * specified program index.

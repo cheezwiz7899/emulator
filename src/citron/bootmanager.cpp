@@ -61,9 +61,16 @@ class QSurface;
 
 constexpr int default_mouse_constrain_timeout = 10;
 
-EmuThread::EmuThread(Core::System& system) : m_system{system} {}
+EmuThread::EmuThread(Core::System& system) : m_system{system} {
+    m_system.RegisterScarletRecompileProgressCallback(
+        [this](bool complete, std::size_t value, std::size_t total) {
+            emit ScarletRecompileProgress(complete, value, total);
+        });
+}
 
-EmuThread::~EmuThread() = default;
+EmuThread::~EmuThread() {
+    m_system.RegisterScarletRecompileProgressCallback({});
+}
 
 void EmuThread::run() {
     Common::SetCurrentThreadName("EmuControlThread");

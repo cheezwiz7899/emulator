@@ -113,6 +113,12 @@ CMAKE_DEPENDENT_OPTION(CITRON_CRASH_DUMPS "Compile crash dump (Minidump) support
 # vcpkg is supported primarily for native MSVC and Android builds.
 option(CITRON_USE_BUNDLED_VCPKG "Use vcpkg for citron dependencies" "${MSVC}")
 option(CITRON_USE_CPM "Use CPM.cmake to fetch dependencies" OFF)
+
+# EXPERIMENTAL: AArch64 CPU backend using ScarletNX's recompiler library (see docs/scarlet-cpu.md).
+# With CITRON_USE_CPM, ScarletNX is fetched and built as an external project. Otherwise, provide
+# an installed ScarletNXRecompiler package through CMAKE_PREFIX_PATH or ScarletNXRecompiler_DIR.
+# x86-64 hosts only; GPL-3.0-or-later library.
+option(CITRON_ENABLE_SCARLET_CPU "Build the experimental ScarletNX recompiler CPU backend" OFF)
 option(CITRON_BUNDLE_SCARLETNX "Bundle a prebuilt ScarletNX (the 'Run with AOT' backend, Windows x86_64 only) next to citron. Needs CITRON_USE_CPM; ~110 MB download, ~350 MB unpacked" OFF)
 option(CITRON_CLANGCL "Build natively on Windows with clang-cl and the MSVC ABI" OFF)
 option(CITRON_CLANGCL_FULL_LTO_LINE_TABLES "Use CodeView line tables for clang-cl full-LTO RelWithDebInfo" OFF)
@@ -392,6 +398,22 @@ if (CITRON_USE_CPM)
     option(CPM_USE_LOCAL_PACKAGES "Prefer system find_package over CPM fetch" OFF)
     include(${CMAKE_SOURCE_DIR}/CMakeModules/CPM.cmake)
     include(${CMAKE_SOURCE_DIR}/CMakeModules/dependencies.cmake)
+endif()
+
+# Select the recompiler target after dependencies.cmake has had a chance to fetch and
+# configure ScarletNX. Non-CPM builds may still use an externally installed package.
+if (CITRON_ENABLE_SCARLET_CPU)
+    if (NOT WIN32 OR NOT CITRON_CLANGTRON OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+        message(FATAL_ERROR "CITRON_ENABLE_SCARLET_CPU currently requires 64-bit Windows llvm-mingw (Clangtron)")
+    endif()
+    if (NOT TARGET ScarletNX::recompiler AND NOT TARGET ScarletNX::recompiler-shared)
+        find_package(ScarletNXRecompiler REQUIRED)
+    endif()
+    # Keep LLVM inside the ScarletNX DLL; Citron deploys this DLL beside its executables.
+    if (NOT TARGET ScarletNX::recompiler-shared)
+        message(FATAL_ERROR "CITRON_ENABLE_SCARLET_CPU on Windows needs ScarletNX's shared recompiler target")
+    endif()
+    set(CITRON_SCARLET_TARGET ScarletNX::recompiler-shared)
 endif()
 
 # Enforce the search mode of non-required packages for better and shorter failure messages

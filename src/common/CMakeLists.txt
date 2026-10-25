@@ -240,6 +240,10 @@ endif()
 
 target_link_libraries(common PUBLIC Boost::context Boost::headers fmt::fmt stb::headers Threads::Threads unordered_dense::unordered_dense)
 target_include_directories(common INTERFACE ${CMAKE_SOURCE_DIR}/src)
+if (CITRON_ENABLE_SCARLET_CPU)
+    # The settings enum is declared in common and shared by the frontend and core.
+    target_compile_definitions(common PUBLIC CITRON_HAS_SCARLET_CPU=1)
+endif()
 # Propagates to every target that links common, including dynarmic (which
 # already does, for this same target) -- see xbyak_abi.h for what it does.
 target_compile_definitions(common INTERFACE DYNARMIC_XBYAK_CUSTOM_CONTAINERS)

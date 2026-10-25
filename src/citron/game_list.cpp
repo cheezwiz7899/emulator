@@ -3532,7 +3532,7 @@ void GameList::AddGamePopup(QMenu& context_menu, const QModelIndex& index, u64 p
     if (const QString suffix = QFileInfo(path).suffix().toLower();
         suffix == QStringLiteral("xci") || suffix == QStringLiteral("nsp") ||
         suffix == QStringLiteral("nro")) {
-        run_aot = context_menu.addAction(tr("Run with AOT (experimental)"));
+        run_aot = context_menu.addAction(tr("Run with ScarletNX AOT (experimental)"));
     }
 #endif
     context_menu.addSeparator();
@@ -3557,6 +3557,9 @@ void GameList::AddGamePopup(QMenu& context_menu, const QModelIndex& index, u64 p
     QAction* remove_play_time_data = remove_menu->addAction(tr("Remove Play Time Data"));
     QAction* remove_cache_storage = remove_menu->addAction(tr("Remove Cache Storage"));
     QAction* remove_vk_shader_cache = remove_menu->addAction(tr("Remove Vulkan Pipeline Cache"));
+#ifdef CITRON_HAS_SCARLET_CPU
+    QAction* remove_scarlet_cache = remove_menu->addAction(tr("Remove ScarletNX AOT Cache"));
+#endif
     remove_menu->addSeparator();
     QAction* remove_shader_cache = remove_menu->addAction(tr("Remove All Pipeline Caches"));
     QAction* remove_all_content = remove_menu->addAction(tr("Remove All Installed Contents"));
@@ -3663,6 +3666,16 @@ void GameList::AddGamePopup(QMenu& context_menu, const QModelIndex& index, u64 p
     remove_dlc->setVisible(
         program_id != 0 && ContentManager::HasDLC(system.GetFileSystemController(), program_id));
     remove_vk_shader_cache->setVisible(program_id != 0);
+#ifdef CITRON_HAS_SCARLET_CPU
+    const auto scarlet_cache_path = Common::FS::GetCitronPath(Common::FS::CitronPath::CitronDir) /
+                                    "scarlet" / "modules" / fmt::format("{:016X}", program_id);
+    const bool has_scarlet_cache = std::filesystem::exists(scarlet_cache_path);
+    remove_scarlet_cache->setVisible(program_id != 0);
+    remove_scarlet_cache->setEnabled(has_scarlet_cache);
+    if (!has_scarlet_cache) {
+        remove_scarlet_cache->setToolTip(tr("No ScarletNX AOT cache exists for this game."));
+    }
+#endif
     remove_shader_cache->setVisible(program_id != 0);
     remove_all_content->setVisible(program_id != 0);
 
@@ -3862,6 +3875,21 @@ void GameList::AddGamePopup(QMenu& context_menu, const QModelIndex& index, u64 p
     connect(remove_vk_shader_cache, &QAction::triggered, [this, program_id, path_str]() {
         emit RemoveFileRequested(program_id, GameListRemoveTarget::VkShaderCache, path_str);
     });
+#ifdef CITRON_HAS_SCARLET_CPU
+    connect(remove_scarlet_cache, &QAction::triggered, [this, game_name, scarlet_cache_path]() {
+        if (QMessageBox::question(
+                this, tr("Remove ScarletNX AOT Cache"),
+                tr("Remove the compiled ScarletNX AOT cache for %1? The next launch will "
+                   "recompile it.")
+                    .arg(game_name)) != QMessageBox::Yes) {
+            return;
+        }
+        if (!Common::FS::RemoveDirRecursively(scarlet_cache_path)) {
+            QMessageBox::warning(this, tr("Remove ScarletNX AOT Cache"),
+                                 tr("Could not remove the ScarletNX AOT cache."));
+        }
+    });
+#endif
     connect(remove_shader_cache, &QAction::triggered, [this, program_id, path_str]() {
         emit RemoveFileRequested(program_id, GameListRemoveTarget::AllShaderCache, path_str);
     });

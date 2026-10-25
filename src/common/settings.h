@@ -234,7 +234,9 @@ struct Values {
                                                     CpuBackend::Dynarmic,
 #endif
                                                     CpuBackend::Dynarmic,
-#ifdef HAS_NCE
+#if defined(CITRON_HAS_SCARLET_CPU)
+                                                    CpuBackend::Scarlet,
+#elif defined(HAS_NCE)
                                                     CpuBackend::Nce,
 #else
                                                     CpuBackend::Dynarmic,

@@ -151,6 +151,8 @@
 #     --source DIR             Citron source tree (default: cwd)
 #     --build DIR              Build directory (default: ./build)
 #     --compiler llvm-mingw|clang-cl  Toolchain (default: llvm-mingw)
+#     --scarlet-source DIR     Use this ScarletNX checkout instead of the pinned CPM source
+#     --scarlet-llvm-dir DIR   Override the Windows-target LLVM CMake package (default: CPM builds a matching SDK on Linux)
 #     --jobs N                 Parallel jobs (default: nproc)
 #     --lto thin|full|none     LTO mode (default: full); MUST match across stages 1-2
 #     --lite-lto               Alias for --lto thin
@@ -226,6 +228,9 @@ TRACY_ALLOC_BUILD="${TRACY_ALLOC_BUILD:-OFF}"   # CITRON_ENABLE_TRACY_ALLOC
 BUILD_TYPE="${BUILD_TYPE:-Release}" # Release|RelWithDebInfo
 CPM_SOURCE_CACHE="${CPM_SOURCE_CACHE:-${HOME}/.cache/cpm}"
 CPM_SOURCE_CACHE="${CPM_SOURCE_CACHE/#\~/$HOME}"
+SCARLETNX_LLVM_DIR="${SCARLETNX_LLVM_DIR:-${LLVM_DIR:-}}"
+SCARLETNX_SOURCE="${SCARLETNX_SOURCE:-}"
+SCRIPT_START_DIR="$(pwd -P)"
 # MARCH_NATIVE="-march=native"  # non-portable, host-tuned build
 MARCH_NATIVE="${MARCH_NATIVE:-}"
 
@@ -301,6 +306,12 @@ info()    { echo -e "${CYAN}[INFO]${RESET} $*"; }
 success() { echo -e "${GREEN}[OK]${RESET} $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${RESET} $*"; }
 error()   { echo -e "${RED}[ERROR]${RESET} $*" >&2; exit 1; }
+absolute_from_start() {
+    case "$1" in
+        /*|[A-Za-z]:*) printf '%s\n' "$1" ;;
+        *) printf '%s/%s\n' "${SCRIPT_START_DIR}" "$1" ;;
+    esac
+}
 header()  { echo -e "\n${BOLD}${GREEN}=================================================================${RESET}"; \
             echo -e "${BOLD}${GREEN}  $*${RESET}"; \
             echo -e "${BOLD}${GREEN}=================================================================${RESET}"; }
@@ -703,6 +714,7 @@ stage_setup() {
             mingw-w64-clang-x86_64-python-pip \
             mingw-w64-clang-x86_64-python-psutil \
             mingw-w64-clang-x86_64-toolchain \
+            mingw-w64-clang-x86_64-llvm \
             mingw-w64-clang-x86_64-cmake \
             mingw-w64-clang-x86_64-ninja \
             mingw-w64-clang-x86_64-python \
@@ -1588,8 +1600,23 @@ build_common_cmake_args() {
     fi
 
     local CMAKE_CPM_CACHE="${CPM_SOURCE_CACHE}"
+    local CMAKE_SCARLETNX_SOURCE="${SCARLETNX_SOURCE}"
+    local CMAKE_SCARLETNX_LLVM_DIR="${SCARLETNX_LLVM_DIR}"
     if [[ "${_HOST_OS}" == "windows" ]]; then
         CMAKE_CPM_CACHE="$(cygpath -m "${CMAKE_CPM_CACHE}")"
+        [[ -z "${CMAKE_SCARLETNX_SOURCE}" ]] || CMAKE_SCARLETNX_SOURCE="$(cygpath -m "${CMAKE_SCARLETNX_SOURCE}")"
+        [[ -z "${CMAKE_SCARLETNX_LLVM_DIR}" ]] || CMAKE_SCARLETNX_LLVM_DIR="$(cygpath -m "${CMAKE_SCARLETNX_LLVM_DIR}")"
+    fi
+
+    if [[ "${SCARLET_CPU_BUILD}" == "ON" ]]; then
+        [[ "${COMPILER_MODE}" == "llvm-mingw" ]] || \
+            error "The ScarletNX CPU backend requires the llvm-mingw build path."
+        if [[ "${_HOST_OS}" == "linux" ]]; then
+            if [[ -n "${CMAKE_SCARLETNX_LLVM_DIR}" && ! -f "${CMAKE_SCARLETNX_LLVM_DIR}/LLVMConfig.cmake" ]]; then
+                error "--scarlet-llvm-dir must point to the directory containing LLVMConfig.cmake: ${CMAKE_SCARLETNX_LLVM_DIR}"
+            fi
+        fi
+        [[ -f "${CMAKE_SCARLETNX_SOURCE}/CMakeLists.txt" ]] || CMAKE_SCARLETNX_SOURCE=""
     fi
 
     # Populate the global array — one element per cmake arg (spaces in paths handled correctly).
@@ -1632,6 +1659,16 @@ build_common_cmake_args() {
     )
     _CMAKE_ARGS+=("-DCITRON_ENABLE_TRACY=${TRACY_BUILD}")
     _CMAKE_ARGS+=("-DCITRON_ENABLE_TRACY_ALLOC=${TRACY_ALLOC_BUILD}")
+    _CMAKE_ARGS+=("-DCITRON_ENABLE_SCARLET_CPU=${SCARLET_CPU_BUILD}")
+    _CMAKE_ARGS+=("-DCITRON_SCARLET_BUILD_JOBS=${JOBS}")
+    if [[ -n "${CMAKE_SCARLETNX_SOURCE}" ]]; then
+        _CMAKE_ARGS+=("-DCITRON_SCARLETNX_SOURCE_DIR=${CMAKE_SCARLETNX_SOURCE}")
+    else
+        # Clear any previous local-checkout override so the CPM pin is used.
+        _CMAKE_ARGS+=("-DCITRON_SCARLETNX_SOURCE_DIR=")
+    fi
+    _CMAKE_ARGS+=("-DCITRON_SCARLETNX_GIT_TAG=${CMAKE_SCARLETNX_GIT_TAG:-e22589f60170cc5105b1e86b4594adadd55af34f}")
+    [[ -z "${CMAKE_SCARLETNX_LLVM_DIR}" ]] || _CMAKE_ARGS+=("-DLLVM_DIR=${CMAKE_SCARLETNX_LLVM_DIR}")
     # Always return 0 — a trailing [[ ]] that evaluates false would trigger set -e in caller.
     :
 }
@@ -4523,9 +4560,13 @@ while [[ $# -gt 0 ]]; do
         setup|generate|csgenerate|use|build-elf|bolt|propeller|clean)
             STAGE="$1"; shift ;;
         --source)
-            SOURCE_DIR="$2"; shift 2 ;;
+            SOURCE_DIR="$(absolute_from_start "$2")"; shift 2 ;;
+        --scarlet-source)
+            SCARLETNX_SOURCE="$(absolute_from_start "$2")"; shift 2 ;;
+        --scarlet-llvm-dir)
+            SCARLETNX_LLVM_DIR="$(absolute_from_start "$2")"; shift 2 ;;
         --build)
-            BUILD_ROOT="$2"
+            BUILD_ROOT="$(absolute_from_start "$2")"
             BUILD_GENERATE="${BUILD_ROOT}/generate"
             BUILD_CSGENERATE="${BUILD_ROOT}/cs-generate"
             BUILD_USE="${BUILD_ROOT}/use"
@@ -4596,6 +4637,20 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$STAGE" ]] || error "No stage specified. Run with --help for usage."
+
+# ScarletNX is part of llvm-mingw Windows builds, native or cross-compiled. It is
+# intentionally unavailable to the separate clang-cl/MSVC-ABI build path.
+SCARLET_CPU_BUILD="OFF"
+if [[ "${COMPILER_MODE}" == "llvm-mingw" ]]; then
+    SCARLET_CPU_BUILD="ON"
+fi
+
+SOURCE_DIR="$(absolute_from_start "${SOURCE_DIR}")"
+[[ -z "${SCARLETNX_SOURCE}" ]] || SCARLETNX_SOURCE="$(absolute_from_start "${SCARLETNX_SOURCE}")"
+if [[ -z "${SCARLETNX_SOURCE}" && -f "${SOURCE_DIR}/../ScarletNX/CMakeLists.txt" ]]; then
+    SCARLETNX_SOURCE="${SOURCE_DIR}/../ScarletNX"
+fi
+[[ -z "${SCARLETNX_LLVM_DIR}" ]] || SCARLETNX_LLVM_DIR="$(absolute_from_start "${SCARLETNX_LLVM_DIR}")"
 
 if [[ "${TRACY_ALLOC_BUILD}" == "ON" && "${TRACY_BUILD}" != "ON" ]]; then
     error "--tracy-alloc requires --tracy (it adds heap tracking on top of the base Tracy instrumentation and does nothing without it)."

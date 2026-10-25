@@ -143,6 +143,7 @@ void LoadingScreen::Prepare(Loader::AppLoader& loader) {
     }
 
     if (!title.empty()) {
+        loading_game_title = QString::fromStdString(title);
         stage_translations = {
             {VideoCore::LoadCallbackStage::Prepare,
              tr("Loading %1").arg(QString::fromStdString(title))},
@@ -151,6 +152,7 @@ void LoadingScreen::Prepare(Loader::AppLoader& loader) {
             {VideoCore::LoadCallbackStage::Complete, tr("Launching...")},
         };
     } else {
+        loading_game_title = tr("Game");
         stage_translations = {
             {VideoCore::LoadCallbackStage::Prepare, tr("Loading Game...")},
             {VideoCore::LoadCallbackStage::Build, tr("Loading Game...")},
@@ -278,6 +280,38 @@ void LoadingScreen::OnLoadProgress(VideoCore::LoadCallbackStage stage, std::size
         }
     }
     previous_time = now;
+}
+
+void LoadingScreen::OnScarletRecompileProgress(bool complete, std::size_t value,
+                                               std::size_t total) {
+    if (complete) {
+        loading_text_animation_timer->stop();
+        base_loading_text = tr("Launching...");
+        ui->stage->setText(tr("Launching..."));
+        ui->progress_bar->setRange(0, 0);
+        ui->progress_bar->setTextVisible(false);
+        return;
+    }
+
+    const QString recompiling_text = tr("Recompiling %1").arg(loading_game_title);
+    if (base_loading_text != recompiling_text) {
+        base_loading_text = recompiling_text;
+        const QFontMetrics metrics(ui->stage->font());
+        ui->stage->setFixedWidth(metrics.horizontalAdvance(base_loading_text + QLatin1String("...")));
+        ui->stage->setText(base_loading_text);
+        loading_text_animation_timer->start(500);
+        ui->shader_widget->setVisible(false);
+        ui->progress_bar->setVisible(true);
+        ui->progress_bar->setFormat(QStringLiteral("%p%"));
+        ui->progress_bar->setTextVisible(true);
+    }
+
+    if (total == 0) {
+        ui->progress_bar->setRange(0, 0);
+    } else {
+        ui->progress_bar->setRange(0, static_cast<int>(total));
+        ui->progress_bar->setValue(static_cast<int>(value));
+    }
 }
 
 void LoadingScreen::paintEvent(QPaintEvent* event) {

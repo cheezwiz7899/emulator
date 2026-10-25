@@ -6,7 +6,7 @@
 function(copy_mingw_deps target)
     set(options "")
     set(oneValueArgs "")
-    set(multiValueArgs SEARCH_PATHS)
+    set(multiValueArgs SEARCH_PATHS EXTRA_DLLS)
     cmake_parse_arguments(ARG "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
 
     # Prefer llvm-readobj from the compiler toolchain.
@@ -72,8 +72,15 @@ function(copy_mingw_deps target)
 set(DUMP_TOOL \"${DUMP_TOOL}\")
 set(DUMP_MODE \"${DUMP_MODE}\")
 # Search local bin first.
-set(SEARCH_PATHS \"\${EXE_DIR};${MINGW_SEARCH_PATHS}\")
 set(EXE_DIR \"\${TARGET_DIR}\")
+# citron and citron-cmd share the runtime output directory and can finish
+# linking concurrently. Their post-build scripts both synchronize that
+# directory, so serialize the whole deployment.
+file(LOCK \"${CMAKE_BINARY_DIR}/.mingw-deploy.lock\" GUARD PROCESS TIMEOUT 600 RESULT_VARIABLE deploy_lock_result)
+if (NOT deploy_lock_result STREQUAL \"0\")
+    message(FATAL_ERROR \"Could not lock MinGW deployment for \${EXE_DIR}: \${deploy_lock_result}\")
+endif()
+set(SEARCH_PATHS \"\${EXE_DIR};${MINGW_SEARCH_PATHS}\")
 set(TARGET_FILE \"\${TARGET_FILE}\")
 set(COMPILER_BIN_DIR \"${COMPILER_BIN_DIR}\")
 set(TOOLCHAIN_RUNTIME_PATHS \"${TOOLCHAIN_RUNTIME_PATHS}\")
@@ -92,11 +99,16 @@ set(ALLOWED_COMPILER_BIN_DLLS
     libbrotlicommon.dll
     libbrotlidec.dll
     libenet-7.dll
+    libffi-8.dll
     libiconv-2.dll
+    libllvm-22.dll
+    libxml2-16.dll
+    libusb-1.0.dll
     libopus-0.dll
     libspeexdsp-1.dll
     libva.dll
     libva_win32.dll
+    libzstd.dll
     zlib1.dll)
 
 set(QT_PLUGIN_BASE \"\${QT_TARGET_PLUGIN_DIR}\")
@@ -211,6 +223,23 @@ endfunction()
 set(visited \"\")
 set(all_deps \"\")
 
+# Explicit runtime DLLs may be loaded dynamically and therefore absent from the
+# executable's import table. Stage them before resolving dependencies so their
+# own imports are included and stale-DLL cleanup retains them.
+set(deployed_extra_dlls \"\")
+foreach(extra_dll IN LISTS EXTRA_DLLS)
+    if (EXISTS \"\${extra_dll}\")
+        get_filename_component(extra_name \"\${extra_dll}\" NAME)
+        set(staged_extra \"\${EXE_DIR}/\${extra_name}\")
+        file(COPY \"\${extra_dll}\" DESTINATION \"\${EXE_DIR}\")
+        list(APPEND all_deps \"\${staged_extra}\")
+        list(APPEND deployed_extra_dlls \"\${staged_extra}\")
+        message(STATUS \"  Staged extra runtime DLL: \${extra_name}\")
+    else()
+        message(WARNING \"  Extra runtime DLL does not exist: \${extra_dll}\")
+    endif()
+endforeach()
+
 # 2.3 Pin core Clang runtimes first.
 foreach(runtime libc++.dll libunwind.dll libgcc_s_seh-1.dll libstdc++-6.dll)
     set(runtime_search_paths \"\${TOOLCHAIN_RUNTIME_PATHS};\${SEARCH_PATHS}\")
@@ -231,6 +260,9 @@ endforeach()
 
 # Resolve for the targeted executable
 resolve_deps(\"\${EXE_DIR}/\${TARGET_FILE}\" visited all_deps)
+foreach(extra_dll IN LISTS deployed_extra_dlls)
+    resolve_deps(\"\${extra_dll}\" visited all_deps)
+endforeach()
 
 # Resolve only the plugins we deployed above.
 foreach(subdir platforms styles imageformats iconengines tls)
@@ -266,22 +298,9 @@ if (all_deps)
         message(STATUS \"  All DLLs are already up to date.\")
     endif()
 
-    set(resolved_dll_names \"\")
-    foreach(dll \${all_deps})
-        get_filename_component(dll_name \"\${dll}\" NAME)
-        list(APPEND resolved_dll_names \"\${dll_name}\")
-    endforeach()
-    list(REMOVE_DUPLICATES resolved_dll_names)
-
-    file(GLOB existing_root_dlls \"\${EXE_DIR}/*.dll\")
-    foreach(existing_dll \${existing_root_dlls})
-        get_filename_component(existing_name \"\${existing_dll}\" NAME)
-        list(FIND resolved_dll_names \"\${existing_name}\" resolved_idx)
-        if (resolved_idx EQUAL -1)
-            message(STATUS \"  Removing stale DLL: \${existing_name}\")
-            file(REMOVE \"\${existing_dll}\")
-        endif()
-    endforeach()
+    # Keep existing root DLLs. citron.exe and citron-cmd.exe share this output
+    # directory, so a per-target stale-DLL pass can delete dependencies needed
+    # by the sibling executable (or race its deployment script).
 endif()
 ")
 
@@ -289,6 +308,7 @@ endif()
         COMMAND ${CMAKE_COMMAND}
             "-DTARGET_DIR=$<TARGET_FILE_DIR:${target}>"
             "-DTARGET_FILE=$<TARGET_FILE_NAME:${target}>"
+            "-DEXTRA_DLLS=${ARG_EXTRA_DLLS}"
             -P "${DEPLOY_SCRIPT}"
         COMMENT "Deploying MinGW runtime DLLs and Qt plugins for ${target}"
         VERBATIM

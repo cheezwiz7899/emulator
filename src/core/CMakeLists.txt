@@ -1276,6 +1276,25 @@ if (ENABLE_WEB_SERVICE)
     target_link_libraries(core PRIVATE web_service)
 endif()
 
+if (CITRON_ENABLE_SCARLET_CPU)
+    target_sources(core PRIVATE
+        arm/scarlet/arm_scarlet_64.cpp
+        arm/scarlet/arm_scarlet_64.h
+        arm/scarlet/guest_coroutine.h
+        arm/scarlet/module_metadata.cpp
+        arm/scarlet/module_metadata.h
+        arm/scarlet/scarlet_code_manager.cpp
+        arm/scarlet/scarlet_code_manager.h
+        arm/scarlet/scarlet_fault_handler.cpp
+        arm/scarlet/scarlet_fault_handler.h
+    )
+    target_link_libraries(core PRIVATE ${CITRON_SCARLET_TARGET})
+    if (CITRON_SCARLETNX_BUILD_TARGET)
+        add_dependencies(core ${CITRON_SCARLETNX_BUILD_TARGET})
+    endif()
+    target_compile_definitions(core PUBLIC CITRON_HAS_SCARLET_CPU=1)
+endif()
+
 if (HAS_NCE)
     enable_language(C ASM)
     set(CMAKE_ASM_FLAGS "${CFLAGS} -x assembler-with-cpp")
