@@ -563,13 +563,27 @@ void CodeManager::Run(CPU* cpu, std::uint64_t pc, std::uint64_t stop) {
     cpu->pc = pc;
     while (cpu->pc != stop) {
         const auto current = cpu->pc;
-        if (!InPrimarySegment(current) || IsInvalidated(current)) {
+        if (!InPrimarySegment(current)) {
             if (!RunLiveFallback(cpu, current)) {
                 cpu->rt->undef(cpu, current, 0);
             }
-        } else {
-            snx_recompiled_call(m_primary, cpu, current);
+            continue;
         }
+        if (!IsInvalidated(current)) {
+            snx_recompiled_call(m_primary, cpu, current);
+            continue;
+        }
+        // Stale primary code: the queued cache-first JIT recompiles the pc from live memory and
+        // re-arms dispatch, which is what the runtime does after an invalidation. The manager's
+        // whole-window JIT re-expanded the call closure on every invalidation line (the UltraCam
+        // boot storm) and ran only when the queued path cannot provide this pc at all.
+        const auto before = cpu->pc;
+        if (m_default_miss)
+            m_default_miss(cpu, current);
+        if (cpu->pc == before && snx_recompiled_function(m_primary, current))
+            snx_recompiled_call(m_primary, cpu, current);
+        else if (cpu->pc == before && !RunLiveFallback(cpu, current))
+            cpu->rt->undef(cpu, current, 0);
     }
 }
 
@@ -793,14 +807,18 @@ void CodeManager::Miss(CPU* c, std::uint64_t pc) {
     if (InPrimarySegment(pc)) {
         NoteHint(pc);
         const auto started = std::chrono::steady_clock::now();
-        if (IsInvalidated(pc)) {
+        if (IsInvalidated(pc) && !m_default_miss) {
+            // No queued pool to ask for this stale pc: the manager's window JIT is the only
+            // option left (this used to be every stale primary pc's path: the whole-window
+            // closure compile that re-ran on every invalidation line in the UltraCam storm).
             if (!RunLiveFallback(c, pc))
                 c->rt->undef(c, pc, 0);
-            return;
-        }
-        // The library's RtAPI.miss waits for ScarletNX's batched JIT worker pool. Do not create
-        // a synchronous one-function module for every primary dispatch miss.
-        if (m_default_miss) {
+        } else if (m_default_miss) {
+            // The library's RtAPI.miss waits for ScarletNX's batched JIT worker pool: it
+            // queues the pc, compiles it cache-first from live memory, re-arms dispatch and
+            // resumes there. Stale pcs now take this path too, like cold pcs: ScarletNX's
+            // runtime re-JITs invalidated code through its queued JIT, not through a
+            // synchronous window recompiling the whole closure.
             m_default_miss(c, pc);
         } else {
             c->rt->undef(c, pc, 0);
