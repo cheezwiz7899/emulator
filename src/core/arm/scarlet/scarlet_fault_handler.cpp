@@ -26,6 +26,13 @@ struct GuestSink {
 // RunThread, so the thread-local is valid wherever the guest is executing.
 thread_local GuestSink g_sink;
 
+// The guest address last faulted on this thread. ScarletNX's own policy for a faulting protected
+// page is one strike: unprotect the page, retry the access once. If the same address faults a
+// second time the retry did not fix it (the page got re-protected under the retry), and retrying
+// again would spin this host thread forever — the launch-screen hang. A repeat goes to the sink
+// path instead. Reset when a guest thread binds its sink.
+thread_local u64 g_last_fault{~u64{}};
+
 [[nodiscard]] bool InArena(const void* address) {
     const auto* p = static_cast<const u8*>(address);
     return p >= g_arena_base && p < g_arena_base + g_arena_size;
@@ -38,10 +45,25 @@ thread_local GuestSink g_sink;
     return g_memory->InvalidateNCE(vaddr, Memory::CITRON_PAGESIZE);
 }
 
+// The retry path with the one-strike rule applied (see g_last_fault above).
+[[nodiscard]] bool RetryOnceInArena(const void* address) {
+    if (!InArena(address)) {
+        return false;
+    }
+    const u64 guest_address =
+        static_cast<u64>(static_cast<const u8*>(address) - g_arena_base);
+    if (guest_address == g_last_fault) {
+        return false; // second fault at the same address: retrying would spin this thread
+    }
+    g_last_fault = guest_address;
+    return TryInvalidate(address);
+}
+
 } // namespace
 
 void SetGuestFaultSink(void* context, GuestFaultFn fn) {
     g_sink = {context, fn};
+    g_last_fault = ~u64{}; // the retry history belongs to this guest-thread run
 }
 
 } // namespace Core
@@ -76,7 +98,7 @@ LONG CALLBACK Handler(PEXCEPTION_POINTERS info) {
     }
     const auto* address = reinterpret_cast<const void*>(record.ExceptionInformation[1]);
 
-    if (InArena(address) && TryInvalidate(address)) {
+    if (RetryOnceInArena(address)) {
         return EXCEPTION_CONTINUE_EXECUTION; // the access is retried
     }
 
@@ -166,7 +188,7 @@ bool Redirect(void* context, void* address) {
 }
 
 void Handler(int sig, siginfo_t* info, void* context) {
-    if (InArena(info->si_addr) && TryInvalidate(info->si_addr)) {
+    if (RetryOnceInArena(info->si_addr)) {
         return; // the access is retried
     }
     if (g_sink.fn != nullptr && Redirect(context, info->si_addr)) {
