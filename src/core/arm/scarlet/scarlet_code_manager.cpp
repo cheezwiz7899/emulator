@@ -356,9 +356,6 @@ CodeManager::~CodeManager() {
     for (const auto& entry : m_secondary_modules) {
         snx_recompiled_free(entry.module);
     }
-    for (const auto& rm : m_retired_modules) {
-        snx_recompiled_free(rm.module);
-    }
     if (m_primary) {
         snx_recompiled_free(m_primary);
     }
@@ -916,7 +913,7 @@ GuestFn CodeManager::CompileSecondary(std::uint64_t pc) {
                         functions++;
                     }
                 }
-                m_secondary_modules.push_back({module, module_lo, module_hi, functions});
+                m_secondary_modules.push_back({module, module_lo, module_hi});
             }
         }
         if (changed_underneath) {
@@ -1082,22 +1079,11 @@ void CodeManager::Invalidate(std::uint64_t addr, std::uint64_t size) {
         const auto count = span / 4 + ((span & 3) ? 1 : 0);
         probes = count > UINT64_MAX - probes ? UINT64_MAX : probes + count;
     }
-    std::size_t evicted_count = 0;
-    auto on_erased = [&](std::uint64_t erased_pc) {
-        for (auto& mod : m_secondary_modules) {
-            if (erased_pc >= mod.lo && erased_pc < mod.hi && mod.live_functions > 0) {
-                mod.live_functions--;
-            }
-        }
-    };
     if (probes <= m_secondary.size()) {
         // Small change (an IC IVAU line): look the entries up instead of scanning the table.
         for (const auto& [start, stop] : evict) {
             for (std::uint64_t pc = (start + 3) & ~std::uint64_t{3}; pc < stop; pc += 4) {
-                if (m_secondary.erase(pc)) {
-                    evicted_count++;
-                    on_erased(pc);
-                }
+                m_secondary.erase(pc);
                 if (pc > UINT64_MAX - 4)
                     break;
             }
@@ -1109,64 +1095,12 @@ void CodeManager::Invalidate(std::uint64_t addr, std::uint64_t size) {
                 [](std::uint64_t address, const auto& candidate) { return address < candidate.first; });
             const bool stale = range != evict.begin() && it->first < std::prev(range)->second;
             if (stale) {
-                const auto erased_pc = it->first;
                 it = m_secondary.erase(it);
-                evicted_count++;
-                on_erased(erased_pc);
             } else {
                 it = std::next(it);
             }
         }
     }
-
-    if (evicted_count > 0) {
-        const auto now = std::chrono::steady_clock::now();
-        for (auto it = m_secondary_modules.begin(); it != m_secondary_modules.end();) {
-            if (it->live_functions == 0) {
-                m_retired_modules.push_back(
-                    {it->module, now, m_epoch.fetch_add(1, std::memory_order_seq_cst)});
-                it = m_secondary_modules.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    }
-
-    // Free retired modules nothing can return into any more. Age alone is not enough: a guest
-    // thread blocked in an SVC keeps its host frames inside the module for as long as it waits,
-    // however many seconds that is, and resumes by returning into them.
-    const auto cutoff = std::chrono::steady_clock::now() - m_retired_min_age;
-    std::erase_if(m_retired_modules, [&](const RetiredModule& rm) {
-        if (rm.retired_at <= cutoff && NoCallChainBelow(rm.epoch)) {
-            snx_recompiled_free(rm.module);
-            return true;
-        }
-        return false;
-    });
-}
-
-void CodeManager::AddCoroutineEpoch(const std::atomic<std::uint64_t>* epoch) {
-    std::scoped_lock lock{m_coroutine_lock};
-    m_coroutine_epochs.push_back(epoch);
-}
-
-void CodeManager::RemoveCoroutineEpoch(const std::atomic<std::uint64_t>* epoch) {
-    std::scoped_lock lock{m_coroutine_lock};
-    std::erase(m_coroutine_epochs, epoch);
-}
-
-bool CodeManager::NoCallChainBelow(std::uint64_t epoch) const {
-    std::scoped_lock lock{m_coroutine_lock};
-    for (const auto* started : m_coroutine_epochs) {
-        if (started->load(std::memory_order_seq_cst) <= epoch)
-            return false;
-    }
-    return true;
-}
-
-std::size_t CodeManager::RetiredModuleCount() const {
-    std::shared_lock lock{m_secondary_lock};
-    return m_retired_modules.size();
 }
 
 std::size_t CodeManager::SecondaryModuleCount() const {
