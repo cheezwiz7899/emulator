@@ -48,6 +48,18 @@ static void OnUndef(CPU *c, uint64_t pc, uint32_t) {
 }
 static void OnBrk(CPU *c, uint64_t, uint32_t) { c->pc = 0; }
 
+// Registers a chain's start epoch for the whole scope, deregistered by the
+// destructor even if Run throws: the manager never keeps a pointer to a dead
+// stack slot.
+struct Chain {
+  CodeManager &m;
+  std::atomic<uint64_t> epoch;
+  explicit Chain(CodeManager &mm) : m(mm), epoch(mm.Epoch()) {
+    m.AddCoroutineEpoch(&epoch);
+  }
+  ~Chain() { m.RemoveCoroutineEpoch(&epoch); }
+};
+
 static uint64_t run(CodeManager &m, RtAPI &, int idx, uint64_t pc) {
   CPU cpu{};
   cpu.mem = mem;
@@ -58,8 +70,14 @@ static uint64_t run(CodeManager &m, RtAPI &, int idx, uint64_t pc) {
     std::printf("bind failed\n");
     return ~0ull;
   }
+  Chain chain{m}; // the epoch stays live only for this scope
   m.Run(&cpu, pc, 0);
   return cpu.x[0];
+}
+
+// Modules ever compiled and not yet freed: active plus retired.
+static size_t total(CodeManager &m) {
+  return m.SecondaryModuleCount() + m.RetiredModuleCount();
 }
 
 int main() {
@@ -97,18 +115,18 @@ int main() {
               (unsigned long long)r, mgr.SecondaryModuleCount(),
               mgr.SecondaryFunctionCount());
   CHECK(r == 1111);
-  CHECK(mgr.SecondaryModuleCount() == 1);
+  CHECK(total(mgr) == 1);
 
   r = run(mgr, mgr.Rt(), 0, 0x10000);
   CHECK(r == 1111);
-  CHECK(mgr.SecondaryModuleCount() == 1); // cache hit, no recompile
+  CHECK(total(mgr) == 1); // cache hit, no recompile
 
   // Invalidating code whose bytes did not change (a permission flip, a remap, a spurious IC IVAU)
   // must leave the primary module and the cached secondary code in use.
   mgr.Invalidate(0x10000, 0x1000);
   r = run(mgr, mgr.Rt(), 0, 0x10000);
   CHECK(r == 1111);
-  CHECK(mgr.SecondaryModuleCount() == 1); // A stayed AOT; no live copy was compiled
+  CHECK(total(mgr) == 1); // A stayed AOT; no live copy was compiled
 
   // non-executable target -> undef hook
   run(mgr, mgr.Rt(), 0, 0x10200);
@@ -140,7 +158,7 @@ int main() {
               mgr.SecondaryModuleCount());
   CHECK(r == 1112);
   // modules so far: B, the live copy of A2 (changed), B again, the live copy of A2 (restored)
-  CHECK(mgr.SecondaryModuleCount() == 4);
+  CHECK(total(mgr) == 4);
 
   // 4 threads missing the same new range at once: compiled exactly once
   mgr.Invalidate(0x2000000, 0x1000);
@@ -160,7 +178,22 @@ int main() {
   for (int i = 0; i < 4; i++)
     CHECK(res[i] == 1113);
   std::printf("4 threads: modules=%zu\n", mgr.SecondaryModuleCount());
-  CHECK(mgr.SecondaryModuleCount() == 5); // exactly one more: the new B
+  CHECK(total(mgr) == 5); // exactly one more: the new B
+  // Retired code stays until every call chain that began before it is gone. A coroutine parked in
+  // an SVC keeps its frames in a module for as long as it waits.
+  {
+    mgr.SetRetiredMinAge(std::chrono::milliseconds(0));
+    Chain parked{mgr}; // a call chain that began before what follows
+    run(mgr, mgr.Rt(), 0, 0x10000);
+    mgr.Invalidate(0, ~0ull); // every cached entry goes, so the modules behind them retire
+    mgr.Invalidate(0, ~0ull);
+    CHECK(mgr.RetiredModuleCount() >= 1);       // held: `parked` could return into it
+    parked.epoch = ~0ull; // the chain ended or was abandoned
+    mgr.Invalidate(0, ~0ull);
+    CHECK(mgr.RetiredModuleCount() == 0); // now it can go
+    std::printf("retired gating: ok\n");
+  }
+
   // Invalidate never waits for a compile, and a compile racing it never publishes stale code:
   // four threads run the secondary code while another invalidates it over and over.
   {

@@ -1078,7 +1078,8 @@ void CodeManager::Invalidate(std::uint64_t addr, std::uint64_t size) {
     MergeRanges(evict);
     std::uint64_t probes = 0;
     for (const auto& [start, stop] : evict) {
-        const auto count = (stop - start + 3) / 4;
+        const auto span = stop - start; // no "+ 3": it wraps for the whole address space
+        const auto count = span / 4 + ((span & 3) ? 1 : 0);
         probes = count > UINT64_MAX - probes ? UINT64_MAX : probes + count;
     }
     std::size_t evicted_count = 0;
@@ -1122,7 +1123,8 @@ void CodeManager::Invalidate(std::uint64_t addr, std::uint64_t size) {
         const auto now = std::chrono::steady_clock::now();
         for (auto it = m_secondary_modules.begin(); it != m_secondary_modules.end();) {
             if (it->live_functions == 0) {
-                m_retired_modules.push_back({it->module, now});
+                m_retired_modules.push_back(
+                    {it->module, now, m_epoch.fetch_add(1, std::memory_order_seq_cst)});
                 it = m_secondary_modules.erase(it);
             } else {
                 ++it;
@@ -1130,15 +1132,41 @@ void CodeManager::Invalidate(std::uint64_t addr, std::uint64_t size) {
         }
     }
 
-    // Clean up retired modules that have been idle for > 5 seconds.
-    const auto cutoff = std::chrono::steady_clock::now() - std::chrono::seconds(5);
-    std::erase_if(m_retired_modules, [cutoff](const RetiredModule& rm) {
-        if (rm.retired_at < cutoff) {
+    // Free retired modules nothing can return into any more. Age alone is not enough: a guest
+    // thread blocked in an SVC keeps its host frames inside the module for as long as it waits,
+    // however many seconds that is, and resumes by returning into them.
+    const auto cutoff = std::chrono::steady_clock::now() - m_retired_min_age;
+    std::erase_if(m_retired_modules, [&](const RetiredModule& rm) {
+        if (rm.retired_at <= cutoff && NoCallChainBelow(rm.epoch)) {
             snx_recompiled_free(rm.module);
             return true;
         }
         return false;
     });
+}
+
+void CodeManager::AddCoroutineEpoch(const std::atomic<std::uint64_t>* epoch) {
+    std::scoped_lock lock{m_coroutine_lock};
+    m_coroutine_epochs.push_back(epoch);
+}
+
+void CodeManager::RemoveCoroutineEpoch(const std::atomic<std::uint64_t>* epoch) {
+    std::scoped_lock lock{m_coroutine_lock};
+    std::erase(m_coroutine_epochs, epoch);
+}
+
+bool CodeManager::NoCallChainBelow(std::uint64_t epoch) const {
+    std::scoped_lock lock{m_coroutine_lock};
+    for (const auto* started : m_coroutine_epochs) {
+        if (started->load(std::memory_order_seq_cst) <= epoch)
+            return false;
+    }
+    return true;
+}
+
+std::size_t CodeManager::RetiredModuleCount() const {
+    std::shared_lock lock{m_secondary_lock};
+    return m_retired_modules.size();
 }
 
 std::size_t CodeManager::SecondaryModuleCount() const {

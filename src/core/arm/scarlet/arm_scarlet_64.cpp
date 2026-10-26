@@ -9,6 +9,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <limits>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -164,6 +165,12 @@ struct ArmScarlet64::Impl {
         : system{system_}, process{process_}, core_index{core_index_},
           shared{SharedCodeFor(process_)} {}
 
+    ~Impl() {
+        if (epoch_registered) {
+            shared->manager.RemoveCoroutineEpoch(&co_epoch);
+        }
+    }
+
     System& system;
     Kernel::KProcess* process;
     std::size_t core_index;
@@ -179,6 +186,12 @@ struct ArmScarlet64::Impl {
     HaltReason halt{};
 
     Scarlet::GuestCoroutine co;
+
+    // The code manager's epoch when the current coroutine started, UINT64_MAX while it holds no
+    // frames. The manager frees retired native code only when no coroutine older than the
+    // retirement can still return into it.
+    std::atomic<u64> co_epoch{std::numeric_limits<u64>::max()};
+    bool epoch_registered{};
 
     // What the suspended coroutine is waiting to continue: the same thread, at the same pc.
     Kernel::KThread* resume_thread{};
@@ -402,6 +415,8 @@ struct ArmScarlet64::Impl {
             LOG_CRITICAL(Core_ARM, "ScarletNX: binding the CPU to the module failed");
             return false;
         }
+        shared->manager.AddCoroutineEpoch(&co_epoch);
+        epoch_registered = true;
         bound = true;
         return true;
     }
@@ -434,6 +449,9 @@ HaltReason ArmScarlet64::RunThread(Kernel::KThread* thread) {
         s.co.IsSuspended() && s.resume_thread == thread && s.resume_pc == s.cpu.pc;
     if (!resumable) {
         s.co.Reset();
+        // Read before the first frame exists: a module retired after this cannot have been
+        // entered through a route this coroutine took.
+        s.co_epoch.store(s.shared->manager.Epoch(), std::memory_order_seq_cst);
         s.co.Start(&Impl::Body, &s);
     }
 
@@ -524,6 +542,7 @@ HaltReason ArmScarlet64::RunThread(Kernel::KThread* thread) {
     }
 
     if (s.co.IsFinished()) {
+        s.co_epoch.store(std::numeric_limits<u64>::max(), std::memory_order_seq_cst);
         s.resume_thread = nullptr; // Body() set the halt reason
     } else {
         s.resume_thread = thread;
@@ -558,6 +577,8 @@ void ArmScarlet64::GetContext(Kernel::Svc::ThreadContext& ctx) const {
 
 void ArmScarlet64::SetContext(const Kernel::Svc::ThreadContext& ctx) {
     m_impl->resume_thread = nullptr;
+    // The suspended frames, if any, are never resumed now: the next RunThread starts afresh.
+    m_impl->co_epoch.store(std::numeric_limits<u64>::max(), std::memory_order_seq_cst);
     CPU& c = m_impl->cpu;
     for (std::size_t i = 0; i < 29; i++) {
         c.x[i] = ctx.r[i];

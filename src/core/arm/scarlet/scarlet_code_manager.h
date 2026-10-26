@@ -104,6 +104,22 @@ public:
     void Invalidate(std::uint64_t addr, std::uint64_t size);
 
     [[nodiscard]] std::size_t SecondaryModuleCount() const;
+    [[nodiscard]] std::size_t RetiredModuleCount() const;
+
+    /// Retired native code can only be freed once no guest call chain can return into it. Every
+    /// call chain lives on a coroutine, so each coroutine publishes the epoch it started in (and
+    /// UINT64_MAX while it holds no frames); a module retired at epoch E is freed when all of them
+    /// are above E. A guest thread parked in an SVC for minutes keeps its frames, and its module.
+    [[nodiscard]] std::uint64_t Epoch() const {
+        return m_epoch.load(std::memory_order_seq_cst);
+    }
+    void AddCoroutineEpoch(const std::atomic<std::uint64_t>* epoch);
+    void RemoveCoroutineEpoch(const std::atomic<std::uint64_t>* epoch);
+    /// How long a module stays retired before it can be freed (default 5 s); tests lower it,
+    /// never below zero, so the age floor can't be switched off.
+    void SetRetiredMinAge(std::chrono::milliseconds age) {
+        m_retired_min_age = age < std::chrono::milliseconds::zero() ? std::chrono::milliseconds::zero() : age;
+    }
     [[nodiscard]] std::size_t SecondaryFunctionCount() const;
 
     /// Collects a runtime-discovered function entry point for future warm-start.
@@ -146,6 +162,7 @@ private:
     struct RetiredModule {
         snx_recompiled* module{};
         std::chrono::steady_clock::time_point retired_at{};
+        std::uint64_t epoch{}; // the value of m_epoch when it was retired
     };
 
     static void MissThunk(CPU* c, std::uint64_t pc);
@@ -210,6 +227,12 @@ private:
     std::atomic<bool> m_hints_dirty{};
     std::string m_cache_dir;
     std::vector<RetiredModule> m_retired_modules;
+    std::chrono::milliseconds m_retired_min_age{5000};
+
+    std::atomic<std::uint64_t> m_epoch{1};
+    mutable std::mutex m_coroutine_lock;
+    std::vector<const std::atomic<std::uint64_t>*> m_coroutine_epochs;
+    [[nodiscard]] bool NoCallChainBelow(std::uint64_t epoch) const;
 };
 
 } // namespace Core::Scarlet
