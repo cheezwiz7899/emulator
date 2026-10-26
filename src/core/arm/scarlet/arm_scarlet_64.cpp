@@ -5,6 +5,7 @@
 // come before the Citron headers.
 #include "core/arm/scarlet/scarlet_code_manager.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -17,12 +18,15 @@
 
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
+#include "common/hex_util.h"
 #include "common/logging.h"
 #include "core/arm/scarlet/arm_scarlet_64.h"
 #include "core/arm/scarlet/guest_coroutine.h"
 #include "core/arm/scarlet/scarlet_fault_handler.h"
 #include "core/core.h"
+#include "core/core_timing.h"
 #include "core/device_memory.h"
+#include "core/hardware_properties.h"
 #include "core/hle/kernel/k_memory_block.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_thread.h"
@@ -124,6 +128,10 @@ std::map<const Kernel::KProcess*, std::weak_ptr<SharedCode>> g_registry;
 
 std::shared_ptr<SharedCode> SharedCodeFor(Kernel::KProcess* process) {
     std::scoped_lock lk{g_registry_lock};
+    // Entries of finished processes would otherwise stay for the life of Citron.
+    for (auto it = g_registry.begin(); it != g_registry.end();) {
+        it = it->second.expired() ? g_registry.erase(it) : std::next(it);
+    }
     auto& slot = g_registry[process];
     if (auto existing = slot.lock()) {
         return existing;
@@ -131,6 +139,20 @@ std::shared_ptr<SharedCode> SharedCodeFor(Kernel::KProcess* process) {
     auto created = std::make_shared<SharedCode>(process);
     slot = created;
     return created;
+}
+
+std::atomic<Timing::CoreTiming*> s_core_timing{nullptr};
+
+inline void PauseProcessor() {
+#if defined(_MSC_VER)
+    YieldProcessor();
+#elif defined(__x86_64__) || defined(_M_X64)
+    asm volatile("pause");
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    asm volatile("yield");
+#else
+    std::this_thread::yield();
+#endif
 }
 
 constexpr u32 PstateFlagsMask = 0xF0000000;
@@ -151,6 +173,7 @@ struct ArmScarlet64::Impl {
     bool bound{};
     bool first_dispatch_logged{};
     u32 pstate_rest{}; // PSTATE bits outside NZCV, kept so a context round-trips unchanged
+    u32 wfe_count{};
     u32 svc{};
     u64 brk_pc{};
     HaltReason halt{};
@@ -180,6 +203,7 @@ struct ArmScarlet64::Impl {
     }
     static void OnSvc(CPU* c, uint32_t imm) {
         auto* self = From(c);
+        self->wfe_count = 0;
         self->svc = imm;
         self->Halt(HaltReason::SupervisorCall);
     }
@@ -187,13 +211,43 @@ struct ArmScarlet64::Impl {
         // Set by SignalInterrupt() from another host thread. Generated code has already stored pc
         // and written its registers back (a runtime call invalidates its register cache).
         __atomic_store_n(&c->poll, 0u, __ATOMIC_RELAXED);
-        From(c)->Halt(HaltReason::BreakLoop);
+        auto* self = From(c);
+        self->wfe_count = 0;
+        self->Halt(HaltReason::BreakLoop);
     }
-    static void OnWfe(CPU*) {
-        // ScarletNX's NX runtime leaves the guest core around WFE and yields the host
-        // scheduler. This adapter has no guest-core lock to release, so yield the host
-        // thread directly instead of taking the library default's immediate no-op path.
-        std::this_thread::yield();
+    static uint64_t OnTicks() {
+        if (auto* timing = s_core_timing.load(std::memory_order_relaxed)) {
+            return timing->GetClockTicks();
+        }
+        return 0;
+    }
+    static void OnWfe(CPU* c) {
+        auto* self = From(c);
+        // If an interrupt was signaled by the kernel, yield immediately.
+        if (__atomic_load_n(&c->poll, __ATOMIC_RELAXED)) {
+            __atomic_store_n(&c->poll, 0u, __ATOMIC_RELAXED);
+            self->wfe_count = 0;
+            self->Halt(HaltReason::BreakLoop);
+            return;
+        }
+        // Adaptive spin-yielding:
+        // Brief hardware pause allows spinlocks held by concurrent threads on other host
+        // cores to resolve without incurring an expensive coroutine unwind and scheduler trip.
+        // After 32 iterations, we yield back to Citron's kernel scheduler (BreakLoop)
+        // so other ready guest threads scheduled on this physical core can run,
+        // completely preventing single-core starvation deadlocks.
+        if (++self->wfe_count >= 32) {
+            self->wfe_count = 0;
+            self->Halt(HaltReason::BreakLoop);
+        } else {
+            PauseProcessor();
+        }
+    }
+    static void OnCodeChanged(CPU* c, uint64_t addr) {
+        auto* self = From(c);
+        // IC IVAU: guest code modified at runtime (e.g. UltraCam / ExLaunch hooks).
+        // Invalidate the 64-byte CTR_EL0 IminLine cache line across primary and secondary JIT.
+        self->shared->manager.Invalidate(addr & ~uint64_t{63}, 64);
     }
     static void OnBrk(CPU* c, uint64_t pc, uint32_t imm) {
         auto* self = From(c);
@@ -209,8 +263,12 @@ struct ArmScarlet64::Impl {
         // from actually executing an A64 UDF #0 in the module.
         uint32_t guest_word = 0;
         self->process->GetMemory().ReadBlock(pc, &guest_word, sizeof(guest_word));
-        if (guest_word != word && self->shared->manager.RunLiveFallback(c, pc)) {
-            return;
+        if (guest_word != word) {
+            const u64 page_base = pc & ~0xFFFull;
+            self->shared->manager.Invalidate(page_base, 0x1000);
+            if (self->shared->manager.RunLiveFallback(c, pc)) {
+                return;
+            }
         }
         const auto& ranges = self->process->GetExecutableRanges();
         bool in_executable_range = false;
@@ -284,9 +342,19 @@ struct ArmScarlet64::Impl {
             modules.push_back(
                 {module.image_address, module.image_size, module.text_offset, module.text_size});
         }
-        const auto cache = Common::FS::GetCitronPath(Common::FS::CitronPath::CitronDir) /
-                           "scarlet" / "modules" / fmt::format("{:016X}", process->GetProgramId());
+        const auto& build_id_raw = system.GetApplicationProcessBuildID();
+        const bool has_build_id = std::any_of(build_id_raw.begin(), build_id_raw.end(),
+                                              [](u8 b) { return b != 0; });
+        const auto build_id_str =
+            has_build_id ? Common::HexToString(build_id_raw, false) : std::string{};
+
+        auto cache = Common::FS::GetCitronPath(Common::FS::CitronPath::CitronDir) /
+                     "scarlet" / "modules" / fmt::format("{:016X}", process->GetProgramId());
+        if (has_build_id) {
+            cache /= build_id_str;
+        }
         const auto cache_utf8 = Common::FS::PathToUTF8String(cache);
+        LOG_INFO(Core_ARM, "ScarletNX: module cache path: {}", cache_utf8);
         LOG_INFO(Core_ARM, "ScarletNX: recompiling {} executable segment(s)...", segments.size());
 
         std::string error;
@@ -302,12 +370,15 @@ struct ArmScarlet64::Impl {
             LOG_CRITICAL(Core_ARM, "ScarletNX recompile failed: {}", error);
             return false;
         }
+        s_core_timing.store(&system.CoreTiming(), std::memory_order_relaxed);
         auto& rt = sh.manager.Rt();
         rt.svc = &Impl::OnSvc;
         rt.undef = &Impl::OnUndef;
         rt.brk = &Impl::OnBrk;
         rt.poll = &Impl::OnPoll;
         rt.wfe = &Impl::OnWfe;
+        rt.ticks = &Impl::OnTicks;
+        rt.code_changed = &Impl::OnCodeChanged;
         sh.initialized = true;
         sh.failed = false;
         return true;
@@ -354,6 +425,7 @@ HaltReason ArmScarlet64::RunThread(Kernel::KThread* thread) {
         return HaltReason::PrefetchAbort;
     }
     s.cpu.excl_on = 0;
+    s.wfe_count = 0;
 
     // Fast path: the same thread continues where its last event stopped (the common SVC case).
     // Anything else (another thread, another core, a rewritten pc) starts a fresh run at cpu.pc,
@@ -423,6 +495,7 @@ HaltReason ArmScarlet64::RunThread(Kernel::KThread* thread) {
     if (now_ns - last_summary >= 10'000'000'000ull &&
         stats.last_summary_ns.compare_exchange_strong(last_summary, now_ns,
                                                       std::memory_order_relaxed)) {
+        s.shared->manager.PeriodicSaveHints();
         const auto calls = stats.run_calls.load(std::memory_order_relaxed);
         const auto host_ns = stats.run_host_ns.load(std::memory_order_relaxed);
         const auto previous_calls =
@@ -484,6 +557,7 @@ void ArmScarlet64::GetContext(Kernel::Svc::ThreadContext& ctx) const {
 }
 
 void ArmScarlet64::SetContext(const Kernel::Svc::ThreadContext& ctx) {
+    m_impl->resume_thread = nullptr;
     CPU& c = m_impl->cpu;
     for (std::size_t i = 0; i < 29; i++) {
         c.x[i] = ctx.r[i];
@@ -528,16 +602,32 @@ void ArmScarlet64::SignalInterrupt(Kernel::KThread*) {
     __atomic_store_n(&m_impl->cpu.poll, 1u, __ATOMIC_RELAXED);
 }
 
+/// The page table and the debugger notify every core of a process, but the compiled code is shared
+/// by all of them: only the first core's interface acts, or each event would be handled four times.
+bool ArmScarlet64::IsInvalidationLeader() const {
+    for (std::size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; ++i) {
+        if (const auto* interface = m_impl->process->GetArmInterface(i)) {
+            return interface == static_cast<const ArmInterface*>(this);
+        }
+    }
+    return true;
+}
+
 void ArmScarlet64::ClearInstructionCache() {
-    // A guest `ic iallu` / debugger edit: forget every secondary (NRO / later-mapped) entry point.
-    // The primary module (the NSO segments) is keyed by content hash and is not re-derived.
-    m_impl->shared->manager.Invalidate(0, ~u64{0});
+    // A guest `ic iallu` / debugger edit. Primary code is compared with what it was compiled from
+    // (a line at a time), so this retires only code whose bytes differ; secondary entries go.
+    if (IsInvalidationLeader()) {
+        m_impl->shared->manager.Invalidate(0, ~u64{0});
+    }
 }
 
 void ArmScarlet64::InvalidateCacheRange(u64 addr, std::size_t size) {
     // Called by the page table for every core when code memory is mapped, unmapped or
-    // reprotected (an NRO unloaded and another loaded at the same place). Idempotent.
-    m_impl->shared->manager.Invalidate(addr, size);
+    // reprotected (an NRO unloaded and another loaded at the same place), and by the debugger and
+    // cheats. Cheap when the bytes did not change.
+    if (IsInvalidationLeader()) {
+        m_impl->shared->manager.Invalidate(addr, size);
+    }
 }
 
 const Kernel::DebugWatchpoint* ArmScarlet64::HaltedWatchpoint() const {

@@ -14,6 +14,7 @@
 #undef CBAR
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
@@ -23,6 +24,7 @@
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -91,14 +93,36 @@ public:
 
     /// snx_recompiled_run on the primary module: runs from pc until cpu->pc == stop.
     void Run(CPU* cpu, std::uint64_t pc, std::uint64_t stop);
-    /// Recompile and run a stale primary instruction from current guest memory.
+    /// Runs the code at pc from a copy compiled from current guest memory (stale primary code, or
+    /// a primary miss in a changed line). False when pc cannot be compiled.
     [[nodiscard]] bool RunLiveFallback(CPU* cpu, std::uint64_t pc);
 
-    /// Guest code in [addr, addr + size) changed (IC IVAU, mapping update, or debugger edit).
+    /// Guest code in [addr, addr + size) may have changed (IC IVAU, mapping update, or debugger
+    /// edit). Primary code is retired only for 64-byte lines whose bytes differ from what the
+    /// primary module was compiled from, so permission flips and remaps of unchanged code cost a
+    /// hash compare. Does not wait for running compiles. Safe to call from any thread.
     void Invalidate(std::uint64_t addr, std::uint64_t size);
 
     [[nodiscard]] std::size_t SecondaryModuleCount() const;
     [[nodiscard]] std::size_t SecondaryFunctionCount() const;
+
+    /// Collects a runtime-discovered function entry point for future warm-start.
+    void NoteHint(std::uint64_t pc);
+
+    /// Saves collected runtime hints to disk for next-launch warm-start.
+    void SaveHints(const char* cache_dir_utf8) const;
+
+    /// Loads previously saved hints from disk.
+    void LoadHints(const char* cache_dir_utf8);
+
+    /// Pre-warms JIT units from loaded hints using library-jit.cache.
+    void WarmUpHints();
+
+    /// Saves hints to disk periodically if any new hints were added.
+    void PeriodicSaveHints();
+
+    /// Returns the current hint set (thread-safe copy).
+    [[nodiscard]] std::vector<std::uint64_t> CopyHints() const;
 
 private:
     struct RtBlock { // RtAPI first: a CPU.rt pointer converts back to the block
@@ -106,22 +130,40 @@ private:
         CodeManager* owner{};
     };
 
+    using RangeList = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+
     struct InvalidatedRangeContext {
-        std::vector<std::pair<std::uint64_t, std::uint64_t>>* ranges;
+        RangeList* ranges;
+    };
+
+    struct SecondaryModule {
+        snx_recompiled* module{};
+        std::uint64_t lo{};
+        std::uint64_t hi{};
+        std::size_t live_functions{};
+    };
+
+    struct RetiredModule {
+        snx_recompiled* module{};
+        std::chrono::steady_clock::time_point retired_at{};
     };
 
     static void MissThunk(CPU* c, std::uint64_t pc);
     static void CodeChangedThunk(CPU* c, std::uint64_t addr);
+    static void NoteHintThunk(std::uint64_t pc);
     static int SkipThunk(void* context, std::uint64_t address);
     static void InvalidatedRangeThunk(void* context, std::uint64_t start, std::uint64_t end);
 
     void Miss(CPU* c, std::uint64_t pc);
     void CodeChanged(std::uint64_t addr);
     [[nodiscard]] bool IsInvalidated(std::uint64_t pc) const;
-    void MergeInvalidatedRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges);
+    void MergeInvalidatedRanges(RangeList ranges);
+    [[nodiscard]] const RangeList* LoadInvalidatedRanges() const;
+    /// Primary-segment runs [start, end) whose bytes differ from the compiled snapshot.
+    [[nodiscard]] RangeList ChangedPrimaryRuns(std::uint64_t addr, std::uint64_t end) const;
     [[nodiscard]] bool InPrimarySegment(std::uint64_t address) const;
     [[nodiscard]] GuestFn FindSecondary(std::uint64_t pc) const;
-    GuestFn CompileSecondary(std::uint64_t pc, bool force = false);
+    GuestFn CompileSecondary(std::uint64_t pc);
     void HandleCompilerOutputLine(const std::string& line);
     void LogCapturedCompilerOutput();
 
@@ -135,18 +177,39 @@ private:
     snx_recompiled* m_primary{};
     std::vector<Segment> m_segments;
 
-    std::mutex m_compile_lock; // snx_recompiler is one-thread-at-a-time
+    /// Hash of every 64-byte line of each primary segment as compiled (parallel to m_segments).
+    std::vector<std::vector<std::uint64_t>> m_segment_hashes;
+
+    const std::uint64_t m_instance_id;
+    std::mutex m_compile_lock; // snx_recompiler is one-thread-at-a-time; Invalidate never takes it
+    std::mutex m_invalidate_lock; // serializes Invalidate calls
     mutable std::shared_mutex m_secondary_lock;
     std::unordered_map<std::uint64_t, GuestFn> m_secondary;
-    std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> m_invalidated_ranges;
+    std::vector<SecondaryModule> m_secondary_modules;
+    /// Bumped by every Invalidate before it touches anything; a compile that sees it change
+    /// re-verifies its source bytes before publishing.
+    std::atomic<std::uint64_t> m_invalidate_gen{};
+
+    /// Primary guest ranges whose compiled code is retired. Writers (under m_ranges_mutex) publish
+    /// a new list and bump the generation; readers keep a per-thread copy keyed by it, so the
+    /// hot IsInvalidated path takes no lock while nothing changes.
+    mutable std::mutex m_ranges_mutex;
+    std::shared_ptr<const RangeList> m_invalidated_ranges;
+    std::atomic<std::uint64_t> m_ranges_generation{};
     std::atomic<bool> m_has_invalidations{};
-    std::atomic<bool> m_invalidation_active{};
-    std::vector<snx_recompiled*> m_secondary_modules;
+    std::atomic<std::uint64_t> m_live_fallback_logs{};
     std::function<void(std::size_t, std::size_t)> m_recompile_progress;
     std::atomic<std::uint64_t> m_primary_miss_count{};
     std::atomic<std::uint64_t> m_primary_miss_time_ns{};
     std::ofstream m_compiler_trace;
     std::vector<std::string> m_pending_compiler_log_lines;
+
+    mutable std::mutex m_hints_lock;
+    std::vector<std::uint64_t> m_hints;
+    std::unordered_set<std::uint64_t> m_hint_set;
+    std::atomic<bool> m_hints_dirty{};
+    std::string m_cache_dir;
+    std::vector<RetiredModule> m_retired_modules;
 };
 
 } // namespace Core::Scarlet

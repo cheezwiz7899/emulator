@@ -37,7 +37,7 @@ if (CITRON_ENABLE_SCARLET_CPU)
         message(FATAL_ERROR "CITRON_ENABLE_SCARLET_CPU CPM integration requires 64-bit Windows llvm-mingw (Clangtron)")
     endif()
 
-    set(CITRON_SCARLETNX_REVISION "785bfa7df4a8ad65780949b1386a3fb6bff57b33" CACHE STRING
+    set(CITRON_SCARLETNX_REVISION "5621a9e4ddfec71cf319ec129202a91621110e45" CACHE STRING
         "ScarletNX revision used by the experimental CPU backend")
     set(CITRON_SCARLETNX_SOURCE_DIR "" CACHE PATH
         "Use an existing ScarletNX checkout instead of CPM's pinned source")
@@ -50,7 +50,7 @@ if (CITRON_ENABLE_SCARLET_CPU)
         list(APPEND _citron_scarlet_cpm_args SOURCE_DIR "${CITRON_SCARLETNX_SOURCE_DIR}")
     else()
         list(APPEND _citron_scarlet_cpm_args
-            GITHUB_REPOSITORY cheezwiz7899/ScarletNX
+            GITHUB_REPOSITORY scarletnx/ScarletNX
             GIT_TAG "${CITRON_SCARLETNX_REVISION}")
     endif()
 

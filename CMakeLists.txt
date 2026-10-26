@@ -114,7 +114,7 @@ CMAKE_DEPENDENT_OPTION(CITRON_CRASH_DUMPS "Compile crash dump (Minidump) support
 option(CITRON_USE_BUNDLED_VCPKG "Use vcpkg for citron dependencies" "${MSVC}")
 option(CITRON_USE_CPM "Use CPM.cmake to fetch dependencies" OFF)
 
-# EXPERIMENTAL: AArch64 CPU backend using ScarletNX's recompiler library (see docs/scarlet-cpu.md).
+# EXPERIMENTAL: AArch64 CPU backend using ScarletNX's recompiler library.
 # With CITRON_USE_CPM, ScarletNX is fetched and built as an external project. Otherwise, provide
 # an installed ScarletNXRecompiler package through CMAKE_PREFIX_PATH or ScarletNXRecompiler_DIR.
 # x86-64 hosts only; GPL-3.0-or-later library.

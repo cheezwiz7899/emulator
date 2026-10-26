@@ -14,7 +14,7 @@ class System;
 
 /// EXPERIMENTAL AArch64 backend running games recompiled ahead of time by ScarletNX's recompiler
 /// library (libscarletnx-recompiler, GPL-3.0-or-later) instead of dynarmic. Select ScarletNX in
-/// Configure > CPU when built with CITRON_ENABLE_SCARLET_CPU. See docs/scarlet-cpu.md.
+/// Configure > CPU when built with CITRON_ENABLE_SCARLET_CPU.
 ///
 /// The recompiler's own header is a GNU C dialect that defines macros and typedefs; it is kept out
 /// of this header (pimpl).
@@ -50,6 +50,8 @@ protected:
     void RewindBreakpointInstruction() override;
 
 private:
+    [[nodiscard]] bool IsInvalidationLeader() const;
+
     struct Impl;
     std::unique_ptr<Impl> m_impl;
 };

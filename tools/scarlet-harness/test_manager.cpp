@@ -1,5 +1,6 @@
 #include "core/arm/scarlet/scarlet_code_manager.h"
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <sys/mman.h>
@@ -102,6 +103,13 @@ int main() {
   CHECK(r == 1111);
   CHECK(mgr.SecondaryModuleCount() == 1); // cache hit, no recompile
 
+  // Invalidating code whose bytes did not change (a permission flip, a remap, a spurious IC IVAU)
+  // must leave the primary module and the cached secondary code in use.
+  mgr.Invalidate(0x10000, 0x1000);
+  r = run(mgr, mgr.Rt(), 0, 0x10000);
+  CHECK(r == 1111);
+  CHECK(mgr.SecondaryModuleCount() == 1); // A stayed AOT; no live copy was compiled
+
   // non-executable target -> undef hook
   run(mgr, mgr.Rt(), 0, 0x10200);
   CHECK(undefs == 1);
@@ -131,7 +139,8 @@ int main() {
   std::printf("after invalidate: x0=%llu modules=%zu\n", (unsigned long long)r,
               mgr.SecondaryModuleCount());
   CHECK(r == 1112);
-  CHECK(mgr.SecondaryModuleCount() == 2);
+  // modules so far: B, the live copy of A2 (changed), B again, the live copy of A2 (restored)
+  CHECK(mgr.SecondaryModuleCount() == 4);
 
   // 4 threads missing the same new range at once: compiled exactly once
   mgr.Invalidate(0x2000000, 0x1000);
@@ -151,7 +160,32 @@ int main() {
   for (int i = 0; i < 4; i++)
     CHECK(res[i] == 1113);
   std::printf("4 threads: modules=%zu\n", mgr.SecondaryModuleCount());
-  CHECK(mgr.SecondaryModuleCount() == 3);
+  CHECK(mgr.SecondaryModuleCount() == 5); // exactly one more: the new B
+  // Invalidate never waits for a compile, and a compile racing it never publishes stale code:
+  // four threads run the secondary code while another invalidates it over and over.
+  {
+    std::atomic<bool> stop{false};
+    std::atomic<int> wrong{0};
+    std::thread runners[4];
+    for (int i = 0; i < 4; i++)
+      runners[i] = std::thread([&, i] {
+        while (!stop)
+        {
+          const auto v = run(mgr, mgr.Rt(), i + 1, 0x10000);
+          if (v != 1113)
+            wrong++;
+        }
+      });
+    for (int i = 0; i < 20; i++) {
+      mgr.Invalidate(0x2000000, 0x1000);
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    stop = true;
+    for (auto &x : runners)
+      x.join();
+    std::printf("invalidate race: wrong=%d\n", wrong.load());
+    CHECK(wrong == 0);
+  }
   std::printf("RESULT %s\n", fails ? "FAIL" : "PASS");
   return fails;
 }
