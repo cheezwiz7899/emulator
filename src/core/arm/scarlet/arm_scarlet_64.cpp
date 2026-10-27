@@ -348,13 +348,20 @@ struct ArmScarlet64::Impl {
         const auto build_id_str =
             has_build_id ? Common::HexToString(build_id_raw, false) : std::string{};
 
+        // One cache folder for the whole program. A folder per build id (the old shape) threw away
+        // everything two versions have in common: switching a version then re-read an empty per-
+        // unit JIT cache (library-jit.cache) and lost the leader addresses (runtime.hints) that the
+        // versions which ran before it had already paid for - which is the difference between our
+        // multi-minute version switch and the much quicker one the runtime shows. ScarletNX names
+        // every artifact it writes by the bytes it compiled, the addresses they carry, the entries
+        // and leaders it found, the settings, SNX_ABI and the host CPU (snx_recompiler_set_cache),
+        // so a shared folder cannot hand a version code compiled from different bytes; it only
+        // shares what is genuinely the same.
         auto cache = Common::FS::GetCitronPath(Common::FS::CitronPath::CitronDir) /
                      "scarlet" / "modules" / fmt::format("{:016X}", process->GetProgramId());
-        if (has_build_id) {
-            cache /= build_id_str;
-        }
         const auto cache_utf8 = Common::FS::PathToUTF8String(cache);
-        LOG_INFO(Core_ARM, "ScarletNX: module cache path: {}", cache_utf8);
+        LOG_INFO(Core_ARM, "ScarletNX: module cache path shared by this program's versions: build id {} at {}",
+                 has_build_id ? build_id_str : std::string{"no build id"}, cache_utf8);
         LOG_INFO(Core_ARM, "ScarletNX: recompiling {} executable segment(s)...", segments.size());
 
         std::string error;

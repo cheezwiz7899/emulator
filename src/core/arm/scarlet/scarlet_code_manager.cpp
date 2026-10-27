@@ -549,7 +549,38 @@ void CodeManager::LogCapturedCompilerOutput() {
 bool CodeManager::Bind(CPU* cpu) {
     t_current_manager = this;
     cpu->rt = &m_block.rt;
-    return m_primary && snx_recompiled_bind(m_primary, cpu) == 0;
+    if (!m_primary || snx_recompiled_bind(m_primary, cpu) != 0) {
+        return false;
+    }
+    bool validate_load = false;
+    {
+        // Every core of a process shares the primary module's dispatch table, so the pointers
+        // repeat; keep one entry per table. Invalidate writes through it, and only these slots
+        // make a guest call that entered retired code reach live code again.
+        std::scoped_lock lk{m_tables_lock};
+        bool known = false;
+        for (const auto& entry : m_tables) {
+            known = known || entry.table == cpu->disp;
+        }
+        if (!known && cpu->disp && cpu->code_lo <= cpu->code_hi) {
+            m_tables.push_back(DispatchTable{cpu->disp, cpu->code_lo, cpu->code_hi});
+        }
+        if (!m_load_staleness_checked) {
+            m_load_staleness_checked = true;
+            validate_load = true;
+        }
+    }
+    if (validate_load) {
+        // A module that came from the disk cache was compiled from the bytes its cache key names,
+        // and the library only marks its own stale array when Invalidate tells it code changed:
+        // guest bytes that already differ from those (a patch applied before this launch, or a
+        // write the game makes while its code is being compiled) would otherwise run in the AOT
+        // copy forever. Look once at load time, through the same path a later patch takes.
+        for (const auto& seg : m_segments) {
+            Invalidate(seg.addr, seg.size);
+        }
+    }
+    return true;
 }
 
 void CodeManager::Run(CPU* cpu, std::uint64_t pc, std::uint64_t stop) {
@@ -1042,6 +1073,72 @@ CodeManager::RangeList CodeManager::ChangedPrimaryRuns(std::uint64_t addr,
     return runs;
 }
 
+// Refill the primary dispatch slots of a guest range with the manager's miss hook, atomically:
+// slots are read with relaxed atomic loads while guest threads run (SNX_ABI contract 10).
+std::size_t CodeManager::RedirectPrimaryEntries(std::uint64_t lo, std::uint64_t hi) {
+    if (lo >= hi) {
+        return 0;
+    }
+    std::scoped_lock lk{m_tables_lock};
+    std::size_t redirected = 0;
+    for (auto& entry : m_tables) {
+        if (!entry.table || entry.hi <= lo || entry.lo >= hi) {
+            continue;
+        }
+        const GuestFn thunk = &CodeManager::MissThunk;
+        const auto from = std::max(lo, entry.lo) & ~std::uint64_t{3};
+        const auto to = (std::min(hi, entry.hi) + 3) & ~std::uint64_t{3};
+        for (auto pc = from; pc < to && pc < entry.hi; pc += 4) {
+            auto* slot = entry.table + ((pc - entry.lo) >> 2);
+            if (__atomic_load_n(slot, __ATOMIC_RELAXED) != thunk) {
+                __atomic_store_n(slot, thunk, __ATOMIC_RELAXED);
+                redirected++;
+            }
+        }
+    }
+    return redirected;
+}
+
+// The stored hashes follow the bytes memory holds now, so the second report of one patch (the
+// page table's unmapping and the guest's own IC IVAU both describe the same write) retires and
+// logs nothing again, and a later write of different bytes is found again. Same walk as the
+// comparison above, storing instead of comparing.
+void CodeManager::RefreshPrimaryHashes(std::uint64_t addr, std::uint64_t end) {
+    std::vector<std::uint8_t> buffer;
+    for (std::size_t i = 0; i < m_segments.size(); ++i) {
+        const auto& seg = m_segments[i];
+        const auto seg_end = seg.addr + seg.size;
+        if (addr >= seg_end || seg.addr >= end || i >= m_segment_hashes.size()) {
+            continue;
+        }
+        const auto lo = std::max(addr, seg.addr);
+        const auto hi = std::min(end, seg_end);
+        if (lo >= hi) {
+            continue;
+        }
+        auto& hashes = m_segment_hashes[i];
+        const auto first_line = (lo - seg.addr) / LineSize;
+        const auto last_line = (hi - 1 - seg.addr) / LineSize;
+        for (std::uint64_t chunk = first_line; chunk <= last_line;) {
+            const auto chunk_lines =
+                std::min<std::uint64_t>(last_line - chunk + 1, HashReadChunk / LineSize);
+            const auto chunk_addr = seg.addr + chunk * LineSize;
+            const auto chunk_end = std::min(seg_end, chunk_addr + chunk_lines * LineSize);
+            buffer.resize(chunk_end - chunk_addr);
+            m_source.Read(chunk_addr, buffer.data(), buffer.size());
+            for (std::uint64_t line = 0; line < chunk_lines; ++line) {
+                const auto offset = line * LineSize;
+                const auto length = std::min<std::uint64_t>(LineSize, buffer.size() - offset);
+                if (chunk + line < hashes.size()) {
+                    hashes[chunk + line] =
+                        HashLine(buffer.data() + offset, static_cast<std::size_t>(length));
+                }
+            }
+            chunk += chunk_lines;
+        }
+    }
+}
+
 void CodeManager::Invalidate(std::uint64_t addr, std::uint64_t size) {
     if (size > UINT64_MAX - addr)
         size = UINT64_MAX - addr;
@@ -1065,11 +1162,28 @@ void CodeManager::Invalidate(std::uint64_t addr, std::uint64_t size) {
                 retired += snx_recompiled_invalidate(m_primary, start, stop - start,
                                                      &InvalidatedRangeThunk, &context);
             }
+            // SNX_ABI 14's stale guard makes a stale AOT function "run its entry through
+            // dispatch" - it looks its own entry up in CPU.disp and tail-jumps to what it finds.
+            // After the call above that entry is still the function itself, so a guest already
+            // inside it, or a call site whose direct call was hooked there, re-enters the body it
+            // was retired for and repeats those few instructions for ever (the launching-screen
+            // spin) or, when the module's code was freed, jumps into stale/zeroed host code (the
+            // crash). Name the manager's miss hook there instead: the next call into the range
+            // reaches the queued JIT, which compiles the pc from live memory, re-arms the slot and
+            // resumes guest code from the patched bytes.
+            std::size_t redirected = 0;
+            std::uint64_t span_lo = addr;
+            std::uint64_t span_hi = end;
+            for (const auto& [start, stop] : stale) {
+                redirected += RedirectPrimaryEntries(start, stop);
+                span_lo = std::min(span_lo, start);
+                span_hi = std::max(span_hi, stop);
+            }
             MergeInvalidatedRanges(std::move(stale));
-            if (retired) {
-                SCARLET_LOG_INFO("ScarletNX invalidated {} primary AOT function(s) for "
-                                 "{:#x}-{:#x}",
-                                 retired, addr, end);
+            RefreshPrimaryHashes(addr, end);
+            if (retired || redirected) {
+                SCARLET_LOG_INFO("ScarletNX invalidated {} primary AOT function(s) and refilled {} dispatch entry(s) for {:#x}-{:#x}",
+                                 retired, redirected, span_lo, span_hi);
             }
         }
     }

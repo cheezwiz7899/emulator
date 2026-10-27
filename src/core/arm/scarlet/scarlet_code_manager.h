@@ -143,6 +143,13 @@ private:
         std::uint64_t hi{};
     };
 
+    /// One bound CPU's view of the primary module's dispatch table (CPU.disp with its guest range).
+    struct DispatchTable {
+        GuestFn* table{};
+        std::uint64_t lo{};
+        std::uint64_t hi{};
+    };
+
     static void MissThunk(CPU* c, std::uint64_t pc);
     static void CodeChangedThunk(CPU* c, std::uint64_t addr);
     static void NoteHintThunk(std::uint64_t pc);
@@ -151,6 +158,17 @@ private:
 
     void Miss(CPU* c, std::uint64_t pc);
     void CodeChanged(std::uint64_t addr);
+    /// Refills CPU.disp slots in [lo, hi) with the manager's miss hook and returns how many it
+    /// wrote. The AOT's stale guard (SNX_ABI 14) runs a stale function's entry through dispatch,
+    /// so a slot that still names the retired function sends the guest back into that function: it
+    /// looks the same slot up again and repeats its own body for ever. A slot that names the miss
+    /// hook makes the call reach the queued JIT, which compiles the pc from live memory, re-arms
+    /// the slot and resumes there.
+    std::size_t RedirectPrimaryEntries(std::uint64_t lo, std::uint64_t hi);
+    /// Rewrites the stored per-line hashes of primary code in [addr, end) with the hashes of the
+    /// bytes there now, so an Invalidate that arrives again for the same bytes (the page table and
+    /// the guest's own IC IVAU both report one patch) retires nothing a second time.
+    void RefreshPrimaryHashes(std::uint64_t addr, std::uint64_t end);
     [[nodiscard]] bool IsInvalidated(std::uint64_t pc) const;
     void MergeInvalidatedRanges(RangeList ranges);
     [[nodiscard]] const RangeList* LoadInvalidatedRanges() const;
@@ -171,6 +189,12 @@ private:
     bool m_secondary_cache_enabled{};
     snx_recompiled* m_primary{};
     std::vector<Segment> m_segments;
+
+    /// The dispatch table every bound CPU points at (cpu.disp, cpu.code_lo/code_hi), recorded at
+    /// Bind time and deduplicated: every core of a process shares the primary module's one table.
+    mutable std::mutex m_tables_lock;
+    std::vector<DispatchTable> m_tables;
+    bool m_load_staleness_checked{};
 
     /// Hash of every 64-byte line of each primary segment as compiled (parallel to m_segments).
     std::vector<std::vector<std::uint64_t>> m_segment_hashes;
