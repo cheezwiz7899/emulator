@@ -54,10 +54,16 @@ thread_local CodeManager* t_current_manager = nullptr;
 
 // Instructions one just-in-time step compiles: the function reached and what it calls, breadth
 // first (the figure ScarletNX's gnuabi runtime uses).
-constexpr std::size_t JitStepInstructions = 65536;
-// Executable bytes read around a missed pc. NRO text is a few MiB; the library's tables cover at
-// most 1 GiB.
-constexpr std::uint64_t MaxJitRange = 64ull * 1024 * 1024;
+//
+// Small on purpose. A step compiles everything breadth first from the missed pc whether or not
+// the guest ever runs it, and each stale pc of a patched title is a step of its own: at 64 Ki
+// instructions an UltraCam boot compiled 800 to 3000 functions per miss, 30 to 45 MiB of module
+// span each, the same spans again and again. A few thousand instructions cover the function and
+// its near callees; anything further is a miss of its own, compiled when it is reached.
+constexpr std::size_t JitStepInstructions = 8192;
+// Executable bytes read around a missed pc (half on each side). The module a step makes spans
+// what it reached inside this window, and publishing walks that span word by word.
+constexpr std::uint64_t MaxJitRange = 2ull * 1024 * 1024;
 
 // Granularity of change detection for the primary module (IC IVAU's line size).
 constexpr std::uint64_t LineSize = 64;
@@ -604,17 +610,14 @@ void CodeManager::Run(CPU* cpu, std::uint64_t pc, std::uint64_t stop) {
             snx_recompiled_call(m_primary, cpu, current);
             continue;
         }
-        // Stale primary code: the queued cache-first JIT recompiles the pc from live memory and
-        // re-arms dispatch, which is what the runtime does after an invalidation. The manager's
-        // whole-window JIT re-expanded the call closure on every invalidation line (the UltraCam
-        // boot storm) and ran only when the queued path cannot provide this pc at all.
-        const auto before = cpu->pc;
-        if (m_default_miss)
-            m_default_miss(cpu, current);
-        if (cpu->pc == before && snx_recompiled_function(m_primary, current))
-            snx_recompiled_call(m_primary, cpu, current);
-        else if (cpu->pc == before && !RunLiveFallback(cpu, current))
+        // Stale primary code runs from a copy compiled from the bytes memory holds now. The
+        // library's queued JIT cannot do this: it compiles the module's own copy of the code, as
+        // it was when the module was made, so it would rebuild the code the patch replaced. And
+        // its default miss returns whatever the dispatch slot holds, which for a retired span
+        // is this manager's own miss thunk: calling it from here recurses until the stack ends.
+        if (!RunLiveFallback(cpu, current)) {
             cpu->rt->undef(cpu, current, 0);
+        }
     }
 }
 
@@ -633,6 +636,13 @@ bool CodeManager::RunLiveFallback(CPU* cpu, std::uint64_t pc) {
     }
     f(cpu, pc);
     return true;
+}
+
+bool CodeManager::SlotNamesMissThunk(const CPU* c, std::uint64_t pc) {
+    if (!c->disp || pc < c->code_lo || pc >= c->code_hi)
+        return false;
+    return __atomic_load_n(&c->disp[(pc - c->code_lo) >> 2], __ATOMIC_RELAXED) ==
+           &CodeManager::MissThunk;
 }
 
 bool CodeManager::InPrimarySegment(std::uint64_t address) const {
@@ -838,19 +848,39 @@ void CodeManager::Miss(CPU* c, std::uint64_t pc) {
     if (InPrimarySegment(pc)) {
         NoteHint(pc);
         const auto started = std::chrono::steady_clock::now();
-        if (IsInvalidated(pc) && !m_default_miss) {
-            // No queued pool to ask for this stale pc: the manager's window JIT is the only
-            // option left (this used to be every stale primary pc's path: the whole-window
-            // closure compile that re-ran on every invalidation line in the UltraCam storm).
+        if (IsInvalidated(pc) || SlotNamesMissThunk(c, pc)) {
+            // Stale code, or a slot that Invalidate pointed at this thunk: compile from live
+            // memory. Never the library's default miss for these: it compiles the module's
+            // snapshot (the code the patch replaced) and returns the slot's own contents, which
+            // here is MissThunk, so it would call back into this function for ever.
             if (!RunLiveFallback(c, pc))
                 c->rt->undef(c, pc, 0);
         } else if (m_default_miss) {
-            // The library's RtAPI.miss waits for ScarletNX's batched JIT worker pool: it
-            // queues the pc, compiles it cache-first from live memory, re-arms dispatch and
-            // resumes there. Stale pcs now take this path too, like cold pcs: ScarletNX's
-            // runtime re-JITs invalidated code through its queued JIT, not through a
-            // synchronous window recompiling the whole closure.
+            // A cold pc of the primary module: the library's RtAPI.miss queues it on ScarletNX's
+            // batched, cache-first JIT worker pool, which re-arms the slot and resumes there.
+            // This function's contract is stronger than that: MissThunk is the module's fallback
+            // ("compiles the code there and runs it"), so pc must have run before this returns.
+            // The queued JIT can answer without running it -- its pending unit for the pc was
+            // already consumed (jit_service.c:78: bit set, nothing queued, so a miss gets NULL
+            // without compiling), or the pc is not inside the frozen images it compiles from.
+            // Returning on that path unwinds one host frame with cpu->pc still at pc: the guest
+            // walks back out of its own call stack, re-missing at every outer frame (a run of
+            // this title logged 1.24 million misses, each one a fraction of a millisecond), and
+            // ends in a thread whose registers hold string bytes and a read of unmapped memory.
+            // Require progress instead: cpu->pc moved off pc, otherwise run the live copy.
             m_default_miss(c, pc);
+            if (c->pc == pc) {
+                const auto taken =
+                    m_miss_no_progress_fallbacks.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (taken <= 16) {
+                    SCARLET_LOG_WARN(
+                        "ScarletNX: queued JIT took {:#x} and ran nothing; running a live JIT copy",
+                        pc);
+                }
+                if (!RunLiveFallback(c, pc)) {
+                    c->rt->undef(c, pc, 0);
+                }
+            }
         } else {
             c->rt->undef(c, pc, 0);
         }
@@ -962,7 +992,21 @@ GuestFn CodeManager::CompileSecondary(std::uint64_t pc) {
                         functions++;
                     }
                 }
-                m_secondary_modules.push_back({module, module_lo, module_hi});
+                // Record the bytes this module describes, one hash per line: an invalidation
+                // whose range turns out to hold the same bytes (the whole-cache clearing SVC, an
+                // undefined-instruction window that was never written) must not retire it, or
+                // every address inside it compiles a fresh module again and the address space
+                // runs out.
+                std::vector<std::uint64_t> line_hashes;
+                line_hashes.reserve((module_hi - module_lo) / LineSize + 1);
+                for (std::size_t off = 0; module_lo + off < module_hi; off += LineSize) {
+                    const auto length =
+                        std::min<std::uint64_t>(LineSize, module_hi - (module_lo + off));
+                    line_hashes.push_back(HashLine(bytes.data() + (module_lo - lo) + off,
+                                                   static_cast<std::size_t>(length)));
+                }
+                m_secondary_modules.push_back(
+                    {module, module_lo, module_hi, std::move(line_hashes)});
             }
         }
         if (changed_underneath) {
@@ -1073,6 +1117,41 @@ CodeManager::RangeList CodeManager::ChangedPrimaryRuns(std::uint64_t addr,
     return runs;
 }
 
+// Does a published just-in-time module still describe the memory in [addr, end)? Same walk as the
+// primary comparison above, over one module's stored line hashes, and stopped at the first line
+// that differs.
+bool CodeManager::SecondarySourceChanged(const SecondaryModule& entry, std::uint64_t addr,
+                                         std::uint64_t end) const {
+    const auto lo = std::max(addr, entry.lo);
+    const auto hi = std::min(end, entry.hi);
+    if (lo >= hi) {
+        return false;
+    }
+    std::vector<std::uint8_t> buffer;
+    const auto first_line = (lo - entry.lo) / LineSize;
+    const auto last_line = (hi - 1 - entry.lo) / LineSize;
+    for (std::uint64_t chunk = first_line; chunk <= last_line;) {
+        const auto chunk_lines =
+            std::min<std::uint64_t>(last_line - chunk + 1, HashReadChunk / LineSize);
+        const auto chunk_addr = entry.lo + chunk * LineSize;
+        const auto chunk_end = std::min(entry.hi, chunk_addr + chunk_lines * LineSize);
+        buffer.resize(chunk_end - chunk_addr);
+        m_source.Read(chunk_addr, buffer.data(), buffer.size());
+        for (std::uint64_t line = 0; line < chunk_lines; ++line) {
+            const auto offset = line * LineSize;
+            const auto length = std::min<std::uint64_t>(LineSize, buffer.size() - offset);
+            if (chunk + line < entry.line_hashes.size() &&
+                HashLine(buffer.data() + offset, static_cast<std::size_t>(length)) ==
+                    entry.line_hashes[chunk + line]) {
+                continue;
+            }
+            return true;
+        }
+        chunk += chunk_lines;
+    }
+    return false;
+}
+
 // Refill the primary dispatch slots of a guest range with the manager's miss hook, atomically:
 // slots are read with relaxed atomic loads while guest threads run (SNX_ABI contract 10).
 std::size_t CodeManager::RedirectPrimaryEntries(std::uint64_t lo, std::uint64_t hi) {
@@ -1090,7 +1169,11 @@ std::size_t CodeManager::RedirectPrimaryEntries(std::uint64_t lo, std::uint64_t 
         const auto to = (std::min(hi, entry.hi) + 3) & ~std::uint64_t{3};
         for (auto pc = from; pc < to && pc < entry.hi; pc += 4) {
             auto* slot = entry.table + ((pc - entry.lo) >> 2);
-            if (__atomic_load_n(slot, __ATOMIC_RELAXED) != thunk) {
+            // Only a slot that names code can be re-entered; the library clears the entries and
+            // leaders of the functions it retires and leaves every other slot as it found it, and
+            // an empty slot is already the answer "none" for that address.
+            const auto current = __atomic_load_n(slot, __ATOMIC_RELAXED);
+            if (current && current != thunk) {
                 __atomic_store_n(slot, thunk, __ATOMIC_RELAXED);
                 redirected++;
             }
@@ -1168,9 +1251,10 @@ void CodeManager::Invalidate(std::uint64_t addr, std::uint64_t size) {
             // inside it, or a call site whose direct call was hooked there, re-enters the body it
             // was retired for and repeats those few instructions for ever (the launching-screen
             // spin) or, when the module's code was freed, jumps into stale/zeroed host code (the
-            // crash). Name the manager's miss hook there instead: the next call into the range
-            // reaches the queued JIT, which compiles the pc from live memory, re-arms the slot and
-            // resumes guest code from the patched bytes.
+            // crash. Name the manager's miss hook there instead, at the slots that still name
+            // code: the manager checks a pc against this list before the module's queued JIT is
+            // asked, because that queue compiles the module's own copy of the code, frozen when
+            // the module was made, and would hand back the bytes this patch just replaced.
             std::size_t redirected = 0;
             std::uint64_t span_lo = addr;
             std::uint64_t span_hi = end;
@@ -1196,13 +1280,26 @@ void CodeManager::Invalidate(std::uint64_t addr, std::uint64_t size) {
     evict.emplace_back(addr, end);
     InvalidatedRangeContext evict_context{&evict};
     std::unique_lock lock{m_secondary_lock};
+    std::size_t kept = 0;
     for (const auto& entry : m_secondary_modules) {
-        if (entry.hi > addr && entry.lo < end) {
-            snx_recompiled_invalidate(entry.module, addr, size, &InvalidatedRangeThunk,
-                                      &evict_context);
-            // Running code of this module may now divert and return to Run() mid-function.
-            m_has_invalidations.store(true, std::memory_order_release);
+        if (entry.hi <= addr || entry.lo >= end) {
+            continue;
         }
+        // A module whose lines under this range still hold the bytes it was compiled from says
+        // nothing about this invalidation: keeping it is what stops a whole-cache clearing SVC,
+        // or an undefined-instruction window, from retiring every just-in-time module it meets.
+        if (!entry.line_hashes.empty() && !SecondarySourceChanged(entry, addr, end)) {
+            kept++;
+            continue;
+        }
+        snx_recompiled_invalidate(entry.module, addr, size, &InvalidatedRangeThunk, &evict_context);
+        // Running code of this module may now divert and return to Run() mid-function.
+        m_has_invalidations.store(true, std::memory_order_release);
+    }
+    if (kept) {
+        SCARLET_LOG("ScarletNX kept {} just-in-time module(s) over {:#x}-{:#x}; the bytes there did "
+                    "not change",
+                    kept, addr, end);
     }
     MergeRanges(evict);
     std::uint64_t probes = 0;

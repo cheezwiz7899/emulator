@@ -137,10 +137,13 @@ private:
         RangeList* ranges;
     };
 
+    /// A published just-in-time module: its guest range and the hash of every line it was compiled
+    /// from, so an invalidation that describes no write can be refused instead of retiring it.
     struct SecondaryModule {
         snx_recompiled* module{};
         std::uint64_t lo{};
         std::uint64_t hi{};
+        std::vector<std::uint64_t> line_hashes{};
     };
 
     /// One bound CPU's view of the primary module's dispatch table (CPU.disp with its guest range).
@@ -151,6 +154,8 @@ private:
     };
 
     static void MissThunk(CPU* c, std::uint64_t pc);
+    /// True when pc's primary dispatch slot names MissThunk (a retired span's slots do).
+    [[nodiscard]] static bool SlotNamesMissThunk(const CPU* c, std::uint64_t pc);
     static void CodeChangedThunk(CPU* c, std::uint64_t addr);
     static void NoteHintThunk(std::uint64_t pc);
     static int SkipThunk(void* context, std::uint64_t address);
@@ -158,17 +163,22 @@ private:
 
     void Miss(CPU* c, std::uint64_t pc);
     void CodeChanged(std::uint64_t addr);
-    /// Refills CPU.disp slots in [lo, hi) with the manager's miss hook and returns how many it
-    /// wrote. The AOT's stale guard (SNX_ABI 14) runs a stale function's entry through dispatch,
-    /// so a slot that still names the retired function sends the guest back into that function: it
-    /// looks the same slot up again and repeats its own body for ever. A slot that names the miss
-    /// hook makes the call reach the queued JIT, which compiles the pc from live memory, re-arms
-    /// the slot and resumes there.
+    /// Names the manager's miss hook in the CPU.disp slots of [lo, hi) that still name a function,
+    /// and returns how many it wrote. The AOT's stale guard (SNX_ABI 14) runs a stale function's
+    /// entry through dispatch, so a slot that still names the retired function sends the guest back
+    /// into that body for ever. Only slots that name something are rewritten: an empty slot already
+    /// means "none", and thunking an empty one sends a cold address through the manager instead of
+    /// the library, which pays for a just-in-time copy of code that was never patched.
     std::size_t RedirectPrimaryEntries(std::uint64_t lo, std::uint64_t hi);
     /// Rewrites the stored per-line hashes of primary code in [addr, end) with the hashes of the
     /// bytes there now, so an Invalidate that arrives again for the same bytes (the page table and
     /// the guest's own IC IVAU both report one patch) retires nothing a second time.
     void RefreshPrimaryHashes(std::uint64_t addr, std::uint64_t end);
+    /// True when a line of a published just-in-time module inside [addr, end) now reads bytes
+    /// different from the ones it was compiled from; a module that answers false still describes
+    /// memory and is not retired by this invalidation.
+    [[nodiscard]] bool SecondarySourceChanged(const SecondaryModule& entry, std::uint64_t addr,
+                                              std::uint64_t end) const;
     [[nodiscard]] bool IsInvalidated(std::uint64_t pc) const;
     void MergeInvalidatedRanges(RangeList ranges);
     [[nodiscard]] const RangeList* LoadInvalidatedRanges() const;
@@ -220,6 +230,9 @@ private:
     std::function<void(std::size_t, std::size_t)> m_recompile_progress;
     std::atomic<std::uint64_t> m_primary_miss_count{};
     std::atomic<std::uint64_t> m_primary_miss_time_ns{};
+    /// How often Miss had to run a live copy because the module's queued JIT returned without
+    /// running the pc it was given (see Miss). Counted across cores; only gates the log.
+    std::atomic<std::uint64_t> m_miss_no_progress_fallbacks{};
     std::ofstream m_compiler_trace;
     std::vector<std::string> m_pending_compiler_log_lines;
 
