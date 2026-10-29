@@ -147,15 +147,7 @@ private:
     };
 
     /// One bound CPU's view of the primary module's dispatch table (CPU.disp with its guest range).
-    struct DispatchTable {
-        GuestFn* table{};
-        std::uint64_t lo{};
-        std::uint64_t hi{};
-    };
-
     static void MissThunk(CPU* c, std::uint64_t pc);
-    /// True when pc's primary dispatch slot names MissThunk (a retired span's slots do).
-    [[nodiscard]] static bool SlotNamesMissThunk(const CPU* c, std::uint64_t pc);
     static void CodeChangedThunk(CPU* c, std::uint64_t addr);
     static void NoteHintThunk(std::uint64_t pc);
     static int SkipThunk(void* context, std::uint64_t address);
@@ -163,13 +155,6 @@ private:
 
     void Miss(CPU* c, std::uint64_t pc);
     void CodeChanged(std::uint64_t addr);
-    /// Names the manager's miss hook in the CPU.disp slots of [lo, hi) that still name a function,
-    /// and returns how many it wrote. The AOT's stale guard (SNX_ABI 14) runs a stale function's
-    /// entry through dispatch, so a slot that still names the retired function sends the guest back
-    /// into that body for ever. Only slots that name something are rewritten: an empty slot already
-    /// means "none", and thunking an empty one sends a cold address through the manager instead of
-    /// the library, which pays for a just-in-time copy of code that was never patched.
-    std::size_t RedirectPrimaryEntries(std::uint64_t lo, std::uint64_t hi);
     /// Rewrites the stored per-line hashes of primary code in [addr, end) with the hashes of the
     /// bytes there now, so an Invalidate that arrives again for the same bytes (the page table and
     /// the guest's own IC IVAU both report one patch) retires nothing a second time.
@@ -179,9 +164,6 @@ private:
     /// memory and is not retired by this invalidation.
     [[nodiscard]] bool SecondarySourceChanged(const SecondaryModule& entry, std::uint64_t addr,
                                               std::uint64_t end) const;
-    [[nodiscard]] bool IsInvalidated(std::uint64_t pc) const;
-    void MergeInvalidatedRanges(RangeList ranges);
-    [[nodiscard]] const RangeList* LoadInvalidatedRanges() const;
     /// Primary-segment runs [start, end) whose bytes differ from the compiled snapshot.
     [[nodiscard]] RangeList ChangedPrimaryRuns(std::uint64_t addr, std::uint64_t end) const;
     [[nodiscard]] bool InPrimarySegment(std::uint64_t address) const;
@@ -203,7 +185,6 @@ private:
     /// The dispatch table every bound CPU points at (cpu.disp, cpu.code_lo/code_hi), recorded at
     /// Bind time and deduplicated: every core of a process shares the primary module's one table.
     mutable std::mutex m_tables_lock;
-    std::vector<DispatchTable> m_tables;
     bool m_load_staleness_checked{};
 
     /// Hash of every 64-byte line of each primary segment as compiled (parallel to m_segments).
@@ -219,12 +200,8 @@ private:
     /// re-verifies its source bytes before publishing.
     std::atomic<std::uint64_t> m_invalidate_gen{};
 
-    /// Primary guest ranges whose compiled code is retired. Writers (under m_ranges_mutex) publish
-    /// a new list and bump the generation; readers keep a per-thread copy keyed by it, so the
-    /// hot IsInvalidated path takes no lock while nothing changes.
-    mutable std::mutex m_ranges_mutex;
-    std::shared_ptr<const RangeList> m_invalidated_ranges;
-    std::atomic<std::uint64_t> m_ranges_generation{};
+    /// Set once any secondary code was invalidated: running code of those modules may divert and
+    /// return to Run() with cpu->pc outside the primary module, which Run() then re-enters by pc.
     std::atomic<bool> m_has_invalidations{};
     std::atomic<std::uint64_t> m_live_fallback_logs{};
     std::function<void(std::size_t, std::size_t)> m_recompile_progress;

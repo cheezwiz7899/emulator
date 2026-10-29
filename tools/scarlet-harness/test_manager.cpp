@@ -139,8 +139,9 @@ int main() {
   std::printf("after invalidate: x0=%llu modules=%zu\n", (unsigned long long)r,
               mgr.SecondaryModuleCount());
   CHECK(r == 1112);
-  // modules so far: B, the live copy of A2 (changed), B again, the live copy of A2 (restored)
-  CHECK(mgr.SecondaryModuleCount() == 4);
+  // modules so far: B, and B again. A2, retired primary code, is the library JIT's: it ran its
+  // new bytes without a module of the manager's.
+  CHECK(mgr.SecondaryModuleCount() == 2);
 
   // 4 threads missing the same new range at once: compiled exactly once
   mgr.Invalidate(0x2000000, 0x1000);
@@ -160,7 +161,7 @@ int main() {
   for (int i = 0; i < 4; i++)
     CHECK(res[i] == 1113);
   std::printf("4 threads: modules=%zu\n", mgr.SecondaryModuleCount());
-  CHECK(mgr.SecondaryModuleCount() == 5); // exactly one more: the new B
+  CHECK(mgr.SecondaryModuleCount() == 3); // exactly one more: the new B
   // Invalidating the whole address space ends (the per-address probe count must not wrap) and
   // leaves everything runnable: code is compiled again on demand.
   mgr.Invalidate(0, ~0ull);

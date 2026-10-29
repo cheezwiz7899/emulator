@@ -560,17 +560,7 @@ bool CodeManager::Bind(CPU* cpu) {
     }
     bool validate_load = false;
     {
-        // Every core of a process shares the primary module's dispatch table, so the pointers
-        // repeat; keep one entry per table. Invalidate writes through it, and only these slots
-        // make a guest call that entered retired code reach live code again.
         std::scoped_lock lk{m_tables_lock};
-        bool known = false;
-        for (const auto& entry : m_tables) {
-            known = known || entry.table == cpu->disp;
-        }
-        if (!known && cpu->disp && cpu->code_lo <= cpu->code_hi) {
-            m_tables.push_back(DispatchTable{cpu->disp, cpu->code_lo, cpu->code_hi});
-        }
         if (!m_load_staleness_checked) {
             m_load_staleness_checked = true;
             validate_load = true;
@@ -606,18 +596,9 @@ void CodeManager::Run(CPU* cpu, std::uint64_t pc, std::uint64_t stop) {
             }
             continue;
         }
-        if (!IsInvalidated(current)) {
-            snx_recompiled_call(m_primary, cpu, current);
-            continue;
-        }
-        // Stale primary code runs from a copy compiled from the bytes memory holds now. The
-        // library's queued JIT cannot do this: it compiles the module's own copy of the code, as
-        // it was when the module was made, so it would rebuild the code the patch replaced. And
-        // its default miss returns whatever the dispatch slot holds, which for a retired span
-        // is this manager's own miss thunk: calling it from here recurses until the stack ends.
-        if (!RunLiveFallback(cpu, current)) {
-            cpu->rt->undef(cpu, current, 0);
-        }
+        // Retired primary code leaves its dispatch slots empty: the library's queued JIT
+        // compiles what the guest has there now, from the copy Invalidate refreshed.
+        snx_recompiled_call(m_primary, cpu, current);
     }
 }
 
@@ -636,13 +617,6 @@ bool CodeManager::RunLiveFallback(CPU* cpu, std::uint64_t pc) {
     }
     f(cpu, pc);
     return true;
-}
-
-bool CodeManager::SlotNamesMissThunk(const CPU* c, std::uint64_t pc) {
-    if (!c->disp || pc < c->code_lo || pc >= c->code_hi)
-        return false;
-    return __atomic_load_n(&c->disp[(pc - c->code_lo) >> 2], __ATOMIC_RELAXED) ==
-           &CodeManager::MissThunk;
 }
 
 bool CodeManager::InPrimarySegment(std::uint64_t address) const {
@@ -834,8 +808,9 @@ int CodeManager::SkipThunk(void* context, std::uint64_t address) {
         return 1;
     }
     if (self->InPrimarySegment(address)) {
-        return !self->IsInvalidated(address) &&
-               snx_recompiled_function(self->m_primary, address) != nullptr;
+        // The primary module owns these, stale or not: a call into one goes through its dispatch
+        // table and the library's JIT, which compiles the current code.
+        return 1;
     }
     return 0;
 }
@@ -848,11 +823,9 @@ void CodeManager::Miss(CPU* c, std::uint64_t pc) {
     if (InPrimarySegment(pc)) {
         NoteHint(pc);
         const auto started = std::chrono::steady_clock::now();
-        if (IsInvalidated(pc) || SlotNamesMissThunk(c, pc)) {
-            // Stale code, or a slot that Invalidate pointed at this thunk: compile from live
-            // memory. Never the library's default miss for these: it compiles the module's
-            // snapshot (the code the patch replaced) and returns the slot's own contents, which
-            // here is MissThunk, so it would call back into this function for ever.
+        if (!m_default_miss) {
+            // No queued JIT to ask (the library gave no default miss): the live copy is all
+            // there is.
             if (!RunLiveFallback(c, pc))
                 c->rt->undef(c, pc, 0);
         } else if (m_default_miss) {
@@ -1033,47 +1006,6 @@ void CodeManager::InvalidatedRangeThunk(void* context, std::uint64_t start, std:
         ranges->emplace_back(start, end);
 }
 
-void CodeManager::MergeInvalidatedRanges(RangeList ranges) {
-    if (ranges.empty())
-        return;
-    std::scoped_lock lock{m_ranges_mutex};
-    if (m_invalidated_ranges)
-        ranges.insert(ranges.end(), m_invalidated_ranges->begin(), m_invalidated_ranges->end());
-    MergeRanges(ranges);
-    m_invalidated_ranges = std::make_shared<const RangeList>(std::move(ranges));
-    m_ranges_generation.fetch_add(1, std::memory_order_release);
-    m_has_invalidations.store(true, std::memory_order_release);
-}
-
-const CodeManager::RangeList* CodeManager::LoadInvalidatedRanges() const {
-    struct Cache {
-        std::uint64_t instance{};
-        std::uint64_t generation{};
-        std::shared_ptr<const RangeList> ranges;
-    };
-    thread_local Cache cache;
-    const auto generation = m_ranges_generation.load(std::memory_order_acquire);
-    if (cache.instance != m_instance_id || cache.generation != generation) {
-        std::scoped_lock lock{m_ranges_mutex};
-        cache.ranges = m_invalidated_ranges;
-        cache.generation = m_ranges_generation.load(std::memory_order_relaxed);
-        cache.instance = m_instance_id;
-    }
-    return cache.ranges.get();
-}
-
-bool CodeManager::IsInvalidated(std::uint64_t pc) const {
-    if (!m_has_invalidations.load(std::memory_order_acquire))
-        return false;
-    const auto* ranges = LoadInvalidatedRanges();
-    if (!ranges)
-        return false;
-    const auto it = std::upper_bound(
-        ranges->begin(), ranges->end(), pc,
-        [](std::uint64_t address, const auto& range) { return address < range.first; });
-    return it != ranges->begin() && pc < std::prev(it)->second;
-}
-
 CodeManager::RangeList CodeManager::ChangedPrimaryRuns(std::uint64_t addr,
                                                        std::uint64_t end) const {
     RangeList runs;
@@ -1152,36 +1084,6 @@ bool CodeManager::SecondarySourceChanged(const SecondaryModule& entry, std::uint
     return false;
 }
 
-// Refill the primary dispatch slots of a guest range with the manager's miss hook, atomically:
-// slots are read with relaxed atomic loads while guest threads run (SNX_ABI contract 10).
-std::size_t CodeManager::RedirectPrimaryEntries(std::uint64_t lo, std::uint64_t hi) {
-    if (lo >= hi) {
-        return 0;
-    }
-    std::scoped_lock lk{m_tables_lock};
-    std::size_t redirected = 0;
-    for (auto& entry : m_tables) {
-        if (!entry.table || entry.hi <= lo || entry.lo >= hi) {
-            continue;
-        }
-        const GuestFn thunk = &CodeManager::MissThunk;
-        const auto from = std::max(lo, entry.lo) & ~std::uint64_t{3};
-        const auto to = (std::min(hi, entry.hi) + 3) & ~std::uint64_t{3};
-        for (auto pc = from; pc < to && pc < entry.hi; pc += 4) {
-            auto* slot = entry.table + ((pc - entry.lo) >> 2);
-            // Only a slot that names code can be re-entered; the library clears the entries and
-            // leaders of the functions it retires and leaves every other slot as it found it, and
-            // an empty slot is already the answer "none" for that address.
-            const auto current = __atomic_load_n(slot, __ATOMIC_RELAXED);
-            if (current && current != thunk) {
-                __atomic_store_n(slot, thunk, __ATOMIC_RELAXED);
-                redirected++;
-            }
-        }
-    }
-    return redirected;
-}
-
 // The stored hashes follow the bytes memory holds now, so the second report of one patch (the
 // page table's unmapping and the guest's own IC IVAU both describe the same write) retires and
 // logs nothing again, and a later write of different bytes is found again. Same walk as the
@@ -1238,36 +1140,33 @@ void CodeManager::Invalidate(std::uint64_t addr, std::uint64_t size) {
         auto changed = ChangedPrimaryRuns(addr, end);
         if (!changed.empty()) {
             RangeList stale = changed;
-            MergeInvalidatedRanges(changed);
+            // The library's JIT compiles from its own copy of the code, frozen when the module
+            // was made; bring that copy up to what the guest has now, before the functions are
+            // retired, so the first miss after that asks the JIT for the new code (the NX
+            // runtime's JIT reads the guest's memory itself).
+            std::size_t refilled = 0;
+            std::vector<std::uint8_t> now;
+            for (const auto& [start, stop] : changed) {
+                now.resize(stop - start);
+                m_source.Read(start, now.data(), now.size());
+                refilled += snx_recompiled_update_code(m_primary, start, now.data(), now.size());
+            }
             std::size_t retired = 0;
             InvalidatedRangeContext context{&stale};
             for (const auto& [start, stop] : changed) {
                 retired += snx_recompiled_invalidate(m_primary, start, stop - start,
                                                      &InvalidatedRangeThunk, &context);
             }
-            // SNX_ABI 14's stale guard makes a stale AOT function "run its entry through
-            // dispatch" - it looks its own entry up in CPU.disp and tail-jumps to what it finds.
-            // After the call above that entry is still the function itself, so a guest already
-            // inside it, or a call site whose direct call was hooked there, re-enters the body it
-            // was retired for and repeats those few instructions for ever (the launching-screen
-            // spin) or, when the module's code was freed, jumps into stale/zeroed host code (the
-            // crash. Name the manager's miss hook there instead, at the slots that still name
-            // code: the manager checks a pc against this list before the module's queued JIT is
-            // asked, because that queue compiles the module's own copy of the code, frozen when
-            // the module was made, and would hand back the bytes this patch just replaced.
-            std::size_t redirected = 0;
             std::uint64_t span_lo = addr;
             std::uint64_t span_hi = end;
             for (const auto& [start, stop] : stale) {
-                redirected += RedirectPrimaryEntries(start, stop);
                 span_lo = std::min(span_lo, start);
                 span_hi = std::max(span_hi, stop);
             }
-            MergeInvalidatedRanges(std::move(stale));
             RefreshPrimaryHashes(addr, end);
-            if (retired || redirected) {
-                SCARLET_LOG_INFO("ScarletNX invalidated {} primary AOT function(s) and refilled {} dispatch entry(s) for {:#x}-{:#x}",
-                                 retired, redirected, span_lo, span_hi);
+            if (retired || refilled) {
+                SCARLET_LOG_INFO("ScarletNX invalidated {} primary AOT function(s) and refreshed {} code byte(s) for {:#x}-{:#x}",
+                                 retired, refilled, span_lo, span_hi);
             }
         }
     }
